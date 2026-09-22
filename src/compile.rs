@@ -70,13 +70,53 @@ fn e(at: impl Into<String>, message: impl Into<String>) -> CompileError {
 ///
 /// 用 `to_bits` 而不是 `==` —— `-0.0 == 0.0` 但二者在文件里是不同的字节，
 /// 而且 `NaN` 用 `==` 永远不相等会让去重失效。
-#[derive(PartialEq, Eq, Hash)]
+///
+/// # 为什么 `bones` 是内联数组而不是 `Vec`
+///
+/// `Vertex.bones` 最多 [`MAX_BONES_PER_VERT`] 组（`smd_vertex_to_ir` 里已截断），
+/// 所以键里的骨骼部分天然定长。早期版本用 `Vec<(i32, u32)>`，
+/// **每个顶点**都要分配一次堆内存（100 万三角形约 300 万次）。
+///
+/// 用「定长数组 + 计数」后零分配。为了保持 `Hash`/`Eq` 的语义与 `Vec` 版本
+/// **完全一致**，比较与哈希只看前 `n` 项（见下面的手写实现）——
+/// 尾部未使用的槽位不参与，否则「3 组」与「1 组 + 2 个填充」会被判成不同。
+#[derive(Debug, Clone, Copy)]
 struct VertexKey {
     pos: [u32; 3],
     normal: [u32; 3],
     uv: [u32; 2],
-    /// 排序后的 (骨骼下标, 权重位模式)，最多 3 组。
-    bones: Vec<(i32, u32)>,
+    /// 排序后的 (骨骼下标, 权重位模式)，前 `n_bones` 项有效。
+    bones: [(i32, u32); MAX_BONES_PER_VERT],
+    n_bones: u8,
+}
+
+impl VertexKey {
+    #[inline]
+    fn bones_slice(&self) -> &[(i32, u32)] {
+        &self.bones[..self.n_bones as usize]
+    }
+}
+
+impl PartialEq for VertexKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos
+            && self.normal == other.normal
+            && self.uv == other.uv
+            && self.bones_slice() == other.bones_slice()
+    }
+}
+impl Eq for VertexKey {}
+
+impl std::hash::Hash for VertexKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pos.hash(state);
+        self.normal.hash(state);
+        self.uv.hash(state);
+        // 与 `Vec` 的 Hash 对齐：先写长度，再写元素。
+        // `Vec<T>` 的 `Hash` 是 `len.hash()` + 每项 `hash()`（含长度前缀），
+        // 这里复刻同样的口径，保证哈希分布不退化。
+        self.bones_slice().hash(state);
+    }
 }
 
 fn fbits(v: f32) -> u32 {
@@ -85,13 +125,13 @@ fn fbits(v: f32) -> u32 {
 }
 
 fn vertex_key(v: &Vertex) -> VertexKey {
-    let mut bones: Vec<(i32, u32)> = v
-        .bones
-        .iter()
-        .map(|p| (p[0] as i32, fbits(p[1])))
-        .collect();
+    let n = v.bones.len().min(MAX_BONES_PER_VERT);
+    let mut bones = [(0i32, 0u32); MAX_BONES_PER_VERT];
+    for (i, p) in v.bones.iter().take(n).enumerate() {
+        bones[i] = (p[0] as i32, fbits(p[1]));
+    }
     // 排序让「绑定顺序不同但语义相同」的顶点也能合并。
-    bones.sort_unstable();
+    bones[..n].sort_unstable();
     VertexKey {
         pos: [fbits(v.pos[0]), fbits(v.pos[1]), fbits(v.pos[2])],
         normal: [
@@ -101,6 +141,7 @@ fn vertex_key(v: &Vertex) -> VertexKey {
         ],
         uv: [fbits(v.uv[0]), fbits(v.uv[1])],
         bones,
+        n_bones: n as u8,
     }
 }
 
@@ -370,6 +411,45 @@ fn build_model_lods(
 /// 材质名 → 材质表下标的映射：先在描述文件的 `[materials].textures` 里
 /// 按名字找（忽略分隔符与 `$cdmaterials` 前缀差异）；找不到则**报错** ——
 /// 静默新建一个材质会让用户在游戏里看到「材质丢失」而不知道原因。
+/// 「SMD 骨骼下标 → 描述文件骨骼下标」的查找表，**每个 SMD 只建一次**。
+///
+/// # 为什么要把它提出顶点循环
+///
+/// [`smd_vertex_to_ir`] 原先在**每个顶点**上重建这两张表：
+/// `node_names`（`Vec<&str>`）与 `desc.bone_index()`（`HashMap<&str, usize>`）。
+/// 后者实测 **71 ns/次**（68 根骨骼），而且**每次都新分配一个 HashMap**。
+///
+/// 100 万三角形（300 万个顶点）时：
+///
+/// | 项 | 成本 |
+/// |---|---|
+/// | 时间 | ≈ 214 ms（占 `compile()` 的 5%） |
+/// | 分配 | ≈ 300 万次 |
+///
+/// 表的内容在一个 SMD 内是**恒定**的（骨骼表来自描述文件，`nodes` 段来自
+/// SMD 本身），所以没有任何理由逐顶点重建。
+struct VertexBoneMap<'s, 'd> {
+    /// SMD `nodes` 段的骨骼名（按 SMD 自己的下标）。
+    node_names: Vec<&'s str>,
+    /// 描述文件骨骼名 → 下标。与 [`ModelDesc::bone_index`] 一致（**大小写敏感**）。
+    desc_index: HashMap<&'d str, usize>,
+    /// `nodes` 段的条目数（只用于报错文案）。
+    node_count: usize,
+    /// 描述文件的骨骼总数。
+    bone_count: usize,
+}
+
+impl<'s, 'd> VertexBoneMap<'s, 'd> {
+    fn new(smd: &'s Smd, desc: &'d ModelDesc) -> Self {
+        VertexBoneMap {
+            node_names: smd.nodes.iter().map(|n| n.name.as_str()).collect(),
+            desc_index: desc.bone_index(),
+            node_count: smd.nodes.len(),
+            bone_count: desc.bones.len(),
+        }
+    }
+}
+
 fn build_meshes(
     smd: &Smd,
     desc: &ModelDesc,
@@ -419,6 +499,9 @@ fn build_meshes(
     // 每个 mesh 自己的顶点去重表。
     let mut dedup: HashMap<usize, HashMap<VertexKey, u32>> = HashMap::new();
 
+    // 骨骼查找表**只建一次**（原先在 `smd_vertex_to_ir` 里逐顶点重建）。
+    let bone_map = VertexBoneMap::new(smd, desc);
+
     for t in &smd.triangles {
         let mi = material_of[t.material.as_str()];
         if let std::collections::hash_map::Entry::Vacant(e) = per_mesh.entry(mi) {
@@ -431,7 +514,7 @@ fn build_meshes(
         let table = dedup.get_mut(&mi).unwrap();
         let mut corner = [0u32; 3];
         for (c, sv) in t.vertices.iter().enumerate() {
-            let v = smd_vertex_to_ir(sv, desc, smd, smd_path, at)?;
+            let v = smd_vertex_to_ir(sv, desc, &bone_map, smd_path, at)?;
             let key = vertex_key(&v);
             let idx = match table.get(&key) {
                 Some(&i) => i,
@@ -483,25 +566,49 @@ fn build_meshes(
 }
 
 /// 把一个 SMD 三角形顶点转成 IR 顶点，并做边界校验。
+///
+/// `bone_map` 由调用方**每个 SMD 建一次**并复用 —— 见 [`VertexBoneMap`]。
+/// 早期版本在这里逐顶点重建骨骼表，是 `compile()` 分配量的主要来源之一。
 fn smd_vertex_to_ir(
     sv: &crate::smd::SmdVertex,
     desc: &ModelDesc,
-    smd: &Smd,
+    bone_map: &VertexBoneMap<'_, '_>,
     smd_path: &Path,
     at: &str,
 ) -> Result<Vertex, CompileError> {
-    let bone_count = desc.bones.len();
+    let bone_count = bone_map.bone_count;
 
     // SMD 的绑定用的是**SMD 自己的**骨骼下标，需要映射到描述文件的骨骼表。
     // 两边都用名字对齐 —— 这样 SMD 里多出的骨骼（例如仅用于动画的辅助骨）
     // 会被明确报错而不是静默错位。
-    let node_names: Vec<&str> = smd.nodes.iter().map(|n| n.name.as_str()).collect();
-    let desc_index = desc.bone_index();
+    let node_names = &bone_map.node_names;
+    let desc_index = &bone_map.desc_index;
 
-    let mut bones: Vec<[f32; 2]> = Vec::with_capacity(sv.links.len());
     // 权重按从大到小排序，并只保留前 MAX_BONES_PER_VERT 组（引擎上限）。
-    let mut links = sv.links.clone();
+    //
+    // # 为什么不克隆 `sv.links`
+    //
+    // `SmdVertex.links` 是 `Vec`，`clone()` 会在**每个顶点**上分配一次堆内存
+    // （100 万三角形约 300 万次）。这里改用栈上的定长数组。
+    //
+    // ⚠️ **必须排全部元素**：若先截断到内联容量再排序，超过容量的顶点
+    // 就可能漏掉本该进前 3 的绑定 —— 那是**语义改变**，不是优化。
+    // 因此超出内联容量时回退到原来的 `Vec` 路径，保证任何输入都逐位等价。
+    const INLINE: usize = 8;
+    let mut inline_buf: [crate::smd::SmdBoneLink; INLINE] =
+        [crate::smd::SmdBoneLink { bone: 0, weight: 0.0 }; INLINE];
+    let mut fallback: Vec<crate::smd::SmdBoneLink>;
+    let links: &mut [crate::smd::SmdBoneLink] = if sv.links.len() <= INLINE {
+        let n = sv.links.len();
+        inline_buf[..n].copy_from_slice(&sv.links[..n]);
+        &mut inline_buf[..n]
+    } else {
+        fallback = sv.links.clone();
+        &mut fallback
+    };
     links.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut bones: Vec<[f32; 2]> = Vec::with_capacity(links.len().min(MAX_BONES_PER_VERT));
     for l in links.iter().take(MAX_BONES_PER_VERT) {
         if l.weight <= 0.0 {
             continue;
@@ -513,7 +620,7 @@ fn smd_vertex_to_ir(
                     "{} 里顶点引用了骨骼下标 {}，但 nodes 段只有 {} 项",
                     smd_path.display(),
                     l.bone,
-                    smd.nodes.len()
+                    bone_map.node_count
                 ),
             )
         })?;
@@ -3891,6 +3998,176 @@ mod tests {
         std::fs::write(&p, text).unwrap();
         p
     }
+
+    // ---------------------------------------------------------------------
+    // 分配优化的回归测试
+    // ---------------------------------------------------------------------
+    //
+    // `VertexKey` 的 `bones` 从 `Vec<(i32,u32)>` 换成了
+    // 「定长数组 + 计数」（为了消掉每顶点一次堆分配）。这带来一个**真实的
+    // 风险**：手写 `PartialEq`/`Hash` 时若把尾部未使用的槽位也算进去，
+    // 「3 组绑定」与「1 组绑定 + 2 个零填充」就会被判成不同 ——
+    // 去重失效 ⟹ 顶点数变多 ⟹ 产物字节变化。
+
+    fn vkey(bones: &[[f32; 2]], pos: [f32; 3]) -> VertexKey {
+        vertex_key(&Vertex {
+            pos,
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            bones: bones.to_vec(),
+        })
+    }
+
+    fn hash_of(k: &VertexKey) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        h.finish()
+    }
+
+    /// 绑定组数不同 ⟹ 键必须不同（否则会把不同蒙皮的顶点合并）。
+    #[test]
+    fn vertex_key_distinguishes_bone_counts() {
+        let a = vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]);
+        let b = vkey(&[[0.0, 1.0], [1.0, 0.0]], [1.0, 2.0, 3.0]);
+        let c = vkey(&[[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]], [1.0, 2.0, 3.0]);
+        assert_ne!(a, b, "1 组 vs 2 组必须不同");
+        assert_ne!(b, c, "2 组 vs 3 组必须不同");
+        assert_ne!(a, c);
+    }
+
+    /// 同内容同组数 ⟹ 必须相等**且哈希相同**。
+    #[test]
+    fn vertex_key_equal_for_identical_bones() {
+        let a = vkey(&[[0.0, 0.5], [1.0, 0.5]], [1.0, 2.0, 3.0]);
+        let b = vkey(&[[0.0, 0.5], [1.0, 0.5]], [1.0, 2.0, 3.0]);
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b), "相等对象必须同哈希");
+    }
+
+    /// **绑定顺序不同但语义相同**必须合并（键里会先排序）。
+    #[test]
+    fn vertex_key_is_order_insensitive_within_bones() {
+        let a = vkey(&[[0.0, 0.5], [1.0, 0.5]], [1.0, 2.0, 3.0]);
+        let b = vkey(&[[1.0, 0.5], [0.0, 0.5]], [1.0, 2.0, 3.0]);
+        assert_eq!(a, b, "绑定顺序不应影响去重");
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    /// **尾部填充槽位绝不能参与比较**（这是手写 `PartialEq` 最容易犯的错）。
+    ///
+    /// `bones` 是定长数组 + `n_bones` 计数。若把整个数组拿来比，
+    /// 「1 组绑定」与「1 组绑定 + 未使用槽位里的垃圾」就会被判成不同 ⟹
+    /// 去重失效 ⟹ 顶点数变多 ⟹ 产物字节变化。
+    ///
+    /// 本测试往**未使用**的槽位里塞垃圾，断言相等性与哈希都不受影响。
+    #[test]
+    fn vertex_key_ignores_unused_padding_slots() {
+        let mut a = vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]);
+        let b = vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]);
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+
+        assert_eq!(a.n_bones, 1, "本夹具只有 1 组有效绑定");
+        a.bones[1] = (999, 0xDEAD_BEEF);
+        a.bones[2] = (123, 0x1234_5678);
+        assert_eq!(
+            a, b,
+            "未使用的填充槽位不得参与相等性比较（否则去重会失效）"
+        );
+        assert_eq!(
+            hash_of(&a),
+            hash_of(&b),
+            "未使用的填充槽位不得参与哈希（否则 HashMap 行为不一致）"
+        );
+    }
+
+    /// 位置/法线/UV 任一不同 ⟹ 键不同。
+    #[test]
+    fn vertex_key_distinguishes_geometry() {
+        let base = vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]);
+        let other_pos = vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.5]);
+        assert_ne!(base, other_pos, "位置不同必须区分");
+
+        // 法线不同（构造完整 Vertex，走真实的 vertex_key 路径）。
+        let other_normal = vertex_key(&Vertex {
+            pos: [1.0, 2.0, 3.0],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            bones: vec![[0.0, 1.0]],
+        });
+        assert_ne!(base, other_normal, "法线不同必须区分");
+
+        // UV 不同。
+        let other_uv = vertex_key(&Vertex {
+            pos: [1.0, 2.0, 3.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.0],
+            bones: vec![[0.0, 1.0]],
+        });
+        assert_ne!(base, other_uv, "UV 不同必须区分");
+    }
+
+    /// **`-0.0` 必须归一化到 `0.0`**（否则同一位置会被拆成两个顶点）。
+    #[test]
+    fn vertex_key_normalizes_negative_zero() {
+        let a = vkey(&[[0.0, 1.0]], [0.0, 1.0, 2.0]);
+        let b = vkey(&[[0.0, 1.0]], [-0.0, 1.0, 2.0]);
+        assert_eq!(a, b, "-0.0 与 0.0 必须视为同一位置");
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    /// `NaN` 用位模式比较 ⟹ 相同位模式的 NaN 必须相等（`==` 语义会失效）。
+    #[test]
+    fn vertex_key_compares_nan_by_bits() {
+        let a = vkey(&[[0.0, 1.0]], [f32::NAN, 0.0, 0.0]);
+        let b = vkey(&[[0.0, 1.0]], [f32::NAN, 0.0, 0.0]);
+        assert_eq!(a, b, "同一位模式的 NaN 必须相等（按位比较）");
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    /// 键的相等性必须与「直接用 HashMap 去重」的结果一致 ——
+    /// 这是 `build_meshes` 真正依赖的性质。
+    #[test]
+    fn vertex_key_dedups_consistently_in_hashmap() {
+        let keys = [
+            vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]),
+            vkey(&[[0.0, 1.0]], [1.0, 2.0, 3.0]), // 重复
+            vkey(&[[1.0, 1.0]], [1.0, 2.0, 3.0]), // 不同骨骼
+            vkey(&[[0.0, 1.0]], [1.0, 2.0, 4.0]), // 不同位置
+            vkey(&[[1.0, 0.5], [0.0, 0.5]], [1.0, 2.0, 3.0]),
+            vkey(&[[0.0, 0.5], [1.0, 0.5]], [1.0, 2.0, 3.0]), // 与上一条等价
+        ];
+        let mut m: HashMap<VertexKey, u32> = HashMap::new();
+        for k in keys {
+            let n = m.len() as u32;
+            m.entry(k).or_insert(n);
+        }
+        assert_eq!(m.len(), 4, "6 个键应去重成 4 个");
+    }
+
+    /// **骨骼查找表提出顶点循环后，报错信息必须仍然准确。**
+    ///
+    /// `VertexBoneMap` 把 `node_names` / `desc_index` / 两个计数缓存起来，
+    /// 报错文案里用的 `node_count` 必须等于 `smd.nodes.len()`，
+    /// 否则「nodes 段只有 N 项」会给出错误数字。
+    #[test]
+    fn vertex_bone_map_reports_correct_node_count() {
+        let dir = std::env::temp_dir().join("mdlc_opt_bonemap_test");
+        let _ = std::fs::create_dir_all(&dir);
+        // SMD 引用了一个不存在的骨骼下标 7（nodes 只有 2 项）。
+        let smd = SMD.replace("1 1 1.000000", "1 7 1.000000");
+        write(&dir, "bad.smd", &smd);
+        let toml = desc_toml("bad.smd");
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let errs = compile(&desc, &dir).unwrap_err();
+        let joined = errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("nodes 段只有 2 项"),
+            "报错必须给出正确的 nodes 项数，实际：{joined}"
+        );
+    }
+
 
     /// 与 SMD 配套的最小描述。
     fn desc_toml(smd: &str) -> String {

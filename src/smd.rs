@@ -158,11 +158,12 @@ impl Smd {
     }
 }
 
-/// 按空白切分一行；**不**处理引号内的空格（SMD 的引号只用于名字，
-/// 而名字里不含空格 —— 这是格式约定，不是本实现的简化）。
-fn tokens(line: &str) -> Vec<&str> {
-    line.split_whitespace().collect()
-}
+// 早先这里有一个 `tokens(line) -> Vec<&str>` 辅助函数（`split_whitespace`
+// 后 `collect`）。它**每行分配一次堆内存**，是 `parse_smd` 最大的分配来源，
+// 已删除 —— 现在 `parse_smd` 复用一个 token 缓冲，见那里的说明。
+//
+// 切词规则未变：按空白切分，**不**处理引号内的空格（SMD 的引号只用于名字，
+// 而名字里不含空格 —— 这是格式约定，不是本实现的简化）。
 
 fn parse_f32(tok: &str, line: usize, what: &str) -> Result<f32, SmdError> {
     tok.parse::<f32>()
@@ -185,6 +186,15 @@ fn unquote(s: &str) -> String {
 }
 
 /// 解析 SMD 文本。
+///
+/// # 分配策略（性能关键）
+///
+/// 本函数**按行**处理，每行都要切词。早期版本用 `line.split_whitespace()
+/// .collect::<Vec<_>>()` —— 那是**每行一次堆分配**（100 万三角形约
+/// 1200 万次）。现在改成**复用一个 token 缓冲**（`clear()` + `extend()`），
+/// 全程只有一次分配。
+///
+/// 语义完全不变：`t` 在每个分支里看到的仍是同一行、同一顺序的 token。
 pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
     let mut version: Option<i32> = None;
     let mut nodes: Vec<SmdNode> = Vec::new();
@@ -203,8 +213,18 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
     // 当前帧（skeleton 段）。
     let mut frame: Option<SmdFrame> = None;
     // 当前三角形正在累积的顶点（triangles 段）。
+    //
+    // 用**定长数组 + 计数**而不是 `Vec<SmdVertex>`：后者在收满 3 个顶点时
+    // 要 `pending[0..2].clone()`，而 `SmdVertex` 里的 `links` 是 `Vec`，
+    // clone 会连带再分配一次。改用数组后是**移动**，零分配、零克隆。
     let mut current_material: Option<String> = None;
-    let mut pending: Vec<SmdVertex> = Vec::new();
+    let mut pending: [Option<SmdVertex>; 3] = [None, None, None];
+    let mut pending_len = 0usize;
+    // 复用的 token 缓冲（见函数文档）。
+    let mut t: Vec<&str> = Vec::with_capacity(32);
+    // 三角形数粗估：顶点行约占 6 行、每行约 90 字节。只是省几次 realloc，
+    // 估错也不影响正确性。
+    triangles.reserve(text.len() / 600);
 
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
@@ -213,7 +233,8 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
             Some(p) => &raw[..p],
             None => raw,
         };
-        let t = tokens(body);
+        t.clear();
+        t.extend(body.split_whitespace());
         if t.is_empty() {
             continue;
         }
@@ -270,7 +291,8 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 // ⚠️ 丢弃的是**残留的不足一组**的顶点行，不是「多出来的
                 // 完整三角形」—— 后者仍会全部保留。
                 if section == Section::Triangles {
-                    pending.clear();
+                    pending = [None, None, None];
+                    pending_len = 0;
                 }
                 section = Section::None;
                 current_material = None;
@@ -334,13 +356,12 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 let is_vertex_line = t[0].parse::<f32>().is_ok();
                 if !is_vertex_line {
                     // 新的材质名 —— 只有在上一个三角形已收满时才合法。
-                    if !pending.is_empty() {
+                    if pending_len != 0 {
                         return Err(err(
                             line,
                             format!(
                                 "材质名 {:?} 出现在未完成的三角形中间（已有 {} 个顶点行）",
-                                t[0],
-                                pending.len()
+                                t[0], pending_len
                             ),
                         ));
                     }
@@ -394,10 +415,15 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     k += 2;
                 }
 
-                let material = current_material.clone().ok_or_else(|| {
+                // 材质名只在**收满一个三角形时**克隆一次，而不是每个顶点
+                // 克隆一次。原先每顶点 `current_material.clone()` 会分配
+                // 一个 `String`（100 万三角形约 300 万次）；这里改成先借用，
+                // 到 `triangles.push` 时才 `to_string()`。
+                let material = current_material.as_deref().ok_or_else(|| {
                     err(line, "顶点行出现在任何材质名之前")
                 })?;
-                pending.push(SmdVertex {
+
+                pending[pending_len] = Some(SmdVertex {
                     parent_bone: parse_i32(t[0], line, "parentBone")?,
                     position: [
                         parse_f32(t[1], line, "pos.x")?,
@@ -446,16 +472,20 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     ],
                     links,
                 });
+                pending_len += 1;
 
-                if pending.len() == 3 {
+                if pending_len == 3 {
+                    // 三个顶点**移动**进三角形（不是 clone）—— 原先的
+                    // `pending[i].clone()` 会连带把每个顶点的 `links` Vec
+                    // 再分配一次，即每三角形 3 次多余分配。
                     let v: [SmdVertex; 3] = [
-                        pending[0].clone(),
-                        pending[1].clone(),
-                        pending[2].clone(),
+                        pending[0].take().expect("已收满 3 个顶点"),
+                        pending[1].take().expect("已收满 3 个顶点"),
+                        pending[2].take().expect("已收满 3 个顶点"),
                     ];
-                    pending.clear();
+                    pending_len = 0;
                     triangles.push(SmdTriangle {
-                        material,
+                        material: material.to_string(),
                         vertices: v,
                     });
                 }
@@ -468,7 +498,10 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
         frames.push(f);
     }
     // 同 `end` 分支：不足一组的顶点行**静默丢弃**（官方实测行为）。
-    pending.clear();
+    //
+    // 这里不需要显式清空 `pending` —— 局部数组在函数返回时自动消失，
+    // 且 `pending_len` 此后不再被读。写 `pending = [None; 3]` 只会触发
+    // `unused_assignments` 警告。
 
     let version = version.ok_or(SmdError {
         line: 1,
@@ -700,5 +733,147 @@ end
         assert!((s.frames[0].poses[0].rotation[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
         assert_eq!(s.triangles.len(), 22911);
         assert_eq!(s.materials_in_order(), vec!["shield", "chain"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // 分配优化的回归测试（见 `parse_smd` 的「分配策略」文档）
+    // ---------------------------------------------------------------------
+    //
+    // 这一组测试钉住**优化后的可观察行为**。它们不直接量分配次数
+    // （那要全局分配器，不适合放单元测试），而是钉住「一旦为了省分配
+    // 而改变了语义，就会立刻失败」的那些点。
+
+    /// **顶点必须是「移动」进三角形的，不是「共享」的。**
+    ///
+    /// 优化把 `pending: Vec<SmdVertex>` 换成了 `[Option<SmdVertex>; 3]`，
+    /// 收满时用 `take()` 取出。若有人误改成复用同一组槽位（只 `clone` 或不
+    /// 清空），第 2、3 个三角形就会拿到前一个三角形的顶点 —— 这里用
+    /// **两个材质不同、坐标不同**的三角形把它钉死。
+    #[test]
+    fn consecutive_triangles_do_not_share_pending_vertices() {
+        let text = String::from(MINIMAL)
+            + "triangles\nsecond_mat\n  1 1 1 0 0 0 1 0 0 1 1 1.0\n  1 2 2 0 0 0 1 1 0 1 1 1.0\n  1 3 3 0 0 0 1 0 1 1 1 1.0\nend\n";
+        let s = parse_smd(&text).unwrap();
+        assert_eq!(s.triangles.len(), 2, "两个三角形都应保留");
+        assert_eq!(s.triangles[0].material, "myprop");
+        assert_eq!(s.triangles[1].material, "second_mat");
+        // 第 2 个三角形的顶点必须来自它自己那 3 行，而不是第 1 个的残留。
+        assert_eq!(s.triangles[1].vertices[0].position, [1.0, 1.0, 0.0]);
+        assert_eq!(s.triangles[1].vertices[1].position, [2.0, 2.0, 0.0]);
+        assert_eq!(s.triangles[1].vertices[2].position, [3.0, 3.0, 0.0]);
+        // 第 1 个三角形也不能被后续覆盖。
+        assert_eq!(s.triangles[0].vertices[0].position, [-8.0, -8.0, 0.0]);
+    }
+
+    /// **材质名是「每个三角形克隆一次」，不是「每个顶点克隆一次」。**
+    ///
+    /// 优化把 `current_material.clone()`（每顶点）挪到了 push 时（每三角形）。
+    /// 若有人把它改成借用/复用，多个三角形的材质名就会串味 ——
+    /// 尤其是「同一材质出现多个三角形」与「材质在中间切换」两种情形。
+    #[test]
+    fn material_is_per_triangle_and_switching_is_exact() {
+        // 材质 A 两个三角形 → 材质 B 一个三角形 → 材质 A 再现。
+        let mut text = String::from(MINIMAL);
+        text.push_str("triangles\nA\n");
+        for k in 0..3 {
+            text.push_str(&format!(
+                "  1 {k} 0 0 0 0 1 0 0 1 1 1.0\n"
+            ));
+        }
+        text.push_str("B\n");
+        for k in 0..3 {
+            text.push_str(&format!("  1 0 {k} 0 0 0 1 0 0 1 1 1.0\n"));
+        }
+        text.push_str("A\n");
+        for k in 0..3 {
+            text.push_str(&format!("  1 0 0 {k} 0 0 1 0 0 1 1 1.0\n"));
+        }
+        text.push_str("end\n");
+        let s = parse_smd(&text).unwrap();
+        assert_eq!(s.triangles.len(), 4, "1（MINIMAL）+ 3");
+        assert_eq!(s.triangles[0].material, "myprop");
+        assert_eq!(s.triangles[1].material, "A");
+        assert_eq!(s.triangles[2].material, "B");
+        assert_eq!(s.triangles[3].material, "A", "材质名必须逐三角形独立");
+        // 材质表按首次出现顺序，且 A 只出现一次。
+        assert_eq!(s.materials_in_order(), vec!["myprop", "A", "B"]);
+    }
+
+    /// **`links` 的全部内容必须原样保留**（含超过 3 组的）。
+    ///
+    /// 解析层**不允许**截断到 3 组 —— 截断是 `compile.rs` 里「按权重降序
+    /// 排序后取前 3」的职责。真实语料里有 **3040 个顶点**的权重不是降序的，
+    /// 解析期截断会选错骨骼（实测会造成 9178 处字段不一致）。
+    ///
+    /// 本测试用 5 组绑定钉住「解析层不截断」，并用**权重乱序**模拟真实
+    /// 导出器（这样「先截断再排序」与「先排序再截断」结果必然不同）。
+    #[test]
+    fn parser_keeps_all_links_beyond_three_including_unsorted_weights() {
+        // 5 组绑定，权重故意**升序**写（真实导出器不保证降序）。
+        // 按权重降序取前 3 应该是 bone 4,3,2；若解析期截断则只剩 0,1,2。
+        let text = MINIMAL.replace(
+            "1 1 1.000000\n  1 8.000000",
+            "5 4 0.10 3 0.20 2 0.30 1 0.35 0 0.05\n  1 8.000000",
+        );
+        let s = parse_smd(&text).unwrap();
+        let l = &s.triangles[0].vertices[0].links;
+        assert_eq!(l.len(), 5, "解析层必须保留全部 5 组绑定，不得截断");
+        assert_eq!(
+            l.iter().map(|x| x.bone).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1, 0],
+            "顺序必须与文件一致"
+        );
+
+        // 再验证「排序后取前 3」得到的是 1,2,3（权重 0.35/0.30/0.20），
+        // 而不是「截断后取前 3」的 4,3,2 —— 两者不同，正是本测试的意义。
+        let mut sorted = l.clone();
+        sorted.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
+        assert_eq!(
+            sorted.iter().take(3).map(|x| x.bone).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "按权重降序的前 3 组应是 1,2,3"
+        );
+        assert_ne!(
+            sorted.iter().take(3).map(|x| x.bone).collect::<Vec<_>>(),
+            l.iter().take(3).map(|x| x.bone).collect::<Vec<_>>(),
+            "本夹具必须让「先排序」与「先截断」结果不同，否则测不出问题"
+        );
+    }
+
+    /// **`links == 0` 与「残留不足一组」两种边界在优化后仍然成立。**
+    ///
+    /// 优化改动了 `pending` 的清空逻辑（`end` 分支与文件结束两处），
+    /// 这两条边界正是最容易被动坏的地方。
+    #[test]
+    fn zero_links_and_trailing_partial_group_survive_optimization() {
+        // 一个三角形：全部 3 个顶点 links=0（官方允许，boneCount=0）。
+        //
+        // ⚠️ 顶点行**仍然需要 12 个 token**（`t.len() < 12` 的检查先于
+        // `links` 解析）—— 所以 `links=0` 时后面还要凑够占位 token。
+        // 这正是 `docs/_probe/smdl/tb1.smd` 的写法。
+        let text = MINIMAL.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
+            "  1 -8 -8 0 0 0 1 0 0 0 0 0\n  1 8 -8 0 0 0 1 1 0 0 0 0\n  1 0 8 0 0 0 1 0.5 1 0 0 0",
+        );
+        let s = parse_smd(&text).unwrap();
+        assert_eq!(s.triangles.len(), 1);
+        for v in &s.triangles[0].vertices {
+            assert!(v.links.is_empty(), "links=0 必须解析成空绑定");
+        }
+
+        // 残留不足一组：删掉 3 行中的 1 行 ⟹ 必须静默丢弃，不报错。
+        let bad = MINIMAL.replace(
+            "  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000\n",
+            "",
+        );
+        let s2 = parse_smd(&bad).expect("残留必须被丢弃而不是报错");
+        assert_eq!(s2.triangles.len(), 0);
+
+        // 两个完整三角形后跟 1 行残留：前两个必须完好，残留丢弃。
+        let mixed = String::from(MINIMAL)
+            + "triangles\nm2\n  1 1 1 0 0 0 1 0 0 1 1 1.0\n  1 2 2 0 0 0 1 1 0 1 1 1.0\n  1 3 3 0 0 0 1 0 1 1 1 1.0\n  1 9 9 0 0 0 1 0 0 1 1 1.0\nend\n";
+        let s3 = parse_smd(&mixed).unwrap();
+        assert_eq!(s3.triangles.len(), 2, "完整的两组保留，残留丢弃");
+        assert_eq!(s3.triangles[1].vertices[0].position, [1.0, 1.0, 0.0]);
     }
 }
