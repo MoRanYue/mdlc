@@ -1,0 +1,16 @@
+# 独立的 crate，避免被 plank 的 Tauri 工程吞并。
+[workspace]
+
+[package]
+name = "mdlc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Source 引擎模型编译器（studiomdl 重写的 MVP 探针）"
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+meshopt = "0.6.2"
+parry3d = "0.31.0"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
