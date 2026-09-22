@@ -245,12 +245,32 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 {
                     frames.push(f);
                 }
-                // triangles 段收尾：把未满 3 个顶点的残留报错，而不是静默丢弃。
-                if section == Section::Triangles && !pending.is_empty() {
-                    return Err(err(
-                        line,
-                        format!("triangles 段结束时还有 {} 个未成组的顶点行", pending.len()),
-                    ));
+                // triangles 段收尾：未满 3 个顶点的残留**静默丢弃**。
+                //
+                // # 为什么是丢弃而不是报错（oracle 实测）
+                //
+                // 官方 studiomdl 对「三角形数不是 3 的倍数」是**静默截断**的。
+                // 判据（`docs/_probe/smdl/iph1.qc` + `iph.smd`）：
+                //
+                // | 项 | 值 |
+                // |---|---|
+                // | `iph.smd` 的 triangles 段顶点行 | **7**（= 2 组 + 1 行残留） |
+                // | 官方 `iph1.vvd` 的 `numLODVertexes[0]` | **6** |
+                // | 官方 stdout/stderr | **无任何相关警告** |
+                //
+                // 且重编官方产物与既有 `artifacts/iph1.mdl` 逐字节相同
+                // （sha `C73F16BF…`）—— 所以这不是「旧产物残留」。
+                //
+                // 语料侧同类证据：`tb1.smd` 也是 4 行（1 组 + 1 行残留），
+                // 官方同样产出 `.mdl`。
+                //
+                // ⟹ 早先这里 `return Err(...)` 比官方**更严**，会让
+                // 官方能编的 QC 在 mdlc 侧失败。改为丢弃（与官方一致）。
+                //
+                // ⚠️ 丢弃的是**残留的不足一组**的顶点行，不是「多出来的
+                // 完整三角形」—— 后者仍会全部保留。
+                if section == Section::Triangles {
+                    pending.clear();
                 }
                 section = Section::None;
                 current_material = None;
@@ -339,8 +359,24 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     ));
                 }
                 let links_count = parse_i32(t[9], line, "links 数")?;
-                if links_count < 1 {
-                    return Err(err(line, format!("links 数必须 ≥ 1，实际 {links_count}")));
+                // `links == 0` 是**合法**的：顶点没有任何骨骼权重。
+                //
+                // # 判据（oracle 实测）
+                //
+                // `docs/_probe/smdl/tb1.smd` 的三个顶点都写 `links = 0`，
+                // 官方 studiomdl 正常产出 `.mdl`（1732 字节，重编可复现），
+                // 且 `.vvd` 里第 3 个顶点是 **`boneCount = 0`**：
+                //
+                // ```text
+                // v2 weights=[0.0000,0.0000,0.0000] bones=[0,0,0] boneCount=0
+                // ```
+                //
+                // ⟹ 官方允许「无权重顶点」，`boneCount = 0`。
+                // 早先这里 `links_count < 1` 直接报错，比官方**更严**，
+                // 会让官方能编的 QC 在 mdlc 侧失败（853 个真实 QC 的普查
+                // 暴露了 `tb1`）。
+                if links_count < 0 {
+                    return Err(err(line, format!("links 数不能为负，实际 {links_count}")));
                 }
                 let mut links = Vec::with_capacity(links_count as usize);
                 let mut k = 10usize;
@@ -431,12 +467,8 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
     if let Some(f) = frame.take() {
         frames.push(f);
     }
-    if !pending.is_empty() {
-        return Err(SmdError {
-            line: text.lines().count(),
-            message: format!("文件结束时还有 {} 个未成组的顶点行", pending.len()),
-        });
-    }
+    // 同 `end` 分支：不足一组的顶点行**静默丢弃**（官方实测行为）。
+    pending.clear();
 
     let version = version.ok_or(SmdError {
         line: 1,
@@ -554,14 +586,40 @@ end
         assert!(e.message.contains("12 个 token"), "{e}");
     }
 
+    /// **不足一组的顶点行必须被静默丢弃**（官方实测行为）。
+    ///
+    /// # 判据（oracle，不是推测）
+    ///
+    /// `docs/_probe/smdl/iph.smd` 的 triangles 段有 **7** 行顶点
+    /// （2 组 + 1 行残留），官方 studiomdl 编译 `iph1.qc` 后：
+    ///
+    /// * 产物 `iph1.vvd` 的 `numLODVertexes[0] == 6`（只算了 2 组）；
+    /// * stdout/stderr **无任何相关警告**；
+    /// * 重编结果与既有 `artifacts/iph1.mdl` 逐字节相同（sha `C73F16BF…`）。
+    ///
+    /// 同类：`tb1.smd` 也是 4 行（1 组 + 1 行残留），官方同样产出 `.mdl`。
+    ///
+    /// ⚠️ 本测试**曾经断言相反的结论**（`rejects_incomplete_triangle`，
+    /// 要求报错）。那是「比官方更严」，会让官方能编的 QC 在 mdlc 侧失败 ——
+    /// 853 个真实 QC 的普查把它暴露了出来（`iph1`/`mvz`/`tb1` 三个用例
+    /// 有官方产物却解析失败）。**旧断言是错的，已按 oracle 改正。**
     #[test]
-    fn rejects_incomplete_triangle() {
+    fn incomplete_trailing_triangle_group_is_silently_dropped() {
+        // 删掉 3 个顶点行中的 1 个 ⟹ 剩 2 行，不足一组。
         let bad = MINIMAL.replace(
             "  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000\n",
             "",
         );
-        let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("未成组"), "{e}");
+        let smd = parse_smd(&bad).expect("不足一组的残留必须被丢弃，而不是报错");
+        // 残留的 2 行被丢掉 ⟹ 三角形数应为 0（本夹具只有 1 个三角形）。
+        assert_eq!(
+            smd.triangles.len(),
+            0,
+            "残留顶点行不得构成三角形，也不得让解析失败"
+        );
+        // 但 nodes / skeleton 必须完好 —— 丢弃只作用于 triangles 段的残留。
+        assert_eq!(smd.nodes.len(), 2, "nodes 段不受影响");
+        assert!(!smd.frames.is_empty(), "skeleton 段不受影响");
     }
 
     #[test]

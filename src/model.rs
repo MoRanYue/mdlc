@@ -132,7 +132,160 @@ pub struct ModelDesc {
     /// 语料 47/47 的名字都以 `models/` 开头，写全更明确。
     #[serde(default)]
     pub include_models: Vec<String>,
+    /// **权重表**（QC 的 `$weightlist`）。
+    ///
+    /// # 它做什么
+    ///
+    /// 每条序列在 `mstudioseqdesc_t.weightlistindex`（`+0x9C`）指向一张
+    /// `float[numbones]`，引擎用它做**增量动画（`delta`）的重建缩放**：
+    ///
+    /// ```c
+    /// float s = panimation->weight[k];
+    /// QuaternionMA( q1, s, q2, q3 );        // q3 = q1 按 s 插值到 q2
+    /// p3 = base.pos + s * delta.pos;
+    /// ```
+    ///
+    /// 所以 `s = 0` 的骨骼**完全不参与**该序列的增量叠加（保持基准姿态），
+    /// `s = 0.5` 只叠加一半。这正是模组作者用它做「只让上半身动」的手法
+    /// （实测真实模组：`v_katana` 的 `empty`、`v_autoshotgun` 的
+    /// `weights_fire_layer`、survivor 的 `INJUREDIDLENOISE`）。
+    ///
+    /// # 索引 0 是隐式的（`$defaultweightlist`）
+    ///
+    /// 官方 `g_weightlist[0]` 是一张**隐式默认表**，不需要手写：
+    ///
+    /// * 表 0 = 全 1；
+    /// * 具名表 `i != 0` = 根骨骼 **0**、其余骨骼**沿父链继承**。
+    ///
+    /// 见 [`WeightList`] 的完整算法与实测判据。
+    ///
+    /// # 放在顶层而不是 `[model]`
+    ///
+    /// 与 `[[bones]]` / `[[bodyparts]]` 同级 —— 它是**模型级**的表集合，
+    /// 序列按名字引用它。
+    #[serde(default)]
+    pub weight_lists: Vec<WeightList>,
 }
+
+/// 一张具名权重表（QC 的 `$weightlist "<名>" { <骨骼> <权重> ... }`）。
+///
+/// # 语义（`buildAnimationWeights`，`simplify.cpp:1646-1719`）
+///
+/// **不是**「没列出的骨骼就是 1」。真实算法分三步：
+///
+/// ```c
+/// // ① 初始化
+/// if (i == 0) {                       // 隐式默认表
+///     root    -> 1
+///     child   -> -1                   // 「未初始化」哨兵
+/// } else {
+///     root    -> 0
+///     child   -> g_weightlist[0].weight[j]   // ← 此刻表 0 的子骨骼还是 -1！
+/// }
+/// // ② 显式条目覆盖
+/// weight[findGlobalBone(name)] = w
+/// // ③ 沿父链补齐（j 升序，父一定在子之前）
+/// if (weight[j] < 0) weight[j] = weight[parent[j]]
+/// ```
+///
+/// ⚠️ **第 ① 步的 `-1` 是关键的**：`i != 0` 的表抄表 0 时，表 0 的子骨骼
+/// **尚未**被第 ③ 步补齐（第 ③ 步在**全部**表初始化完之后才跑），
+/// 所以抄到的是 `-1` ⟹ 最终由**第 ③ 步沿父链继承**决定。
+///
+/// # 实测判据（`docs/_probe/probe_weightlist_semantics.js`）
+///
+/// 骨骼链 `root → mid → leaf → tip`，读官方产物的
+/// `seqdesc.weightlistindex` 指向的 `float[4]`：
+///
+/// | QC | root | mid | leaf | tip |
+/// |---|---|---|---|---|
+/// | 无 `$weightlist` | 1.0 | 1.0 | 1.0 | 1.0 |
+/// | `$weightlist WL root 1` | 1.0 | 1.0 | 1.0 | 1.0 |
+/// | `$weightlist WL root 0` | 0.0 | 0.0 | 0.0 | 0.0 |
+/// | `$weightlist WL mid 0.5` | **0.0** | 0.5 | **0.5** | **0.5** |
+/// | `$weightlist WL leaf 0` | 0.0 | 0.0 | 0.0 | 0.0 |
+///
+/// `mid 0.5` 那行最能说明问题：**根是 0**（不是 1），
+/// 而 `leaf`/`tip` 跟着 `mid` 变成 0.5（沿父链继承）。
+///
+/// # 两条已知的**未实现**交互（语料实测 0 次）
+///
+/// 1. **`$renamebone`**：官方 `findGlobalBone` 会先跑 `RenameBone()`
+///    （`simplify.cpp:2624`），所以 QC 里 `$renamebone "旧" "新"` 之后
+///    权重表里写**旧名**也能命中。mdlc 目前**忽略** `$renamebone`
+///    （`qc/parse.rs` 的忽略清单），因此这种写法会报「找不到骨骼」。
+///    语料 853 个 QC 里 `$renamebone` **0 次**。
+/// 2. **`$insertbone` / `$hierarchy`** 会改变父链，进而改变第 ③ 步的继承。
+///    同样是 0 次，同样未实现。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightList {
+    /// 表名。序列/动画通过它引用。
+    pub name: String,
+    /// 显式条目。**没列出的骨骼走父链继承**（不是「默认 1」）。
+    #[serde(default)]
+    pub bones: Vec<WeightEntry>,
+}
+
+/// 权重表里的一条（QC 的 `<骨骼> <权重> [posweight <权重>]`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightEntry {
+    /// 骨骼名。
+    pub bone: String,
+    /// 旋转权重 —— 落盘进 `seqdesc.weightlistindex` 指向的 `float[]`。
+    ///
+    /// 官方缺省 = 与 `weight` 相同（`Option_Weightlist` 的
+    /// `boneposweight[i] = boneweight[i]`）。
+    pub weight: f32,
+    /// 位置权重（QC 的 `posweight <v>`）。
+    ///
+    /// # 它**不落盘**
+    ///
+    /// `write.cpp:587` 只写 `weight`（`pweight[j] = g_sequence[i].weight[j]`），
+    /// `posweight` 只参与编译期的 `solveBone` / IK 误差计算。
+    ///
+    /// 实测佐证：`probe_weightlist_semantics.js` 里
+    /// `$weightlist WL mid 0.5 posweight 0.25` 的**落盘数组**
+    /// 与 `mid 0.5` 完全相同（都是 `[0, 0.5, 0.5, 0.5]`）。
+    ///
+    /// 缺省 = 与 [`Self::weight`] 相同。
+    #[serde(default)]
+    pub pos_weight: Option<f32>,
+}
+
+impl WeightEntry {
+    /// 位置权重（缺省取 `weight`）。
+    pub fn pos_weight(&self) -> f32 {
+        self.pos_weight.unwrap_or(self.weight)
+    }
+}
+
+/// 一张权重表的条目上限 —— **实测**官方 L4D2 `MAXWEIGHTSPERLIST`。
+///
+/// 超出时 `Option_Weightlist` 报 `Too many bones (128) in weightlist '%s'`
+/// （`studiomdl.cpp:3310-3313`）。
+///
+/// # ⚠️ 这个值是**跑出来的**，不是从 SDK 头文件抄的
+///
+/// `hl2sdk-episode1/utils/studiomdl/studiomdl.h:980` 写的是 **16**，
+/// 但真 `studiomdl.exe` 接受 **128** 条、第 129 条才报错
+/// （`docs/_probe/cmp_weightlist_errors.js` + 手工二分：
+/// 127 OK / 128 OK / 129 ERROR，2000 条时报的还是 `(128)`）。
+///
+/// 这正是本项目反复强调的：**SDK 头文件不是二进制**。
+/// 按 16 去写校验会把真实模组（作者会列上百根骨骼）误判为非法。
+pub const MAX_WEIGHT_ENTRIES: usize = 128;
+
+/// 权重表**张数**上限 —— **实测**官方 L4D2 `MAXWEIGHTLISTS`，
+/// **含隐式的表 0**（`studiomdl.cpp:6886` `g_numweightlist = 1`）。
+/// 所以手写表最多 127 张。
+///
+/// 超出时 `Cmd_Weightlist` 报 `Too many weightlist commands (128)`。
+///
+/// ⚠️ 同样是实测值：episode1 的 `studiomdl.h:979` 写的是 **32**，
+/// 而真二进制是 128（127 张 OK / 128 张 ERROR）。
+pub const MAX_WEIGHT_LISTS: usize = 128;
 
 /// 一条 `$jigglebone`（`mstudiojigglebone_t`，**120 字节** = 30 个 4 字节槽）。
 ///
@@ -880,6 +1033,12 @@ pub struct Sequence {
     /// 序列名（QC 里 `$sequence <name> <smd>` 的第一个参数）。
     pub name: String,
     /// 动画 SMD 路径，**相对描述文件所在目录**。
+    ///
+    /// ⚠️ 对 `$declaresequence` 的空壳（[`Self::forward_declared`]）
+    /// **必须为空** —— 官方连 `panim` 都不分配。所以这个字段有
+    /// `#[serde(default)]`：空壳不用写它，`validate()` 会反过来
+    /// 拒绝「空壳 + 非空 smd」的组合。
+    #[serde(default)]
     pub smd: String,
     /// 帧率，默认 30（与 studiomdl 一致）。
     #[serde(default)]
@@ -949,6 +1108,71 @@ pub struct Sequence {
     /// `$sequence ... fadeout <v>`。缺省同 [`Self::fade_in`]。
     #[serde(default = "default_fade_time")]
     pub fade_out: f32,
+    /// QC 的 `$declaresequence`：一条**前向声明的空壳序列**。
+    ///
+    /// # 官方语义（`Cmd_DeclareSequence`，`studiomdl.cpp:3204-3218`）
+    ///
+    /// ```c
+    /// s_sequence_t *pseq = &g_sequence[ g_sequence.AddToTail() ];
+    /// memset( pseq, 0, sizeof( s_sequence_t ) );   // ← **全零**
+    /// pseq->flags = STUDIO_OVERRIDE;               // ← 0x0800
+    /// GetToken( false );
+    /// strcpyn( pseq->name, token );
+    /// ```
+    ///
+    /// 只有三件事：占一个序列槽、`memset` 清零、置 `STUDIO_OVERRIDE`。
+    /// **没有** `panim`、**没有**动画、`groupsize = [0, 0]`。
+    ///
+    /// # 它为什么存在（survivor 模组的核心机制）
+    ///
+    /// 引擎加载时在 `studio_virtualmodel.cpp:185` 做**跨模型序列替换**：
+    ///
+    /// ```c
+    /// else if (m_group[seq[k].group].GetStudioHdr()
+    ///              ->pLocalSeqdesc(seq[k].index)->flags & STUDIO_OVERRIDE)
+    /// {
+    ///     // the one in memory is a forward declared sequence, override it
+    ///     virtualsequence_t tmp; tmp.group = group; tmp.index = j; ...
+    ///     seq[k] = tmp;
+    /// }
+    /// ```
+    ///
+    /// 即：主模型里声明一堆**空壳**，真正的动画在 `$includemodel`
+    /// 进来的 `anim_<survivor>.mdl` 里，引擎按名字**替换**掉空壳。
+    /// 这样主模型的网格/骨骼/flex 与动画可以分开发布。
+    ///
+    /// # 实测（真实 survivor 产物 + 受控实验）
+    ///
+    /// `docs/_probe/probe_declaresequence.js`（受控实验，真 studiomdl）
+    /// 与 `dump_override_seqdesc.js`（真实 937 条序列的 survivor 模型）：
+    ///
+    /// | 字段 | 空壳的值 | 普通序列 |
+    /// |---|---|---|
+    /// | `flags` | **0x0800** | 0x0000 起 |
+    /// | `numblends` | **0** | 1 |
+    /// | `groupsize` | **[0, 0]** | [1, 1] |
+    /// | `activity` | **0** | -1 |
+    /// | `paramindex` | **[0, 0]** | [-1, -1] |
+    /// | `fadeintime`/`fadeouttime` | **0** | 0.2 |
+    /// | `bbmin`/`bbmax` | **[9999,9999,9999] / [-9999,…]** | 真实包围盒 |
+    /// | `weightlist` | **全 0** | 全 1 |
+    ///
+    /// 那 7 个「不同」全部来自同一个原因：**`memset` 之后没人再动它**。
+    /// 普通序列的 `-1` / `0.2` / 真实包围盒分别来自
+    /// `Cmd_Sequence` 的初始化、`ParseSequence` 的 `0.2`、
+    /// `CalcSequenceBoundingBoxes` —— 而空壳**一个都没跑**。
+    ///
+    /// ⚠️ `weightlist` 是**全 0 而不是全 1**：`simplify.cpp:302-318`
+    /// 先置 `weight[n] = 0`，再用 `groupsize` 的双层循环取 MAX；
+    /// 空壳的 `groupsize = [0,0]` ⟹ **循环一次都不跑** ⟹ 保持 0。
+    ///
+    /// # 语法陷阱（实测）
+    ///
+    /// 声明之后**不能**用 `$sequence <同名>` 去填 —— 官方会报
+    /// `no animations found`（`ParseSequence` 发现 `numblends == 0`）。
+    /// 空壳就是空壳，填充是**引擎运行时**用 `$includemodel` 的模型做的。
+    #[serde(default)]
+    pub forward_declared: bool,
     /// QC 的 `noautoik`（`studiomdl.cpp:2265`，对应 `panim->noAutoIK`）。
     ///
     /// 置位时**不**自动补 `IK_RELEASE` 规则（`simplify.cpp:6251`）。
@@ -1119,6 +1343,54 @@ pub struct Sequence {
     /// > 编译失败）—— 所以 TOML 用两个独立字段而不是「一个可选值」。
     #[serde(default)]
     pub section_threshold: Option<i32>,
+    /// **额外的 `seqdesc.flags` 位**（QC 里没有具名键的那些）。
+    ///
+    /// # 为什么需要这个字段
+    ///
+    /// QC 的 `$sequence` 块里有一批**纯标志位**关键字，它们只做
+    /// `pseq->flags |= XXX`（`ParseSequence`，`studiomdl.cpp:2720-2866`）：
+    ///
+    /// | QC 关键字 | `studio.h` 常量 | 值 |
+    /// |---|---|---|
+    /// | `snap` | `STUDIO_SNAP` | `0x0002` |
+    /// | `autoplay` | `STUDIO_AUTOPLAY` | `0x0008` |
+    /// | `post` | `STUDIO_POST` | `0x0010` |
+    /// | `realtime` | `STUDIO_REALTIME` | `0x0080` |
+    /// | `hidden` | `STUDIO_HIDDEN` | `0x0400` |
+    /// | `worldspace` | `STUDIO_WORLD` | `0x2000` |
+    ///
+    /// `looping`（`STUDIO_LOOPING`）与 `delta`（`STUDIO_DELTA|STUDIO_POST`）
+    /// 已有具名字段，**不写在这里**（避免双重表达）。
+    ///
+    /// # 语料频率（实测，`probe_seq_flags_corpus.js`）
+    ///
+    /// `snap` 与 `hidden` 在真实项目里常见（`snap` 55 处 / `hidden` 45 处，
+    /// 见 `PROGRESS.md` §46 的命令普查），所以不是「0 样本」特性。
+    ///
+    /// # 与 `animdesc.flags` 的关系
+    ///
+    /// 这些位**只**影响 `seqdesc`；`animdesc` 的对应位由
+    /// `$animation` 块决定（见 [`Animation`]）。官方在
+    /// `ParseSequence` 末尾把每格 `animdesc.flags` **OR 进** `seqdesc.flags`，
+    /// 所以两边可能叠加 —— 见 `anim_writer.rs` 的回填处。
+    #[serde(default)]
+    pub extra_flags: Option<i32>,
+    /// 本序列用的**权重表**名（QC 的 `$sequence ... weightlist "<名>"`）。
+    ///
+    /// 省略 = 用隐式默认表（全 1）。
+    ///
+    /// # 作用（`setAnimationWeight`，`simplify.cpp:1721-1729`）
+    ///
+    /// 把该表拷进本序列各动画的 `panim->weight[]`，供
+    /// `CalcBoneTransforms` 的 DELTA 重建缩放用：
+    /// `q3 = slerp(q_base, q_delta, s)`、`p3 = base + s*delta`。
+    ///
+    /// 所以它**只对 `delta` 动画有可观测效果** —— 非 delta 动画走
+    /// `AngleMatrix(sanim.rot, sanim.pos)`，根本不读 `weight[]`。
+    /// 实测：`simplify.cpp:1124-1150` 的「用权重清零无变化骨骼」
+    /// 那段被 `#if 0` 包住了。
+    #[serde(default)]
+    pub weight_list: Option<String>,
 }
 
 /// blend 网格的**一格** —— 指向 [`ModelDesc::animations`] 里的一个动画。
@@ -3010,6 +3282,14 @@ pub struct Animation {
     /// QC 的 `noautoik`。
     #[serde(default)]
     pub no_auto_ik: bool,
+    /// 本动画用的**权重表**名（QC 的 `$animation ... weightlist "<名>"`）。
+    ///
+    /// 见 [`Sequence::weight_list`]。官方把 `weightlist` 当作
+    /// `s_animcmd_t` 的一种（`CMD_WEIGHTS`），挂在**动画**上；
+    /// 序列级关键字只是把它记进序列的 `cmds[]`，最终
+    /// `setAnimationWeight(panim, index)` 作用在动画上。
+    #[serde(default)]
+    pub weight_list: Option<String>,
 }
 
 /// 一个**已编译的动画**（animdesc 的载荷）。
@@ -3058,6 +3338,17 @@ pub struct CompiledSequence {
     pub smd_path: std::path::PathBuf,
     pub fps: f32,
     pub looping: bool,
+    /// 本序列是 `$declaresequence` 的**空壳**，见
+    /// [`Sequence::forward_declared`]。
+    ///
+    /// 置位时写出器走**完全不同的分支**：`numblends=0`、
+    /// `groupsize=[0,0]`、`activity=0`、`paramindex=[0,0]`、
+    /// `fadein/out=0`、`bbmin/bbmax=±9999`、`weightlist` 全 0，
+    /// 并置 `flags |= STUDIO_OVERRIDE`。
+    ///
+    /// 这些「异常值」不是特例代码 —— 它们是官方 `memset` 之后
+    /// **一个字段都没被赋值**的自然结果（见该字段的完整实测表）。
+    pub forward_declared: bool,
     /// `activity` 的原始值（L4D2 的 activity 编号表不在本实现范围内，
     /// 因此默认写 -1 = 未指定，与 studiomdl 在 QC 未写 activity 时一致）。
     pub activity: i32,
@@ -3169,6 +3460,20 @@ pub struct CompiledSequence {
     ///
     /// 非 `subtract` 序列此字段为 `None`（直接用 `frames`）。
     pub pre_subtract_frames: Option<Vec<Vec<crate::smd::SmdPose>>>,
+    /// **额外的 `seqdesc.flags` 位**，见 [`Sequence::extra_flags`]。
+    ///
+    /// `None` = 没有额外位。写出器把它 OR 进算出来的 `flags`。
+    pub extra_flags: Option<i32>,
+    /// **已解析的逐骨骼权重**（`float[numbones]`），落盘进
+    /// `seqdesc.weightlistindex` 指向的块。
+    ///
+    /// # 怎么算出来的（两级合并）
+    ///
+    /// 1. 每格动画的权重来自它自己的 `weight_list`（缺省 = 全 1）；
+    /// 2. 本序列 = **各格逐骨骼取 MAX**（`simplify.cpp:302-318`）。
+    ///
+    /// 见 [`crate::compile::resolve_weight_lists`]。
+    pub weights: Vec<f32>,
 }
 
 /// 一条**已解析**的 IK 规则：名字都换成了下标，帧号也过了
@@ -3591,6 +3896,14 @@ pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（MVP 输入格式�
 #   [[ik_autoplay_locks]]    <- $ikautoplaylock
 #   [[sequences.ik_rules]]   <- $sequence 块内的 ikrule
 #   [[sequences]].no_auto_ik <- $sequence 块内的 noautoik
+#   [[weight_lists]]         <- $weightlist
+#   [[sequences]].weight_list <- $sequence ... weightlist "名"
+#   [[sequences]].forward_declared <- $declaresequence（空壳）
+
+# ⚠️ 顶层裸键（上面这些 `key = value`）必须写在所有 `[[表]]` 之前。
+#    这是 TOML 的作用域规则，不是 mdlc 的要求。
+#    同理 `[[weight_lists]]` 放在这里也只是为了可读性 ——
+#    它是**顶层**表，**不是** `[model]` 的字段。
 
 [model]
 # 输出路径，相对游戏目录。反斜杠会被自动规范化为正斜杠。
@@ -3634,6 +3947,42 @@ name = "root"
 # surface_prop = "metal"
 # $bonemerge：允许该骨骼被 bone merge（L4D2 survivor 模型靠它合并武器/手）。
 # bonemerge = true
+
+# ---------------------------------------------------------------------------
+# 权重表（QC 的 `$weightlist "<名>" { <骨骼> <权重> ... }`）
+#
+# ⚠️ 这是**顶层**表（与 [[bones]] 同级），**不是** [model] 的字段 ——
+#    它是模型级的表集合，序列按名字引用它。
+#
+# 用途：引擎做**增量动画（delta）的重建缩放**：
+#     float s = panimation->weight[k];
+#     QuaternionMA( q1, s, q2, q3 );      // q3 = q1 按 s 插值到 q2
+#     p3 = base.pos + s * delta.pos;
+# 所以 `s = 0` 的骨骼**完全不参与**该序列的增量叠加（保持基准姿态）。
+# 模组作者用它做「只让上半身动」（真实例子：`v_katana` 的 `empty`、
+# `v_autoshotgun` 的 `weights_fire_layer`）。
+#
+# ⚠️ 语义**不是**「没列出的骨骼就是 1」。官方算法（simplify.cpp:1646-1719）：
+#     ① 具名表的**根骨骼默认 0**（不是 1），子骨骼初始为哨兵 -1；
+#     ② 显式条目覆盖；
+#     ③ 沿父链补齐：子骨骼**继承父骨骼**的值。
+# 例：骨骼链 root → mid → leaf → tip，只写 `mid 0.5` 得到
+#     [0, 0.5, 0.5, 0.5]（root 是 **0**，leaf/tip 跟着 mid 变 0.5）。
+# 显式列出的骨骼能**覆盖**继承（再写 `tip 0` 就得到 [0, 0.5, 0.5, 0]）。
+#
+# 骨名与表名都是**大小写不敏感**的（官方用 stricmp）。
+# 官方上限：每表 128 条、共 127 张表（**实测**，不是头文件里的 16/32）。
+# 引用不存在的骨骼是**硬错误**（即使这张表没被任何序列引用）。
+# ---------------------------------------------------------------------------
+# [[weight_lists]]
+# name = "upper"
+#
+# [[weight_lists.bones]]
+# bone = "mid"
+# weight = 0.5
+# 位置权重（QC 的 posweight）。**不落盘** —— 只参与编译期 IK 误差计算。
+# 缺省 = 与 weight 相同。
+# pos_weight = 0.25
 
 [[bodyparts]]
 name = "body"
@@ -3753,6 +4102,37 @@ smd = "myprop-ref.smd"
 # # height = 12.0 / radius = 4.0 / pad = 8.0 / floor = 0.0
 # # fake_origin = [0.0, 0.0, 0.0]   # 强制 pos 并把 bone 置 -1
 # # fake_rotate = [0.0, 0.0, 0.0]   # 度；强制 q 并把 bone 置 -1
+
+# ---------------------------------------------------------------------------
+# 序列。单动画序列写 `smd = "..."`；blend 序列写 `blends = [...]`。
+# ---------------------------------------------------------------------------
+# [[sequences]]
+# name = "idle"
+# smd = "idle.smd"
+# fps = 30.0
+# looping = true
+# # 按名字引用 [[weight_lists]] 里的表；缺省 = 隐式全 1 表。
+# # 表名大小写不敏感。引用不存在的表会报错（官方也是硬错误）。
+# weight_list = "upper"
+
+# ---------------------------------------------------------------------------
+# `$declaresequence` —— **前向声明的空壳序列**（survivor 模组核心机制）。
+#
+# 主模型里声明一堆空名字，真正的动画在 `$includemodel` 进来的
+# `anim_<survivor>.mdl` 里；引擎加载时按名字**替换**掉空壳
+# （`studio_virtualmodel.cpp:185` 的 `STUDIO_OVERRIDE` 分支）。
+# 于是网格/骨骼/flex 与几百条动画可以**分开发布**。
+#
+# ⚠️ 空壳**不要写 smd**（官方连 `panim` 都不分配），写了会被 `validate()` 拒。
+# ⚠️ 空壳**不能**用 `$sequence <同名>` 去填 —— 官方会报
+#    `no animations found`（`ParseSequence` 检查 `numblends == 0`）。
+#    填充是**引擎运行时**做的事，不是编译期。
+# 实测真实工程：`Zoey_$DeclareSequence.qci` 933 条空壳，
+# 编出的 `.mdl` 里 `numlocalseq = 936`（含 3 条实体序列）。
+# ---------------------------------------------------------------------------
+# [[sequences]]
+# name = "Idle_Standing_Align"
+# forward_declared = true
 "#;
 
 /// 校验/规范化时发现的错误。
@@ -4068,11 +4448,31 @@ impl ModelDesc {
                     message: "不能为空".into(),
                 });
             }
-            if seq_names.insert(s.name.as_str(), i).is_some() {
+            // 重名判定**只对实体序列**生效 —— 官方 `Cmd_Sequence` 走
+            // `LookupAnimation`（查的是**动画池**），空壳不在池里
+            // （`Cmd_DeclareSequence` 不分配 `panim`），所以
+            // 「先 `$sequence x` 再 `$declaresequence x`」官方**不报错**，
+            // 产出两条同名序列（实测 `fill_then_declare` → 2 条）。
+            if !s.forward_declared
+                && seq_names.insert(s.name.as_str(), i).is_some()
+            {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     message: format!("序列名重复：{:?}", s.name),
                 });
+            }
+            // `$declaresequence` 的空壳**没有 SMD**（官方连 `panim` 都不分配）。
+            // 除它以外，`smd` 必须非空。
+            if s.forward_declared {
+                // 空壳不该带实体序列的字段 —— 带了说明解析器或手写 TOML
+                // 把两种东西混在了一起，产物会**看起来对但语义错**。
+                if !s.smd.trim().is_empty() {
+                    errs.push(DescError {
+                        path: format!("{path}.smd"),
+                        message: "前向声明（`$declaresequence`）的空壳不该有 smd".into(),
+                    });
+                }
+                continue;
             }
             if s.smd.trim().is_empty() {
                 errs.push(DescError {
@@ -4086,6 +4486,113 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.fps"),
                     message: format!("必须是正有限数，实际为 {fps}"),
+                });
+            }
+        }
+
+        // ---- 权重表（`$weightlist`）----
+        //
+        // 官方对这里的**每一条**都是 `MdlError`（硬错误），不是 warning ——
+        // 与 `$lod` 的未知骨骼（warning + 整块 no-op）**完全不同**。
+        // 实测（`docs/_probe/cmp_weightlist_errors.js`，**11 个用例**与官方判定一致）：
+        //
+        // * `unknown bone reference '%s' in weightlist '%s'`（`simplify.cpp:1697`）
+        //   —— 即使这张表**没被任何序列引用**也照样报错，
+        //   因为 `buildAnimationWeights` 遍历的是**全部**表。
+        // * `unknown weightlist '%s'`（`studiomdl.cpp:1728`）—— 序列/动画引用不存在的表。
+        // * `Duplicate weightlist`（`studiomdl.cpp:3344`）—— 解析期就报。
+        // * `Too many bones (128)`（`MAXWEIGHTSPERLIST`，**实测值**见常量说明）。
+        // * `Too many weightlist commands (128)`（`MAXWEIGHTLISTS`，**实测值**）。
+        //
+        // ⚠️ 骨骼名匹配用**大小写不敏感**（官方 `findGlobalBone` 是 `stricmp`，
+        // `simplify.cpp:2628`）。用 `bone_index()`（大小写敏感）会误报。
+        let bone_ci: std::collections::HashMap<String, usize> = self
+            .bones
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.name.to_ascii_lowercase(), i))
+            .collect();
+        let mut wl_names: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // 官方上限含**隐式的表 0**，所以手写表最多 `MAX_WEIGHT_LISTS - 1` 张。
+        if self.weight_lists.len() >= MAX_WEIGHT_LISTS {
+            errs.push(DescError {
+                path: "weight_lists".into(),
+                message: format!(
+                    "表过多：{} 张，官方上限 {MAX_WEIGHT_LISTS}（含隐式默认表 0，\
+                     所以手写最多 {} 张）",
+                    self.weight_lists.len(),
+                    MAX_WEIGHT_LISTS - 1
+                ),
+            });
+        }
+        for (i, wl) in self.weight_lists.iter().enumerate() {
+            let path = format!("weight_lists[{i}]");
+            if wl.name.trim().is_empty() {
+                errs.push(DescError {
+                    path: format!("{path}.name"),
+                    message: "不能为空".into(),
+                });
+            }
+            if wl_names
+                .insert(wl.name.to_ascii_lowercase(), i)
+                .is_some()
+            {
+                errs.push(DescError {
+                    path: format!("{path}.name"),
+                    message: format!("权重表名重复：{:?}", wl.name),
+                });
+            }
+            // 官方上限 —— **实测值 128**，不是 `studiomdl.h:980` 写的 16。
+            // 见 [`MAX_WEIGHT_ENTRIES`] 的说明：按 16 写会把真实模组误判为非法。
+            if wl.bones.len() > MAX_WEIGHT_ENTRIES {
+                errs.push(DescError {
+                    path: format!("{path}.bones"),
+                    message: format!(
+                        "条目过多：{} 条，官方上限 {MAX_WEIGHT_ENTRIES}",
+                        wl.bones.len()
+                    ),
+                });
+            }
+            for (j, e) in wl.bones.iter().enumerate() {
+                if !bone_ci.contains_key(&e.bone.to_ascii_lowercase()) {
+                    errs.push(DescError {
+                        path: format!("{path}.bones[{j}].bone"),
+                        message: format!(
+                            "找不到骨骼 {:?} —— 官方这里是 MdlError（`unknown bone \
+                             reference`），不是 warning",
+                            e.bone
+                        ),
+                    });
+                }
+                for (v, what) in [(e.weight, "weight"), (e.pos_weight(), "pos_weight")] {
+                    if !v.is_finite() {
+                        errs.push(DescError {
+                            path: format!("{path}.bones[{j}].{what}"),
+                            message: "不是有限数".into(),
+                        });
+                    }
+                }
+            }
+        }
+        // 序列/动画引用的表必须存在（官方 `unknown weightlist`）。
+        for (i, s) in self.sequences.iter().enumerate() {
+            if let Some(n) = &s.weight_list
+                && !wl_names.contains_key(&n.to_ascii_lowercase())
+            {
+                errs.push(DescError {
+                    path: format!("sequences[{i}].weight_list"),
+                    message: format!("找不到权重表 {n:?}"),
+                });
+            }
+        }
+        for (i, a) in self.animations.iter().enumerate() {
+            if let Some(n) = &a.weight_list
+                && !wl_names.contains_key(&n.to_ascii_lowercase())
+            {
+                errs.push(DescError {
+                    path: format!("animations[{i}].weight_list"),
+                    message: format!("找不到权重表 {n:?}"),
                 });
             }
         }
@@ -4156,6 +4663,96 @@ smd = "minimal-ref.smd"
         assert!(!TEMPLATE_TOML.contains("vertices"), "模板不应内联顶点");
         assert!(!TEMPLATE_TOML.contains("triangles"), "模板不应内联三角形");
         assert!(TEMPLATE_TOML.contains("smd ="), "模板应引用 SMD");
+    }
+
+    #[test]
+    fn template_documents_weightlist_where_it_actually_lives() {
+        // 用户最容易踩的坑：把 `weight_lists` 写成 `[model]` 的字段。
+        // 模板必须在**顶层**演示它，并显式警告位置。
+        assert!(
+            TEMPLATE_TOML.contains("[[weight_lists]]"),
+            "模板应演示 [[weight_lists]]"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("[[weight_lists.bones]]"),
+            "模板应演示 [[weight_lists.bones]]"
+        );
+        assert!(
+            !TEMPLATE_TOML.contains("[[model.weight_lists"),
+            "模板**不能**把 weight_lists 写成 [model] 的字段（deny_unknown_fields 会拒）"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("weight_list = "),
+            "模板应演示序列侧的 weight_list 引用"
+        );
+    }
+
+    #[test]
+    fn template_documents_forward_declared_sequences() {
+        // 用户最容易踩的两个坑：给空壳写 smd、想用 `$sequence` 去填它。
+        // 模板必须把这两条写清楚。
+        assert!(
+            TEMPLATE_TOML.contains("forward_declared = true"),
+            "模板应演示 forward_declared"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("$declaresequence"),
+            "模板应说明它对应 QC 的哪条命令"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("no animations found"),
+            "模板应警告「不能用 $sequence 填充空壳」"
+        );
+    }
+
+    #[test]
+    fn forward_declared_round_trips_through_serde() {
+        // `qc2toml` 靠 `to_toml()` 落盘 —— 空壳必须能往返。
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+[[sequences]]
+name = "shell"
+forward_declared = true
+"#
+        );
+        let d = ModelDesc::from_toml(&toml).unwrap();
+        assert!(d.sequences[0].forward_declared);
+        assert_eq!(d.sequences[0].smd, "", "空壳的 smd 缺省为空");
+        let text = d.to_toml().unwrap();
+        let d2 = ModelDesc::from_toml(&text).unwrap();
+        assert_eq!(d.sequences, d2.sequences, "往返后空壳必须一致");
+        assert!(text.contains("forward_declared"), "{text}");
+    }
+
+    #[test]
+    fn weightlist_in_toml_round_trips_through_serde() {
+        // `qc2toml` 靠 `to_toml()` 落盘 —— 权重表必须能往返，
+        // 否则「QC → TOML → 编译」这条路会静默丢数据。
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+[[weight_lists]]
+name = "upper"
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.5
+pos_weight = 0.25
+"#
+        );
+        let d = ModelDesc::from_toml(&toml).unwrap();
+        assert_eq!(d.weight_lists.len(), 1);
+        assert_eq!(d.weight_lists[0].bones[0].weight, 0.5);
+        assert_eq!(d.weight_lists[0].bones[0].pos_weight(), 0.25);
+
+        let text = d.to_toml().unwrap();
+        let d2 = ModelDesc::from_toml(&text).unwrap();
+        assert_eq!(d.weight_lists, d2.weight_lists, "往返后权重表必须一致");
+        assert!(
+            text.contains("weight_lists"),
+            "序列化结果应含 weight_lists：\n{text}"
+        );
     }
 
     #[test]

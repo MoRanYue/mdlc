@@ -1065,6 +1065,28 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     // `subtract` 也在这一步做掉 —— 它引用的是**另一个动画**，
     // 所以必须等池里全部读完之后再减（QC 的声明顺序与引用顺序无关）。
     let bone_index = desc.bone_index();
+    // ---- 权重表（`$weightlist`）----
+    //
+    // 先解析成「逐骨骼权重数组」。`resolved` 与 `desc.weight_lists` 等长；
+    // 索引 0 是**隐式默认表**（全 1）。
+    //
+    // `weights_of` 把「动画声明的表名」映射成实际数组，缺省 = 表 0。
+    let resolved_weights = resolve_weight_lists(desc);
+    let n_bones = desc.bones.len();
+    let default_weights = default_weight_list(n_bones);
+    // 每个动画的权重（下标与 `anims` 对齐，最后用它算序列权重）。
+    let mut anim_weights: Vec<Vec<f32>> = Vec::with_capacity(desc.animations.len());
+    let weights_of = |name: Option<&str>| -> Vec<f32> {
+        match name {
+            None => default_weights.clone(),
+            Some(n) => match weight_list_index(desc, n) {
+                // 下标从 1 起 ⟹ 数组下标减 1。
+                Some(i) => resolved_weights[i - 1].clone(),
+                // 未知名在 `validate()` 里已报错；这里回落到默认。
+                None => default_weights.clone(),
+            },
+        }
+    };
     let mut anims: Vec<crate::model::CompiledAnimation> = Vec::with_capacity(desc.animations.len());
     let mut anim_index: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(desc.animations.len());
@@ -1107,6 +1129,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         }
         pending_subtract.push(a.subtract.as_deref().map(|s| (s.to_owned(), a.subtract_frame.unwrap_or(0))));
         anim_index.insert(a.name.as_str(), anims.len());
+        anim_weights.push(weights_of(a.weight_list.as_deref()));
         anims.push(crate::model::CompiledAnimation {
             name: a.name.clone(),
             smd_path: p,
@@ -1168,6 +1191,56 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     let mut sequences = Vec::with_capacity(desc.sequences.len());
     for (si, s) in desc.sequences.iter().enumerate() {
         let at = format!("sequences[{si}]");
+
+        // ---- `$declaresequence`：前向声明的**空壳** ----
+        //
+        // 官方 `Cmd_DeclareSequence` 只 `memset` 一条 `s_sequence_t` 再置
+        // `STUDIO_OVERRIDE`，**不分配 `panim`、不读 SMD**。
+        // 所以这里**必须**在所有「读 SMD / 解析动画」之前短路 ——
+        // 否则会去读一个空路径。
+        //
+        // 落盘值与普通序列**处处不同**，但那不是特例代码，而是
+        // 「`memset` 之后一个字段都没被赋值」的自然结果。实测表见
+        // [`crate::model::Sequence::forward_declared`]。
+        if s.forward_declared {
+            sequences.push(crate::model::CompiledSequence {
+                name: s.name.clone(),
+                smd_path: std::path::PathBuf::new(),
+                // 官方 `memset` 后 `fps = 0`（普通序列在 `Cmd_Sequence`
+                // 里才被设成 30）。它不落盘，但保持一致以免误导。
+                fps: 0.0,
+                looping: false,
+                // ⚠️ 这两个是**空壳与普通序列差别最大的地方**：
+                // 普通序列 `activity = -1`、`fade = 0.2`，
+                // 空壳全是 `memset` 的 0。
+                activity: 0,
+                activity_name: String::new(),
+                activity_weight: 0,
+                delta: false,
+                frames: Vec::new(),
+                // `groupsize = [0, 0]` ⟹ `cells` 空 ⟹ 写出器走空壳分支。
+                cells: Vec::new(),
+                blend_width: 0,
+                blend_params: [None, None],
+                auto_layers: Vec::new(),
+                events: Vec::new(),
+                fade_in: 0.0,
+                fade_out: 0.0,
+                forward_declared: true,
+                no_auto_ik: false,
+                ik_rules: Vec::new(),
+                iklocks: Vec::new(),
+                movements: Vec::new(),
+                section_frames: 0,
+                num_sections: 0,
+                // ⚠️ **全 0，不是全 1** —— 见 `merge_weights` 的说明：
+                // `groupsize = [0,0]` 让官方的 MAX 循环一次都不跑。
+                weights: vec![0.0; n_bones],
+                pre_subtract_frames: None,
+                extra_flags: None,
+            });
+            continue;
+        }
 
         // ---- blend 网格（`$sequence` 块里写了多个动画名）----
         //
@@ -1313,11 +1386,15 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 movements: s.movements.clone(),
                 section_frames: if sec_len > 0 && nf_i >= sec_thr { sec_len } else { 0 },
                 num_sections: 0,
+                // 本序列的权重 = 各格动画**逐骨骼取 MAX**（`simplify.cpp:302-318`）。
+                weights: merge_weights(&cell_idx, &anim_weights, desc.bones.len()),
                 // 取**第一格**减除前的帧（官方按格取，但 blend 的每一格
                 // 都是独立的 animdesc，这里 `first` 也是第一格的）。
                 pre_subtract_frames: pre_subtract
                     .get(cell_idx[0])
                     .and_then(|p| p.clone()),
+                extra_flags: s.extra_flags,
+                forward_declared: false,
             });
             continue;
         }
@@ -1356,6 +1433,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 let name = format!("@{}", s.name);
                 // 登记在**动画名**下，与官方一致。
                 anim_index.insert(Box::leak(name.clone().into_boxed_str()), i);
+                // 隐含动画的权重取**序列**的 `weightlist`
+                // （官方 `Cmd_ImpliedAnimation` 建完动画后，序列的
+                // `cmds[]` 里的 `CMD_WEIGHTS` 会作用到它）。
+                anim_weights.push(weights_of(s.weight_list.as_deref()));
                 anims.push(crate::model::CompiledAnimation {
                     name,
                     smd_path: smd_path.clone(),
@@ -1397,6 +1478,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             section_frames: if sec_len > 0 && nf >= sec_thr { sec_len } else { 0 },
             num_sections: 0, // 下面按 section_frames 算（依赖 frames 数）
             pre_subtract_frames: pre_subtract.get(anim_ix).and_then(|p| p.clone()),
+            extra_flags: s.extra_flags,
+            forward_declared: false,
+            weights: merge_weights(&[anim_ix], &anim_weights, n_bones),
         });
     }
     if !seq_errors.is_empty() {
@@ -3644,6 +3728,159 @@ fn resolve_lid(
     Ok(())
 }
 
+/// 把一条序列的各格动画权重合并成序列权重：**逐骨骼取 MAX**。
+///
+/// # 官方依据（`simplify.cpp:302-318`，逐字）
+///
+/// ```c
+/// for (i = 0; i < g_sequence.Count(); i++) {
+///     for (n = 0; n < g_numbones; n++) {
+///         g_sequence[i].weight[n] = 0.0;
+///         for (j = 0; j < g_sequence[i].groupsize[0]; j++)
+///             for (k = 0; k < g_sequence[i].groupsize[1]; k++)
+///                 g_sequence[i].weight[n] =
+///                     MAX( g_sequence[i].weight[n], g_sequence[i].panim[j][k]->weight[n] );
+///     }
+/// }
+/// ```
+///
+/// ⚠️ 是 **MAX 而不是「取第一格」** —— blend 序列的每一格可能是不同动画，
+/// 各自带不同权重表。
+///
+/// 空的 `cells`（理论上不会出现）回落到全 1。
+fn merge_weights(cells: &[usize], anim_weights: &[Vec<f32>], n_bones: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_bones];
+    for &c in cells {
+        let Some(w) = anim_weights.get(c) else {
+            continue;
+        };
+        for (n, slot) in out.iter_mut().enumerate() {
+            if let Some(v) = w.get(n) {
+                *slot = slot.max(*v);
+            }
+        }
+    }
+    // 没有任何格（或格为空）⟹ 全 1，与「无 `$weightlist`」一致。
+    if cells.is_empty() {
+        return default_weight_list(n_bones);
+    }
+    out
+}
+
+/// 把权重表解析成**逐骨骼权重数组**（`float[numbones]`）。
+///
+/// # 算法（`buildAnimationWeights`，`simplify.cpp:1646-1719` 逐字复刻）
+///
+/// ```c
+/// for (i = 0; i < g_numweightlist; i++) {
+///     if (i == 0) {                              // 隐式默认表
+///         for (j) if (parent[j] != -1) weight[j] = -1;   // 子骨骼：未初始化
+///                 else                 weight[j] = 1;    // 根骨骼：1
+///     } else {
+///         for (j) if (parent[j] != -1) weight[j] = g_weightlist[0].weight[j];
+///                 else                 weight[j] = 0;    // 根骨骼：**0**
+///     }
+///     for (j = 0; j < numbones; j++) {           // 显式条目
+///         k = findGlobalBone(bonename[j]);
+///         if (k == -1) MdlError(...);            // 未知骨骼 = 硬错误
+///         weight[k] = boneweight[j];
+///     }
+/// }
+/// for (i) for (j) {                              // 沿父链补齐
+///     if (weight[j] < 0.0 && parent[j] != -1)
+///         weight[j] = weight[parent[j]];
+/// }
+/// ```
+///
+/// # ⚠️ 三个容易读错的点（都有实测判据）
+///
+/// 1. **`i != 0` 的表把根骨骼置 0，不是 1。**
+///    实测 `$weightlist WL mid 0.5` → `[0, 0.5, 0.5, 0.5]`（root = **0**）。
+/// 2. **`i != 0` 抄表 0 时抄到的是 `-1`（哨兵），不是 1。**
+///    因为第 ③ 步（沿父链补齐）在**全部**表初始化完之后才跑 ——
+///    抄的那一刻表 0 的子骨骼还是 `-1`。所以子骨骼最终由第 ③ 步
+///    按**父链**决定，而不是「默认 1」。
+/// 3. **沿父链补齐是「子取父」，方向向下。**
+///    实测 `mid 0.5` 让 `leaf`/`tip` 也变 0.5。
+///
+/// # 返回
+///
+/// 与 `desc.weight_lists` **等长**的数组（不含隐式表 0）。
+/// 调用方用 [`weight_list_index`] 拿到「官方下标」（从 1 起）后减 1 索引。
+pub fn resolve_weight_lists(desc: &ModelDesc) -> Vec<Vec<f32>> {
+    let n = desc.bones.len();
+    let index = desc.bone_index();
+    // ⚠️ 官方 `findGlobalBone` 用 **`stricmp`**（`simplify.cpp:2628`），
+    // 所以 `$weightlist WL MID 0.5` 能命中 `mid`。
+    // `bone_index()` 是**大小写敏感**的，直接用它会让这条静默失效 ——
+    // 而 `validate()` 现在用的是大小写不敏感的表，两边必须一致。
+    let ci: std::collections::HashMap<String, usize> = desc
+        .bones
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.name.to_ascii_lowercase(), i))
+        .collect();
+    let parents: Vec<i32> = desc
+        .bones
+        .iter()
+        .map(|b| match b.parent.as_deref() {
+            Some(p) => index.get(p).map(|v| *v as i32).unwrap_or(-1),
+            None => -1,
+        })
+        .collect();
+
+    // 表 0 = 隐式默认：根 1、子骨骼 -1（哨兵）。
+    let mut default: Vec<f32> = (0..n)
+        .map(|j| if parents[j] != -1 { -1.0 } else { 1.0 })
+        .collect();
+
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(desc.weight_lists.len());
+    for wl in &desc.weight_lists {
+        // `i != 0` 分支：根 0、子骨骼抄表 0（此刻表 0 的子骨骼仍是 -1）。
+        let mut w: Vec<f32> = (0..n)
+            .map(|j| if parents[j] != -1 { default[j] } else { 0.0 })
+            .collect();
+        for e in &wl.bones {
+            if let Some(&k) = ci.get(&e.bone.to_ascii_lowercase()) {
+                w[k] = e.weight;
+            }
+        }
+        out.push(w);
+    }
+
+    // 沿父链补齐 —— **表 0 与所有具名表都要跑**。
+    // 表 0 的子骨骼是 `-1`，必须由父链补成 1。
+    for w in std::iter::once(&mut default).chain(out.iter_mut()) {
+        // `j` 升序：父下标一定小于子下标（`validate()` 保证）。
+        for j in 0..n {
+            if w[j] < 0.0 && parents[j] != -1 {
+                w[j] = w[parents[j] as usize];
+            }
+        }
+    }
+
+    out
+}
+
+/// 隐式默认权重表（`g_weightlist[0]`，全 1）。
+///
+/// 实测：`probe_weightlist_semantics.js` 的 `none` 行 → `[1,1,1,1]`。
+pub fn default_weight_list(n_bones: usize) -> Vec<f32> {
+    vec![1.0; n_bones]
+}
+
+/// 权重表名 → **官方下标**（从 **1** 起，0 是隐式默认表）。
+///
+/// 官方查找循环是 `for (i = 1; i < g_numweightlist; i++)` ——
+/// **跳过 0**（`studiomdl.cpp:1719`）。找不到报
+/// `unknown weightlist '<名>'`。
+pub fn weight_list_index(desc: &ModelDesc, name: &str) -> Option<usize> {
+    desc.weight_lists
+        .iter()
+        .position(|w| w.name.eq_ignore_ascii_case(name))
+        .map(|i| i + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5517,6 +5754,581 @@ end
         assert!(
             errs.iter().any(|x| x.message.contains("没有可用的三角形")),
             "{errs:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // ================= $weightlist =================
+    //
+    // 判据来自 `docs/_probe/cmp_weightlist_oracle.js`（11/11 与官方逐位一致）
+    // 与 `docs/_probe/cmp_weightlist_errors.js`（11/11 判定一致）。
+    // 这里的表就是那两张表的 Rust 版 —— 用的是**官方产物实测**的值。
+
+    /// 骨骼链 `root → mid → leaf → tip` 的权重表描述。
+    fn wl_desc(lists: &str) -> ModelDesc {
+        let toml = format!(
+            r#"
+{lists}
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "mid"
+parent = "root"
+
+[[bones]]
+name = "leaf"
+parent = "mid"
+
+[[bones]]
+name = "tip"
+parent = "leaf"
+
+[model]
+name = "models/test/wl.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{{ name = "models/test/mat" }}]
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "wl.smd"
+"#
+        );
+        ModelDesc::from_toml(&toml).expect("描述必须能解析")
+    }
+
+    #[test]
+    fn weightlist_semantics_match_official() {
+        // 官方实测（`cmp_weightlist_oracle.js`，逐位比较）：
+        //   none             -> [1, 1, 1, 1]
+        //   root 1           -> [1, 1, 1, 1]
+        //   root 0           -> [0, 0, 0, 0]
+        //   mid 0.5          -> [0, 0.5, 0.5, 0.5]   ← 根是 0，子沿父链继承
+        //   mid 0            -> [0, 0, 0, 0]
+        //   leaf 0           -> [0, 0, 0, 0]
+        //   tip 0.25         -> [0, 0, 0, 0.25]
+        //   mid 0.5 + tip 0  -> [0, 0.5, 0.5, 0]     ← 显式条目覆盖继承
+        //   all four         -> [1, 0.75, 0.5, 0.25]
+        let cases: &[(&str, &str, [f32; 4])] = &[
+            (
+                "root1",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "root"
+weight = 1.0
+"#,
+                [1.0, 1.0, 1.0, 1.0],
+            ),
+            (
+                "root0",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "root"
+weight = 0.0
+"#,
+                [0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                // 最能说明问题的一行：根是 **0**（不是 1），
+                // 而 leaf/tip 沿父链继承 mid 的 0.5。
+                "mid_half",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+"#,
+                [0.0, 0.5, 0.5, 0.5],
+            ),
+            (
+                "mid_zero",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.0
+"#,
+                [0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "tip_quarter",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.25
+"#,
+                [0.0, 0.0, 0.0, 0.25],
+            ),
+            (
+                // 显式 `tip 0` **覆盖**从 mid 继承来的 0.5。
+                "block_form",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.0
+"#,
+                [0.0, 0.5, 0.5, 0.0],
+            ),
+            (
+                "all_four",
+                r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "root"
+weight = 1.0
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.75
+
+[[weight_lists.bones]]
+bone = "leaf"
+weight = 0.5
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.25
+"#,
+                [1.0, 0.75, 0.5, 0.25],
+            ),
+        ];
+
+        for (tag, lists, want) in cases {
+            let d = wl_desc(lists);
+            let r = resolve_weight_lists(&d);
+            assert_eq!(r.len(), 1, "{tag}: 应当解析出 1 张表");
+            assert_eq!(r[0], want, "{tag}: 与官方实测不一致");
+        }
+    }
+
+    #[test]
+    fn weightlist_absent_means_all_ones() {
+        // 官方实测 `none` → [1,1,1,1]（隐式表 0：根 1、子骨骼沿父链继承 1）。
+        let d = wl_desc("");
+        assert!(resolve_weight_lists(&d).is_empty());
+        assert_eq!(default_weight_list(4), vec![1.0; 4]);
+    }
+
+    #[test]
+    fn weightlist_bone_name_is_case_insensitive() {
+        // 官方 `findGlobalBone` 用 `stricmp`（`simplify.cpp:2628`），
+        // 所以 `MID` 必须命中 `mid` —— 用大小写敏感的表会静默失效。
+        let d = wl_desc(
+            r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "MID"
+weight = 0.5
+"#,
+        );
+        assert_eq!(resolve_weight_lists(&d)[0], [0.0, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn weightlist_index_starts_at_one() {
+        // 官方查找循环 `for (i = 1; i < g_numweightlist; i++)`
+        // （`studiomdl.cpp:1719`）—— **跳过 0**（0 是隐式默认表）。
+        let d = wl_desc(
+            r#"[[weight_lists]]
+name = "first"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+
+[[weight_lists]]
+name = "second"
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.25
+"#,
+        );
+        assert_eq!(weight_list_index(&d, "first"), Some(1));
+        assert_eq!(weight_list_index(&d, "second"), Some(2));
+        // 表名也大小写不敏感（官方 `stricmp`）。
+        assert_eq!(weight_list_index(&d, "FIRST"), Some(1));
+        assert_eq!(weight_list_index(&d, "nope"), None);
+    }
+
+    #[test]
+    fn merge_weights_takes_per_bone_max_across_cells() {
+        // 官方 `simplify.cpp:302-318` 是 **MAX 而不是「取第一格」**。
+        let a = vec![1.0, 0.0, 0.5, 0.0];
+        let b = vec![0.0, 1.0, 0.25, 0.0];
+        let m = merge_weights(&[0, 1], &[a.clone(), b.clone()], 4);
+        assert_eq!(m, vec![1.0, 1.0, 0.5, 0.0]);
+        // 单格 = 它自己。
+        assert_eq!(merge_weights(&[1], &[vec![0.0; 4], b.clone()], 4), b);
+        // 没有任何格 ⟹ 全 1（与「无 `$weightlist`」一致）。
+        assert_eq!(merge_weights(&[], &[], 4), vec![1.0; 4]);
+    }
+
+    #[test]
+    fn declared_but_unused_weightlist_leaves_weights_all_ones() {
+        // 官方实测 `declared_unused` → [1,1,1,1]：表被声明但序列没引用它，
+        // 于是序列用的是隐式表 0。**表仍然会被 resolve**（官方在
+        // `buildAnimationWeights` 里遍历全部表，所以未知骨骼照样报错）。
+        let d = wl_desc(
+            r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+"#,
+        );
+        // 表本身被解析出来了……
+        assert_eq!(resolve_weight_lists(&d)[0], [0.0, 0.5, 0.5, 0.5]);
+        // ……但序列没有 `weight_list` ⟹ 用隐式表 0。
+        assert!(d.sequences.is_empty());
+        assert_eq!(default_weight_list(d.bones.len()), vec![1.0; 4]);
+    }
+
+    // ---- 校验：官方是硬错误，不是 warning ----
+
+    #[test]
+    fn validate_rejects_unknown_bone_in_weightlist() {
+        // 官方 `unknown bone reference '%s' in weightlist '%s'`
+        // （`simplify.cpp:1697`）—— 即使该表**没被引用**也报错。
+        let d = wl_desc(
+            r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "nosuchbone"
+weight = 0.5
+"#,
+        );
+        let errs = d.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.path.contains("weight_lists[0].bones[0].bone")
+                && e.message.contains("nosuchbone")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_weightlist_reference() {
+        // 官方 `unknown weightlist '%s'`（`studiomdl.cpp:1728`）。
+        let mut d = wl_desc("");
+        d.sequences.push(crate::model::Sequence {
+            name: "idle".into(),
+            smd: "wl.smd".into(),
+            fps: Some(30.0),
+            looping: false,
+            delta: false,
+            activity: None,
+            activity_weight: 0,
+            events: Vec::new(),
+            fade_in: 0.2,
+            fade_out: 0.2,
+            forward_declared: false,
+            no_auto_ik: false,
+            ik_rules: Vec::new(),
+            iklocks: Vec::new(),
+            blends: Vec::new(),
+            blend_width: None,
+            blend_params: Vec::new(),
+            auto_layers: Vec::new(),
+            movements: Vec::new(),
+            section_frames: None,
+            section_threshold: None,
+            extra_flags: None,
+            weight_list: Some("NOPE".into()),
+        });
+        let errs = d.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.path == "sequences[0].weight_list" && e.message.contains("NOPE")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_weightlist_name() {
+        // 官方 `Duplicate weightlist '%s'`（`studiomdl.cpp:3344`），大小写不敏感。
+        let d = wl_desc(
+            r#"[[weight_lists]]
+name = "WL"
+
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+
+[[weight_lists]]
+name = "wl"
+
+[[weight_lists.bones]]
+bone = "tip"
+weight = 0.25
+"#,
+        );
+        let errs = d.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("权重表名重复")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_weightlist_limits_match_real_binary() {
+        // ⚠️ 官方 L4D2 的实测上限是 **128 条/表、128 张表**，
+        // 不是 episode1 头文件写的 16/32（见 `MAX_WEIGHT_ENTRIES` 的说明）。
+        // 这里把边界钉死：128 条合法、129 条非法。
+        let ok = wl_desc(&format!(
+            "[[weight_lists]]\nname = \"WL\"\n\n{}",
+            (0..128)
+                .map(|_| "[[weight_lists.bones]]\nbone = \"mid\"\nweight = 0.5\n")
+                .collect::<String>()
+        ));
+        assert!(
+            ok.validate().is_ok(),
+            "128 条应当合法：{:?}",
+            ok.validate().unwrap_err()
+        );
+
+        let bad = wl_desc(&format!(
+            "[[weight_lists]]\nname = \"WL\"\n\n{}",
+            (0..129)
+                .map(|_| "[[weight_lists.bones]]\nbone = \"mid\"\nweight = 0.5\n")
+                .collect::<String>()
+        ));
+        let errs = bad.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("条目过多")),
+            "{errs:?}"
+        );
+    }
+
+    // ================= $declaresequence =================
+    //
+    // 判据来自 `docs/_probe/cmp_declaresequence_oracle.js`
+    // （6/6 逐字段一致）与 `cmp_survivor_declaresequence.js`
+    // （真实 41 KB survivor QCI，936 条序列含 933 条空壳全部一致）。
+
+    /// 造一个带 `$declaresequence` 空壳的描述（TOML 侧）。
+    ///
+    /// `forward_declared = true` 是**顶层字段**，直接写在 `[[sequences]]` 里。
+    ///
+    /// ⚠️ 材质名必须与 `SMD` 夹具里的一致（`myprop`）—— 用别的名字
+    /// `compile()` 会报「SMD 里的材质名找不到」。
+    fn dsq_desc(extra: &str) -> String {
+        format!(
+            r#"
+[model]
+name = "models/test/dsq.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{{ name = "models/test/myprop" }}]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "tip"
+parent = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "dsq.smd"
+
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn forward_declared_sequence_has_no_animation_data() {
+        // 官方 `Cmd_DeclareSequence` 只 `memset` + 置 `STUDIO_OVERRIDE`：
+        // **不分配 `panim`、不读 SMD**。所以编译出来的
+        // `CompiledSequence` 必须是「空」的，且各字段停在 `memset` 值。
+        let d = tmpdir("dsq");
+        write(&d, "dsq.smd", SMD);
+        let desc = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "shell"
+forward_declared = true
+"#,
+        ))
+        .unwrap();
+        assert!(desc.validate().is_ok(), "{:?}", desc.validate().unwrap_err());
+
+        let c = compile(&desc, &d).unwrap();
+        assert_eq!(c.sequences.len(), 1);
+        let s = &c.sequences[0];
+        assert!(s.forward_declared);
+        // 官方 `memset` 之后这些字段**保持 0**，不是普通序列的默认值。
+        assert_eq!(s.activity, 0, "空壳的 activity 是 memset 的 0，不是 -1");
+        assert_eq!(s.fade_in, 0.0, "空壳的 fadeintime 是 0，不是 0.2");
+        assert_eq!(s.fade_out, 0.0, "空壳的 fadeouttime 是 0，不是 0.2");
+        assert!(s.cells.is_empty(), "空壳没有 blend 格");
+        assert!(s.frames.is_empty(), "空壳没有帧");
+        // ⚠️ **全 0 不是全 1** —— `groupsize=[0,0]` 让官方的 MAX 循环不跑。
+        assert_eq!(
+            s.weights,
+            vec![0.0; desc.bones.len()],
+            "空壳的 weightlist 是全 0（simplify.cpp:302-318 的初值）"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn forward_declared_sequence_is_not_required_to_have_smd() {
+        // 官方连 `panim` 都不分配 ⟹ 空壳**没有 SMD**。
+        // `validate()` 对普通序列要求 `smd` 非空，对空壳必须放行。
+        let d = tmpdir("dsq2");
+        write(&d, "dsq.smd", SMD);
+        let desc = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "shell"
+forward_declared = true
+"#,
+        ))
+        .unwrap();
+        assert!(
+            desc.validate().is_ok(),
+            "空壳不该因为没有 smd 而报错：{:?}",
+            desc.validate().unwrap_err()
+        );
+        // 反例：普通序列没有 smd 仍然要报错。
+        let bad = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "normal"
+"#,
+        ))
+        .unwrap();
+        let errs = bad.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.path == "sequences[0].smd"),
+            "{errs:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn forward_declared_sequence_may_share_a_name_with_a_real_one() {
+        // 官方 `Cmd_Sequence` 走 `LookupAnimation`（查**动画池**），
+        // 空壳不在池里 ⟹ 「先 `$sequence x` 再 `$declaresequence x`」
+        // 官方**不报错**，产出两条同名序列（实测 `fill_then_declare` → 2 条）。
+        let d = tmpdir("dsq3");
+        write(&d, "dsq.smd", SMD);
+        let desc = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "same"
+smd = "dsq.smd"
+fps = 30.0
+
+[[sequences]]
+name = "same"
+forward_declared = true
+"#,
+        ))
+        .unwrap();
+        assert!(
+            desc.validate().is_ok(),
+            "同名空壳不该报重复：{:?}",
+            desc.validate().unwrap_err()
+        );
+        let c = compile(&desc, &d).unwrap();
+        assert_eq!(c.sequences.len(), 2, "两条同名序列都要保留");
+        assert!(!c.sequences[0].forward_declared);
+        assert!(c.sequences[1].forward_declared);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn forward_declared_sequence_rejects_a_real_smd() {
+        // 空壳带 SMD 说明两种东西被混在了一起 —— 产物会「看起来对但语义错」。
+        let d = tmpdir("dsq4");
+        write(&d, "dsq.smd", SMD);
+        let desc = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "shell"
+forward_declared = true
+smd = "dsq.smd"
+"#,
+        ))
+        .unwrap();
+        let errs = desc.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.path == "sequences[0].smd" && e.message.contains("不该有 smd")),
+            "{errs:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn forward_declared_survives_a_model_with_no_animations_at_all() {
+        // ⚠️ **本轮修掉的一个真 bug**：只有空壳的模型
+        // `numlocalanim == 0` 而 `numlocalseq > 0`。
+        // `mdl_writer` 早先把 seqdesc 数组整块挂在 `anim_count > 0` 上，
+        // 于是空壳**一个字节都没写**。
+        //
+        // 官方实测（`dump_mdl_header.js`）：`numlocalanim=0` 时
+        // `localanimindex` / `localseqindex` **都不是 0**（都是 1532），
+        // seqdesc 数组照写不误。
+        let d = tmpdir("dsq5");
+        write(&d, "dsq.smd", SMD);
+        let desc = ModelDesc::from_toml(&dsq_desc(
+            r#"[[sequences]]
+name = "shell_a"
+forward_declared = true
+
+[[sequences]]
+name = "shell_b"
+forward_declared = true
+"#,
+        ))
+        .unwrap();
+        let c = compile(&desc, &d).unwrap();
+        assert_eq!(c.sequences.len(), 2);
+        assert!(
+            c.sequences.iter().all(|s| s.forward_declared),
+            "两条都应是空壳"
+        );
+        // 写出后自检：`localseqindex` 必须指向 seqdesc 数组而不是 0。
+        let out = crate::mdl_writer::write_mdl(&c).unwrap();
+        let rd = |o: usize| i32::from_le_bytes(out.bytes[o..o + 4].try_into().unwrap());
+        let seq_off = rd(0xC0);
+        assert_ne!(seq_off, 0, "有序列时 localseqindex 不该是 0");
+        assert_eq!(rd(0xBC), 2, "numlocalseq");
+        // 该偏移处的第一条 seqdesc 必须真的是空壳：`flags = 0x800`。
+        let flags = i32::from_le_bytes(
+            out.bytes[seq_off as usize + 0x0C..seq_off as usize + 0x10]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            flags & 0x800,
+            0x800,
+            "seqdesc[0].flags 应当带 STUDIO_OVERRIDE（说明数组真的写出来了）"
         );
         std::fs::remove_dir_all(&d).ok();
     }

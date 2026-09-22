@@ -2313,17 +2313,27 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
 
     // 动画：animdesc 与 seqdesc 一一对应（本实现每个序列一个动画）。
     put_i32(&mut buf, off::LOCAL_ANIM_COUNT, anim_count as i32);
-    put_i32(
-        &mut buf,
-        off::LOCAL_ANIM_OFFSET,
-        if anim_count == 0 { 0 } else { anim_off as i32 },
-    );
+    put_i32(&mut buf, off::LOCAL_ANIM_OFFSET, if anim_count == 0 { 0 } else { anim_off as i32 });
     put_i32(&mut buf, off::LOCAL_SEQ_COUNT, seq_count as i32);
-    put_i32(
-        &mut buf,
-        off::LOCAL_SEQ_OFFSET,
-        if anim_count == 0 { 0 } else { seq_off as i32 },
-    );
+    // ⚠️ `localseqindex` 的条件是 **`seq_count == 0`**，不是 `anim_count == 0`。
+    //
+    // 早先这里跟着 `localanimindex` 一起按 `anim_count == 0` 写 0 ——
+    // 对普通模型两者同进同退（没有动画就没有序列），所以一直没暴露。
+    // **`$declaresequence` 打破了这个巧合**：空壳序列**没有动画**
+    // （`numlocalanim = 0`）但**有序列**（`numlocalseq > 0`）。
+    //
+    // 实测官方（只有 2 条空壳的 QC）：
+    // ```text
+    // numlocalanim=0  localanimindex=1532   ← 有值！
+    // numlocalseq =2  localseqindex =1532
+    // ```
+    // 即 `localanimindex` **也**不是 0 —— 它指向 `ALIGN4(bonetablename
+    // + numbones)`（= 1532），只是因为 `numlocalanim == 0` 而没有数组。
+    //
+    // 所以两个字段都**不再看 `anim_count`**：布局已经把偏移算好了
+    // （`layout.rs` 的 `localanim` / `localseq` 不依赖数量）。
+    // 真实 survivor 产物 `survivor_teenangst.mdl` 也是这个形态。
+    put_i32(&mut buf, off::LOCAL_SEQ_OFFSET, seq_off as i32);
     // surfaceprop 是**文件绝对偏移**（头部字段一律绝对）。
     put_i32(
         &mut buf,
@@ -3018,7 +3028,19 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     }
 
     // ---- 10. 动画：animdesc / 动画链 / seqdesc / seq 子表 ----
-    if anim_count > 0 {
+    //
+    // ⚠️ 条件是 **`anim_count > 0 || seq_count > 0`**，不是 `anim_count > 0`。
+    //
+    // 早先只看 `anim_count` —— 对普通模型两者同进同退（没动画就没序列），
+    // 所以一直没暴露。**`$declaresequence` 打破了这个巧合**：
+    // 一个「只有空壳序列」的 QC 有 `numlocalseq > 0` 而 `numlocalanim == 0`，
+    // 于是整个 seqdesc 数组（含 label、`STUDIO_OVERRIDE`、
+    // `±9999` 包围盒）**一个字节都没写**。
+    //
+    // 实测官方（只有 2 条空壳）：`numlocalseq=2`、`numlocalanim=0`，
+    // seqdesc 数组**照写不误**（`survivor_teenangst.mdl` 是 937 条
+    // 序列 / 4 个动画的同形态极端样本）。
+    if anim_count > 0 || seq_count > 0 {
         buf[anim_off..anim_off + anim.animdescs.len()].copy_from_slice(&anim.animdescs);
         buf[anim_data_off..anim_data_off + anim.anim_data.len()]
             .copy_from_slice(&anim.anim_data);
@@ -3068,6 +3090,17 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         // 官方 `bbmax=[19.8,10,7]`，静止姿势只有 `[0,10,7]`）。
         let seq_bounds: Vec<([f32; 3], [f32; 3])> = (0..compiled.sequences.len())
             .map(|i| {
+                // `$declaresequence` 的空壳**没有动画** ⟹
+                // `CalcSequenceBoundingBoxes`（`simplify.cpp:7173-7201`）
+                // 的两重循环一次都不跑 ⟹ `bmin/bmax` 停在**初值**
+                // `[9999, 9999, 9999] / [-9999, -9999, -9999]`
+                // （`simplify.cpp:7180-7181`）。
+                //
+                // ⚠️ 这正是那个「倒置包围盒」哨兵 —— 实测官方空壳就是它，
+                // 不是 `[0,0,0]`。真实 survivor 产物 933 条全是这个值。
+                if compiled.sequences[i].forward_declared {
+                    return ([9999.0; 3], [-9999.0; 3]);
+                }
                 crate::compile::sequence_pose_bounds(desc, compiled, i, &render_bounds)
                     .unwrap_or_else(|| compiled.bounds().unwrap_or(([0.0; 3], [0.0; 3])))
             })

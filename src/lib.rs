@@ -40,6 +40,7 @@
 //! | [`lod`] | **多 LOD 与 fixup 表**（顶点池排序、分段、重映射） |
 //! | [`vta`] | **`.vta` 顶点动画解析**（SMD 语法、7 字段行、相对帧号） |
 //! | [`flex`] | **VTA 形状解析**（就近匹配 → 差量 → smoothstep → 载荷） |
+//! | [`qc`] | **QC 前端**（`.qc` 脚本 → [`model::ModelDesc`]，即 Phase 2 的输入适配） |
 
 pub mod anim_writer;
 pub mod ani_writer;
@@ -51,6 +52,7 @@ pub mod lod;
 pub mod mdl_writer;
 pub mod model;
 pub mod phy;
+pub mod qc;
 pub mod smd;
 pub mod tangent;
 pub mod vta;

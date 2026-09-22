@@ -49,6 +49,16 @@ mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
                   `parent` 沿骨骼链**上溯**到第一个在碰撞列表里的祖先
                   （官方 FixParent）。
 
+  mdlc qc2toml <model.qc> [--out <path.toml>]
+      把 QC 脚本解析成 mdlc 的 TOML 描述文件（**只写文本，不编译**）。
+      QC 里的 $include / $definevariable / $pushd 都会被展开，
+      骨骼表与材质表会**读 SMD 补全**（与官方 BuildGlobalBonetable 一致）。
+      用途：把 QC 项目迁移到 TOML，或人工核对解析结果。
+
+  mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]
+      直接从 QC 编译 —— 等价于 `qc2toml` 之后再 `build`，
+      但中间描述不落盘（与 studiomdl 的行为一致）。
+
   mdlc template
       打印一份带注释的最小 TOML 模板。
 ";
@@ -73,6 +83,8 @@ fn main() -> ExitCode {
         "build" => build(rest),
         "check" => check(rest),
         "phy" => phy_cmd(rest),
+        "qc2toml" => qc2toml(rest),
+        "build-qc" => build_qc(rest),
         "vvd-info" | "vvd-roundtrip" => {
             let Some(path) = rest.first() else {
                 eprintln!("错误：{cmd} 需要一个文件参数");
@@ -210,10 +222,145 @@ fn build(argv: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(c) => return c,
     };
-
     // 编译前端：读 SMD、按材质划分 mesh、解析参考姿态。
     let base = toml_path.parent().unwrap_or(Path::new("."));
-    let mut compiled = match compile(&desc, base) {
+    compile_and_write(&desc, base, &out_root, cli_optimize_vtx)
+}
+
+/// 把 QC 解析成 `ModelDesc`，报错格式与 TOML 路径一致。
+fn load_qc(path: &Path) -> Result<ModelDesc, ExitCode> {
+    match mdlc::qc::parse_qc_file(path) {
+        Ok(d) => Ok(d),
+        Err(errs) => {
+            eprintln!("{} 解析失败，{} 处错误：", path.display(), errs.len());
+            for e in &errs {
+                eprintln!("  - {e}");
+            }
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// `mdlc qc2toml <model.qc> [--out <path.toml>]`。
+fn qc2toml(argv: &[String]) -> ExitCode {
+    let mut qc: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => match it.next() {
+                Some(p) => out = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("错误：--out 后面缺少路径");
+                    return ExitCode::from(2);
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("错误：未知选项 {other:?}");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if qc.is_some() {
+                    eprintln!("错误：多余的参数 {a:?}");
+                    return ExitCode::from(2);
+                }
+                qc = Some(PathBuf::from(a));
+            }
+        }
+    }
+    let Some(qc) = qc else {
+        eprintln!("错误：qc2toml 需要一个 .qc 文件参数");
+        return ExitCode::from(2);
+    };
+    let desc = match load_qc(&qc) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    // 与 `build` 一样先校验 —— 「解析成功但描述非法」也应当报出来。
+    if let Err(errs) = desc.validate() {
+        eprintln!("解析出的描述有 {} 处错误：", errs.len());
+        for e in &errs {
+            eprintln!("  - {e}");
+        }
+        return ExitCode::from(1);
+    }
+    let text = match desc.to_toml() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("错误：{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let out = out.unwrap_or_else(|| qc.with_extension("toml"));
+    if let Err(e) = std::fs::write(&out, &text) {
+        eprintln!("错误：写不到 {}：{e}", out.display());
+        return ExitCode::from(2);
+    }
+    println!("{} → {}", qc.display(), out.display());
+    println!(
+        "  骨骼 {}，材质 {}，body part {}，序列 {}，动画 {}",
+        desc.bones.len(),
+        desc.materials.textures.len(),
+        desc.bodyparts.len(),
+        desc.sequences.len(),
+        desc.animations.len()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]`。
+fn build_qc(argv: &[String]) -> ExitCode {
+    let mut qc: Option<PathBuf> = None;
+    let mut out = PathBuf::from(".");
+    let mut optimize_vtx = false;
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => match it.next() {
+                Some(p) => out = PathBuf::from(p),
+                None => {
+                    eprintln!("错误：--out 后面缺少路径");
+                    return ExitCode::from(2);
+                }
+            },
+            "--optimize-vtx" => optimize_vtx = true,
+            other if other.starts_with("--") => {
+                eprintln!("错误：未知选项 {other:?}");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if qc.is_some() {
+                    eprintln!("错误：多余的参数 {a:?}");
+                    return ExitCode::from(2);
+                }
+                qc = Some(PathBuf::from(a));
+            }
+        }
+    }
+    let Some(qc) = qc else {
+        eprintln!("错误：build-qc 需要一个 .qc 文件参数");
+        return ExitCode::from(2);
+    };
+    let desc = match load_qc(&qc) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let base = qc.parent().unwrap_or(Path::new("."));
+    compile_and_write(&desc, base, &out, optimize_vtx)
+}
+
+/// 把已解析的描述编译成四件套并落盘。
+///
+/// `build`（TOML）与 `build-qc`（QC）共用这条路径 —— 两者只在
+/// **怎么得到 `ModelDesc`** 上不同，之后完全一致。这正是
+/// `model.rs` 模块文档承诺的「写出器一行都不用改」。
+fn compile_and_write(
+    desc: &ModelDesc,
+    base: &Path,
+    out_root: &Path,
+    cli_optimize_vtx: bool,
+) -> ExitCode {
+    let mut compiled = match compile(desc, base) {
         Ok(c) => c,
         Err(errs) => {
             eprintln!("编译失败，{} 处错误：", errs.len());
@@ -479,7 +626,7 @@ fn build(argv: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    println!("描述        {}", toml_path.display());
+    println!("模型        {}", desc.model.name);
     println!("版本        {}", desc.version());
     println!("checksum    {}  （已写入各文件，配对一致）", out.checksum);
     println!();

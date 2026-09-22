@@ -133,6 +133,26 @@ pub const STUDIO_DELTA: i32 = 0x0004;
 pub const STUDIO_POST: i32 = 0x0010;
 /// `STUDIO_ALLZEROS`：该动画没有真实动画数据。
 pub const STUDIO_ALLZEROS: i32 = 0x0020;
+/// `STUDIO_OVERRIDE`：一条**前向声明的空壳序列**（QC 的 `$declaresequence`）。
+///
+/// `studio.h:2003`：`#define STUDIO_OVERRIDE 0x0800`，
+/// 官方注释是 `// a forward declared sequence (empty)`。
+///
+/// # 引擎侧语义（`studio_virtualmodel.cpp:185`）
+///
+/// ```c
+/// else if (m_group[seq[k].group].GetStudioHdr()
+///              ->pLocalSeqdesc(seq[k].index)->flags & STUDIO_OVERRIDE)
+/// {
+///     // the one in memory is a forward declared sequence, override it
+///     virtualsequence_t tmp; tmp.group = group; tmp.index = j; ...
+///     seq[k] = tmp;
+/// }
+/// ```
+///
+/// 即主模型里的空壳会被 `$includemodel` 进来的模型**按名字替换**。
+/// 这正是 survivor 模组「网格与动画分开发布」的机制。
+pub const STUDIO_OVERRIDE: i32 = 0x0800;
 
 /// 量化除数。**是 32767 不是 32768** —— 实测用严格比较精确命中。
 const QUANT_DIVISOR: f32 = 32767.0;
@@ -2520,6 +2540,12 @@ pub fn pack_anim_blocks(
 /// 报错并返回 `None`，而写出阶段拿不到那个错误通道；编译期算好、
 /// 存进 [`crate::model::CompiledSequence::blend_width`] 才是单一来源。
 fn seq_grid(seq: &crate::model::CompiledSequence) -> (i32, i32) {
+    // `$declaresequence` 的空壳：官方 `groupsize` 保持 `memset` 的
+    // **[0, 0]**（不是 1×1！）。实测见
+    // [`crate::model::Sequence::forward_declared`]。
+    if seq.forward_declared {
+        return (0, 0);
+    }
     // 单动画序列的 `cells` 只有 1 项（隐含动画），网格退化成 1×1。
     let cells = if seq.cells.len() <= 1 { 0 } else { seq.cells.len() };
     if cells == 0 {
@@ -3109,9 +3135,15 @@ pub fn write_animations(
     let mut posekey_offsets = Vec::with_capacity(compiled.sequences.len());
     let mut autolayer_offsets = Vec::with_capacity(compiled.sequences.len());
     // weightlist 的**复用**：官方对内容逐元素相同的块只写一次
-    // （`write.cpp:556-595`）。mdlc 的权重恒为全 1，所以整份文件只会有
-    // 一个块 —— 这里记下它，后续序列全部指回去。
-    let mut weight_block_off: Option<usize> = None;
+    // （`write.cpp:556-595`）。
+    //
+    // 键是**权重的位模式**（`Vec<u32>`）而不是 `Vec<f32>` ——
+    // `f32` 不实现 `Hash`/`Eq`。用 `to_bits()` 是**精确**比较，
+    // 与官方 `g_sequence[i].weight[j] != g_sequence[k].weight[j]`
+    // 的逐 float 比较语义一致（注意 `-0.0 != 0.0` 在 C 里为假，
+    // 但位模式不同 —— 官方那种情况会复用，mdlc 会新建一块。
+    // 两者**语义等价**（内容都是 ±0），只是块数可能差 1）。
+    let mut weight_block_cache: HashMap<Vec<u32>, usize> = HashMap::new();
     let mut seqdescs = vec![0u8; compiled.sequences.len() * SEQDESC_SIZE];
     // 待回填的事件名字：`(子表区内的字段偏移, 名字)`。
     //
@@ -3226,22 +3258,52 @@ pub fn write_animations(
         // `write.cpp:556-595`：官方为**每条序列**都写这张表，且若内容与
         // 更早某条序列的块**逐元素相同**就**复用**它的偏移、不新建。
         //
-        // mdlc 不实现 `$weightlist`（见 `model.rs` 的说明），所以权重恒为
-        // **全 1**（`simplify.cpp:1653-1669` 的 `g_weightlist[0]` 初值）——
-        // 于是只有第一条序列新建、其余全部复用它。这与官方对「没有
-        // `$weightlist` 的 QC」的行为完全一致。
+        // # 内容从哪来（`setAnimationWeight` + `merge weightlists`）
         //
-        // ⚠️ 早先本实现把它当空表写 `SEQDESC_SIZE`，是**错的**：引擎的
+        // 官方是**两级**合并：
+        //
+        // 1. 每条**动画**的 `panim->weight[]` 来自它自己的 `weightlist`
+        //    命令（缺省 = 表 0，全 1）；
+        // 2. 序列的权重 = **各格动画逐骨骼取 MAX**
+        //    （`simplify.cpp:302-318`）：
+        //
+        //    ```c
+        //    for (n) { g_sequence[i].weight[n] = 0.0;
+        //              for (j) for (k)
+        //                  g_sequence[i].weight[n] = MAX( ..., panim[j][k]->weight[n] ); }
+        //    ```
+        //
+        // 所以 blend 序列取的是「所有格的最大权重」，**不是**第一格。
+        //
+        // ⚠️ 早先本实现把权重**硬编码成全 1**（因为不实现 `$weightlist`），
+        // 于是只有第一条序列新建块、其余全部复用 —— 这对「没有
+        // `$weightlist` 的 QC」是对的，但对**有**的 QC 会写出错误的权重。
+        //
+        // ⚠️ 也不能把它当空表写 `SEQDESC_SIZE`（更早的错误）：引擎的
         // `pBoneweight(0)` 会按 `g_numbones` 个 float 去读，
         // 空表等于让它读到相邻子表（events / blend）的字节。
-        let weightlist_off_in_sub = match weight_block_off {
-            Some(off) => off,
+        //
+        // # 复用规则（与官方一致，逐元素比较）
+        //
+        // 官方从**后往前**扫已有序列，找第一张内容相同的块复用
+        // （`write.cpp:560-575` 的 `for (k = 0; k < i; k++)` 配合
+        // `pBoneweight(0) > pweight` 的「只看更新的」剪枝）。
+        // mdlc 用「内容 → 偏移」的哈希表表达同一件事：
+        // **内容相同 ⟹ 同一偏移**，与官方等价（官方也是逐元素比）。
+        let weights: &[f32] = &seq.weights;
+        let key: Vec<u32> = weights.iter().map(|w| w.to_bits()).collect();
+        let weightlist_off_in_sub = match weight_block_cache.get(&key) {
+            Some(off) => *off,
             None => {
                 let off = seq_subtables.len();
-                for _ in 0..bone_count {
+                for w in weights.iter().take(bone_count) {
+                    seq_subtables.extend_from_slice(&w.to_le_bytes());
+                }
+                // 权重数组短于骨骼数时补 1.0（防御；`compile` 保证等长）。
+                for _ in weights.len()..bone_count {
                     seq_subtables.extend_from_slice(&1.0f32.to_le_bytes());
                 }
-                weight_block_off = Some(off);
+                weight_block_cache.insert(key, off);
                 off
             }
         };
@@ -3310,11 +3372,17 @@ pub fn write_animations(
         // blend 序列的每一格指向**共享的** animdesc（`seq.cells`）。
         let blend_off_in_sub = seq_subtables.len();
         blend_offsets.push(blend_off_in_sub);
-        for k in 0..gs1.max(1) as usize {
-            for j in 0..gs0.max(1) as usize {
+        // ⚠️ **不要 `.max(1)`** —— `$declaresequence` 的空壳
+        // `groupsize = [0, 0]`，官方那两重循环**一次都不跑**，
+        // 于是 blend 表**一个字节都不写**（`write.cpp:615` 的
+        // `pData += 0 * sizeof(short)` 是 no-op）。
+        //
+        // 普通序列 `groupsize >= 1`，循环次数与原来完全一致。
+        for k in 0..gs1 as usize {
+            for j in 0..gs0 as usize {
                 // 行主序的第 `k*gs0 + j` 格 → 该格引用的 animdesc 下标
                 // （存储顺序是列主序，但下标本身按行主序数格子）。
-                let cell = k * gs0.max(1) as usize + j;
+                let cell = k * gs0 as usize + j;
                 let idx = seq.cells.get(cell).copied().unwrap_or(0) as u16;
                 seq_subtables.extend_from_slice(&idx.to_le_bytes());
             }
@@ -3339,6 +3407,23 @@ pub fn write_animations(
         // 实测 `look_poses` 的 `flags == 0x14` = `STUDIO_POST | STUDIO_DELTA`。
         if seq.delta {
             flags |= STUDIO_DELTA | STUDIO_POST;
+        }
+        // QC 的**纯标志位**关键字（`snap` / `hidden` / `autoplay` /
+        // `realtime` / `worldspace` / `post`）——
+        // `ParseSequence`（`studiomdl.cpp:2720-2866`）逐个 `pseq->flags |= XXX`。
+        //
+        // 这些位在 QC 里没有具名 TOML 键，所以由 [`Sequence::extra_flags`]
+        // 承载（QC 前端解析时填，TOML 也可以手写）。
+        if let Some(extra) = seq.extra_flags {
+            flags |= extra;
+        }
+        // `$declaresequence` ⟹ `STUDIO_OVERRIDE`（0x0800）。
+        //
+        // 官方 `Cmd_DeclareSequence` 是 `pseq->flags = STUDIO_OVERRIDE`
+        // （**赋值不是或**），但对一条 `memset` 过的记录来说两者等价。
+        // 实测空壳的 `flags` 恒为 `0x0800`。
+        if seq.forward_declared {
+            flags |= STUDIO_OVERRIDE;
         }
         // ⚠️ **再 OR 上每一格动画自己的 `animdesc.flags`**
         // （`studiomdl.cpp:3026-3038`）：
@@ -3382,7 +3467,13 @@ pub fn write_animations(
         // `write.cpp:438` 写的是 `g_sequence[i].numblends`，而它在
         // `studiomdl.cpp:3040` 被赋成「实际读到的动画个数」——
         // 与 `groupsize[0]*groupsize[1]` 恒等（同一函数 3019 行校验过）。
-        let numblends = gs0.max(1) * gs1.max(1);
+        //
+        // ⚠️ **空壳序列（`$declaresequence`）是 0，不是 1。**
+        // 官方 `memset` 之后从没给它赋过 `numblends`，`groupsize` 也是
+        // `[0, 0]`。实测 `probe_declaresequence.js`：空壳
+        // `numblends=0 groupsize=[0,0]`，而普通序列是 `1 / [1,1]`。
+        // 早先这里对两者都写 `max(1)` —— 那会让空壳看起来像「1 格动画」。
+        let numblends = gs0 * gs1;
         seqdescs[o + 0x38..o + 0x3C].copy_from_slice(&numblends.to_le_bytes());
         // `animindexindex` @0x3C：blend 表**相对该 seqdesc 自身**的偏移。
         //
@@ -3394,14 +3485,21 @@ pub fn write_animations(
             .copy_from_slice(&(sub_base_rel + blend_off_in_sub as i32).to_le_bytes());
         // movementindex @0x40 = 0
         // groupsize[0] @0x44 / groupsize[1] @0x48
-        seqdescs[o + 0x44..o + 0x48].copy_from_slice(&gs0.max(1).to_le_bytes());
-        seqdescs[o + 0x48..o + 0x4C].copy_from_slice(&gs1.max(1).to_le_bytes());
+        // ⚠️ 同样**不要 `.max(1)`** —— 空壳是 `[0, 0]`（`memset` 原值）。
+        seqdescs[o + 0x44..o + 0x48].copy_from_slice(&gs0.to_le_bytes());
+        seqdescs[o + 0x48..o + 0x4C].copy_from_slice(&gs1.to_le_bytes());
         // paramindex[0] @0x4C / paramindex[1] @0x50
+        // ⚠️ 空壳是 **[0, 0]**（`memset` 原值），不是普通序列的 `[-1, -1]`
+        // （后者来自 `Cmd_Sequence` 的 `pseq->paramindex[0] = -1`）。
         for (axis, at) in [(0usize, 0x4Cusize), (1, 0x50)] {
-            let v = seq.blend_params[axis]
-                .as_ref()
-                .map(|p| p.parameter_index)
-                .unwrap_or(-1);
+            let v = if seq.forward_declared {
+                0
+            } else {
+                seq.blend_params[axis]
+                    .as_ref()
+                    .map(|p| p.parameter_index)
+                    .unwrap_or(-1)
+            };
             seqdescs[o + at..o + at + 4].copy_from_slice(&v.to_le_bytes());
         }
         // paramstart[0] @0x54 / paramstart[1] @0x58
@@ -3777,6 +3875,7 @@ mod tests {
             smd_path: std::path::PathBuf::from("test.smd"),
             fps: 30.0,
             looping,
+            forward_declared: false,
             activity: -1,
             activity_name: String::new(),
             activity_weight: 0,
@@ -3798,6 +3897,9 @@ mod tests {
             section_frames: 0,
             num_sections: 0,
             pre_subtract_frames: None,
+            extra_flags: None,
+            // 单骨骼、无 `$weightlist` ⟹ 权重全 1（`g_weightlist[0]`）。
+            weights: vec![1.0],
         }
     }
 
@@ -3892,6 +3994,7 @@ mod tests {
                 jiggle_bones: Vec::new(),
                 quat_interp_bones: Vec::new(),
                 include_models: Vec::new(),
+                weight_lists: Vec::new(),
             },
             bodyparts: Vec::new(),
             animations,
@@ -5539,6 +5642,7 @@ mod tests {
                 jiggle_bones: Vec::new(),
                 quat_interp_bones: Vec::new(),
                 include_models: Vec::new(),
+                weight_lists: Vec::new(),
             },
             bodyparts: Vec::new(),
             sequences: vec![CompiledSequence {
@@ -5546,6 +5650,7 @@ mod tests {
                 smd_path: std::path::PathBuf::from("ikr.smd"),
                 fps: 30.0,
                 looping: false,
+                forward_declared: false,
                 activity: -1,
                 activity_weight: 0,
                 activity_name: String::new(),
@@ -5570,6 +5675,9 @@ mod tests {
                 section_frames: 0,
                 num_sections: 0,
                 pre_subtract_frames: None,
+                extra_flags: None,
+                // 单骨骼、无 `$weightlist` ⟹ 权重全 1。
+                weights: vec![1.0],
             }],
             // 隐含动画（`@idle`），与 `compile.rs` 的单动画序列路径一致。
             animations: vec![crate::model::CompiledAnimation {
