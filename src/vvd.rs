@@ -391,6 +391,37 @@ impl Vvd {
             });
         }
 
+        // ---- 骨骼下标：**格式**上限（有符号 char，0..=127）----
+        //
+        // ⚠️ 查的是**被顶点引用的下标**，不是骨骼总数。实测
+        // （`docs/_probe/diag_bone_use.js`）：
+        //   · mdlc 的 `linnea-export` 有 **134 根**骨骼，但最大引用下标只 **118**
+        //   · 官方 122 根产物最大引用下标 **119**
+        // 两者都没越界 —— 没被引用的骨骼只存在于 `mstudiobone_t` 数组里。
+        //
+        // 所以「骨骼总数 ≤ 128」是**错的**判据（那样会误拒上面两个真实模型），
+        // 真正装不下的是**下标 ≥ 128**：`char` 会把 200 读成 −56。
+        //
+        // 只查前 `bone_count` 个槽位 —— 后面的填充槽位无意义
+        // （studiomdl 常写 0），不参与语义。
+        for (i, v) in self.vertices.iter().enumerate() {
+            // `bone[]` 是定长 3 元素数组（`MAX_NUM_BONES_PER_VERT`）。
+            let n = (v.bone_count as usize).min(3);
+            for k in 0..n {
+                let b = v.bone[k];
+                if b > crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX as u8 {
+                    return Err(VvdError::Inconsistent {
+                        detail: format!(
+                            "顶点 {i} 引用了骨骼下标 {b}，超过格式上限 {} —— \
+                             VVD 的 `mstudioboneweight_t.bone[]` 是**有符号 char**，\
+                             下标 ≥128 会被引擎读成负数",
+                            crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
+                        ),
+                    });
+                }
+            }
+        }
+
         let fixup_table_start = HEADER_SIZE; // ALIGN4(64) == 64
         let vertex_data_start = align_up(fixup_table_start + self.fixups.len() * FIXUP_SIZE, 16);
         let tangent_data_start = align_up(vertex_data_start + count * VERTEX_SIZE, 16);

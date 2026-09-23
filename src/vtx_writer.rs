@@ -361,7 +361,11 @@ fn write_vtx_single(
         for m in &bp.models {
             for mesh in &m.meshes {
                 let n = mesh.vertices.len();
-                if n > u16::MAX as usize {
+                // ⚠️ 判据是 `>`（不是 `>=`）：`origMeshVertID` 是 `uint16`，
+                // 能表达下标 `0..=65535` ⟹ **65536 个顶点是合法的**。
+                // 早期写成 `n > u16::MAX`（= `n > 65535`）⟹ 把 65536 误拒，
+                // 恰好少了一个 —— 见 `MAXSTUDIOVERTS_PER_MESH`。
+                if n > crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH {
                     return Err(VtxWriteError::TooManyVertices {
                         model: m.name.clone(),
                         count: n,
@@ -760,7 +764,8 @@ fn write_vtx_multi(
                         .iter()
                         .map(|t| [slot[&t[0]], slot[&t[1]], slot[&t[2]]])
                         .collect();
-                    if used.len() > u16::MAX as usize {
+                    // 同前：`>` 而非 `>=`，65536 个顶点合法（下标 0..=65535）。
+                    if used.len() > crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH {
                         return Err(VtxWriteError::TooManyVertices {
                             model: m.name.clone(),
                             count: used.len(),
@@ -958,7 +963,24 @@ fn write_vtx_multi(
             }
             put_u16(&mut buf, o + 4, local as u16);
             for k in 0..3usize {
-                buf[o + 6 + k] = v.bones.get(k).map(|p| p[0] as u8).unwrap_or(0);
+                let b = v.bones.get(k).map(|p| p[0] as u8).unwrap_or(0);
+                // ⚠️ VTX 的 `boneID[]` 也是 **`char`（有符号）**
+                // （`optimize.h:48`，v49 = `hl2sdk-doi`；与 VVD 的 `bone[]`
+                // 同宽度）⟹ 骨骼下标同样必须 ≤ 127，越界会被读成负数。
+                //
+                // 真正的拒绝在 VVD 写出时（`vvd::Vvd::to_bytes` 逐顶点查
+                // `MAX_BONE_INDEX_IN_VERTEX`）—— VTX 与 VVD 共用同一份顶点，
+                // 所以那边先触发。这里只做 debug 断言。
+                debug_assert!(
+                    v.bones.get(k).is_none_or(|p| {
+                        p[0] >= 0.0
+                            && p[0] <= crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX as f32
+                    }),
+                    "骨骼下标 {} 超出有符号 char 的范围（≤ {}）",
+                    v.bones.get(k).map_or(0.0, |p| p[0]),
+                    crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
+                );
+                buf[o + 6 + k] = b;
             }
         }
 

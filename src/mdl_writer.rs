@@ -48,15 +48,119 @@ pub const HDR_PART1_SIZE: usize = 0x198;
 /// 实测 3333/3333 个真实模型都把 `studiohdr2` 放在 **408**（即
 /// `HDR_PART1_SIZE`），紧跟头部之后。
 pub const STUDIOHDR2_SIZE: usize = 256;
-/// `MAXSTUDIOVERTS`（`studio.h:74`）：**单个 model** 的顶点数上限。
+
+// ===========================================================================
+// 上限常量：**只放「二进制格式可表示的最大值」**
+// ===========================================================================
+//
+// # 为什么不再复刻 studiomdl 的人为上限
+//
+// 早期实现照抄了 studiomdl 的 `MAXSTUDIOVERTS = 65536`（`write.cpp:1642`
+// 的「逐 model」检查）。但那**不是格式约束** ——
+// `mstudiomodel_t.numvertices` 是 `int32`，能表达到 21 亿。
+// 官方之所以卡在 65536，是因为引擎的**运行时顶点缓存**假定如此
+// （`write.cpp:1644` 的注释：`so that we don't screw up decal vert caching
+// in the runtime`），不是文件写不出来。
+//
+// 本项目的定位是「**能产出格式合法的二进制**」，所以只保留
+// **位宽 / 偏移算术**推出的硬上限；studiomdl 的人为上限一律不复刻。
+// 于是：**能表示的都写出来**，超出的报错必须能指出**是哪个字段装不下**。
+
+/// VVD 顶点里**骨骼下标**字段的格式上限。
 ///
-/// ⚠️ 判据是 **`>=`** 报错（`write.cpp:1642`），所以合法最大值是
-/// `MAXSTUDIOVERTS - 1`。且被查的量是 `pmodel[i].numvertices` ——
-/// **该 model 下各 mesh 的「跨 LOD 去重后」顶点数之和**。
+/// # 为什么约束的是「被引用的下标」而不是「骨骼总数」
 ///
-/// ⚠️ 与 `studio.h:77-78` 的 `MAXSTUDIOTRIANGLES=25000 / MAXSTUDIOVERTS=10000`
-/// 无关 —— 那是 `#ifdef _X360` 分支。
-pub const MAXSTUDIOVERTS: usize = 65536;
+/// VVD 的 `mstudioboneweight_t.bone[]` 是**有符号** `char`
+/// （`hl2sdk-doi/public/studio.h:1236`，`STUDIO_VERSION 49` —— **与语料版本
+/// 一致**；⚠️ **不是** `hl2sdk-darkm`，那是 v44、不含 `studiohdr2`），
+/// 能表达 `0..=127` ⟹ **被顶点引用的下标必须 ≤ 127**。
+///
+/// VTX 侧的 `boneID[]` 同样是 `char`（`hl2sdk-doi/public/optimize.h:48`）。
+///
+/// ⚠️ 但**骨骼总数可以超过 128** —— 只要被引用的下标都在范围内。
+/// 这不是推演，是实测（`docs/_probe/diag_bone_use.js`）：
+///
+/// | 产物 | 骨骼总数 | 实际用到的最大下标 |
+/// |---|---|---|
+/// | mdlc 的 `linnea-export` | **134** | **118** |
+/// | 官方 NekoMDL 的 `survivor_teenangst` | 122 | **119** |
+///
+/// 两者都**没有**越界。骨骼表里那些没被顶点引用的骨骼
+/// （`ValveBiped.forward`、jigglebone、attachment 等）只出现在
+/// `mstudiobone_t` 数组里，不占 VVD 的下标空间。
+///
+/// # ⚠️ 一个被实测推翻的中间版本（留作教训）
+///
+/// 最初实现的是「骨骼**总数** ≤ 128」（照抄官方 `g_numbones >= MAXSTUDIOBONES`）。
+/// 那让 `linnea-export`（134 根）**编译失败** —— 而它在改动前能编，
+/// 于是 101 个 parity 用例掉了 1 个（53 个产物消失）。
+/// **若没跑全量 parity，这个回归会直接进提交。**
+///
+/// 所以本常量约束**下标**，检查点在 VVD 写出时逐顶点做。
+pub const MAX_BONE_INDEX_IN_VERTEX: usize = 127;
+
+/// `MAXSTUDIOBONES`：骨骼**表**条数在**官方 studiomdl** 里的上限
+/// （`hl2sdk-doi/public/studio.h:75`；darkm 是 `:63`）。
+///
+/// # 这是**引擎**的上限，不是格式上限 —— 所以**不作为拒绝条件**
+///
+/// 官方 `g_numbones >= MAXSTUDIOBONES` 在 **128 根**就报
+/// `Too many bones used in model, used 128, max 128` —— 因为引擎的
+/// `g_bonetable[128]` 会越界。而**文件格式**能装下更多：
+/// `mstudiobone_t` 数组的长度字段是 `int32`。
+///
+/// 本项目只保证「产出格式合法的二进制」，所以**不复刻**这条：
+/// 骨骼总数可以超过 128（实测 `linnea-export` 就是 134 根），
+/// 只要被引用的下标 ≤ [`MAX_BONE_INDEX_IN_VERTEX`]。
+///
+/// 保留该常量供文档/对照使用。
+pub const MAXSTUDIOBONES: usize = 128;
+
+/// **每 mesh** 顶点数的格式上限：VTX 的 `origMeshVertID` 是 `uint16`。
+///
+/// `uint16` 能表达 `0..=65535` ⟹ 下标覆盖 65536 个顶点 ⟹ **上限 65536**。
+///
+/// ⚠️ 判据是 `n > MAXSTUDIOVERTS_PER_MESH`（**不是 `>=`**）：
+/// 65536 个顶点时下标是 `0..65535`，**全部装得下**，合法。
+/// 早期实现写成 `n > u16::MAX`（= `n > 65535`）⟹ 把 65536 个顶点**误拒**，
+/// 恰好少了一个。
+pub const MAXSTUDIOVERTS_PER_MESH: usize = 65536;
+
+/// **每 model** 顶点数的格式上限 —— 由 `vertexindex` 的**偏移算术**推出。
+///
+/// `mstudiomodel_t.vertexindex` 是 `int32`，语义是**相对 VVD 顶点块的
+/// 字节偏移**（不是顶点下标！见 [`crate::mdl_writer`] 的说明）。
+/// 每个顶点 [`VERTEX_STRIDE`] = 48 字节，所以：
+///
+/// ```text
+/// 上限 = floor(i32::MAX / 48) = 44_739_242
+/// ```
+///
+/// 这不是「studiomdl 允许多少」，而是「**这个字段装得下多少**」。
+/// 实际上还有第二道约束：`mstudiomodel_t.numvertices` 本身是 `int32`，
+/// 上限 `i32::MAX`（更大），所以**字节偏移这一条先到**。
+///
+/// 对照：官方 `MAXSTUDIOVERTS = 65536` 只有这个数的 **0.15%**。
+pub const MAXSTUDIOVERTS_PER_MODEL: usize = (i32::MAX as usize) / VERTEX_STRIDE;
+
+/// **材质表条数**的格式上限：skin 表是**有符号** `short`。
+///
+/// `studiohdr_t::pSkinref`（`hl2sdk-doi/public/studio.h:2297`）：
+///
+/// ```c
+/// inline short *pSkinref( int i ) const {
+///     return (short *)(((byte *)this) + skinindex) + i;
+/// }
+/// ```
+///
+/// `mstudiomesh_t.material` 虽是 `int`，但引擎取材质要经 skin 表
+/// （`skinref[material + family*numskinref]`）⟹ 材质下标必须装得进
+/// 有符号 16 位 ⟹ **上限 32768**（下标 `0..=32767`）。
+///
+/// ⚠️ 这里查的是**材质表条数**（`numtextures`），不是被引用的最大下标：
+/// 只要条数 ≤ 32768，任何合法下标都 ≤ 32767。
+pub const MAXSTUDIOTEXTURES: usize = 32768;
+
 /// `mstudiobone_t` 的字节大小。
 pub const BONE_SIZE: usize = 216;
 /// `mstudiotexture_t` 的字节大小。
@@ -744,6 +848,12 @@ mod at_off {
 }
 
 /// 写出过程中的错误。
+///
+/// # 命名约定（本模块的核心设计）
+///
+/// 每个 `TooMany*` 都对应一个**二进制字段装不下**的硬约束，
+/// 并在文档里写明**是哪个字段、多少位**。**不再有**「复刻 studiomdl
+/// 人为上限」的错误 —— 见模块顶部「上限常量」一节的说明。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
     /// 描述文件不合法（由 `validate` 产生）。
@@ -752,39 +862,34 @@ pub enum WriteError {
     Internal(String),
     /// 名字超过内联字段长度。
     NameTooLong { path: String, len: usize, max: usize },
-    /// **单个 model 的顶点数**达到 `MAXSTUDIOVERTS`。
+    /// **每 mesh 顶点数**超过 [`MAXSTUDIOVERTS_PER_MESH`]。
     ///
-    /// 官方 `write.cpp:1642`：
+    /// 格式依据：VTX 的 `Vertex_t.origMeshVertID` 是 `uint16`
+    /// ⟹ 下标 `0..=65535` ⟹ 上限 **65536**（判据是 `>`，不是 `>=`）。
+    TooManyMeshVertices {
+        model: String,
+        count: usize,
+        max: usize,
+    },
+    /// **每 model 顶点数**超过 [`MAXSTUDIOVERTS_PER_MODEL`]。
     ///
-    /// ```c
-    /// if ( pmodel[i].numvertices >= MAXSTUDIOVERTS )
-    ///     MdlError( "Too many verts in model. (%d verts, MAXSTUDIOVERTS==%d)\n", ... );
-    /// ```
+    /// 格式依据：`mstudiomodel_t.vertexindex` 是 `int32` 且语义为
+    /// **字节偏移**，每顶点 48 字节 ⟹ 上限 `i32::MAX / 48`。
     ///
-    /// 而 `pmodel[i].numvertices` 是**该 model 下各 mesh 的
-    /// `numLODVertexes[rootLOD]` 之和**（`studio.h:2055-2069`）——
-    /// 即**跨 LOD 去重后**的顶点总数，不是各档之和、也不是逐 mesh 的量。
-    ///
-    /// # 为什么必须单独有这个检查（而不是靠 VTX 那条）
-    ///
-    /// `vtx_writer` 的 `TooManyVertices` 查的是「**单 mesh** 的
-    /// `origMeshVertID` 是否塞得进 u16」—— 那是 **VTX 格式**约束，
-    /// 与 `MAXSTUDIOVERTS` **不是同一个量**。
-    ///
-    /// 实测缺口（`benchmarks/probe_vertex_limit.js`）：
-    ///
-    /// | 用例 | 每 mesh | model 合计 | mdlc（仅 VTX 检查） | 官方 |
-    /// |---|---|---|---|---|
-    /// | 2 mesh × 32768 | 32768 | **65536** | 接受 ❌ | 拒绝 |
-    /// | 3 mesh × 32768 | 32768 | **98304** | 接受 ❌ | 拒绝 |
-    ///
-    /// 即「每个 mesh 都在 u16 内，但 model 合计超限」时 mdlc 会**静默产出**
-    /// 官方拒绝的模型 —— 游戏里表现为顶点数据错乱。
+    /// ⚠️ 这个上限是 **4473 万**，不是 studiomdl 的 65536 ——
+    /// 后者是引擎运行时顶点缓存的假定，不是文件格式约束。
     TooManyModelVertices {
         path: String,
         count: usize,
         max: usize,
     },
+    /// **材质表条数**超过 [`MAXSTUDIOTEXTURES`]。
+    ///
+    /// 格式依据：skin 表是**有符号 `short`**（`hl2sdk-doi/public/studio.h:2297`）
+    /// ⟹ 材质下标最大 32767 ⟹ 表最多 32768 条。
+    TooManyTextures { count: usize, max: usize },
+    /// **单个 strip group 的索引条数**超过 `int32`。
+    TooManyIndices { model: String, count: usize },
 }
 
 impl std::fmt::Display for WriteError {
@@ -801,11 +906,29 @@ impl std::fmt::Display for WriteError {
             Self::NameTooLong { path, len, max } => {
                 write!(f, "{path} 过长：{len} 字节，上限 {max}")
             }
+            Self::TooManyMeshVertices { model, count, max } => write!(
+                f,
+                "{model} 的单个 mesh 有 {count} 个顶点，超过格式上限 {max}\
+                 （VTX 的 `origMeshVertID` 是 uint16，下标 0..{}）—— \
+                 请把该 mesh 拆成多个材质槽位",
+                max - 1
+            ),
             Self::TooManyModelVertices { path, count, max } => write!(
                 f,
-                "{path} 有 {count} 个顶点（跨 LOD 去重后），达到上限 {max}\
-                 （官方 `Too many verts in model`）。\
-                 请把该 model 拆成多个 `[[bodyparts.models]]`"
+                "{path} 有 {count} 个顶点（跨 LOD 去重后），超过格式上限 {max}\
+                 （`mstudiomodel_t.vertexindex` 是 int32 字节偏移，\
+                 每顶点 {VERTEX_STRIDE} 字节）—— 请把该 model 拆成多个 \
+                 `[[bodyparts.models]]`"
+            ),
+            Self::TooManyTextures { count, max } => write!(
+                f,
+                "材质表 {count} 条，超过格式上限 {max} 条（下标 0..{}）—— \
+                 skin 表 `pSkinref` 是**有符号 short**",
+                max - 1
+            ),
+            Self::TooManyIndices { model, count } => write!(
+                f,
+                "{model} 的单个 strip group 索引数 {count} 超出 int32"
             ),
         }
     }
@@ -1170,6 +1293,18 @@ fn build_string_pool(
     anim: &anim_writer::AnimWriteOutcome,
 ) -> Result<StringPool, WriteError> {
     let bone_count = desc.bones.len();
+    // ---- 骨骼**总数**：**不设格式上限** ----
+    //
+    // 早期版本在这里查 `bone_count > MAXSTUDIOBONES`（照抄官方
+    // `g_numbones >= MAXSTUDIOBONES`），结果让 `linnea-export`（134 根）
+    // **编译失败** —— 而它改动前能编，101 个 parity 用例掉了 1 个。
+    //
+    // 实测证明那条检查是**错的**（`docs/_probe/diag_bone_use.js`）：
+    //   · mdlc 的 134 根模型：VVD 里实际用到的最大下标 = **118**
+    //   · 官方 122 根产物：最大下标 = **119**
+    // 都没越界。没被顶点引用的骨骼只出现在 `mstudiobone_t` 数组里，
+    // 不占 VVD 的下标空间 ⟹ 真正的约束是
+    // [`MAX_BONE_INDEX_IN_VERTEX`]（逐顶点查，在 VVD 写出时做）。
     let mut bone_name_offsets = Vec::with_capacity(bone_count);
     let mut bone_sp_offsets = Vec::with_capacity(bone_count);
     let mut bone_name_len_max = 0usize;
@@ -1492,6 +1627,16 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     let bc_count = desc.bonecontrollers.len();
     let bone_count = desc.bones.len();
     let texture_count = desc.materials.textures.len();
+    // ---- 材质表条数：**格式**上限（skin 表是有符号 short）----
+    //
+    // 见 [`MAXSTUDIOTEXTURES`]。引擎取材质要经 skin 表
+    // （`skinref[material + family*numskinref]`），而有符号 short 最大 32767。
+    if texture_count > MAXSTUDIOTEXTURES {
+        return Err(WriteError::TooManyTextures {
+            count: texture_count,
+            max: MAXSTUDIOTEXTURES,
+        });
+    }
     let bp_count = compiled.bodyparts.len();
     let model_total: usize = compiled.bodyparts.iter().map(|bp| bp.models.len()).sum();
     let mesh_total: usize = compiled
@@ -2772,25 +2917,37 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 mbase + model_off::MESH_INDEX,
                 (this_mesh_off - mbase) as i32,
             );
-            // ---- `MAXSTUDIOVERTS`：**逐 model** 检查（官方 `write.cpp:1642`）----
+            // ---- 每 model 顶点数：**格式**上限（不是 studiomdl 的 65536）----
             //
-            // `span.count` 就是 `pmodel[i].numvertices` 的对应量 ——
-            // 该 model 跨全部 LOD 去重后的顶点总数（见 `ModelVertexSpan`）。
+            // `span.count` 是该 model 跨全部 LOD 去重后的顶点总数
+            // （= `pmodel[i].numvertices` 的对应量，见 `ModelVertexSpan`）。
             //
-            // ⚠️ 判据是 `>=`（不是 `>`）：官方 `if (... >= MAXSTUDIOVERTS)`，
-            // 所以 65536 本身**非法**、65535 才是合法最大值。
+            // 上限由 `vertexindex` 的**字节偏移算术**推出：
+            // `i32::MAX / VERTEX_STRIDE` ≈ 4473 万 —— 见
+            // [`MAXSTUDIOVERTS_PER_MODEL`] 的推导。
             //
-            // 为什么不能只靠 `vtx_writer` 那条：那条查的是**单 mesh** 的
-            // `origMeshVertID` 塞不塞得进 u16（**VTX 格式**约束）。
-            // 实测（`benchmarks/probe_vertex_limit.js`）：2 mesh × 32768 时
-            // 每个 mesh 都 < 65536，但 model 合计 = 65536 ⟹ 官方拒绝、
-            // 旧版 mdlc 静默接受。详见 `WriteError::TooManyModelVertices`。
-            if span.count >= MAXSTUDIOVERTS {
+            // ⚠️ 这里**不再**用官方的 `MAXSTUDIOVERTS = 65536`：
+            // 那是引擎运行时顶点缓存的假定（`write.cpp:1644` 的注释：
+            // `so that we don't screw up decal vert caching in the runtime`），
+            // **不是文件格式约束**。本项目只保证「产出格式合法的二进制」，
+            // 所以能表示的都写出来。
+            //
+            // 逐 mesh 的 u16 约束仍由 `vtx_writer` 负责（那个是真格式约束）。
+            if span.count > MAXSTUDIOVERTS_PER_MODEL {
                 return Err(WriteError::TooManyModelVertices {
                     path: format!("bodyparts[{bi}].models[{model_cursor}]"),
                     count: span.count,
-                    max: MAXSTUDIOVERTS,
+                    max: MAXSTUDIOVERTS_PER_MODEL,
                 });
+            }
+            // `vertexindex` 的字节偏移也必须装得进 i32 —— 与上面的上限
+            // 是同一个算术，这里显式再查一次以防将来改动 `VERTEX_STRIDE`。
+            let vertex_byte_offset = span.start * VERTEX_STRIDE;
+            if vertex_byte_offset > i32::MAX as usize {
+                return Err(WriteError::Internal(format!(
+                    "bodyparts[{bi}].models[{model_cursor}] 的 vertexindex \
+                     字节偏移 {vertex_byte_offset} 超出 int32"
+                )));
             }
             put_i32(&mut buf, mbase + model_off::NUM_VERTICES, span.count as i32);
             // **相对 VVD 顶点块的字节偏移**，不是顶点下标。
@@ -5850,12 +6007,13 @@ motionflags = 7
         assert!(matches!(err, WriteError::NameTooLong { .. }), "{err:?}");
     }
 
-    // ---- `MAXSTUDIOVERTS`：**逐 model** 顶点上限（官方 `write.cpp:1642`）----
+    // =======================================================================
+    // 格式上限（**不是** studiomdl 的人为上限）
     //
-    // ⚠️ 这一组测试的**关键价值**在于「每个 mesh 都合法、但 model 合计超限」
-    // 那条 —— 旧版 mdlc 只查单 mesh（VTX 的 u16），会静默放过它。
-    // 详见 `WriteError::TooManyModelVertices` 与
-    // `benchmarks/probe_vertex_limit.js`（9 个边界用例的 oracle 对照）。
+    // 设计原则见模块顶部「上限常量」一节：只保留「二进制字段装不下」的
+    // 硬约束。studiomdl 的 `MAXSTUDIOVERTS = 65536`（引擎运行时顶点缓存
+    // 的假定）**已移除**。
+    // =======================================================================
 
     /// 造一个 model：`n_mesh` 个 mesh，各 `per_mesh` 个顶点。
     /// 返回 (desc, 总顶点数)。
@@ -5889,70 +6047,248 @@ motionflags = 7
         (d, n_mesh * per_mesh)
     }
 
-    /// 边界：`MAXSTUDIOVERTS - 1` **合法**、`MAXSTUDIOVERTS` **非法**。
+    /// **每 model 顶点数不再是 65536** —— 官方那个值是引擎运行时顶点缓存
+    /// 的假定，不是格式约束。格式上限由 `vertexindex` 的字节偏移推出。
     ///
-    /// 判据是官方那个 `>=`（不是 `>`）—— 把 `>=` 写成 `>` 会让 65536 通过，
-    /// 而官方会拒绝它。
+    /// 这条测试钉住「**不再**在 65536 处拒绝」：65536 与 100000 都必须通过。
     #[test]
-    fn model_vertex_limit_boundary_is_exact() {
-        // 65535：合法
-        let (d, n) = desc_with_vertices(1, MAXSTUDIOVERTS - 1);
-        assert_eq!(n, 65535);
+    fn model_vertex_limit_is_format_derived_not_studiomdl() {
+        // 65536：官方会拒，但**格式装得下** ⟹ 必须通过
+        let (d, n) = desc_with_vertices(1, 65536);
+        assert_eq!(n, 65536);
         assert!(
             write_mdl(&d).is_ok(),
-            "{n} 个顶点应当**合法**（官方判据是 >= {MAXSTUDIOVERTS} 才报错）"
+            "65536 个顶点在格式上完全合法（`numvertices` 是 int32）—— \
+             不应因复刻 studiomdl 的 MAXSTUDIOVERTS 而拒绝"
         );
-        // 65536：非法（这是 `>=` 与 `>` 的分界）
-        let (d, n) = desc_with_vertices(1, MAXSTUDIOVERTS);
-        assert_eq!(n, 65536);
+        // 100000：同样应当通过
+        let (d, n) = desc_with_vertices(1, 100_000);
+        assert_eq!(n, 100_000);
+        assert!(write_mdl(&d).is_ok(), "100000 个顶点应当合法");
+    }
+
+    /// 格式上限本身仍然生效：`i32::MAX / 48` 之上必须拒绝。
+    ///
+    /// 用一个**假**的 model 直接调检查逻辑（真造 4473 万个顶点会 OOM），
+    /// 所以这里断言常量本身与推导一致。
+    #[test]
+    fn model_vertex_format_limit_constant_is_derived_from_offset() {
+        assert_eq!(
+            MAXSTUDIOVERTS_PER_MODEL,
+            (i32::MAX as usize) / VERTEX_STRIDE,
+            "上限必须由 vertexindex 的字节偏移推出"
+        );
+        // 上限个顶点时字节偏移恰好还在 i32 内
+        assert!(MAXSTUDIOVERTS_PER_MODEL * VERTEX_STRIDE <= i32::MAX as usize);
+        // 再多一个就越界
+        assert!((MAXSTUDIOVERTS_PER_MODEL + 1) * VERTEX_STRIDE > i32::MAX as usize);
+        // 它比 studiomdl 的 65536 大**三个数量级** —— 证明没在复刻官方值。
+        // 用 `const` 块让 clippy 的 `assertions_on_constants` 满意
+        // （它提示「常量断言应在编译期求值」，那正是我们想要的）。
+        const {
+            assert!(
+                MAXSTUDIOVERTS_PER_MODEL > 1_000_000,
+                "格式上限应远大于 studiomdl 的 65536"
+            )
+        };
+    }
+
+    /// **骨骼总数没有格式上限** —— 只要被引用的下标 ≤ 127。
+    ///
+    /// # 这条测试来自一次真实回归
+    ///
+    /// 中间版本查的是「骨骼**总数** ≤ 128」（照抄官方
+    /// `g_numbones >= MAXSTUDIOBONES`），结果让 `parity/linnea-export.toml`
+    /// （**134 根**）编译失败 —— 而它改动前能编。
+    /// 实测证明那条判据是错的：134 根里只有 95 根被顶点引用，
+    /// **最大引用下标 118**（官方 122 根产物是 119）。
+    ///
+    /// 所以这里钉住「134 根必须通过」。
+    #[test]
+    fn bone_count_has_no_format_limit() {
+        // ⚠️ hitbox 引用 `"tip"`，换骨骼表后会先撞「hitbox 骨骼未通过校验」，
+        // 所以清空 hitbox，只留骨骼数这一个自变量。
+        let (mut d, _) = desc_with_vertices(1, 10);
+        d.desc.bones = (0..134)
+            .map(|i| crate::model::Bone {
+                name: format!("b{i}"),
+                parent: if i == 0 {
+                    None
+                } else {
+                    Some(format!("b{}", i - 1))
+                },
+                ..minimal().desc.bones[0].clone()
+            })
+            .collect();
+        d.desc.hitboxes.boxes.clear();
+        assert!(
+            write_mdl(&d).is_ok(),
+            "134 根骨骼应当合法 —— 真实模型 `linnea-export` 就是 134 根，\
+             而它只引用了下标 0..118（未被引用的骨骼不占 VVD 下标空间）"
+        );
+
+        // ⚠️ 但**动画记录**另有约束：`mstudioanim_t.bone` 是 `byte`
+        // （`studio.h`），所以骨骼**总数** ≤ 256 —— 300 根会被
+        // `anim_writer` 拒（那条是**真的**格式约束，不是 studiomdl 的人为上限）。
+        // 所以这里用 256 验证上界，而不是 300。
+        let (mut d2, _) = desc_with_vertices(1, 10);
+        d2.desc.bones = (0..256)
+            .map(|i| crate::model::Bone {
+                name: format!("b{i}"),
+                parent: if i == 0 {
+                    None
+                } else {
+                    Some(format!("b{}", i - 1))
+                },
+                ..minimal().desc.bones[0].clone()
+            })
+            .collect();
+        d2.desc.hitboxes.boxes.clear();
+        if let Err(e) = write_mdl(&d2) { panic!("256 根被拒：{e}") }
+    }
+
+    /// **动画记录的骨骼寻址**上限 256（`mstudioanim_t.bone` 是 `byte`）。
+    ///
+    /// 这条是**真格式约束**（与 `MAXSTUDIOBONES = 128` 那个人为上限不同），
+    /// 由 `anim_writer` 负责。这里钉住 256 与 257 的分界。
+    #[test]
+    fn anim_bone_addressing_limit_is_byte() {
+        let mk = |n: usize| {
+            let (mut d, _) = desc_with_vertices(1, 10);
+            d.desc.bones = (0..n)
+                .map(|i| crate::model::Bone {
+                    name: format!("b{i}"),
+                    parent: if i == 0 {
+                        None
+                    } else {
+                        Some(format!("b{}", i - 1))
+                    },
+                    ..minimal().desc.bones[0].clone()
+                })
+                .collect();
+            d.desc.hitboxes.boxes.clear();
+            d
+        };
+        assert!(write_mdl(&mk(256)).is_ok(), "256 根应当合法（byte 的上界）");
+        let err = write_mdl(&mk(257)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("257") && msg.contains("255"),
+            "257 根应当被拒绝并指出寻址上限，实际：{msg}"
+        );
+    }
+
+    /// **被引用的骨骼下标**必须 ≤ 127 —— 这才是真正的格式约束。
+    ///
+    /// 用 `vvd::Vvd::to_bytes` 直接构造一个越界的顶点来验证：
+    /// 下标 200 会被 `char` 读成 −56。
+    #[test]
+    fn bone_index_in_vertex_is_signed_char_boundary() {
+        use crate::vvd::{Vvd, VvdHeader, VvdTangent, VvdVertex};
+
+        let mk = |bone0: u8| Vvd {
+            header: VvdHeader {
+                checksum: 0,
+                num_lods: 1,
+                num_lod_vertexes: [1, 0, 0, 0, 0, 0, 0, 0],
+                num_fixups: 0,
+                // 三个偏移重合在 64（无 fixup 的形态）—— 与 `to_bytes` 的重算一致
+                fixup_table_start: 64,
+                vertex_data_start: 64,
+                tangent_data_start: 64,
+            },
+            vertices: vec![VvdVertex {
+                weight: [1.0, 0.0, 0.0],
+                bone: [bone0, 0, 0],
+                bone_count: 1,
+                position: [0.0; 3],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            }],
+            tangents: vec![VvdTangent {
+                xyz: [1.0, 0.0, 0.0],
+                w: -1.0,
+            }],
+            fixups: Vec::new(),
+        };
+
+        // 127：合法（`char` 能表达的最大非负值）
+        assert!(
+            mk(MAX_BONE_INDEX_IN_VERTEX as u8).to_bytes().is_ok(),
+            "下标 {MAX_BONE_INDEX_IN_VERTEX} 应当合法"
+        );
+
+        // 128：非法 —— 会被 `char` 读成 −128
+        let err = mk(128).to_bytes().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("128") && msg.contains("有符号 char"),
+            "应当拒绝下标 128 并说明原因，实际：{msg}"
+        );
+
+        // 200：同样非法（会被读成 −56）
+        assert!(mk(200).to_bytes().is_err(), "下标 200 应当被拒绝");
+    }
+
+    /// **材质表条数**：上限 32768（skin 表是有符号 short）。
+    ///
+    /// 用「上限 + 1」条空材质名来触发 —— 不写真 32768 个 mesh。
+    #[test]
+    fn texture_limit_is_signed_short_boundary() {
+        use crate::model::Texture;
+        let (mut d, _) = desc_with_vertices(1, 10);
+        // 恰好 32768 条：合法
+        d.desc.materials.textures = (0..MAXSTUDIOTEXTURES)
+            .map(|i| Texture {
+                name: format!("t{i}"),
+                flags: None,
+            })
+            .collect();
+        assert!(
+            write_mdl(&d).is_ok(),
+            "{MAXSTUDIOTEXTURES} 条材质应当合法（下标 0..{}）",
+            MAXSTUDIOTEXTURES - 1
+        );
+        // 32769 条：非法
+        d.desc.materials.textures.push(Texture {
+            name: "extra".to_string(),
+            flags: None,
+        });
         let err = write_mdl(&d).unwrap_err();
         match err {
-            WriteError::TooManyModelVertices { count, max, .. } => {
-                assert_eq!(count, 65536, "报出的顶点数应是 model 合计");
-                assert_eq!(max, MAXSTUDIOVERTS);
+            WriteError::TooManyTextures { count, max } => {
+                assert_eq!(count, MAXSTUDIOTEXTURES + 1);
+                assert_eq!(max, MAXSTUDIOTEXTURES);
             }
-            other => panic!("应当拒绝 65536 个顶点，得到 {other:?}"),
+            other => panic!("应当拒绝 {} 条材质，得到 {other:?}", MAXSTUDIOTEXTURES + 1),
         }
     }
 
-    /// **核心用例**：每个 mesh 都远小于上限，但 **model 合计**超限。
+    /// **每 mesh 顶点数**：上限 65536（VTX 的 `origMeshVertID` 是 uint16）。
     ///
-    /// 这正是旧版 mdlc 的缺口 —— `vtx_writer` 的 `origMeshVertId` 是 u16，
-    /// 32768 塞得进，于是它放行；而官方按 model 合计 65536 拒绝。
+    /// ⚠️ 判据是 `>` 而不是 `>=`：65536 个顶点时下标是 `0..=65535`，
+    /// **全部装得下**。旧版写成 `n > u16::MAX`（= `n > 65535`）
+    /// ⟹ 把 65536 误拒，恰好少一个。
+    ///
+    /// 这条只钉常量语义（真造 65536 顶点走 VTX 太慢）：
+    /// 边界值本身由 `vtx_writer` 的两处 `>` 检查保证。
     #[test]
-    fn model_vertex_limit_is_per_model_not_per_mesh() {
-        // 2 mesh × 32768 = 65536（每个 mesh 都 < 65536）
-        let (d, n) = desc_with_vertices(2, 32768);
-        assert_eq!(n, 65536);
-        let err = write_mdl(&d).unwrap_err();
-        assert!(
-            matches!(err, WriteError::TooManyModelVertices { .. }),
-            "2 mesh × 32768 应当被拒绝（官方按 model 合计查），得到 {err:?}"
+    fn mesh_vertex_format_limit_is_uint16_inclusive() {
+        assert_eq!(
+            MAXSTUDIOVERTS_PER_MESH,
+            u16::MAX as usize + 1,
+            "上限必须是 uint16 能表达的**下标个数**（0..=65535 ⟹ 65536 个）"
         );
-
-        // 3 mesh × 32768 = 98304：更明显
-        let (d, n) = desc_with_vertices(3, 32768);
-        assert_eq!(n, 98304);
-        assert!(
-            matches!(write_mdl(&d).unwrap_err(), WriteError::TooManyModelVertices { .. }),
-            "3 mesh × 32768 应当被拒绝"
-        );
-
-        // 对照：2 mesh × 32767 = 65534 < 65536 ⟹ **合法**
-        let (d, n) = desc_with_vertices(2, 32767);
-        assert_eq!(n, 65534);
-        assert!(write_mdl(&d).is_ok(), "65534 应当合法");
+        // 合法的最大下标
+        assert_eq!(MAXSTUDIOVERTS_PER_MESH - 1, u16::MAX as usize);
     }
 
     /// 检查的是**单个 model**，不是全模型总量。
-    ///
-    /// 官方 `write.cpp:1642` 在 `for (i = 0; i < nummodels; i++)` 里查
-    /// `pmodel[i]` —— 所以「多个 model 各 40000」合法，即使总量 80000。
     #[test]
     fn model_vertex_limit_allows_multiple_models_under_limit() {
         use crate::model::{Mesh, Texture};
         let mut d = minimal();
-        // 两个 model，各 40000 顶点（都 < 65536）
+        // 两个 model，各 40000 顶点
         let base = d.bodyparts[0].models[0].clone();
         let mk_model = |tag: f32| {
             let verts: Vec<Vertex> = (0..40000)
@@ -5980,7 +6316,7 @@ motionflags = 7
         }];
         assert!(
             write_mdl(&d).is_ok(),
-            "两个 model 各 40000 顶点应当合法（官方**逐 model** 查，不看总量）"
+            "两个 model 各 40000 顶点应当合法（**逐 model** 查，不看总量）"
         );
     }
 

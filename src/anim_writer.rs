@@ -70,6 +70,14 @@ pub const COMPRESSED_IK_ERROR_SIZE: usize = 36;
 /// 与 `mdl_writer::IK_LOCK_SIZE` 是同一个结构体 —— 两处分别用于
 /// 「模型级 `$ikautoplaylock` 数组」与「序列级子表」，值必须一致。
 pub const IK_LOCK_SIZE: usize = 32;
+/// 动画链能寻址的骨骼**根数**上限（= `byte` 的容量）。
+///
+/// 格式依据：`mstudioanim_t.bone` 是 `byte`（`studio.h`）⟹ 下标 `0..=255`
+/// ⟹ 最多 **256** 根（下标 0..=255）。
+///
+/// ⚠️ 这是**真格式约束**，与 `mdl_writer::MAXSTUDIOBONES = 128`（官方
+/// 引擎数组的大小，**不复刻**）不同。
+pub const MAX_ANIM_ADDRESSABLE_BONES: usize = 256;
 /// `CompressIKErrors` 里位置通道的初值上界（`simplify.cpp:6650`）。
 const IK_ERROR_POS_LIMIT: f32 = 128.0;
 /// 旋转通道的初值上界 `π/8`（`simplify.cpp:6655`）。
@@ -176,6 +184,10 @@ pub enum AnimWriteError {
     /// 帧数超出 `int32`。
     TooManyFrames { sequence: String, count: usize },
     /// 骨骼数超出可寻址范围。
+    ///
+    /// 格式依据：动画链的 `mstudioanim_t.bone` 是 `byte`
+    /// （`studio.h`）⟹ 下标 `0..=255` ⟹ 骨骼**根数** ≤
+    /// [`MAX_ANIM_ADDRESSABLE_BONES`]（= 256）。
     TooManyBones { count: usize },
     /// 内部不一致 —— 属本实现的 bug。
     Internal(String),
@@ -2584,7 +2596,13 @@ pub fn write_animations(
     anim_data_abs: usize,
 ) -> Result<AnimWriteOutcome, AnimWriteError> {
     let bone_count = compiled.desc.bones.len();
-    if bone_count > 255 {
+    // 动画链的骨骼下标字段是 `byte`（`mstudioanim_t.bone`，`studio.h`），
+    // 能表达 `0..=255` ⟹ 骨骼**根数**上限是 **256**（下标 0..=255）。
+    //
+    // ⚠️ 判据是 `>` 而不是 `>=`：早期写成 `bone_count > 255`（= `>= 256`）
+    // 会把 **256 根**误拒，恰好少一个 —— 与 `vtx_writer` 的
+    // `MAXSTUDIOVERTS_PER_MESH` 是同一类差一错误。
+    if bone_count > MAX_ANIM_ADDRESSABLE_BONES {
         return Err(AnimWriteError::TooManyBones { count: bone_count });
     }
     if ref_poses.len() != bone_count {
