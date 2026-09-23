@@ -360,6 +360,7 @@ fn compile_and_write(
     out_root: &Path,
     cli_optimize_vtx: bool,
 ) -> ExitCode {
+    let _t_compile = mdlc::prof::Span::new("main: compile()");
     let mut compiled = match compile(desc, base) {
         Ok(c) => c,
         Err(errs) => {
@@ -370,6 +371,7 @@ fn compile_and_write(
             return ExitCode::from(1);
         }
     };
+    drop(_t_compile);
 
     // ---- 碰撞 SMD：**必须在 `write_mdl` 之前**解析 ----
     //
@@ -422,6 +424,7 @@ fn compile_and_write(
             mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
     }
 
+    let _t_mdl = mdlc::prof::Span::new("main: write_mdl + flatten_vertices");
     let out = match write_mdl(&compiled) {
         Ok(o) => o,
         Err(e) => {
@@ -432,6 +435,8 @@ fn compile_and_write(
 
     // 顶点摊平 —— 必须与 write_mdl 用同一套 spans 编号。
     let flat = flatten_vertices(&compiled, &out.spans);
+    drop(_t_mdl);
+    let _t_vvd = mdlc::prof::Span::new("main: build_vvd + to_bytes");
     let vvd = match build_vvd(&compiled, out.checksum) {
         Ok(v) => v,
         Err(e) => {
@@ -451,6 +456,7 @@ fn compile_and_write(
         eprintln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
         return ExitCode::from(1);
     }
+    drop(_t_vvd);
 
     // VTX：没有它模型在游戏里根本不渲染。
     //
@@ -460,6 +466,7 @@ fn compile_and_write(
     let vtx_opts = vtx_writer::VtxOptions {
         optimize_vertex_cache: desc.model.optimize_vtx || cli_optimize_vtx,
     };
+    let _t_vtx = mdlc::prof::Span::new("main: write_vtx");
     let vtx = match write_vtx_with(&compiled, vtx_opts) {
         Ok(v) => v,
         Err(e) => {
@@ -467,6 +474,7 @@ fn compile_and_write(
             return ExitCode::from(1);
         }
     };
+    drop(_t_vtx);
     if let Err(e) = vtx_writer::check_invariants(&vtx, &compiled) {
         eprintln!("错误：写出的 VTX 不自洽（本实现的 bug）：{e}");
         return ExitCode::from(1);
@@ -644,6 +652,7 @@ fn compile_and_write(
     }
     println!();
     println!("**编译成功**（各文件布局自检均通过）");
+    mdlc::prof::dump();
     ExitCode::SUCCESS
 }
 

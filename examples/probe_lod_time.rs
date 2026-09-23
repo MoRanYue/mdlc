@@ -73,4 +73,5 @@ fn main() {
         ms,
         ms / n_tris.max(1) as f64
     );
+    mdlc::prof::dump();
 }

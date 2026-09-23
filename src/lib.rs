@@ -52,6 +52,7 @@ pub mod lod;
 pub mod mdl_writer;
 pub mod model;
 pub mod phy;
+pub mod prof;
 pub mod qc;
 pub mod smd;
 pub mod tangent;

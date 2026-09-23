@@ -928,7 +928,9 @@ pub fn collapse_and_sort_bone_weights(v: &mut Vertex) {
 // ===========================================================================
 
 /// `POSITION_EPSILON`（`UnifyLODs.cpp:235`：0.05）。
-const POSITION_EPSILON_SQR: f32 = 0.05 * 0.05;
+const POSITION_EPSILON: f32 = 0.05;
+/// `POSITION_EPSILON` 的平方（`ComparePositionFuzzy` 返回的就是平方距离）。
+const POSITION_EPSILON_SQR: f32 = POSITION_EPSILON * POSITION_EPSILON;
 /// `TEXCOORD_EPSILON`（`UnifyLODs.cpp:236`：0.1）。
 const TEXCOORD_EPSILON_SQR: f32 = 0.1 * 0.1;
 /// `NORMAL_EPSILON` / `TANGENT_EPSILON` 的余弦（60°，`UnifyLODs.cpp:237-238`）。
@@ -1029,7 +1031,7 @@ fn boneweight_err(b1: &[[f32; 2]], b2: &[[f32; 2]]) -> (bool, f32) {
     (err <= BONEWEIGHT_EPSILON, err)
 }
 
-/// `FindVertexWithinVertexDictionary`（`UnifyLODs.cpp:561`）。
+/// `FindVertexWithinVertexDictionary`（`UnifyLODs.cpp:561`）的**平局链**。
 ///
 /// # ⚠️ 平局规则（这是整个算法最容易写错的一处）
 ///
@@ -1050,20 +1052,23 @@ fn boneweight_err(b1: &[[f32; 2]], b2: &[[f32; 2]]) -> (bool, f32) {
 /// VVD 顺序变成 `D,E,A',B',C', B,C,A` —— 把 `>=` 写成 `>` 会让顺序反过来，
 /// 而 `numLODVertexes` 却**依然正确**（都是 `[8,5]`）。
 /// **只比顶点数会漏掉这个 bug。**
+///
+/// # 为什么把「候选序列」与「平局链」拆开
+///
+/// 平局链是**顺序敏感**的（末层 `>=` ⟹ 同误差时后者胜），所以加速版本
+/// 必须喂进**同一顺序**的候选。拆出本函数后，线性扫描版
+/// （[`find_best_in_range_naive`]）与网格版（[`PosIndex::find_best`]）
+/// 共用**逐字同一段**判定代码 —— 等价性只取决于「候选集合与顺序相同」，
+/// 不再需要人眼比对两份 if-else。
 #[allow(clippy::too_many_arguments)]
-fn find_best_in_range(
+fn pick_best(
     pool: &[DictVert],
-    start: usize,
-    end: usize,
+    cands: impl Iterator<Item = usize>,
     find_v: &Vertex,
     find_t: &VvdTangent,
     ignore_boneweight: bool,
     ignore_tangents: bool,
 ) -> Option<usize> {
-    let end = end.min(pool.len());
-    if start >= end {
-        return None;
-    }
     let mut best: Option<usize> = None;
     let mut min_pos = f32::MAX;
     let mut min_tex = f32::MAX;
@@ -1071,7 +1076,8 @@ fn find_best_in_range(
     let mut min_nrm = f32::MAX;
     let mut min_tan = if ignore_tangents { 0.0 } else { f32::MAX };
 
-    for (i, c) in pool.iter().enumerate().take(end).skip(start) {
+    for i in cands {
+        let c = &pool[i];
         let pe = pos_err(find_v.pos, c.v.pos);
         if pe > POSITION_EPSILON_SQR {
             continue;
@@ -1138,6 +1144,245 @@ fn find_best_in_range(
         }
     }
     best
+}
+
+/// **朴素**版：线性扫描 `pool[start..end)`（原实现）。
+///
+/// ⚠️ **这是 [`PosIndex`] 等价性的唯一 oracle，不要删。**
+/// 它在多 LOD 路径上是 O(N²)，生产路径走网格版；`USE_INDEX = false` 的
+/// 单态化只由测试触发，所以这里的 `dead_code` 允许是**故意的**。
+#[allow(dead_code)]
+fn find_best_in_range_naive(
+    pool: &[DictVert],
+    start: usize,
+    end: usize,
+    find_v: &Vertex,
+    find_t: &VvdTangent,
+    ignore_boneweight: bool,
+    ignore_tangents: bool,
+) -> Option<usize> {
+    let end = end.min(pool.len());
+    if start >= end {
+        return None;
+    }
+    pick_best(
+        pool,
+        start..end,
+        find_v,
+        find_t,
+        ignore_boneweight,
+        ignore_tangents,
+    )
+}
+
+/// 位置桶索引：把顶点池按 `4 × POSITION_EPSILON` 边长的均匀网格分桶，
+/// 把 [`find_best_in_range_naive`] 的线性扫描降成「查 27 个邻格」。
+///
+/// # 为什么这是**逐位等价**，不是近似
+///
+/// `FindVertexWithinVertexDictionary` 的第一道判定是**硬性的**：
+///
+/// ```cpp
+/// flPositionSError = ComparePositionFuzzy( find.pos, vert.pos );  // 平方距离
+/// if ( flPositionSError > POSITION_EPSILON_SQR ) continue;        // ← 早于平局链
+/// ```
+///
+/// 所以**只有距离 ≤ ε 的候选**才可能成为结果；而平局链按**池下标升序**
+/// 依次比较。于是「精确地把候选限制成 ε 邻域、再按下标升序喂给同一条
+/// 平局链」与原实现**逐位同结果**（[`pick_best`] 是同一段代码）。
+///
+/// # 格边长取 `4ε`、扫 27 格为什么**完备**
+///
+/// 设格边长 `c = 4ε`。若两点距离 ≤ ε，则每轴坐标差 ≤ ε，于是
+/// `|a/c − b/c| ≤ 1/4 < 1`。而 `floor` 差 ≥ 2 需要 `x − y > 1`
+/// （若 `floor(x) ≥ floor(y)+2` 则 `x ≥ floor(y)+2 > y+1`）。
+/// 所以**格号差每轴 ≤ 1** ⟹ 27 邻域必定覆盖全部候选。
+///
+/// 取 `4ε` 而不是 `ε` 正是为了留出这个「< 1」的余量 —— 格边长恰好等于 ε
+/// 时 `|x − y| ≤ 1` 只是**临界**成立，浮点舍入会把边界点推到隔 2 格。
+///
+/// # 非有限 / 超大坐标：**回退全扫**，不是丢弃
+///
+/// `cell_of` 对 `NaN`/`±Inf` 以及 `|坐标| > CELL_LIMIT` 返回 `None`。
+/// 这类点**照常进索引**（放进 `special`，不丢），而**查询点**落在这一类时
+/// 直接退化成原来的全区间线性扫描（[`PosIndex::find_best`] 的 `None` 分支）。
+/// 于是完备性不依赖任何浮点假设，也不会因为「算不出格号」而漏候选。
+///
+/// `special` 在正常查询里也一并纳入候选：`±Inf` 位置的点在 `find_exact`
+/// 里**可能**与同样 `±Inf` 的查询逐位相等而命中（`NaN != NaN` 则不会）。
+/// 多扫一个通常为空的桶，换掉一整类边界推理。
+///
+/// # 范围限制（`[start, end)`）
+///
+/// 两个调用点的区间都是**固定**的：根 LOD 区间 `[root_start, root_end)`、
+/// 以及本档开始前的池前缀 `[0, prev_count)`。而池只会**追加**，
+/// 所以「全局索引 + 收集时按区间过滤」与「只索引该区间」等价 ——
+/// 而且只需建一次索引，边追加边插入。
+struct PosIndex {
+    buckets: HashMap<(i64, i64, i64), Vec<u32>>,
+    /// 格号算不出来的点（非有限 / 超大坐标）。
+    special: Vec<u32>,
+    /// 复用的候选缓冲（避免每次查询分配）。
+    scratch: Vec<u32>,
+}
+
+/// 格边长：`4 × POSITION_EPSILON`（见 [`PosIndex`] 的完备性证明）。
+const CELL_SIZE: f64 = POSITION_EPSILON as f64 * 4.0;
+/// 超过这个绝对值就不分桶（回退全扫）—— 远大于任何真实模型坐标，
+/// 又远小于 `f64` 除法精度开始影响「格号差 ≤ 1」的量级。
+const CELL_LIMIT: f64 = 1.0e9;
+
+/// 坐标 → 格号。非有限或超大返回 `None`（调用方回退全扫）。
+#[inline]
+fn cell_of(p: [f32; 3]) -> Option<(i64, i64, i64)> {
+    let mut out = [0i64; 3];
+    for k in 0..3 {
+        let c = p[k];
+        if !c.is_finite() {
+            return None;
+        }
+        let v = c as f64;
+        if v.abs() > CELL_LIMIT {
+            return None;
+        }
+        // 用 f64 做除法：`f32` 输入在此量级下舍入误差 ≪ 1 格，
+        // 「格号差 ≤ 1」的证明因此成立。
+        out[k] = (v / CELL_SIZE).floor() as i64;
+    }
+    Some((out[0], out[1], out[2]))
+}
+
+impl PosIndex {
+    fn new() -> Self {
+        PosIndex {
+            buckets: HashMap::new(),
+            special: Vec::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// 把一个池下标加入索引（池只追加，所以按升序调用即可）。
+    fn insert(&mut self, i: usize, p: [f32; 3]) {
+        match cell_of(p) {
+            Some(c) => self.buckets.entry(c).or_default().push(i as u32),
+            None => self.special.push(i as u32),
+        }
+    }
+
+    /// 把 `[start, end)` 内的候选收集进 `scratch`（**按升序**）。
+    ///
+    /// 返回 `false` = 查询点算不出格号，调用方**必须**回退全扫。
+    ///
+    /// 升序是硬要求：平局链末层是 `>=`，同误差时**后者胜**。
+    /// 27 个桶各自有序，但拼接起来不是 —— 所以统一排序。
+    /// 候选数实测极小（真实 Linnea：p50 = 1、p90 = 3、max = 42），
+    /// 排序是插入排序级别，可忽略。
+    fn gather(&mut self, p: [f32; 3], start: usize, end: usize) -> bool {
+        let Some((cx, cy, cz)) = cell_of(p) else {
+            return false;
+        };
+        self.scratch.clear();
+        let (lo, hi) = (start as u32, end as u32);
+        // `special` 通常为空，先判空省掉一次遍历。
+        let push = |dst: &mut Vec<u32>, v: &[u32]| {
+            if v.is_empty() {
+                return;
+            }
+            // 桶内升序；整桶都在区间内时走快路径（绝大多数查询如此）。
+            if v.first().is_some_and(|f| *f >= lo) && v.last().is_some_and(|l| *l < hi) {
+                dst.extend_from_slice(v);
+            } else {
+                dst.extend(v.iter().copied().filter(|i| *i >= lo && *i < hi));
+            }
+        };
+        for dx in -1..=1i64 {
+            for dy in -1..=1i64 {
+                for dz in -1..=1i64 {
+                    if let Some(v) = self.buckets.get(&(cx + dx, cy + dy, cz + dz)) {
+                        push(&mut self.scratch, v);
+                    }
+                }
+            }
+        }
+        // 借用检查：`special` 与 `scratch` 同属 `self`，先拷出引用再推。
+        let special = std::mem::take(&mut self.special);
+        push(&mut self.scratch, &special);
+        self.special = special;
+        self.scratch.sort_unstable();
+        true
+    }
+
+    /// 网格版 [`find_best_in_range_naive`] —— 结果逐位相同。
+    #[allow(clippy::too_many_arguments)]
+    fn find_best(
+        &mut self,
+        pool: &[DictVert],
+        start: usize,
+        end: usize,
+        find_v: &Vertex,
+        find_t: &VvdTangent,
+        ignore_boneweight: bool,
+        ignore_tangents: bool,
+    ) -> Option<usize> {
+        let end = end.min(pool.len());
+        if start >= end {
+            return None;
+        }
+        if self.gather(find_v.pos, start, end) {
+            pick_best(
+                pool,
+                self.scratch.iter().map(|i| *i as usize),
+                find_v,
+                find_t,
+                ignore_boneweight,
+                ignore_tangents,
+            )
+        } else {
+            // 查询点算不出格号 ⟹ 回退原实现（全区间线性扫描）。
+            pick_best(
+                pool,
+                start..end,
+                find_v,
+                find_t,
+                ignore_boneweight,
+                ignore_tangents,
+            )
+        }
+    }
+
+    /// 网格版 [`find_exact_in_range`] —— 结果逐位相同。
+    ///
+    /// 精确比较是**逐位**的（`c.v.pos != v.pos`），命中者位置位完全相同
+    /// ⟹ 格号也完全相同 ⟹ **只查自己那一格**就完备（不需要 27 邻域）。
+    /// 查询点算不出格号时同样回退全扫。
+    fn find_exact(
+        &mut self,
+        pool: &[DictVert],
+        start: usize,
+        end: usize,
+        v: &Vertex,
+        t: &VvdTangent,
+    ) -> Option<usize> {
+        let end = end.min(pool.len());
+        if start >= end {
+            return None;
+        }
+        let Some(c) = cell_of(v.pos) else {
+            return pick_exact(pool, start..end, v, t);
+        };
+        self.scratch.clear();
+        let (lo, hi) = (start as u32, end as u32);
+        if let Some(b) = self.buckets.get(&c) {
+            if b.first().is_some_and(|f| *f >= lo) && b.last().is_some_and(|l| *l < hi) {
+                self.scratch.extend_from_slice(b);
+            } else {
+                self.scratch
+                    .extend(b.iter().copied().filter(|i| *i >= lo && *i < hi));
+            }
+        }
+        self.scratch.sort_unstable();
+        pick_exact(pool, self.scratch.iter().map(|i| *i as usize), v, t)
+    }
 }
 
 /// `FindBoneWeightWithinModel`（`UnifyLODs.cpp:678`）。
@@ -1215,19 +1460,18 @@ fn bone_weights_equal(b1: &[[f32; 2]], b2: &[[f32; 2]]) -> bool {
     matched == b1.len()
 }
 
-/// `FindVertexInDictionaryExact`（`UnifyLODs.cpp:1016`）。
+/// `FindVertexInDictionaryExact`（`UnifyLODs.cpp:1016`）的判定体。
 ///
 /// **逐位**比较位置 / 权重集合 / UV / 法线 / 切线 —— 没有 epsilon。
 /// 顺序是 `for nVertID in start..end`，**第一个匹配者获胜**。
-fn find_exact_in_range(
+fn pick_exact(
     pool: &[DictVert],
-    start: usize,
-    end: usize,
+    cands: impl Iterator<Item = usize>,
     v: &Vertex,
     t: &VvdTangent,
 ) -> Option<usize> {
-    let end = end.min(pool.len());
-    for (i, c) in pool.iter().enumerate().take(end).skip(start) {
+    for i in cands {
+        let c = &pool[i];
         if c.v.pos != v.pos {
             continue;
         }
@@ -1246,6 +1490,24 @@ fn find_exact_in_range(
         return Some(i);
     }
     None
+}
+
+/// **朴素**版：线性扫描 `pool[start..end)`（原实现）。
+///
+/// ⚠️ **[`PosIndex::find_exact`] 等价性的 oracle，不要删。**
+#[allow(dead_code)]
+fn find_exact_in_range_naive(
+    pool: &[DictVert],
+    start: usize,
+    end: usize,
+    v: &Vertex,
+    t: &VvdTangent,
+) -> Option<usize> {
+    let end = end.min(pool.len());
+    if start >= end {
+        return None;
+    }
+    pick_exact(pool, start..end, v, t)
 }
 
 /// 一个 LOD 档的输入：源网格 + 该档的骨骼映射。
@@ -1280,6 +1542,25 @@ impl LodSource {
 /// 本函数是官方算法，两者的**共同输入**上结果一致（见测试），
 /// 但本函数额外支持 `$lod` 的骨骼坍缩。
 pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> MeshLods {
+    unify_lods_impl::<true>(lods, bone_usage)
+}
+
+/// [`unify_lods_remapped`] 的**朴素**版本：线性扫描，不用位置桶索引。
+///
+/// ⚠️ **这是等价性的唯一 oracle，不要删。**
+/// 它与生产版**共用整个函数体**（同一份 `unify_lods_impl`），
+/// 唯一差别是 `USE_INDEX = false` ⟹ 等价性只取决于两个查找函数，
+/// 不存在「两份实现各自演化」的风险。
+#[cfg(test)]
+pub(crate) fn unify_lods_remapped_naive(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> MeshLods {
+    unify_lods_impl::<false>(lods, bone_usage)
+}
+
+/// `USE_INDEX = true` 走位置桶索引，`false` 走原来的线性扫描。
+fn unify_lods_impl<const USE_INDEX: bool>(
+    lods: &[LodSource],
+    bone_usage: &mut [LodFlags],
+) -> MeshLods {
     let num_lods = lods.len().max(1);
     let mut pool: Vec<DictVert> = Vec::new();
     let mut triangles: Vec<Vec<[u32; 3]>> = Vec::with_capacity(num_lods);
@@ -1322,6 +1603,59 @@ pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> M
     triangles.push(l0.triangles.clone());
     lod_vertex_index.push((root_start..root_end).map(|i| i as u32).collect());
 
+    // 位置桶索引：池**只追加**，所以这里一次建好、之后边追加边插入。
+    //
+    // 注意要在 LOD 0 的池建完之后插入 —— 此时 `pool[root_start..root_end]`
+    // 就是根区间，两个查询区间（根区间、`[0, prev_count)`）都只涉及已插入项。
+    //
+    // ⚠️ **单 LOD 时根本不建**：`num_lods == 1` 时下面那个循环一次都不跑，
+    // 建索引纯属浪费（实测 178,802 三角形的单 LOD 模型会因此慢约 4%）。
+    // 单 LOD 是绝大多数模型的路径（基准语料 3302/3302 都是），所以这条
+    // 早退不是微优化，而是「不给常见路径添成本」。
+    let mut index = PosIndex::new();
+    if USE_INDEX && num_lods > 1 {
+        for (i, d) in pool.iter().enumerate() {
+            index.insert(i, d.v.pos);
+        }
+    }
+    // 朴素路径的适配器：签名与 `PosIndex` 的两个查找一致，
+    // 于是下面的循环体**一个字都不用改**。
+    // 用泛型常量分派（不是 `if`）：`USE_INDEX = true` 时朴素分支
+    // 在编译期被消掉，生产路径**没有**任何额外分支。
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_best<const USE_INDEX: bool>(
+        index: &mut PosIndex,
+        pool: &[DictVert],
+        start: usize,
+        end: usize,
+        v: &Vertex,
+        t: &VvdTangent,
+        ibw: bool,
+        itan: bool,
+    ) -> Option<usize> {
+        if USE_INDEX {
+            index.find_best(pool, start, end, v, t, ibw, itan)
+        } else {
+            find_best_in_range_naive(pool, start, end, v, t, ibw, itan)
+        }
+    }
+    #[inline]
+    fn lookup_exact<const USE_INDEX: bool>(
+        index: &mut PosIndex,
+        pool: &[DictVert],
+        start: usize,
+        end: usize,
+        v: &Vertex,
+        t: &VvdTangent,
+    ) -> Option<usize> {
+        if USE_INDEX {
+            index.find_exact(pool, start, end, v, t)
+        } else {
+            find_exact_in_range_naive(pool, start, end, v, t)
+        }
+    }
+
     // ---- LOD 1..N：CreateLODVertsInDictionary ----
     for (n, src) in lods.iter().enumerate().take(num_lods).skip(1) {
         let prev_count = pool.len();
@@ -1341,8 +1675,11 @@ pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> M
                 tangent: cand_t,
                 lod_flags: 0,
             };
-            match find_best_in_range(
-                &pool, root_start, root_end, cand, &cand_t, true, true,
+            // ⚠️ 这几个 `Span` 是 §49 定位热点的**证据来源**，
+            // 默认 feature 下是零开销的空实现（见 `src/prof.rs`）。
+            let t1 = crate::prof::Span::new("    unify: 1) 根区间几何匹配");
+            match lookup_best::<USE_INDEX>(
+                &mut index, &pool, root_start, root_end, cand, &cand_t, true, true,
             ) {
                 // 命中 ⟹ **整条拷贝**（含根 LOD 的权重与切线）。
                 Some(k) => ideal = pool[k].clone(),
@@ -1351,9 +1688,12 @@ pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> M
                     ideal.v.bones = find_bone_weight_within_model(cand, &cand_t, &pool[root_start..root_end]);
                 }
             }
+            drop(t1);
 
             // 2) 再用**全部属性**在 [0, prev_count) 里找理想顶点。
-            if let Some(k) = find_best_in_range(
+            let t2 = crate::prof::Span::new("    unify: 2) 全属性匹配");
+            if let Some(k) = lookup_best::<USE_INDEX>(
+                &mut index,
                 &pool,
                 0,
                 prev_count,
@@ -1364,8 +1704,10 @@ pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> M
             ) {
                 ideal = pool[k].clone();
             }
+            drop(t2);
 
             // 3) 重映射 → 折叠 → 按权重排序 → 标记本档用到的骨骼。
+            let t3 = crate::prof::Span::new("    unify: 3) remap+collapse");
             remap_bone_weights(&mut ideal.v, &src.bone_map);
             collapse_and_sort_bone_weights(&mut ideal.v);
             let bit: LodFlags = 1u32 << n;
@@ -1376,19 +1718,27 @@ pub fn unify_lods_remapped(lods: &[LodSource], bone_usage: &mut [LodFlags]) -> M
                 }
             }
             ideal.lod_flags = bit;
+            drop(t3);
 
             // 4) 精确查重或追加。
-            let id = match find_exact_in_range(&pool, 0, prev_count, &ideal.v, &ideal.tangent) {
+            let t4 = crate::prof::Span::new("    unify: 4) 精确查重");
+            let id = match lookup_exact::<USE_INDEX>(
+                &mut index, &pool, 0, prev_count, &ideal.v, &ideal.tangent,
+            ) {
                 Some(k) => {
                     pool[k].lod_flags |= bit;
                     k
                 }
                 None => {
                     let k = pool.len();
+                    if USE_INDEX {
+                        index.insert(k, ideal.v.pos);
+                    }
                     pool.push(ideal);
                     k
                 }
             };
+            drop(t4);
             remap_ids.push(id as u32);
         }
 
@@ -1967,7 +2317,7 @@ mod tests {
             w: -1.0,
         };
         assert_eq!(
-            find_exact_in_range(&pool, 0, 2, &a, &t1),
+            find_exact_in_range_naive(&pool, 0, 2, &a, &t1),
             Some(1),
             "切线相同的那一个才应命中"
         );
@@ -1976,7 +2326,7 @@ mod tests {
             w: -1.0,
         };
         assert_eq!(
-            find_exact_in_range(&pool, 0, 2, &a, &t2),
+            find_exact_in_range_naive(&pool, 0, 2, &a, &t2),
             None,
             "切线不同的两个都不该命中 ⟹ 调用方会**新增**顶点"
         );
@@ -2030,5 +2380,470 @@ mod tests {
         assert_eq!(q_log2(2), 1);
         assert_eq!(q_log2(0b101), 2);
         assert_eq!(q_log2(1 << 7), 7);
+    }
+
+    // =======================================================================
+    // 位置桶索引（`PosIndex`）与朴素线性扫描的**逐位等价**
+    //
+    // ⚠️ 这些测试的第一道防线是 `assert!(!cands.is_empty())` 之类的
+    // **非空洞断言** —— §37 的教训：差分测试两边都取空集时 `assert_eq!` 恒真，
+    // 一个恒真的测试比没有测试更危险。
+    // =======================================================================
+
+    /// 构造一个池 + 与它同步的索引。
+    fn pool_with_index(verts: &[Vertex]) -> (Vec<DictVert>, PosIndex) {
+        let pool: Vec<DictVert> = verts
+            .iter()
+            .map(|v| DictVert {
+                v: v.clone(),
+                tangent: VvdTangent {
+                    xyz: [1.0, 0.0, 0.0],
+                    w: -1.0,
+                },
+                lod_flags: 1,
+            })
+            .collect();
+        let mut idx = PosIndex::new();
+        for (i, d) in pool.iter().enumerate() {
+            idx.insert(i, d.v.pos);
+        }
+        (pool, idx)
+    }
+
+    /// 索引版与朴素版必须在**同一区间**上给出同一答案（含 `None`）。
+    ///
+    /// 返回 `(索引版, 朴素版)` 供调用方做**非空洞**断言。
+    #[allow(clippy::too_many_arguments)]
+    fn diff_best(
+        pool: &[DictVert],
+        idx: &mut PosIndex,
+        start: usize,
+        end: usize,
+        q: &Vertex,
+        t: &VvdTangent,
+        ibw: bool,
+        itan: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        (
+            idx.find_best(pool, start, end, q, t, ibw, itan),
+            find_best_in_range_naive(pool, start, end, q, t, ibw, itan),
+        )
+    }
+
+    /// 随机化（确定性 LCG）大规模差分：**网格版必须逐位等于朴素版**。
+    ///
+    /// 覆盖：同格多点、跨格边界、恰好 `ε` 距离、`ε` 略外、重复坐标、
+    /// 非有限坐标、极端坐标。
+    #[test]
+    fn pos_index_matches_naive_on_adversarial_pool() {
+        // 确定性 LCG（不引入 rand 依赖）。
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) as f32 / (u32::MAX >> 1) as f32
+        };
+
+        let mut verts: Vec<Vertex> = Vec::new();
+        // ① 随机点（覆盖正常分布）
+        for i in 0..400 {
+            verts.push(Vertex {
+                pos: [next() * 10.0, next() * 10.0, next() * 10.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [next(), next()],
+                bones: vec![[(i % 4) as f32, 1.0]],
+            });
+        }
+        // ② 格边界上密集撒点 —— 这是索引最容易漏候选的地方
+        //    （格边长 4ε = 0.2，边界在 0.2 的整数倍）
+        for k in 0..60 {
+            let base = k as f32 * 0.2;
+            for d in [-0.001f32, 0.0, 0.001, 0.05, 0.199] {
+                verts.push(Vertex {
+                    pos: [base + d, base, base],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                    bones: vec![[0.0, 1.0]],
+                });
+            }
+        }
+        // ③ 恰好 ε（0.05）距离的成对点
+        for k in 0..40 {
+            let x = k as f32 * 0.7;
+            verts.push(Vertex {
+                pos: [x, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            });
+            verts.push(Vertex {
+                pos: [x + POSITION_EPSILON, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            });
+            // 略超 ε ⟹ 必须**不**被匹配
+            verts.push(Vertex {
+                pos: [x + POSITION_EPSILON * 1.5, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            });
+        }
+        // ④ 完全重复的坐标（考验平局链「后者胜」）
+        for _ in 0..20 {
+            verts.push(Vertex {
+                pos: [1.0, 2.0, 3.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            });
+        }
+        // ⑤ 非有限 + 极端坐标
+        for p in [
+            [f32::NAN, 0.0, 0.0],
+            [0.0, f32::INFINITY, 0.0],
+            [f32::NEG_INFINITY, 0.0, 0.0],
+            [1e30, 0.0, 0.0],
+            [-1e30, 0.0, 0.0],
+            [0.0, 0.0, f32::NAN],
+        ] {
+            verts.push(Vertex {
+                pos: p,
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            });
+        }
+
+        let (pool, mut idx) = pool_with_index(&verts);
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+
+        let n = pool.len();
+        let mut compared = 0usize;
+        let mut non_none = 0usize;
+        // 查询点 = 池里的每个点 + 一批微扰点（含跨格边界）
+        let mut queries: Vec<[f32; 3]> = pool.iter().map(|d| d.v.pos).collect();
+        for k in 0..120 {
+            let base = k as f32 * 0.2;
+            queries.push([base + 0.001, base, base]);
+            queries.push([base + 0.05, base + 0.05, base]);
+            queries.push([base - 0.001, base, base]);
+        }
+        for q in &queries {
+            let qv = Vertex {
+                pos: *q,
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            };
+            // 覆盖多种区间（含空区间、单点区间、全区间）
+            for &(s, e) in &[
+                (0usize, n),
+                (0, n / 2),
+                (n / 2, n),
+                (0, 1),
+                (n.saturating_sub(1), n),
+                (5, 5), // 空区间
+            ] {
+                for &(ibw, itan) in &[(true, true), (false, false), (true, false), (false, true)] {
+                    let (got, want) = diff_best(&pool, &mut idx, s, e, &qv, &t, ibw, itan);
+                    assert_eq!(
+                        got, want,
+                        "find_best 不一致：query={q:?} 区间=[{s},{e}) ibw={ibw} itan={itan}"
+                    );
+                    compared += 1;
+                    if want.is_some() {
+                        non_none += 1;
+                    }
+                }
+            }
+            // 精确查重
+            for &(s, e) in &[(0usize, n), (0, n / 2), (n / 2, n), (5, 5)] {
+                let got = idx.find_exact(&pool, s, e, &qv, &t);
+                let want = find_exact_in_range_naive(&pool, s, e, &qv, &t);
+                assert_eq!(got, want, "find_exact 不一致：query={q:?} 区间=[{s},{e})");
+            }
+        }
+
+        // ---- 非空洞防线 ----
+        assert!(compared > 10_000, "比较次数太少（{compared}），测试可能是空洞的");
+        assert!(
+            non_none > 100,
+            "绝大多数查询都没命中（只有 {non_none} 次非 None）—— 差分强度不足"
+        );
+    }
+
+    /// 索引**必须真的缩小候选集**，否则「等价」是廉价的
+    /// （朴素版与网格版都退化成全扫时也会「等价」）。
+    ///
+    /// 这条是**性能不变式**，防的是「索引写了但没接上」这类回归。
+    #[test]
+    fn pos_index_actually_narrows_candidates() {
+        // 400 个点，间距 1.0 ≫ 格边长 0.2 ⟹ 每格至多 1 个点
+        let verts: Vec<Vertex> = (0..400)
+            .map(|i| Vertex {
+                pos: [(i % 20) as f32, (i / 20) as f32, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            })
+            .collect();
+        let (pool, mut idx) = pool_with_index(&verts);
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+        let q = Vertex {
+            pos: [5.0, 5.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            bones: vec![[0.0, 1.0]],
+        };
+        let hit = idx
+            .find_best(&pool, 0, pool.len(), &q, &t, true, true)
+            .expect("间距 1.0 的点必然在 ε 邻域内");
+        assert_eq!(hit, 105, "应当命中池下标 105（即 (5,5,0)）");
+        // 朴素版扫 400 个；索引版收集到的候选必须**远少于**它。
+        // 直接量 `gather` 的产出（复用 `scratch`）。
+        idx.gather(q.pos, 0, pool.len());
+        assert!(
+            idx.scratch.len() <= 8,
+            "候选集没有被缩小：收集到 {} 个（池共 {}）—— 索引可能没接上",
+            idx.scratch.len(),
+            pool.len()
+        );
+        assert!(!idx.scratch.is_empty(), "候选集不该为空（否则测试是空洞的）");
+    }
+
+    /// 索引版在**逐位**语义上必须与朴素版一致：包括「同误差时后者胜」。
+    ///
+    /// 这条专门钉住**候选顺序**：若 `gather` 忘了排序，或按桶序拼接，
+    /// 平局链末层的 `>=` 会选错顶点 —— 而顶点数可能仍然正确。
+    #[test]
+    fn pos_index_preserves_tie_break_order() {
+        // 五个**位置完全相同**的顶点：同位必然同格 ⟹ 都落进同一个桶。
+        // UV/法线/切线全同 ⟹ 平局链一路走到切线层，`>=` 恒真
+        // ⟹ **最后一个**（下标 4）获胜。这正是 §lodtan 记下的指纹。
+        let verts: Vec<Vertex> = (0..5)
+            .map(|_| Vertex {
+                pos: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            })
+            .collect();
+        let (pool, mut idx) = pool_with_index(&verts);
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+        let q = pool[0].v.clone();
+        let got = idx.find_best(&pool, 0, pool.len(), &q, &t, false, false);
+        let want = find_best_in_range_naive(&pool, 0, pool.len(), &q, &t, false, false);
+        assert_eq!(got, want, "平局顺序不一致");
+        assert_eq!(
+            want,
+            Some(4),
+            "同误差时应当是**最后**一个（下标 4）获胜 —— 这是 `>=` 的指纹"
+        );
+        // 精确查重是**第一个**获胜（`FindVertexInDictionaryExact` 语义相反）
+        let exact = idx.find_exact(&pool, 0, pool.len(), &q, &t);
+        assert_eq!(exact, find_exact_in_range_naive(&pool, 0, pool.len(), &q, &t));
+        assert_eq!(exact, Some(0), "精确查重应当是**第一个**获胜");
+    }
+
+    /// 平局候选**跨多个桶**时，`gather` 必须仍按池下标升序输出。
+    ///
+    /// # 为什么单独有这一条（变异测试发现的空洞）
+    ///
+    /// 上面那条用的 5 个同位顶点**全在同一个桶里**，而桶内天然有序
+    /// ⟹ 把 `gather` 末尾的 `sort_unstable()` 删掉，测试**照样全绿**。
+    /// 这是「恒真的测试比没有测试更危险」的又一例。
+    ///
+    /// # 怎么造出**精确**的跨桶平局
+    ///
+    /// 位置误差是 `(q − c)²`。取 `q = 0`、两个候选放在 `±2⁻⁵ = ±0.03125`
+    /// （**二进制精确**），则两边误差都恰好是 `2⁻¹⁰` —— 逐位相等，不是「接近」。
+    ///
+    /// 格边长 `4ε = 0.2`，于是 `floor(−0.03125/0.2) = −1`、
+    /// `floor(+0.03125/0.2) = 0` ⟹ **跨两个桶**。
+    ///
+    /// 再把**下标顺序与桶遍历顺序刻意反着放**：桶遍历是 `dx = −1, 0, +1`，
+    /// 所以把格 `−1` 的点放在**下标 1**、格 `0` 的点放在**下标 0**。
+    /// 于是：
+    ///
+    /// | 版本 | 候选顺序 | 末位获胜者 |
+    /// |---|---|---|
+    /// | 朴素（按下标升序） | `[0, 1]` | **1** |
+    /// | `gather` 忘了排序 | `[1, 0]` | **0** |
+    ///
+    /// 两者必须都等于朴素版 ⟹ 漏排序会被当场抓住。
+    #[test]
+    fn pos_index_tie_across_buckets_needs_sort() {
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+        let mk = |x: f32| Vertex {
+            pos: [x, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            bones: vec![[0.0, 1.0]],
+        };
+        // 下标 0 = 格 0（+d），下标 1 = 格 −1（−d）。
+        let d = 0.03125f32; // 2⁻⁵
+        let verts = vec![mk(d), mk(-d)];
+        let (pool, mut idx) = pool_with_index(&verts);
+
+        // ---- 前置断言：这三条不成立，本测试就退化成空洞的 ----
+        assert_ne!(
+            cell_of(pool[0].v.pos),
+            cell_of(pool[1].v.pos),
+            "两个候选必须在不同格，否则测不到跨桶顺序"
+        );
+        let q = mk(0.0);
+        assert_eq!(
+            pos_err(q.pos, pool[0].v.pos),
+            pos_err(q.pos, pool[1].v.pos),
+            "两者位置误差必须**逐位相等**，否则不是平局用例"
+        );
+        assert!(
+            pos_err(q.pos, pool[0].v.pos) <= POSITION_EPSILON_SQR,
+            "两者都必须在 ε 邻域内"
+        );
+
+        let want = find_best_in_range_naive(&pool, 0, pool.len(), &q, &t, false, false);
+        let got = idx.find_best(&pool, 0, pool.len(), &q, &t, false, false);
+        assert_eq!(want, Some(1), "朴素版应当选下标 1（末位获胜）");
+        assert_eq!(got, want, "跨桶平局的候选顺序不一致 —— `gather` 可能漏了排序");
+    }
+
+    /// 索引在**边追加边查询**（真实调用模式）下也必须等价。
+    #[test]
+    fn pos_index_matches_naive_while_appending() {
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+        let mk = |p: [f32; 3]| Vertex {
+            pos: p,
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            bones: vec![[0.0, 1.0]],
+        };
+        let mut pool: Vec<DictVert> = Vec::new();
+        let mut idx = PosIndex::new();
+        let mut checked = 0usize;
+        for i in 0..300 {
+            let p = [(i % 17) as f32 * 0.3, (i % 13) as f32 * 0.3, 0.0];
+            let v = mk(p);
+            let prev = pool.len();
+            // 查询（与生产路径一致：只查 [0, prev)）
+            if prev > 0 {
+                let q = mk([p[0] + 0.01, p[1], p[2]]);
+                let (got, want) = diff_best(&pool, &mut idx, 0, prev, &q, &t, false, false);
+                assert_eq!(got, want, "追加过程中 find_best 不一致 @i={i}");
+                let ge = idx.find_exact(&pool, 0, prev, &q, &t);
+                let we = find_exact_in_range_naive(&pool, 0, prev, &q, &t);
+                assert_eq!(ge, we, "追加过程中 find_exact 不一致 @i={i}");
+                checked += 1;
+            }
+            // 追加
+            idx.insert(pool.len(), v.pos);
+            pool.push(DictVert {
+                v,
+                tangent: t,
+                lod_flags: 1,
+            });
+        }
+        assert!(checked > 200, "比较次数太少（{checked}），测试可能是空洞的");
+    }
+
+    /// 空池 / 空区间 / 越界区间必须与朴素版一致（都返回 `None`）。
+    #[test]
+    fn pos_index_handles_empty_ranges() {
+        let (pool, mut idx) = pool_with_index(&[v([0.0; 3], [0.0, 0.0])]);
+        let t = VvdTangent {
+            xyz: [1.0, 0.0, 0.0],
+            w: -1.0,
+        };
+        let q = pool[0].v.clone();
+        for &(s, e) in &[(0usize, 0usize), (1, 1), (2, 5), (0, 0)] {
+            assert_eq!(idx.find_best(&pool, s, e, &q, &t, true, true), None);
+            assert_eq!(find_best_in_range_naive(&pool, s, e, &q, &t, true, true), None);
+            assert_eq!(idx.find_exact(&pool, s, e, &q, &t), None);
+            assert_eq!(find_exact_in_range_naive(&pool, s, e, &q, &t), None);
+        }
+        // 空池
+        let (empty, mut eidx) = pool_with_index(&[]);
+        assert_eq!(eidx.find_best(&empty, 0, 0, &q, &t, true, true), None);
+    }
+
+    /// **端到端**差分：同一个多 LOD 输入，网格版与朴素版的**产物必须逐位相同**。
+    ///
+    /// 前面几条测的是单个查询；这条测的是整个 `unify_lods_remapped` ——
+    /// 池的演化、`lod_flags`、`numLODVertexes`、fixup 全都要一致。
+    #[test]
+    fn unify_lods_remapped_matches_naive_end_to_end() {
+        // 造 3 档 LOD：LOD1/LOD2 是 LOD0 的稀疏子集 + 少量位移点。
+        let mut l0: Vec<Vertex> = Vec::new();
+        for i in 0..120 {
+            l0.push(Vertex {
+                pos: [(i % 12) as f32 * 0.37, (i / 12) as f32 * 0.41, (i % 5) as f32 * 0.13],
+                normal: [0.0, 0.0, 1.0],
+                uv: [(i % 7) as f32 * 0.1, (i % 3) as f32 * 0.1],
+                bones: vec![[(i % 3) as f32, 1.0]],
+            });
+        }
+        let tris0: Vec<[u32; 3]> = (0..40).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect();
+
+        // LOD1：取偶数下标 + 一个「附近但不重合」的点（触发模糊匹配 + 权重回退）
+        let mut l1: Vec<Vertex> = l0.iter().step_by(2).cloned().collect();
+        l1.push(Vertex {
+            pos: [100.0, 100.0, 100.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.5],
+            bones: vec![[0.0, 1.0]],
+        });
+        let tris1: Vec<[u32; 3]> = (0..10).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect();
+
+        // LOD2：更稀疏 + 带骨骼坍缩映射（1→0）
+        let l2: Vec<Vertex> = l0.iter().step_by(4).cloned().collect();
+        let tris2: Vec<[u32; 3]> = (0..5).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect();
+
+        let srcs = vec![
+            LodSource::new(l0.clone(), tris0.clone()),
+            LodSource {
+                vertices: l1,
+                triangles: tris1,
+                bone_map: Vec::new(),
+            },
+            LodSource {
+                vertices: l2,
+                triangles: tris2,
+                bone_map: vec![0, 0, 1], // 骨骼 1 塌到 0
+            },
+        ];
+
+        let mut usage_a = vec![0u32; 3];
+        let mut usage_b = vec![0u32; 3];
+        let got = unify_lods_remapped(&srcs, &mut usage_a);
+        let want = unify_lods_remapped_naive(&srcs, &mut usage_b);
+
+        // ---- 非空洞防线：产物必须真的有内容 ----
+        assert!(!got.vertices.is_empty(), "顶点池为空 ⟹ 测试是空洞的");
+        assert!(got.vertices.len() > 50, "顶点池太小（{}）", got.vertices.len());
+        assert_eq!(got.triangles.len(), 3, "应当有 3 档三角形");
+        assert!(got.lod_vertex_counts.iter().all(|c| *c > 0));
+
+        assert_eq!(got.vertices, want.vertices, "顶点池不一致");
+        assert_eq!(got.lod_flags, want.lod_flags, "lod_flags 不一致");
+        assert_eq!(got.triangles, want.triangles, "三角形不一致");
+        assert_eq!(got.lod_vertex_counts, want.lod_vertex_counts);
+        assert_eq!(got.lod_vertex_index, want.lod_vertex_index);
+        assert_eq!(usage_a, usage_b, "bone_lod_usage 不一致");
     }
 }

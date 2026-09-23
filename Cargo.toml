@@ -14,3 +14,10 @@ meshopt = "0.6.2"
 parry3d = "0.31.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[features]
+# 分段计时探针（`src/prof.rs`）。**默认关闭** —— 打开后 `Span::new` 会做
+# 一次 `OnceLock` 初始化检查，实测给单 LOD 常见路径带来约 2.5% 开销。
+# 只有 `MDLC_PROF=1` 的测量场景才需要：
+#   cargo build --release --features profiling
+profiling = []
