@@ -48,6 +48,15 @@ pub const HDR_PART1_SIZE: usize = 0x198;
 /// 实测 3333/3333 个真实模型都把 `studiohdr2` 放在 **408**（即
 /// `HDR_PART1_SIZE`），紧跟头部之后。
 pub const STUDIOHDR2_SIZE: usize = 256;
+/// `MAXSTUDIOVERTS`（`studio.h:74`）：**单个 model** 的顶点数上限。
+///
+/// ⚠️ 判据是 **`>=`** 报错（`write.cpp:1642`），所以合法最大值是
+/// `MAXSTUDIOVERTS - 1`。且被查的量是 `pmodel[i].numvertices` ——
+/// **该 model 下各 mesh 的「跨 LOD 去重后」顶点数之和**。
+///
+/// ⚠️ 与 `studio.h:77-78` 的 `MAXSTUDIOTRIANGLES=25000 / MAXSTUDIOVERTS=10000`
+/// 无关 —— 那是 `#ifdef _X360` 分支。
+pub const MAXSTUDIOVERTS: usize = 65536;
 /// `mstudiobone_t` 的字节大小。
 pub const BONE_SIZE: usize = 216;
 /// `mstudiotexture_t` 的字节大小。
@@ -743,6 +752,39 @@ pub enum WriteError {
     Internal(String),
     /// 名字超过内联字段长度。
     NameTooLong { path: String, len: usize, max: usize },
+    /// **单个 model 的顶点数**达到 `MAXSTUDIOVERTS`。
+    ///
+    /// 官方 `write.cpp:1642`：
+    ///
+    /// ```c
+    /// if ( pmodel[i].numvertices >= MAXSTUDIOVERTS )
+    ///     MdlError( "Too many verts in model. (%d verts, MAXSTUDIOVERTS==%d)\n", ... );
+    /// ```
+    ///
+    /// 而 `pmodel[i].numvertices` 是**该 model 下各 mesh 的
+    /// `numLODVertexes[rootLOD]` 之和**（`studio.h:2055-2069`）——
+    /// 即**跨 LOD 去重后**的顶点总数，不是各档之和、也不是逐 mesh 的量。
+    ///
+    /// # 为什么必须单独有这个检查（而不是靠 VTX 那条）
+    ///
+    /// `vtx_writer` 的 `TooManyVertices` 查的是「**单 mesh** 的
+    /// `origMeshVertID` 是否塞得进 u16」—— 那是 **VTX 格式**约束，
+    /// 与 `MAXSTUDIOVERTS` **不是同一个量**。
+    ///
+    /// 实测缺口（`benchmarks/probe_vertex_limit.js`）：
+    ///
+    /// | 用例 | 每 mesh | model 合计 | mdlc（仅 VTX 检查） | 官方 |
+    /// |---|---|---|---|---|
+    /// | 2 mesh × 32768 | 32768 | **65536** | 接受 ❌ | 拒绝 |
+    /// | 3 mesh × 32768 | 32768 | **98304** | 接受 ❌ | 拒绝 |
+    ///
+    /// 即「每个 mesh 都在 u16 内，但 model 合计超限」时 mdlc 会**静默产出**
+    /// 官方拒绝的模型 —— 游戏里表现为顶点数据错乱。
+    TooManyModelVertices {
+        path: String,
+        count: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for WriteError {
@@ -759,6 +801,12 @@ impl std::fmt::Display for WriteError {
             Self::NameTooLong { path, len, max } => {
                 write!(f, "{path} 过长：{len} 字节，上限 {max}")
             }
+            Self::TooManyModelVertices { path, count, max } => write!(
+                f,
+                "{path} 有 {count} 个顶点（跨 LOD 去重后），达到上限 {max}\
+                 （官方 `Too many verts in model`）。\
+                 请把该 model 拆成多个 `[[bodyparts.models]]`"
+            ),
         }
     }
 }
@@ -2724,6 +2772,26 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 mbase + model_off::MESH_INDEX,
                 (this_mesh_off - mbase) as i32,
             );
+            // ---- `MAXSTUDIOVERTS`：**逐 model** 检查（官方 `write.cpp:1642`）----
+            //
+            // `span.count` 就是 `pmodel[i].numvertices` 的对应量 ——
+            // 该 model 跨全部 LOD 去重后的顶点总数（见 `ModelVertexSpan`）。
+            //
+            // ⚠️ 判据是 `>=`（不是 `>`）：官方 `if (... >= MAXSTUDIOVERTS)`，
+            // 所以 65536 本身**非法**、65535 才是合法最大值。
+            //
+            // 为什么不能只靠 `vtx_writer` 那条：那条查的是**单 mesh** 的
+            // `origMeshVertID` 塞不塞得进 u16（**VTX 格式**约束）。
+            // 实测（`benchmarks/probe_vertex_limit.js`）：2 mesh × 32768 时
+            // 每个 mesh 都 < 65536，但 model 合计 = 65536 ⟹ 官方拒绝、
+            // 旧版 mdlc 静默接受。详见 `WriteError::TooManyModelVertices`。
+            if span.count >= MAXSTUDIOVERTS {
+                return Err(WriteError::TooManyModelVertices {
+                    path: format!("bodyparts[{bi}].models[{model_cursor}]"),
+                    count: span.count,
+                    max: MAXSTUDIOVERTS,
+                });
+            }
             put_i32(&mut buf, mbase + model_off::NUM_VERTICES, span.count as i32);
             // **相对 VVD 顶点块的字节偏移**，不是顶点下标。
             put_i32(
@@ -5780,6 +5848,140 @@ motionflags = 7
         d.bodyparts[0].models[0].name = "x".repeat(80);
         let err = write_mdl(&d).unwrap_err();
         assert!(matches!(err, WriteError::NameTooLong { .. }), "{err:?}");
+    }
+
+    // ---- `MAXSTUDIOVERTS`：**逐 model** 顶点上限（官方 `write.cpp:1642`）----
+    //
+    // ⚠️ 这一组测试的**关键价值**在于「每个 mesh 都合法、但 model 合计超限」
+    // 那条 —— 旧版 mdlc 只查单 mesh（VTX 的 u16），会静默放过它。
+    // 详见 `WriteError::TooManyModelVertices` 与
+    // `benchmarks/probe_vertex_limit.js`（9 个边界用例的 oracle 对照）。
+
+    /// 造一个 model：`n_mesh` 个 mesh，各 `per_mesh` 个顶点。
+    /// 返回 (desc, 总顶点数)。
+    fn desc_with_vertices(n_mesh: usize, per_mesh: usize) -> (CompiledModelDesc, usize) {
+        use crate::model::{Mesh, Texture};
+        let mut d = minimal();
+        let mut meshes = Vec::new();
+        for k in 0..n_mesh {
+            let verts: Vec<Vertex> = (0..per_mesh)
+                .map(|i| Vertex {
+                    pos: [(k * per_mesh + i) as f32, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                    bones: vec![[0.0, 1.0]],
+                })
+                .collect();
+            meshes.push(Mesh {
+                material: k,
+                vertices: verts,
+                triangles: Vec::new(),
+                eyeball_tag: None,
+            });
+        }
+        d.desc.materials.textures = (0..n_mesh)
+            .map(|k| Texture {
+                name: format!("m{k}"),
+                flags: None,
+            })
+            .collect();
+        d.bodyparts[0].models[0].meshes = meshes;
+        (d, n_mesh * per_mesh)
+    }
+
+    /// 边界：`MAXSTUDIOVERTS - 1` **合法**、`MAXSTUDIOVERTS` **非法**。
+    ///
+    /// 判据是官方那个 `>=`（不是 `>`）—— 把 `>=` 写成 `>` 会让 65536 通过，
+    /// 而官方会拒绝它。
+    #[test]
+    fn model_vertex_limit_boundary_is_exact() {
+        // 65535：合法
+        let (d, n) = desc_with_vertices(1, MAXSTUDIOVERTS - 1);
+        assert_eq!(n, 65535);
+        assert!(
+            write_mdl(&d).is_ok(),
+            "{n} 个顶点应当**合法**（官方判据是 >= {MAXSTUDIOVERTS} 才报错）"
+        );
+        // 65536：非法（这是 `>=` 与 `>` 的分界）
+        let (d, n) = desc_with_vertices(1, MAXSTUDIOVERTS);
+        assert_eq!(n, 65536);
+        let err = write_mdl(&d).unwrap_err();
+        match err {
+            WriteError::TooManyModelVertices { count, max, .. } => {
+                assert_eq!(count, 65536, "报出的顶点数应是 model 合计");
+                assert_eq!(max, MAXSTUDIOVERTS);
+            }
+            other => panic!("应当拒绝 65536 个顶点，得到 {other:?}"),
+        }
+    }
+
+    /// **核心用例**：每个 mesh 都远小于上限，但 **model 合计**超限。
+    ///
+    /// 这正是旧版 mdlc 的缺口 —— `vtx_writer` 的 `origMeshVertId` 是 u16，
+    /// 32768 塞得进，于是它放行；而官方按 model 合计 65536 拒绝。
+    #[test]
+    fn model_vertex_limit_is_per_model_not_per_mesh() {
+        // 2 mesh × 32768 = 65536（每个 mesh 都 < 65536）
+        let (d, n) = desc_with_vertices(2, 32768);
+        assert_eq!(n, 65536);
+        let err = write_mdl(&d).unwrap_err();
+        assert!(
+            matches!(err, WriteError::TooManyModelVertices { .. }),
+            "2 mesh × 32768 应当被拒绝（官方按 model 合计查），得到 {err:?}"
+        );
+
+        // 3 mesh × 32768 = 98304：更明显
+        let (d, n) = desc_with_vertices(3, 32768);
+        assert_eq!(n, 98304);
+        assert!(
+            matches!(write_mdl(&d).unwrap_err(), WriteError::TooManyModelVertices { .. }),
+            "3 mesh × 32768 应当被拒绝"
+        );
+
+        // 对照：2 mesh × 32767 = 65534 < 65536 ⟹ **合法**
+        let (d, n) = desc_with_vertices(2, 32767);
+        assert_eq!(n, 65534);
+        assert!(write_mdl(&d).is_ok(), "65534 应当合法");
+    }
+
+    /// 检查的是**单个 model**，不是全模型总量。
+    ///
+    /// 官方 `write.cpp:1642` 在 `for (i = 0; i < nummodels; i++)` 里查
+    /// `pmodel[i]` —— 所以「多个 model 各 40000」合法，即使总量 80000。
+    #[test]
+    fn model_vertex_limit_allows_multiple_models_under_limit() {
+        use crate::model::{Mesh, Texture};
+        let mut d = minimal();
+        // 两个 model，各 40000 顶点（都 < 65536）
+        let base = d.bodyparts[0].models[0].clone();
+        let mk_model = |tag: f32| {
+            let verts: Vec<Vertex> = (0..40000)
+                .map(|i| Vertex {
+                    pos: [tag, i as f32, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                    bones: vec![[0.0, 1.0]],
+                })
+                .collect();
+            let mut m = base.clone();
+            m.name = format!("m{tag}");
+            m.meshes = vec![Mesh {
+                material: 0,
+                vertices: verts,
+                triangles: Vec::new(),
+                eyeball_tag: None,
+            }];
+            m
+        };
+        d.bodyparts[0].models = vec![mk_model(0.0), mk_model(100.0)];
+        d.desc.materials.textures = vec![Texture {
+            name: "m0".to_string(),
+            flags: None,
+        }];
+        assert!(
+            write_mdl(&d).is_ok(),
+            "两个 model 各 40000 顶点应当合法（官方**逐 model** 查，不看总量）"
+        );
     }
 
     // ---- linearbone（骨骼加速结构，`studiohdr2.linearboneindex`）----
