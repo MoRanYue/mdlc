@@ -9,6 +9,16 @@ rust-version = "1.85"
 description = "Source 引擎模型编译器（studiomdl 重写的 MVP 探针）"
 
 [dependencies]
+# CLI 解析。`default-features = false` 关掉了彩色输出 / 终端探测
+# （`color` / `wrap_help` / `env` 等）—— 本工具的输出会被 Crowbar 之类的
+# 宿主**逐行抓取**，ANSI 转义码只会污染日志；顺带省掉 anstream/anstyle。
+clap = { version = "4.6.7", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
 indexmap = { version = "2", features = ["serde"] }
 meshopt = "0.6.2"
 parry3d = "0.31.0"

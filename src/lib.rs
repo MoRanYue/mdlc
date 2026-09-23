@@ -45,6 +45,7 @@
 pub mod anim_writer;
 pub mod ani_writer;
 pub mod bone_math;
+pub mod cli;
 pub mod compile;
 pub mod flex;
 pub mod layout;

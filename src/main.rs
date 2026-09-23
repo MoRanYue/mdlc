@@ -6,6 +6,11 @@
 //! - `vvd-info <file>`                    解析并打印 VVD 头部与统计
 //! - `vvd-roundtrip <file>`               读入再写出，逐字节比对（布局判据）
 //! - `phy <in.smd> <out.phy>`             SMD 三角形 → 凸包 → `.phy` 碰撞文件
+//!
+//! 另有**官方 `studiomdl` 兼容形态**（首参为 `-` 或以 `.qc` 结尾时启用）：
+//! `mdlc -game <gamedir> [-nop4] [-verbose] <model.qc>`，产物写到
+//! `<gamedir>\models\<$modelname>` —— 用于直接替换 Crowbar 的编译器路径。
+//! 解析细节见 [`mdlc::cli`] 模块文档。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -61,42 +66,76 @@ mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
 
   mdlc template
       打印一份带注释的最小 TOML 模板。
+
+官方 studiomdl 兼容形态（用于直接替换 Crowbar 等宿主的编译器路径）：
+  mdlc -game <gamedir> [-nop4] [-verbose] <model.qc>
+      等价于 `build-qc <model.qc> --out <gamedir>\\models`
+      —— 即官方的产物规则 `<gamedir> + models/ + $modelname`
+      （见 write.cpp:1321-1331）。也可省略 -game：`mdlc <model.qc>`。
+      官方单横线选项会被归一化接受；未实现的（如 -minlod）会警告后忽略。
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(cmd) = args.first().map(String::as_str) else {
-        eprint!("{USAGE}");
-        return ExitCode::from(2);
-    };
-    let rest = &args[1..];
+    let argv: Vec<String> = std::env::args().collect();
+    let rest: Vec<String> = argv.iter().skip(1).cloned().collect();
 
-    match cmd {
-        "-h" | "--help" | "help" => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
+    // ---- 分流：官方兼容形态 vs mdlc 自有形态 ----
+    //
+    // 官方形态有两种（`studiomdl.cpp:6823` 的 `studiomdl [options] <file.qc>`）：
+    // - 首参以 `-` 开头：`mdlc -game <gamedir> <x.qc>`（Crowbar 用）；
+    // - 首参就是 `.qc`：`mdlc <x.qc>`（选项全默认）。
+    //
+    // 两者与 mdlc 自有形态无歧义：mdlc 的子命令都是**裸词**，且没有以
+    // `.qc` 结尾的。`-h` / `--help` 例外 —— 仍归 mdlc（官方 `-h` 是
+    // dump hboxes，归一化后是 `--h`，不会撞上 `--help`）。
+    let first = rest.first().map(String::as_str);
+    let official_form = match first {
+        Some(f) if f.starts_with('-') => f != "-h" && f != "--help",
+        Some(f) => f.to_ascii_lowercase().ends_with(".qc"),
+        None => false,
+    };
+
+    if official_form {
+        return run_official(&argv);
+    }
+
+    let matches = match mdlc::cli::build_cli().try_get_matches_from(&argv) {
+        Ok(m) => m,
+        Err(e) => return cli_exit(e),
+    };
+
+    match matches.subcommand() {
+        None => {
+            // 保持迁移前的契约：**无参数 = 用法错误**（usage 走 stderr、
+            // 退出码 2），而不是 clap 默认的「打印帮助、退出 0」。
+            eprint!("{USAGE}");
+            ExitCode::from(2)
         }
-        "template" => {
+        Some(("template", _)) => {
             print!("{}", mdlc::model::TEMPLATE_TOML);
             ExitCode::SUCCESS
         }
-        "build" => build(rest),
-        "check" => check(rest),
-        "phy" => phy_cmd(rest),
-        "qc2toml" => qc2toml(rest),
-        "build-qc" => build_qc(rest),
-        "vvd-info" | "vvd-roundtrip" => {
-            let Some(path) = rest.first() else {
-                eprintln!("错误：{cmd} 需要一个文件参数");
-                return ExitCode::from(2);
+        Some(("build", m)) => {
+            let (toml_path, out_root, cli_optimize_vtx) = mdlc::cli::build_args(m);
+            let desc = match load_desc(&toml_path) {
+                Ok(d) => d,
+                Err(c) => return c,
             };
-            if cmd == "vvd-info" {
-                vvd_info(path)
-            } else {
-                vvd_roundtrip(path)
-            }
+            let base = toml_path.parent().unwrap_or(Path::new("."));
+            compile_and_write(&desc, base, &out_root, cli_optimize_vtx)
         }
-        other => {
+        Some(("check", m)) => check(Path::new(m.get_one::<String>("toml").expect("required"))),
+        Some(("phy", m)) => phy_cmd(m),
+        Some(("qc2toml", m)) => qc2toml(m),
+        Some(("build-qc", m)) => {
+            let (qc, out, optimize_vtx) = mdlc::cli::build_qc_args(m);
+            build_qc_from(&qc, &out, optimize_vtx)
+        }
+        Some(("vvd-info", m)) => vvd_info(m.get_one::<String>("file").expect("required")),
+        Some(("vvd-roundtrip", m)) => {
+            vvd_roundtrip(m.get_one::<String>("file").expect("required"))
+        }
+        Some((other, _)) => {
             eprintln!("错误：未知子命令 {other:?}\n");
             eprint!("{USAGE}");
             ExitCode::from(2)
@@ -104,35 +143,66 @@ fn main() -> ExitCode {
     }
 }
 
-/// 解析 `build` 的参数。
+/// 把 clap 的错误映射成退出码。
 ///
-/// 返回 `(TOML 路径, 输出根目录, 是否强制打开 VTX 缓存优化)`。
+/// - `--help` / `--version` 之类走 **stdout、退出码 0**（clap 的
+///   `DisplayHelp` / `DisplayVersion`）；
+/// - 其余用法错误走 **stderr、退出码 2** —— 与迁移前的**手写解析契约一致**，
+///   既有脚本（`probe_*.js` / `cmp_*.js`）都按这个码判定。
+fn cli_exit(e: clap::Error) -> ExitCode {
+    let _ = e.print();
+    if e.use_stderr() {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// 官方兼容模式：`mdlc -game <gamedir> [-nop4] [-verbose] <model.qc>`。
 ///
-/// `--optimize-vtx` 是**单向开关**（只能打开、不能关闭），因为 TOML 的
-/// `[model] optimize_vtx` 默认就是关的 —— 没有「需要显式关掉」的场景。
-fn parse_build_args(argv: &[String]) -> Result<(PathBuf, PathBuf, bool), String> {
-    let mut toml_path = None;
-    let mut out = PathBuf::from(".");
-    let mut optimize_vtx = false;
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--out" => out = PathBuf::from(it.next().ok_or("--out 后面缺少路径")?),
-            "--optimize-vtx" => optimize_vtx = true,
-            other if other.starts_with("--") => return Err(format!("未知选项 {other:?}")),
-            _ => {
-                if toml_path.is_some() {
-                    return Err(format!("多余的参数 {a:?}"));
-                }
-                toml_path = Some(PathBuf::from(a));
-            }
+/// 语义与官方 `studiomdl` 对齐（见 [`mdlc::cli`] 模块文档）：
+/// 产物写到 `<gamedir>\models\<$modelname>`。
+fn run_official(argv: &[String]) -> ExitCode {
+    let norm = mdlc::cli::normalize_official_args(argv);
+
+    // 用户要求：未知选项**一律警告后继续**（不中断编译）。
+    if !norm.unknown.is_empty() {
+        eprintln!(
+            "警告：忽略无法识别的选项 {}（mdlc 未实现或非官方选项）",
+            norm.unknown.join(" ")
+        );
+    }
+
+    let m = match mdlc::cli::build_official_cli().try_get_matches_from(&norm.argv) {
+        Ok(m) => m,
+        Err(e) => return cli_exit(e),
+    };
+
+    // 未实现的官方 flag 逐一告警 —— **静默忽略会产出与官方不同的模型**，
+    // 那比拒绝更危险（例如 `-minlod` 会截断 LOD）。
+    //
+    // ⚠️ 布尔 flag 必须用 `get_flag` 判断，**不能用 `value_source`**：
+    // clap 对未出现的 `SetTrue` 参数也返回 `Some(DefaultValue)`，
+    // 用它会把「没传的 flag」也报成「已忽略」。
+    for name in ["striplods", "definebones", "printbones"] {
+        if m.get_flag(name) {
+            eprintln!("警告：官方选项 -{name} 尚未实现，已忽略");
         }
     }
-    Ok((
-        toml_path.ok_or("缺少 TOML 描述文件参数")?,
-        out,
-        optimize_vtx,
-    ))
+    for name in ["minlod", "t", "a"] {
+        if m.value_source(name).is_some() {
+            eprintln!("警告：官方选项 -{name} 尚未实现，已忽略");
+        }
+    }
+
+    let Some(qc) = m.get_one::<String>("qc") else {
+        eprintln!("错误：缺少 .qc 文件参数");
+        eprintln!("用法：mdlc -game <gamedir> [选项] <model.qc>");
+        return ExitCode::from(2);
+    };
+
+    let out_root = mdlc::cli::official_out_root(&m);
+    build_qc_from(Path::new(qc), &out_root, m.get_flag("optimize_vtx"))
 }
 
 /// 读入并解析描述文件，打印全部校验错误。
@@ -161,12 +231,7 @@ fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
     Ok(desc)
 }
 
-fn check(argv: &[String]) -> ExitCode {
-    let Some(path) = argv.first() else {
-        eprintln!("错误：check 需要一个 TOML 描述文件参数");
-        return ExitCode::from(2);
-    };
-    let p = Path::new(path);
+fn check(p: &Path) -> ExitCode {
     let desc = match load_desc(p) {
         Ok(d) => d,
         Err(c) => return c,
@@ -175,7 +240,7 @@ fn check(argv: &[String]) -> ExitCode {
     let base = p.parent().unwrap_or(Path::new("."));
     match compile(&desc, base) {
         Ok(c) => {
-            println!("{path} 合法");
+            println!("{} 合法", p.display());
             println!(
                 "  骨骼 {}，材质 {}，body part {}，顶点 {}，三角形 {}",
                 desc.bones.len(),
@@ -201,30 +266,13 @@ fn check(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(errs) => {
-            eprintln!("{} 有 {} 处错误：", path, errs.len());
+            eprintln!("{} 有 {} 处错误：", p.display(), errs.len());
             for e in &errs {
                 eprintln!("  - {e}");
             }
             ExitCode::from(1)
         }
     }
-}
-
-fn build(argv: &[String]) -> ExitCode {
-    let (toml_path, out_root, cli_optimize_vtx) = match parse_build_args(argv) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("错误：{e}");
-            return ExitCode::from(2);
-        }
-    };
-    let desc = match load_desc(&toml_path) {
-        Ok(d) => d,
-        Err(c) => return c,
-    };
-    // 编译前端：读 SMD、按材质划分 mesh、解析参考姿态。
-    let base = toml_path.parent().unwrap_or(Path::new("."));
-    compile_and_write(&desc, base, &out_root, cli_optimize_vtx)
 }
 
 /// 把 QC 解析成 `ModelDesc`，报错格式与 TOML 路径一致。
@@ -242,36 +290,9 @@ fn load_qc(path: &Path) -> Result<ModelDesc, ExitCode> {
 }
 
 /// `mdlc qc2toml <model.qc> [--out <path.toml>]`。
-fn qc2toml(argv: &[String]) -> ExitCode {
-    let mut qc: Option<PathBuf> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--out" => match it.next() {
-                Some(p) => out = Some(PathBuf::from(p)),
-                None => {
-                    eprintln!("错误：--out 后面缺少路径");
-                    return ExitCode::from(2);
-                }
-            },
-            other if other.starts_with("--") => {
-                eprintln!("错误：未知选项 {other:?}");
-                return ExitCode::from(2);
-            }
-            _ => {
-                if qc.is_some() {
-                    eprintln!("错误：多余的参数 {a:?}");
-                    return ExitCode::from(2);
-                }
-                qc = Some(PathBuf::from(a));
-            }
-        }
-    }
-    let Some(qc) = qc else {
-        eprintln!("错误：qc2toml 需要一个 .qc 文件参数");
-        return ExitCode::from(2);
-    };
+fn qc2toml(m: &clap::ArgMatches) -> ExitCode {
+    let qc = PathBuf::from(m.get_one::<String>("qc").expect("required"));
+    let out: Option<PathBuf> = m.get_one::<String>("out").map(PathBuf::from);
     let desc = match load_qc(&qc) {
         Ok(d) => d,
         Err(c) => return c,
@@ -308,45 +329,19 @@ fn qc2toml(argv: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]`。
-fn build_qc(argv: &[String]) -> ExitCode {
-    let mut qc: Option<PathBuf> = None;
-    let mut out = PathBuf::from(".");
-    let mut optimize_vtx = false;
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--out" => match it.next() {
-                Some(p) => out = PathBuf::from(p),
-                None => {
-                    eprintln!("错误：--out 后面缺少路径");
-                    return ExitCode::from(2);
-                }
-            },
-            "--optimize-vtx" => optimize_vtx = true,
-            other if other.starts_with("--") => {
-                eprintln!("错误：未知选项 {other:?}");
-                return ExitCode::from(2);
-            }
-            _ => {
-                if qc.is_some() {
-                    eprintln!("错误：多余的参数 {a:?}");
-                    return ExitCode::from(2);
-                }
-                qc = Some(PathBuf::from(a));
-            }
-        }
-    }
-    let Some(qc) = qc else {
-        eprintln!("错误：build-qc 需要一个 .qc 文件参数");
-        return ExitCode::from(2);
-    };
-    let desc = match load_qc(&qc) {
+/// `mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]`，
+/// 以及官方兼容模式（`mdlc -game <gamedir> <model.qc>`）共用的入口。
+///
+/// `out_root` 由调用方决定：
+/// - mdlc 自有形态 → `--out`（默认当前目录）；
+/// - 官方兼容形态 → `<gamedir>\models`（见 [`mdlc::cli::official_out_root`]）。
+fn build_qc_from(qc: &Path, out_root: &Path, optimize_vtx: bool) -> ExitCode {
+    let desc = match load_qc(qc) {
         Ok(d) => d,
         Err(c) => return c,
     };
     let base = qc.parent().unwrap_or(Path::new("."));
-    compile_and_write(&desc, base, &out, optimize_vtx)
+    compile_and_write(&desc, base, out_root, optimize_vtx)
 }
 
 /// 把已解析的描述编译成四件套并落盘。
@@ -779,60 +774,39 @@ struct PhyArgs {
     ragdoll: bool,
 }
 
-/// 解析 `phy` 的参数。`--checksum` 同时接受十进制与 `0x` 十六进制
-/// （实测工作流里 checksum 常常是从 `.mdl` 头里以十六进制抄出来的）。
-fn parse_phy_args(argv: &[String]) -> Result<PhyArgs, String> {
-    let mut positional: Vec<String> = Vec::new();
-    let mut checksum = 0u32;
+/// 从 `phy` 的 clap 匹配结果取参数。
+///
+/// `--checksum` 同时接受十进制与 `0x` 十六进制（实测工作流里 checksum
+/// 常常是从 `.mdl` 头里以十六进制抄出来的），所以不走 clap 的数值解析，
+/// 而是取字符串后交给 [`parse_u32`]。
+fn phy_args_from(m: &clap::ArgMatches) -> Result<PhyArgs, String> {
+    let checksum = match m.get_one::<String>("checksum") {
+        Some(v) => parse_u32(v).map_err(|e| format!("--checksum {v:?}：{e}"))?,
+        None => 0,
+    };
     // 官方缺省是 **1.0**（`CJointedModel` 构造函数 `m_totalMass = 1.0`，
     // 而 `ComputeMass()` 首句 `if (m_totalMass >= 0) return;` 直接返回）。
-    let mut mass = 1.0f32;
-    let mut surface_prop = "default".to_string();
-    let mut concave = false;
-    let mut vhacd = false;
-    let mut ragdoll = false;
-
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--checksum" => {
-                let v = it.next().ok_or("--checksum 后面缺少数值")?;
-                checksum = parse_u32(v).map_err(|e| format!("--checksum {v:?}：{e}"))?;
-            }
-            "--mass" => {
-                let v = it.next().ok_or("--mass 后面缺少数值")?;
-                mass = v
-                    .parse::<f32>()
-                    .map_err(|_| format!("--mass 不是合法浮点数：{v:?}"))?;
-            }
-            "--surfaceprop" => {
-                surface_prop = it.next().ok_or("--surfaceprop 后面缺少字符串")?.clone();
-            }
-            "--concave" => concave = true,
-            "--vhacd" => vhacd = true,
-            // 旧名 `--decompose` 曾是 VHACD 的别名。保留以免破坏既有脚本，
-            // 但**语义已明确**为 VHACD（非官方），不是 `$concave`。
-            "--decompose" => vhacd = true,
-            "--ragdoll" => ragdoll = true,
-            other if other.starts_with("--") => return Err(format!("未知选项 {other:?}")),
-            _ => positional.push(a.clone()),
-        }
-    }
-    if positional.len() != 2 {
-        return Err(format!(
-            "需要两个位置参数 <in.smd> <out.phy>，实际给了 {} 个",
-            positional.len()
-        ));
-    }
+    let mass = match m.get_one::<String>("mass") {
+        Some(v) => v
+            .parse::<f32>()
+            .map_err(|_| format!("--mass 不是合法浮点数：{v:?}"))?,
+        None => 1.0,
+    };
+    // `--decompose` 是 `--vhacd` 的旧别名：保留以免破坏既有脚本，
+    // 但**语义已明确**为 VHACD（非官方），不是 `$concave`。
+    let vhacd = m.get_flag("vhacd") || m.get_flag("decompose");
     Ok(PhyArgs {
-        input: PathBuf::from(&positional[0]),
-        output: PathBuf::from(&positional[1]),
+        input: PathBuf::from(m.get_one::<String>("input").expect("required")),
+        output: PathBuf::from(m.get_one::<String>("output").expect("required")),
         checksum,
         mass,
-        surface_prop,
-        concave,
+        surface_prop: m
+            .get_one::<String>("surfaceprop")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string()),
+        concave: m.get_flag("concave"),
         vhacd,
-        ragdoll,
+        ragdoll: m.get_flag("ragdoll"),
     })
 }
 
@@ -857,8 +831,8 @@ fn parse_u32(s: &str) -> Result<u32, String> {
 ///
 /// 存在的意义是**让 PHY 写出能脱离完整模型编译独立测试**：只要有任意一个
 /// SMD 就能产出一个可被 `validate-final.js` 校验的碰撞文件。
-fn phy_cmd(argv: &[String]) -> ExitCode {
-    let args = match parse_phy_args(argv) {
+fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
+    let args = match phy_args_from(m) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("错误：{e}");
