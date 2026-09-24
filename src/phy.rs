@@ -3224,7 +3224,7 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             ));
         }
         let node_len = solid_end - node_off;
-        if node_len % LEDGETREE_NODE_SIZE != 0 {
+        if !node_len.is_multiple_of(LEDGETREE_NODE_SIZE) {
             return bad(format!("solid[{si}] 树区长度 {node_len} 不是 28 的倍数"));
         }
         let node_count = node_len / LEDGETREE_NODE_SIZE;
@@ -3332,7 +3332,7 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
         // ---- 共享点数组正好填满 [最后一个 ledge 结束, 树起点) ----
         let shared_base = cursor;
         // 约束 10：16 字节对齐。
-        if (node_off - shared_base) % POINT_SIZE != 0 {
+        if !(node_off - shared_base).is_multiple_of(POINT_SIZE) {
             return bad(format!("solid[{si}] 共享点数组不是 16 字节对齐"));
         }
         let n_points = (node_off - shared_base) / POINT_SIZE;

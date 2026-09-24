@@ -716,14 +716,20 @@ end
         assert_eq!(s.triangles[0].vertices[0].links[0].weight, 1.0);
     }
 
-    /// 真实文件验证（存在则跑，不存在则跳过并打印）。
+    /// 真实文件验证。
+    ///
+    /// ⚠️ **标了 `#[ignore]`**（需要真实反编译 SMD）。手动跑：
+    /// `cargo test --release -- --ignored`
     #[test]
+    #[ignore = "需要真实反编译 SMD（MDLC_TEST_SMD）"]
     fn parses_real_decompiled_smd() {
-        let p = r"D:\GITHUB\plank\target\decompile-sample\body2_model0.smd";
-        let Ok(text) = std::fs::read_to_string(p) else {
-            eprintln!("跳过：找不到真实素材 {p}");
-            return;
-        };
+        let p = crate::test_assets::require(
+            "MDLC_TEST_SMD",
+            r"D:\GITHUB\plank\target\decompile-sample\body2_model0.smd",
+            "真实反编译 SMD（body2_model0.smd）",
+        );
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
         let s = parse_smd(&text).expect("真实 SMD 必须能解析");
         assert_eq!(s.version, 1);
         assert_eq!(s.nodes.len(), 89);

@@ -871,13 +871,18 @@ mod tests {
     /// **核心判据**：官方模型的 `quat` 必须能被逐骨骼复现。
     ///
     /// `quat` 是引擎 `InitPose` 直接读的字段，写 0 是非法四元数。
+    ///
+    /// ⚠️ **标了 `#[ignore]`**（需要官方 `v_autoshotgun.mdl`）。手动跑：
+    /// `cargo test --release -- --ignored`
     #[test]
+    #[ignore = "需要真实素材 v_autoshotgun.mdl（MDLC_TEST_MDL）"]
     fn real_model_quat_matches_official() {
-        let p = r"D:\GITHUB\plank\examples\v_autoshotgun.mdl";
-        let Ok(b) = std::fs::read(p) else {
-            eprintln!("跳过：找不到真实素材 {p}");
-            return;
-        };
+        let p = crate::test_assets::require(
+            "MDLC_TEST_MDL",
+            r"D:\GITHUB\plank\examples\v_autoshotgun.mdl",
+            "官方 v_autoshotgun.mdl",
+        );
+        let b = std::fs::read(&p).unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
         let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let bone_off = g(0xA0) as usize;
@@ -944,13 +949,18 @@ mod tests {
     ///
     /// 这条测试就是为上面那个「欧拉约定写反」的 bug 设的 ——
     /// 它会在 89 根骨骼上全部失败，而任何只看合成数据的测试都发现不了。
+    ///
+    /// ⚠️ **标了 `#[ignore]`**（需要官方 `v_autoshotgun.mdl`）。手动跑：
+    /// `cargo test --release -- --ignored`
     #[test]
+    #[ignore = "需要真实素材 v_autoshotgun.mdl（MDLC_TEST_MDL）"]
     fn real_model_pose_to_bone_matches_official() {
-        let p = r"D:\GITHUB\plank\examples\v_autoshotgun.mdl";
-        let Ok(b) = std::fs::read(p) else {
-            eprintln!("跳过：找不到真实素材 {p}");
-            return;
-        };
+        let p = crate::test_assets::require(
+            "MDLC_TEST_MDL",
+            r"D:\GITHUB\plank\examples\v_autoshotgun.mdl",
+            "官方 v_autoshotgun.mdl",
+        );
+        let b = std::fs::read(&p).unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
         let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let bone_off = g(0xA0) as usize;

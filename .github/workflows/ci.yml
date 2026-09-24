@@ -1,0 +1,93 @@
+name: CI
+
+# 目标：让「别人克隆下来能构建、能跑测试」变成**持续验证的事实**，
+# 而不是 README 里的一句声称。
+#
+# 本仓库的差分验证依赖仓库外的素材（官方 studiomdl 产物、L4D2 语料），
+# 那些**不在 CI 里跑** —— 6 个需要素材的测试已标 `#[ignore]`，
+# 默认测试套件不碰任何外部文件（见 README「测试」一节）。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 让 CI 的失败信息更可读，并统一 lint 级别。
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 是主要开发/验证平台；Linux 用来证明**代码本身可移植**
+        # （没有平台专有 API）。macOS 未纳入：meshopt 要编 vendored C++，
+        # 且本项目面向 Source 引擎的 Windows 工具链。
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # meshopt 会编 vendored C++，需要 C++ 工具链。
+      # ubuntu-latest 自带 gcc/g++；windows-latest 自带 MSVC。这里只做确认。
+      - name: 确认 C++ 工具链可用
+        if: runner.os == 'Linux'
+        run: g++ --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --release --locked
+
+      # 526 个测试，**不需要任何外部素材**。
+      # 需要素材的 6 个已 #[ignore]，结果行会显示 "6 ignored"。
+      - name: cargo test
+        run: cargo test --release --locked
+
+      # profiling feature 也必须能编过（探针配置的回归纪律）。
+      - name: cargo test（profiling feature）
+        run: cargo test --release --locked --features profiling
+
+      - name: cargo clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: cargo clippy（profiling feature）
+        run: cargo clippy --release --all-targets --locked --features profiling -- -D warnings
+
+  msrv:
+    name: MSRV（Cargo.toml 的 rust-version 必须是真的）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ⚠️ 这条 job 存在的理由：Cargo.toml 曾把 rust-version 写成 1.85，
+      # 而源码里用了 `let`-chains（1.88 才稳定）—— **声称的 MSRV 是假的**。
+      # 这里用 Cargo.toml 里声明的版本实际编一遍，防止再次跑偏。
+      - name: 读出声明的 MSRV
+        id: msrv
+        shell: bash
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml 声明 MSRV = $v"
+
+      - name: 安装该工具链
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 用声明的 MSRV 构建 + 测试
+        run: |
+          cargo build --release --locked
+          cargo test --release --locked

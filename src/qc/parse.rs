@@ -694,10 +694,10 @@ impl<'a> Parser<'a> {
                 if depth == 0 {
                     break;
                 }
-            } else if depth == 2 {
-                if let Some(g) = groups.last_mut() {
-                    g.push(t.text);
-                }
+            } else if depth == 2
+                && let Some(g) = groups.last_mut()
+            {
+                g.push(t.text);
             }
         }
         // 官方只支持**一个** `$texturegroup`（`g_numtexturegroups` 递增，
@@ -2757,18 +2757,18 @@ impl<'a> Parser<'a> {
                 if parent_of.contains_key(&key) {
                     continue;
                 }
-                if n.parent >= 0 {
-                    if let Some(par) = smd.nodes.get(n.parent as usize) {
-                        parent_of.insert(key, par.name.clone());
-                    }
+                if n.parent >= 0
+                    && let Some(par) = smd.nodes.get(n.parent as usize)
+                {
+                    parent_of.insert(key, par.name.clone());
                 }
             }
         }
         for b in &mut bones {
-            if b.parent.is_none() {
-                if let Some(p) = parent_of.get(&b.name.to_ascii_lowercase()) {
-                    b.parent = Some(p.clone());
-                }
+            if b.parent.is_none()
+                && let Some(p) = parent_of.get(&b.name.to_ascii_lowercase())
+            {
+                b.parent = Some(p.clone());
             }
         }
         // 注：拓扑排序在字段回填之后做（见 `sort_parents_first`）。

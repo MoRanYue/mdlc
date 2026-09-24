@@ -1727,12 +1727,18 @@ smd = "myprop-ref.smd"
     }
 
     /// 与真实 studiomdl 产物对照：结构字段必须逐项一致。
+    ///
+    /// ⚠️ **标了 `#[ignore]`**（需要官方 `.dx90.vtx`）。手动跑：
+    /// `cargo test --release -- --ignored`
     #[test]
-    fn matches_studiomdl_reference_layout() {        let p = r"E:\SteamLibrary\steamapps\common\Left 4 Dead 2\left4dead2\models\mymod\myprop.dx90.vtx";
-        let Ok(refb) = std::fs::read(p) else {
-            eprintln!("跳过：找不到 studiomdl 参考产物 {p}");
-            return;
-        };
+    #[ignore = "需要官方 myprop.dx90.vtx（MDLC_TEST_VTX）"]
+    fn matches_studiomdl_reference_layout() {
+        let p = crate::test_assets::require(
+            "MDLC_TEST_VTX",
+            r"E:\SteamLibrary\steamapps\common\Left 4 Dead 2\left4dead2\models\mymod\myprop.dx90.vtx",
+            "官方 studiomdl 产物 myprop.dx90.vtx",
+        );
+        let refb = std::fs::read(&p).unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
         let c = minimal();
         let out = write_vtx(&c).unwrap();
         let b = &out.bytes;

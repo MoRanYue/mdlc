@@ -2342,7 +2342,7 @@ fn write_ik_rules(
     anim_data.resize(block_start + rules.len() * IK_RULE_SIZE, 0);
     // ② `ALIGN4(pData)`（`write.cpp:865`）—— 152 是 4 的倍数，所以这步
     //    只在数组起点不是 4 对齐时才移动游标。
-    while anim_data.len() % 4 != 0 {
+    while !anim_data.len().is_multiple_of(4) {
         anim_data.push(0);
     }
 
@@ -2411,7 +2411,7 @@ fn write_ik_rules(
             attachment_patches.push((at + 0x78, s - at));
         }
         // ⑤ `ALIGN4(pData)`（`write.cpp:953`）—— 只有写过载荷才会到这里。
-        while anim_data.len() % 4 != 0 {
+        while !anim_data.len().is_multiple_of(4) {
             anim_data.push(0);
         }
     }
@@ -3252,7 +3252,7 @@ pub fn write_animations(
             (seq.events.len() as i32, sub_base_rel + off as i32)
         };
         // ③ `ALIGN4(pData)`（`write.cpp:524`）—— 无条件执行。
-        while seq_subtables.len() % 4 != 0 {
+        while !seq_subtables.len().is_multiple_of(4) {
             seq_subtables.push(0);
         }
 
@@ -3377,7 +3377,7 @@ pub fn write_animations(
         }
         // ⑦ `ALIGN4(pData)`（`write.cpp:603`）—— **无条件执行**，
         // 即使 `numiklocks == 0` 也走（0 条时游标本就 4 对齐，是 no-op）。
-        while seq_subtables.len() % 4 != 0 {
+        while !seq_subtables.len().is_multiple_of(4) {
             seq_subtables.push(0);
         }
 
@@ -3406,7 +3406,7 @@ pub fn write_animations(
             }
         }
         // ⑨ `ALIGN4(pData)`（`write.cpp:616`）
-        while seq_subtables.len() % 4 != 0 {
+        while !seq_subtables.len().is_multiple_of(4) {
             seq_subtables.push(0);
         }
 
@@ -3793,7 +3793,7 @@ pub fn write_animations(
                 let rules = build_ik_rules(compiled, spec, bone_parents)?;
                 // `WriteIkErrors` 的 `ALIGN4` 无条件执行（`abi8` 实测块长
                 // 68 = align4(66)），所以载荷末尾总是补齐到 4 的倍数。
-                while payload.len() % 4 != 0 {
+                while !payload.len().is_multiple_of(4) {
                     payload.push(0);
                 }
                 if rules.is_empty() {

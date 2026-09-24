@@ -57,6 +57,9 @@ pub mod prof;
 pub mod qc;
 pub mod smd;
 pub mod tangent;
+/// 真实素材测试的路径解析（**仅测试**，`#[cfg(test)]`）。
+#[cfg(test)]
+pub mod test_assets;
 pub mod vta;
 pub mod vtx_writer;
 pub mod vvd;
@@ -127,16 +130,14 @@ mod tests {
 
     /// 官方 L4D2 模型：`v_autoshotgun.vvd`，实测的头部字段。
     /// 这些常量是**独立于实现**记录下来的实测值，用来防止实现与测试一起跑偏。
-    const REAL_VVD: &str = r"D:\GITHUB\plank\examples\v_autoshotgun.vvd";
+    ///
+    /// 路径解析见 [`crate::test_assets`] —— 环境变量 `MDLC_TEST_VVD` 优先。
+    const REAL_VVD_DEFAULT: &str = r"D:\GITHUB\plank\examples\v_autoshotgun.vvd";
     const REAL_MDL_CHECKSUM: i32 = -1709441603;
     const REAL_VERTEX_COUNT: usize = 388765;
     const REAL_FILE_LEN: usize = 24_881_024;
     const REAL_VERTEX_DATA_START: i32 = 64;
     const REAL_TANGENT_DATA_START: i32 = 18_660_784;
-
-    fn real_vvd() -> Option<Vec<u8>> {
-        std::fs::read(REAL_VVD).ok()
-    }
 
     /// 构造一个最小可用的合成 VVD（不依赖真实素材，CI 也能跑）。
     fn synth(checksum: i32, count: usize) -> Vvd {
@@ -353,14 +354,21 @@ mod tests {
 
     /// **核心判据**：官方 L4D2 模型的往返必须逐字节相同。
     ///
-    /// 素材不存在时跳过（而不是伪造通过）—— 缺失会打印出来，
-    /// 不会静默变成绿色。
+    /// ⚠️ **标了 `#[ignore]`**（需要仓库外的真实素材）。手动跑：
+    /// `cargo test --release -- --ignored`
+    ///
+    /// 素材缺失时**失败**而不是静默跳过 —— 既然被显式要求跑，就该报错。
+    /// （旧版用「读不到就 `return`」，在默认输出里显示成 `ok`，看起来像
+    /// 验过了，实际什么也没验。）
     #[test]
+    #[ignore = "需要真实素材 v_autoshotgun.vvd（MDLC_TEST_VVD）"]
     fn real_l4d2_vvd_round_trips_byte_for_byte() {
-        let Some(buf) = real_vvd() else {
-            eprintln!("跳过：找不到真实素材 {REAL_VVD}");
-            return;
-        };
+        let buf = std::fs::read(crate::test_assets::require(
+            "MDLC_TEST_VVD",
+            REAL_VVD_DEFAULT,
+            "官方 v_autoshotgun.vvd",
+        ))
+        .expect("应能读取 MDLC_TEST_VVD");
 
         // 先用独立记录的实测常量锚定解析结果。
         let parsed = Vvd::parse(&buf).expect("官方 VVD 必须能解析");
@@ -389,19 +397,25 @@ mod tests {
     /// **多 LOD + fixup 的核心判据**：真实语料里全部带 fixup 的 VVD
     /// 必须逐字节往返。
     ///
-    /// 语料在 `D:\DSH\L4D2ReverseEngineering\mdl-corpus\`（3333 个真实模型，
-    /// 其中 53 个带 fixup、230 个多 LOD）。素材不存在时**跳过并打印**，
-    /// 不伪造通过。
+    /// 语料默认在 `D:\DSH\L4D2ReverseEngineering\mdl-corpus\`（3333 个真实
+    /// 模型，其中 53 个带 fixup、230 个多 LOD）；可用环境变量
+    /// `MDLC_TEST_CORPUS` 覆盖。
     ///
     /// 实测结果（本机）：**53/53 逐字节相同**，另有 230 个多 LOD 模型
     /// （含 177 个 `numFixups == 0` 的单 mesh 形态）也全部往返一致。
+    ///
+    /// ⚠️ **标了 `#[ignore]`**（需要仓库外的语料）。手动跑：
+    /// `cargo test --release -- --ignored`
     #[test]
+    #[ignore = "需要真实语料（MDLC_TEST_CORPUS）"]
     fn real_fixup_vvds_round_trip_byte_for_byte() {
-        const CORPUS: &str = r"D:\DSH\L4D2ReverseEngineering\mdl-corpus";
-        if !std::path::Path::new(CORPUS).is_dir() {
-            eprintln!("跳过：找不到语料 {CORPUS}");
-            return;
-        }
+        const CORPUS_DEFAULT: &str = r"D:\DSH\L4D2ReverseEngineering\mdl-corpus";
+        let corpus = crate::test_assets::require(
+            "MDLC_TEST_CORPUS",
+            CORPUS_DEFAULT,
+            "真实语料目录（3333 个 .mdl 及其 .vvd）",
+        );
+        let corpus = corpus.as_path();
         // 递归收集 .vvd。
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
@@ -420,11 +434,12 @@ mod tests {
             }
         }
         let mut files = Vec::new();
-        walk(std::path::Path::new(CORPUS), &mut files);
-        if files.is_empty() {
-            eprintln!("跳过：{CORPUS} 里没有 .vvd");
-            return;
-        }
+        walk(corpus, &mut files);
+        assert!(
+            !files.is_empty(),
+            "语料目录 {} 里没有 .vvd —— 路径指错了？",
+            corpus.display()
+        );
 
         let mut total = 0usize;
         let mut with_fixup = 0usize;

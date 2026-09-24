@@ -1,9 +1,26 @@
-﻿# mdlc — Source 引擎模型编译器（studiomdl 重写的 MVP）
+# mdlc — Source 引擎模型编译器（studiomdl 重写的 MVP）
 
 把 **TOML 描述文件 + SMD 网格**编译成 Source 引擎能加载的 `.mdl` + `.vvd`。
 
 本工程是 `studiomdl.exe` 重写的**第一阶段**：先打通「描述 + 网格 → 二进制」
 这条主动脉，用真实编译器做参照物逐字段对齐，再逐步扩展覆盖面。
+
+- **构建**：Rust **1.89+**（源码用了 `let`-chains，1.88 才稳定；`edition 2024`）
+- **平台**：无平台专有 API，代码本身可移植；开发与验证在 Windows 上进行
+- **许可证**：[GPL-3.0-only](LICENSE)
+
+```powershell
+git clone https://github.com/MoRanYue/mdlc.git
+cd mdlc
+cargo build --release
+cargo test --release        # 526 passed / 0 failed（不需要任何外部素材）
+```
+
+> ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），
+> 依据的是 Source SDK 头文件、公开格式文档，以及对官方产物的**实测**。
+> 它**不包含**任何 Valve 的二进制或美术资源。使用它编译的模型若要分发，
+> 请自行确认你拥有相应素材的权利。Source 引擎与 `studiomdl` 是
+> Valve Corporation 的商标/作品，本项目与之无隶属关系。
 
 ## 职责划分（与 QC 一致）
 
@@ -17,7 +34,13 @@
 `v_autoshotgun` 有 388,765 个），内联会让描述文件膨胀到几百 MB
 且无法用文本工具处理。描述文件只**引用** SMD。
 
+> 输入格式有 **两套并存**：TOML（自有，主线）与 **QC**（`build-qc` /
+> `qc2toml`，与官方 QC 脚本兼容）。两者共用同一个 IR。
+
 ## 当前状态
+
+> 下表每一项都有**对真实 `studiomdl.exe` 产物的差分判据**，不是「按结构定义
+> 写完就算」。判据脚本在 `docs/_probe/`（该目录未进仓库，见下「测试」一节）。
 
 | 项 | 状态 |
 |---|---|
@@ -32,17 +55,47 @@
 | **`$attachment`** | ✅ **全部字段一致**（含 `local` 矩阵） |
 | **`$bonemerge` + 骨骼 flags 按用途计算** | ✅ **与官方逐位相同**（如 `0x40700`） |
 | **动画 / 序列（`$sequence`）** | ✅ **动画链语义与官方完全一致**（见下） |
-| 骨骼 `poseToBone` | ✅ 官方模型 89 根骨骼**逐骨骼吻合**（误差 < 1e-3） |
-| 骨骼 `quat` | ✅ 与官方**逐位相同**（`[0.7071066,0,0,0.7071069]`） |
-| VVD 写出 | ✅ 布局自检通过 |
-| 真实规模编译 | ✅ 89 骨骼 / 22,911 三角形 / 5 万顶点，0.21 秒 |
-| QC 解析 | ❌ 未实现（MVP 刻意用 TOML，见下） |
-| flex / PHY | ❌ 未实现 |
-| **LOD 的自动生成（简化网格）** | ❌ 未实现 —— 只支持**输入**多 LOD，不做 decimate |
+| 骨骼 `poseToBone` / `quat` | ✅ 官方模型 89 根骨骼**逐骨骼吻合** |
+| **QC 解析** | ✅ **已实现**（`src/qc/`；`qc2toml` / `build-qc` 可用。以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准，见 [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md)） |
+| **flex（`.vta` 形状）** | ✅ 已实现（`src/flex.rs` + `src/vta.rs`） |
+| **PHY 碰撞模型** | ✅ 已实现（`phy` 子命令；凸包 / `$concave` / `$collisionjoints`） |
+| **`.phy` 写出** | ✅ 自检通过（`phy::check_invariants`） |
+| **数值上限** | ✅ 只保留**格式可表示**的上限，**不复刻 studiomdl 的人为限制**（见下） |
+| **`studiomdl` 兼容 CLI** | ✅ `mdlc -game <gamedir> <x.qc>`，可直接替换 Crowbar 的编译器路径 |
+| **LOD 的自动生成（简化网格 / decimate）** | ❌ **未实现** —— 只支持**输入**多 LOD |
+| DMX 输入 | ❌ 刻意不实现（`$nekomodel` / `studio "x.dmx"` 显式报错） |
 
-> **三件套齐全**：`.mdl` + `.vvd` + `.dx90.vtx` 都已产出并通过布局自检。
+> **三件套齐全**：`.mdl` + `.vvd` + `.dx90.vtx` 都已产出并通过布局自检
+> （带 `$collisionmodel` 时另有 `.phy`）。
 > 特性差距的完整清单（137 条 QC 命令逐组对照、8 层分解、拦路虎）
-> 见 [`docs/feature-gap.md`](docs/feature-gap.md)。
+> 见 [`docs/feature-gap.md`](docs/feature-gap.md) 与
+> [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md)。
+
+### 数值上限：只保留格式能表示的那些
+
+studiomdl 里有一批**人为**上限（例如单 SMD 65536 顶点、材质 32 个），
+它们不是文件格式的约束。本实现**不复刻**这些限制，只保留格式本身
+表示不了的上限：
+
+| 维度 | 上限 | 依据 |
+|---|---|---|
+| 被引用的骨骼**下标** | **127** | VVD `mstudiovertex_t.bone[]` 是**有符号** `char` |
+| 骨骼**总数** | **256** | 动画链 `mstudioanim_t.bone` 是 `byte` |
+| 每 **mesh** 顶点 | **65536** | VTX `Vertex_t.origMeshVertID` 是 `unsigned short` |
+| 每 **model** 顶点 | **44,739,242** | `vertexindex` 是 int32 字节偏移 ÷ 48 |
+| **材质**表条数 | **32768** | `short pSkinref[]` 是**有符号** `short` |
+| **三角形**数 | 无上限 | VTX `numIndices` 是 int32 |
+| **LOD** 档数 | 8 | `MAX_NUM_LODS` |
+
+> ⚠️ **约束的是「被引用的骨骼下标」，不是「骨骼总数」。**
+> 早期版本误把「总数 ≤ 128」当格式约束，结果**打死真实模型**
+> （`linnea-export` 有 134 根骨骼，但只引用到下标 118）。
+> **没被引用的骨骼不占 VVD 下标空间。**
+>
+> ⚠️ 「每 mesh 顶点 ≤ 65536」的**粒度是 mesh（= 一个材质）**，
+> 不是 bodypart：加一个材质就多一个 mesh，各自独立计数，
+> **不需要手工把 SMD 拆开**。
+
 
 ### 切线、多 LOD、fixup（实测报告）
 
@@ -297,6 +350,8 @@ QC 有约 140 条命令、多套块语法、宏展开、`$include` 与 `$pushd/$
 
 ## 用法
 
+### mdlc 自有形态
+
 ```powershell
 cargo build --release
 
@@ -309,17 +364,47 @@ cargo build --release
 # 编译（产出 .mdl + .vvd + .dx90.vtx）
 .\target\release\mdlc.exe build myprop.toml --out .\out
 
+# 直接用 QC 编译（等价于 qc2toml 之后再 build，中间描述不落盘）
+.\target\release\mdlc.exe build-qc myprop.qc --out .\out
+
+# QC → TOML（只转文本，不编译；用于迁移或人工核对）
+.\target\release\mdlc.exe qc2toml myprop.qc --out myprop.toml
+
+# SMD 三角形 → 凸包 → .phy 碰撞文件
+.\target\release\mdlc.exe phy body.smd out.phy --concave --ragdoll
+
 # 布局判据：官方 VVD 读入再写出必须逐字节相同
 .\target\release\mdlc.exe vvd-roundtrip <官方.vvd>
 ```
 
-### 三个一键回归脚本
+### 官方 `studiomdl` 兼容形态（可直接替换 Crowbar 的编译器）
+
+```powershell
+.\target\release\mdlc.exe -game "<gamedir>" [-nop4] [-verbose] myprop.qc
+```
+
+产物写到 `<gamedir>\models\<$modelname>` —— 与官方 `studiomdl` 的规则一致
+（`write.cpp:1321-1331`）。
+
+**为什么需要它**：[Crowbar](https://github.com/ZeqMacaw/Crowbar) 把编译器路径
+当**不透明配置项**，只传
+`-game "<gamedir>" <选项> "<qc 文件名>"` 并把 CWD 设为 QC 所在目录；
+它的成败判定只有两条 —— ① 编译器有输出；②
+`<gamedir>\models\<$modelname>.mdl` 存在。**它不看退出码，也不解析错误文本。**
+所以把 Crowbar 的「编译器路径」指向 `mdlc.exe` 即可直接替换。
+
+兼容层细节（官方是**单横线长选项**，而 clap 只认 `--long`，故需归一化）
+见 `src/cli.rs` 的模块文档。已知**未实现**的官方选项（`-minlod`、
+`-striplods`、`-definebones`、`-t`、`-a`）会**警告并忽略**，不会静默改变产物。
+
+### 回归脚本
 
 ```powershell
 .\verify_parity.ps1    # 同一几何：mdlc vs 真实 studiomdl，逐字段对照
 .\cmp_features.ps1     # hitbox / attachment / bonemerge 三项的逐字段对照
 ```
 
+> ⚠️ 这两个脚本**未进仓库**（见「测试」一节的说明），只在开发机上存在。
 > `cmp_features.ps1` 需要先用 studiomdl 编译 `parity\myprop.qc`
 > （`verify_parity.ps1` 会做这件事），再用
 > `mdlc build parity\hb.toml --out parity\hb` 生成对照产物。
@@ -638,27 +723,88 @@ node docs\_probe\vpk_extract.js `
 ## 测试
 
 ```powershell
-cargo test
+cargo test --release          # 526 passed / 0 failed / 6 ignored
 ```
 
-212 个测试，覆盖：TOML 解析与校验（含各类非法输入）、
-各结构体偏移与大小的**硬编码断言**（防止实现与测试一起跑偏）、
+**526 个测试默认全跑**，不需要任何外部素材，覆盖：TOML 解析与校验（含各类
+非法输入）、各结构体偏移与大小的**硬编码断言**（防止实现与测试一起跑偏）、
 相对/绝对偏移语义、字符串池规范化、官方 VVD 的逐字节往返、
 **切线算法**（轴对齐四边形 / 手性翻转 / 共享顶点累加 / 退化 UV / 孤立顶点）、
-以及**多 LOD 与 fixup**（排序不变式、分段铺满、fixup 分组、
-单 mesh 不做 fixup、VTX 的 `origMeshVertID` 范围）。
+**多 LOD 与 fixup**（排序不变式、分段铺满、fixup 分组、单 mesh 不做 fixup、
+VTX 的 `origMeshVertID` 范围）、**QC 词法/语法**、**flex/VTA**、**PHY**。
 
-其中一个测试会**扫描真实语料**（`D:\DSH\L4D2ReverseEngineering\mdl-corpus\`，
-3302 个 VVD）并逐个做逐字节往返；语料不存在时跳过并打印，不伪造通过。
+### 6 个需要真实素材的测试（默认 `#[ignore]`）
 
-## 后续阶段（按可验证性排序）
+另有 6 个测试拿**真实 `studiomdl.exe` 产物**做判据。这些素材**不能进仓库**
+（体量大、含 Valve 版权内容），所以它们标了 `#[ignore]` ——
+默认 `cargo test` **不跑**，结果行里显示 `6 ignored`：
 
-1. **QC 解析 → 同一 IR**（写出器不用改）
-2. `studiohdr2` 与 hitbox set —— 差分里最容易补上的两块
-3. 序列与动画（`mstudioseqdesc_t` / `mstudioanimdesc_t` / 位流编码）
-4. flex / eyeball / mouth / ik / attachment
-5. **VTX**（strip 与 LOD 生成是最黑盒的一块）
-6. PHY（可先委托 `vphysics` 或外部工具）
+```powershell
+cargo test --release -- --ignored        # 显式跑它们
+```
+
+素材用**环境变量**指定（不设则回退到开发机的历史路径）：
+
+| 环境变量 | 素材 |
+|---|---|
+| `MDLC_TEST_VVD` | 官方 `v_autoshotgun.vvd`（388,765 顶点 / 24.8 MB） |
+| `MDLC_TEST_MDL` | 官方 `v_autoshotgun.mdl`（89 骨骼） |
+| `MDLC_TEST_SMD` | 真实反编译 SMD（22,911 三角形） |
+| `MDLC_TEST_VTX` | 官方 `myprop.dx90.vtx`（由 `studiomdl` 编译 `parity/myprop.qc` 得到） |
+| `MDLC_TEST_CORPUS` | 真实语料根目录（3333 个 `.mdl` / 3302 个 `.vvd`） |
+
+```powershell
+$env:MDLC_TEST_CORPUS = 'D:\somewhere\mdl-corpus'
+cargo test --release -- --ignored
+```
+
+> ⚠️ **为什么用 `#[ignore]` 而不是「读不到就 `return`」。**
+> 后者在 `cargo test` 的默认输出里**显示成 `ok`**（跳过的 stderr 被测试
+> 框架吞掉），看起来像「验过了」，实际什么也没验 ——
+> **一个恒真的测试比没有测试更危险**。改成 `#[ignore]` 后，
+> 「跳过」与「通过」在结果行里**不再混淆**：显式跑它们时素材缺失会**失败**
+> 并打印该设哪个环境变量，而不是静默变绿。
+>
+> 这个改动**当场就抓到了**：本机 `D:\GITHUB\plank\examples\` 已被清理，
+> 其中 4 个测试的素材早已不存在 —— 它们此前一直以 `ok` 出现在结果里。
+
+### 验证方法：差分对照，不是自证
+
+每项特性的验收都是**与真实 `studiomdl.exe` 的产物逐字段对照**，
+而不是「单元测试全绿」。核心脚本（**未进仓库**，见下）：
+
+| 脚本 | 作用 |
+|---|---|
+| `docs/_probe/parity_snapshot.js` | 全量编译 101 个 TOML 并出快照；`--compare` 逐字节比两次快照 |
+| `docs/_probe/cmp_crowbar_alias.js` | 与真 `studiomdl.exe` **同参数**对照兼容 CLI 的产物路径与文件集 |
+| `docs/_probe/qc_vs_official.js` | 同一批 QC 分别喂 mdlc 与官方，比「谁能编过」 |
+
+> ⚠️ **`docs/_probe/`、`parity/`、`out/` 与两个 `*.ps1` 回归脚本都未进仓库**
+> （`.gitignore` 里写明了理由：体量大、含 L4D2 解包素材）。
+> 因此本 README 与源码注释里对它们的引用，在**只克隆本仓库时是悬空的** ——
+> 它们描述的是**验证过程**，不是运行本程序的依赖。
+> 重建方式见 `.gitignore` 各条目的说明。
+
+### 变异测试（证明测试不是空洞的）
+
+新增或修改差分测试后，会把被测代码**故意改坏**，确认测试变红。
+本项目已被「测试全绿但改坏了也全绿」坑过多次，所以这是**必做收尾**。
+最近一轮（CLI 兼容层）10/10 处变异全部被捕获，且 oracle 探针自身也做了
+变异验证（改坏 `official_out_root` ⟹ 探针从 2/2 变 0/2）。
+
+## 后续阶段
+
+已完成的（QC 前端、动画、flex、VTX、PHY、hitbox/attachment/bonemerge、
+`studiomdl` 兼容 CLI）见上「当前状态」。**剩下的大块**：
+
+1. **LOD 的自动生成**（网格简化 / decimate）—— 目前只支持**输入**多 LOD，
+   不做简化。这是与官方 `studiomdl` 差距最大的一块。
+2. `-definebones`（Crowbar 勾选「Define Bones」时用到：从 SMD 推导骨骼并
+   打印 `$definebone` 行）。
+3. `-minlod` / `-striplods`（按官方语义截断 LOD；现在传了会**警告并忽略**）。
+4. `-t` / `-a` 等官方纹理替换与法线混合角选项。
+5. DX8/DX7 回退变体（官方额外产出 `.dx80.vtx` / `.sw.vtx`；L4D2 是 DX9 引擎，
+   目前只产 `.dx90.vtx`）。
 
 ### 已知的语义等价差异（不必追）
 

@@ -5,8 +5,20 @@
 name = "mdlc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Source 引擎模型编译器（studiomdl 重写的 MVP 探针）"
+# ⚠️ **不能低于 1.88** —— 源码里用了 `let`-chains（`if let A && let B`，
+# 共 18 处），该特性在 Rust 1.88.0 才稳定
+# （https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/）。
+# 原先写 1.85 是**错的**（1.85 只满足 edition 2024，不满足 let-chains）。
+rust-version = "1.89"
+description = "Source 引擎模型编译器 —— studiomdl.exe 的 Rust 重写（MDL/VVD/VTX/PHY）"
+# GPL-3.0 是标准 SPDX 表达式，所以**只用 `license`**；
+# 再加 `license-file` 会让 cargo 报「only one of license or license-file
+# is necessary」。`LICENSE` 文件本身仍在仓库根目录（GPL 要求随附全文）。
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/MoRanYue/mdlc"
+keywords = ["source-engine", "studiomdl", "mdl", "vvd", "vtx"]
+categories = ["command-line-utilities", "game-development", "parser-implementations"]
 
 [dependencies]
 # CLI 解析。`default-features = false` 关掉了彩色输出 / 终端探测
@@ -21,7 +33,9 @@ clap = { version = "4.6.7", default-features = false, features = [
 ] }
 indexmap = { version = "2", features = ["serde"] }
 meshopt = "0.6.2"
-parry3d = "0.31.0"
+# ⚠️ 0.31.0 **已被 crates.io yank**（`cargo package` 会警告）。
+# 锁定文件里仍是 0.31.0（仍可构建），但新解析会取 0.31.1 —— 用 0.31.1 消警告。
+parry3d = "0.31.1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
