@@ -5328,10 +5328,15 @@ mod tests {
             "三条序列的权重全为 1，应复用同一块"
         );
         // 子表区里只有 1 份权重（4 字节）+ 3 份 blend(2B)+对齐。
+        //
+        // 用 `as_chunks::<4>()` 而不是 `chunks_exact(4)`：后者对定长块会触发
+        // `clippy::chunks_exact_to_as_chunks`（CI 的 `-D warnings` 会当错误）。
         let weight_bytes = out
             .seq_subtables
-            .chunks_exact(4)
-            .filter(|c| c == &1.0f32.to_le_bytes())
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|c| **c == 1.0f32.to_le_bytes())
             .count();
         assert_eq!(weight_bytes, 1, "权重只应出现一次");
     }

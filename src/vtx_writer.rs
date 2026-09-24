@@ -243,8 +243,12 @@ fn optimize_group_indices(
         )));
     }
 
+    // 用 `as_chunks::<3>()` 而不是 `chunks_exact(3)`：后者对定长块会触发
+    // `clippy::chunks_exact_to_as_chunks`（CI 的 `-D warnings` 会当错误）。
     let out: Vec<[u16; 3]> = optimized
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| {
             [
                 u16::try_from(c[0]).unwrap_or(u16::MAX),
