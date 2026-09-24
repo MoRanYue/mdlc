@@ -300,9 +300,9 @@ pub fn write_vtx(compiled: &CompiledModelDesc) -> Result<VtxWriteOutcome, VtxWri
 /// 把编译结果写成 VTX 字节，可指定 [`VtxOptions`]。
 ///
 /// 按是否有 LOD 数据分派：
-/// - **全部单 LOD** → [`write_vtx_single`]，与加多 LOD 支持之前**逐字节相同**
+/// - **全部单 LOD** → `write_vtx_single`，与加多 LOD 支持之前**逐字节相同**
 ///   （那条路径一行未改）；
-/// - **有 model 带 LOD** → [`write_vtx_multi`]。
+/// - **有 model 带 LOD** → `write_vtx_multi`。
 pub fn write_vtx_with(
     compiled: &CompiledModelDesc,
     opts: VtxOptions,

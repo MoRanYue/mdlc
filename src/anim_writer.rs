@@ -832,7 +832,7 @@ fn encode_vector48(t: [f32; 3]) -> [u8; 6] {
     out
 }
 
-/// [`float_to_half`] 的公开包装 —— 供 `mdl_writer` 写 VTA 的
+/// `float_to_half` 的公开包装 —— 供 `mdl_writer` 写 VTA 的
 /// `mstudiovertanim_t.delta`/`ndelta` 复用（**必须**与动画用同一套
 /// 舍入方式，否则同一数值在两处会编出不同的 half）。
 pub fn float_to_half_public(f: f32) -> u16 {
@@ -1051,7 +1051,7 @@ impl AnimWriteOutcome {
 ///
 /// `mdl_writer` 需要在写出动画**之前**算出 `anim_data` 的绝对位置
 /// （分段的 `ALIGN16` 要按绝对位置算），而那个位置依赖 animdesc 数量。
-/// 这里暴露出来避免把 [`anim_specs`] 的逻辑复制一份。
+/// 这里暴露出来避免把 `anim_specs` 的逻辑复制一份。
 pub fn anim_specs_len(compiled: &CompiledModelDesc) -> usize {
     anim_specs(compiled).len()
 }
@@ -1587,7 +1587,7 @@ pub enum AnimNameSource {
 ///
 /// 之所以在这里给出、而不是让 `mdl_writer` 自己按
 /// `sequences[].cells` 重算一遍：重算就是**同一规则的第二份实现**，
-/// 而它一旦与 [`anim_specs`] 的顺序分叉，症状是「动画数据对、
+/// 而它一旦与 `anim_specs` 的顺序分叉，症状是「动画数据对、
 /// 名字错」这种不会报错的静默损坏。
 pub fn anim_name_sources(compiled: &CompiledModelDesc) -> Vec<AnimNameSource> {
     if compiled.is_static_prop() {

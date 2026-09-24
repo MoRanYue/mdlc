@@ -24,7 +24,7 @@
 //! [`Lexer`] 只暴露按空白切的 `next_token`。表达式切分是空白切分的
 //! **细化**（一个空白分隔的 run 会裂成 ≥1 个表达式 token，且**永不跨
 //! 空白合并**），所以本模块的做法是：拉一个普通 token，再用
-//! [`split_expr_tokens`] 把它裂成表达式 token 队列。
+//! `split_expr_tokens` 把它裂成表达式 token 队列。
 //!
 //! ⚠️ 有一处**必须**额外处理：`#` 与 `//`。它们在普通词法器里
 //! **不结束** token（只有 `;` 会），所以 `%b#c` 是**一个**普通 token。
@@ -71,7 +71,7 @@
 //! 8. **`\\` 只按首字符判定。** C 是
 //!    `if (token[0] == '\\')` 然后要求下一个**普通** token 也以 `\`
 //!    开头 —— 所以 `\\foo` 是**合法**续行，而 `\foo` 报错。
-//!    见 [`ExprStream::take_continuation_confirm`]。
+//!    见 `ExprStream::take_continuation_confirm`。
 //!
 //! # 与 C 的**故意**差异（都是 C 的未定义行为，或本项目接口约束）
 //!

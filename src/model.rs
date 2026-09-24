@@ -298,7 +298,7 @@ pub const MAX_WEIGHT_LISTS: usize = 128;
 /// # 语义
 ///
 /// QC 的 `$jigglebone "bone" { is_flexible {…} is_rigid {…} has_base_spring {…} }`
-/// 三段各自独立，`flags` 按出现情况置位（见 [`JiggleFlags`] 的说明）。
+/// 三段各自独立，`flags` 按出现情况置位（见 [`JiggleBone`] 各字段的说明）。
 /// **角度输入是「度」，写盘转弧度**（`angle_constraint 60` → `π/3`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1154,7 +1154,7 @@ pub struct Sequence {
     /// | `activity` | **0** | -1 |
     /// | `paramindex` | **[0, 0]** | [-1, -1] |
     /// | `fadeintime`/`fadeouttime` | **0** | 0.2 |
-    /// | `bbmin`/`bbmax` | **[9999,9999,9999] / [-9999,…]** | 真实包围盒 |
+    /// | `bbmin`/`bbmax` | **`[9999,9999,9999]` / `[-9999,…]`** | 真实包围盒 |
     /// | `weightlist` | **全 0** | 全 1 |
     ///
     /// 那 7 个「不同」全部来自同一个原因：**`memset` 之后没人再动它**。
@@ -1424,7 +1424,7 @@ pub type BlendCellName = String;
 pub struct BlendParam {
     /// 参数名（必须与某个 `[[model.pose_parameters]].name` 相同）。
     ///
-    /// 也接受**直接写下标**（`"0"` / `"1"`）—— 与 [`crate::IkRule::chain`]
+    /// 也接受**直接写下标**（`"0"` / `"1"`）—— 与 [`IkRule::chain`]
     /// 的「名字或下标」惯例一致。
     pub parameter: String,
     /// 该轴的起始值（QC `blend` 的第二个数字）。
@@ -1540,7 +1540,7 @@ pub fn default_fade_time() -> f32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceEvent {
-    /// 事件发生的时间点，**归一化到 [0,1]**（不是帧号）。
+    /// 事件发生的时间点，**归一化到 `[0,1]`**（不是帧号）。
     ///
     /// 实测：studiomdl 把 QC 里的帧号除以 `numframes - 1`。
     pub cycle: f32,
@@ -3873,10 +3873,13 @@ impl CompiledModelDesc {
 }
 
 /// `mdlc template` 打印的最小模板（带注释，可直接改）。
-pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（MVP 输入格式，QC 适配在后续阶段）
+pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格式）
 #
 # 网格**不写在这里** —— 由 SMD 文件承载，本文件只引用它们
 # （与 QC 的 $bodygroup { studio "x.smd" } 一致）。
+#
+# 想直接用 QC 而不写 TOML：`mdlc build-qc model.qc --out <目录>`
+# （QC 前端已实现；也可用 `mdlc qc2toml model.qc` 把它转成本格式）。
 #
 # 与 QC 的对应关系：
 #   [model].name             <- $modelname

@@ -96,7 +96,8 @@
 //! 1. **不自己做凸分解。** 输入要求每个凸块已经切好（与 studiomdl 一致——
 //!    它也要求 QC 给的就是凸块）。凹网格的拆分请用 [`decompose_concave`]
 //!    （parry3d 的 VHACD）。
-//! 2. **不自己写凸包算法。** 用 parry3d 的 quickhull（见 [`convex_hull_of`]）。
+//! 2. **不自己写凸包算法。** 用 parry3d 的 quickhull
+//!    （`parry3d::transformation::try_convex_hull`）。
 //!
 //! # 与 §10.2 的偏离：`rotation_inertia` 用真实值而不是 `[1,1,1]`
 //!
@@ -193,7 +194,7 @@ pub const SOURCE_TO_IVP: f32 = 0.0254;
 /// # 这不是单纯的单位换算
 ///
 /// 反编译 `vphysics.dll` 的 `BuildConvexFromVerts`（`0x10083000`，
-/// `ConvexFromVerts` = vtable[1] = `0x10083230` 的第一段）得到逐字对应：
+/// `ConvexFromVerts` = `vtable[1]` = `0x10083230` 的第一段）得到逐字对应：
 ///
 /// ```c
 /// pfVar3 = malloc(0x10);
@@ -418,7 +419,7 @@ impl PhyHull {
     ///
     /// # 官方算法（反编译 `vphysics.dll`）
     ///
-    /// `ConvexFromVerts`（vtable[1] = `0x10083230`）是**两段**：
+    /// `ConvexFromVerts`（`vtable[1]` = `0x10083230`）是**两段**：
     ///
     /// ```c
     /// p1 = BuildConvexFromVerts(verts, n);   // 0x10083000：轴映射 + qhull

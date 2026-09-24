@@ -89,7 +89,7 @@ const OFFICIAL_FLAGS_WITH_VALUE: &[&str] = &["game", "minlod", "t", "a"];
 /// 归一化结果。
 #[derive(Debug, PartialEq, Eq)]
 pub struct Normalized {
-    /// 交给 clap 的 argv（含 argv[0]）。
+    /// 交给 clap 的 argv（含 `argv[0]`）。
     pub argv: Vec<String>,
     /// 被丢弃的未知选项，用于警告。
     pub unknown: Vec<String>,
@@ -171,7 +171,7 @@ pub fn normalize_official_args(argv: &[String]) -> Normalized {
 /// - **mdlc 自有**：`mdlc <子命令> ...`（裸词）；
 /// - **官方兼容**：`mdlc -game <gamedir> [-nop4] <model.qc>`（首参以 `-` 开头）。
 ///
-/// 分流在 [`crate::main`] 里做（首参是否以 `-` 开头），因为两种形态的
+/// 分流在 `main.rs` 里做（首参是否以 `-` 开头），因为两种形态的
 /// 位置参数语义不同：官方形态的裸参数是 `.qc`，mdlc 形态的是子命令。
 pub fn build_cli() -> Command {
     Command::new("mdlc")
@@ -193,7 +193,7 @@ pub fn build_cli() -> Command {
 ///
 /// 它**没有子命令**，位置参数就是 `.qc`。
 ///
-/// flag 表由 [`OFFICIAL_FLAGS_NO_VALUE`] / [`OFFICIAL_FLAGS_WITH_VALUE`]
+/// flag 表由 `OFFICIAL_FLAGS_NO_VALUE` / `OFFICIAL_FLAGS_WITH_VALUE`
 /// 直接生成 —— 这样「归一化认识的」与「clap 接受的」永远是同一份清单，
 /// 不会出现归一化放行、clap 却报 `UnknownArgument` 的裂缝。
 pub fn build_official_cli() -> Command {

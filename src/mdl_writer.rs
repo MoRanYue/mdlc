@@ -443,7 +443,7 @@ pub const VERTANIM_WRINKLE_SIZE: usize = 18;
 /// `STUDIOHDR_FLAGS_STATIC_PROP`。
 pub const FLAG_STATIC_PROP: i32 = 1 << 4;
 
-/// 一个 mesh 的 flex 载荷字节数（含 `ALIGN4`，见 [`SectionCounts::flex_bytes`]）。
+/// 一个 mesh 的 flex 载荷字节数（含 `ALIGN4`，见 [`crate::layout::SectionCounts::flex_bytes`]）。
 ///
 /// 空载荷返回 **0** —— 与 `write.cpp:1753` 的 `if (pmesh[m].numflexes)`
 /// 一致：没有形状的 mesh **不写任何字节**（连 flex 数组头都不写）。

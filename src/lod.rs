@@ -694,7 +694,7 @@ pub struct ModelVertexLayout {
     pub meshes: Vec<(usize, usize)>,
     /// 每个 mesh 的 `numLODVertexes[0..num_lods]`（**累计值**）。
     ///
-    /// `[n]` = 该 mesh 中「最高 LOD 位 >= n」的顶点数 = Σ_{k>=n} |block_m[k]|，
+    /// `[n]` = 该 mesh 中「最高 LOD 位 >= n」的顶点数 = `Σ_{k>=n} |block_m[k]|`，
     /// 单调不增。写在 `mstudiomesh_t` 偏移 **0x34**
     /// （即 `mstudio_meshvertexdata_t.numLODVertexes[8]`），
     /// 运行时按它裁剪该 mesh 在 LOD n 的顶点读取范围。

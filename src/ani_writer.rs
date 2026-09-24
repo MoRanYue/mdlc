@@ -11,7 +11,7 @@
 //! | RVA | 作用 |
 //! |---|---|
 //! | `0x463710` | `Quaternion48` 编码器（本模块 [`encode_quaternion48`]） |
-//! | `0x4639D0` | `FloatToHalf`（位置通道，本模块 [`half_from_f32`]） |
+//! | `0x4639D0` | `FloatToHalf`（位置通道，本模块 `half_from_f32`） |
 //! | `0x4DA860` | `AngleQuaternion`（欧拉角 → 四元数） |
 //! | `0x46AAA0` | 「28 字节固定头部 + 逐帧原始样本」写出器 |
 //! | `0x46C440` | `.ani` 容器（416 字节 `studiohdr_t` + `IDAG`） |

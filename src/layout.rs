@@ -50,7 +50,7 @@
 
 /// 一个段在布局里的位置。
 ///
-/// 字段是 `pub` 的，但**不要手动构造** —— 用 [`SectionLayout::compute`]，
+/// 字段是 `pub` 的，但**不要手动构造** —— 用 [`SectionOffsets::compute`]，
 /// 它保证顺序与偏移都正确。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionOffsets {

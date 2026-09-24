@@ -7,12 +7,12 @@
 //! | 本模块 | 官方 |
 //! |---|---|
 //! | [`Parser::run`] | `ParseScript`（`studiomdl.cpp:6737`） |
-//! | [`Parser::cmd_body`] / [`Parser::cmd_bodygroup`] | `Cmd_Body` / `Cmd_Bodygroup`（`989`/`1034`） |
-//! | [`Parser::option_studio`] | `Option_Studio`（`917`） |
-//! | [`Parser::cmd_model`] | `Cmd_Model`（`4228`） |
-//! | [`Parser::cmd_sequence`] | `Cmd_Sequence` + `ParseSequence`（`2593`/`2650`） |
-//! | [`Parser::cmd_animation`] | `Cmd_Animation` + `ParseAnimation`（`2387`/`2442`） |
-//! | [`Parser::parse_animation_token`] | `ParseAnimationToken`（`2185`） |
+//! | `Parser::cmd_body` / `Parser::cmd_bodygroup` | `Cmd_Body` / `Cmd_Bodygroup`（`989`/`1034`） |
+//! | `Parser::option_studio` | `Option_Studio`（`917`） |
+//! | `Parser::cmd_model` | `Cmd_Model`（`4228`） |
+//! | `Parser::cmd_sequence` | `Cmd_Sequence` + `ParseSequence`（`2593`/`2650`） |
+//! | `Parser::cmd_animation` | `Cmd_Animation` + `ParseAnimation`（`2387`/`2442`） |
+//! | `Parser::parse_animation_token` | `ParseAnimationToken`（`2185`） |
 //!
 //! # 两处**必须**做的「额外 I/O」
 //!

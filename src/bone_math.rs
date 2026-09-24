@@ -85,7 +85,7 @@ pub const IDENTITY: Matrix3x4 = [
 /// 由四元数构造旋转矩阵的 3×3 部分（`matrix3x4_t` 的行主序，平移列留 0）。
 ///
 /// 与 Source 的 `QuaternionMatrix` 一致。中间量用 `f64`（见
-/// [`angle_quaternion_f64`]）。
+/// `angle_quaternion_f64`）。
 pub fn quaternion_matrix(q: [f32; 4]) -> Matrix3x4 {
     quaternion_matrix_f64(q.map(f64::from)).map(|v| v as f32)
 }

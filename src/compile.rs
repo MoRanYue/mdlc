@@ -2093,7 +2093,7 @@ fn auto_hitboxes(compiled: &CompiledModelDesc) -> Vec<crate::model::Hitbox> {
 /// （`simplify.cpp:7120-7130`）。这个「渲染包围盒」由两部分构成：
 ///
 /// 1. **自动 hitbox 的 bbox** —— 即 `g_bonetable[i].bmin/bmax`
-///    （`SetupHitBoxes` 填的，见 [`auto_hitboxes`]）；
+///    （`SetupHitBoxes` 填的，见 `auto_hitboxes`）；
 /// 2. **显式 hitbox** —— `simplify.cpp:7030-7045` 把每个 hitbox 的
 ///    `bmin/bmax` 按骨骼并进去。
 ///
@@ -2220,7 +2220,7 @@ pub fn bone_parents(desc: &ModelDesc) -> Vec<i32> {
 ///
 /// # 为什么 `frame` 里的是「局部」姿态
 ///
-/// [`crate::compile::realign_sequence_frames`] 已经把 `srcRealign` 折进
+/// `realign_sequence_frames` 已经把 `srcRealign` 折进
 /// 每一帧的局部姿态里，所以这里对根骨骼**再**左乘一次 `Rz(90°)` 就等价于
 /// 官方的 `sanim`（它本身也是「父相对」的：`ConvertAnimation` 用
 /// `inverse(destBoneToWorld[parent]) ∘ destBoneToWorld[k]` 反解出来）。
