@@ -1781,6 +1781,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     //
     // 不超限时它是 **no-op**（第一行就返回），所以对既有产物零影响。
     if compiled.desc.model.split_oversized_meshes {
+        let _t_split = crate::prof::Span::new("split_oversized_meshes");
         split_oversized_meshes(&mut compiled)?;
     }
 
