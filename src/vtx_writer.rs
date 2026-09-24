@@ -136,7 +136,14 @@ impl std::fmt::Display for VtxWriteError {
         match self {
             Self::TooManyVertices { model, count } => write!(
                 f,
-                "{model} 有 {count} 个顶点，超过 VTX 的 uint16 上限 65535"
+                "{model} 有 {count} 个顶点，超过 VTX 的每 mesh 上限 {}\n\
+                 VTX 的 `origMeshVertID` 是 `uint16`，能表达下标 0..=65535，\
+                 所以**一个 mesh 最多 65536 个顶点**。\n\
+                 注意粒度是 **mesh（= 一个材质）**，不是整个模型：\
+                 把网格按材质拆成多个 mesh（在 QC 里给多份 `$cdmaterials`/\
+                 多张贴图，或分多个 `$bodygroup` 子模型）即可绕过，\
+                 **不需要手工拆 SMD 文件**。",
+                crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH
             ),
             Self::TooManyIndices { model, count } => {
                 write!(f, "{model} 的三角形索引数 {count} 超出 int32")

@@ -1306,7 +1306,6 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     let mut sequences = Vec::with_capacity(desc.sequences.len());
     for (si, s) in desc.sequences.iter().enumerate() {
         let at = format!("sequences[{si}]");
-
         // ---- `$declaresequence`：前向声明的**空壳** ----
         //
         // 官方 `Cmd_DeclareSequence` 只 `memset` 一条 `s_sequence_t` 再置
@@ -1566,6 +1565,57 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 (i, frames)
             }
         };
+
+        // ---- `$sequence` 块里的 `subtract`（`CMD_SUBTRACT`）----
+        //
+        // 官方 `ParseSequence` 在 `numblends || isAppend` 时把 token 交给
+        // `ParseAnimationToken(animations[0])`（`studiomdl.cpp:2944`），所以
+        // `subtract` 在 `$sequence` 里**同样合法**，且作用对象是
+        // `animations[0]` 那个**动画**（cmds 挂在 panim 上）。
+        //
+        // 本实现把减除作用在**本序列自己的帧副本**上，而不是去改共享的
+        // `anims[j].frames` —— 官方那样会让「同一个动画被两条序列引用」时
+        // 互相污染（减除被叠加两次）。后者在本工程里观测不到（每条
+        // `*_layer` 序列各有独立动画），但改共享状态是更差的选择。
+        let mut frames = frames;
+        let mut seq_pre_subtract: Option<Vec<Vec<crate::smd::SmdPose>>> = None;
+        if let Some(ref_name) = s.subtract.as_deref() {
+            match anim_index.get(ref_name) {
+                Some(&j) => {
+                    let src = anims[j].frames.clone();
+                    let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
+                    if bf >= src.len() {
+                        seq_errors.push(CompileError {
+                            at: format!("{at}.subtract_frame"),
+                            message: format!(
+                                "参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧",
+                                src.len()
+                            ),
+                        });
+                        continue;
+                    }
+                    // 包围盒用**减除前**的姿态（与 `[[animations]]` 同规则）。
+                    seq_pre_subtract = Some(frames.clone());
+                    subtract_base_frames(&mut frames, &src, bf);
+                }
+                None => {
+                    seq_errors.push(CompileError {
+                        at: format!("{at}.subtract"),
+                        message: format!(
+                            "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名**，\
+                             现有：{}）",
+                            desc.animations
+                                .iter()
+                                .map(|a| a.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                    continue;
+                }
+            }
+        }
+
         let nf = frames.len() as i32;
         let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
         let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
@@ -1592,7 +1642,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             movements: s.movements.clone(),
             section_frames: if sec_len > 0 && nf >= sec_thr { sec_len } else { 0 },
             num_sections: 0, // 下面按 section_frames 算（依赖 frames 数）
-            pre_subtract_frames: pre_subtract.get(anim_ix).and_then(|p| p.clone()),
+            // 序列级 `subtract` 的「减除前帧」优先；否则用动画自己的。
+            pre_subtract_frames: seq_pre_subtract
+                .or_else(|| pre_subtract.get(anim_ix).and_then(|p| p.clone())),
             extra_flags: s.extra_flags,
             forward_declared: false,
             weights: merge_weights(&[anim_ix], &anim_weights, n_bones),
@@ -6345,6 +6397,9 @@ weight = 0.5
             section_threshold: None,
             extra_flags: None,
             weight_list: Some("NOPE".into()),
+            subtract: None,
+            subtract_frame: None,
+            num_frames: None,
         });
         let errs = d.validate().unwrap_err();
         assert!(

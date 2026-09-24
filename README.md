@@ -95,6 +95,36 @@ studiomdl 里有一批**人为**上限（例如单 SMD 65536 顶点、材质 32 
 > ⚠️ 「每 mesh 顶点 ≤ 65536」的**粒度是 mesh（= 一个材质）**，
 > 不是 bodypart：加一个材质就多一个 mesh，各自独立计数，
 > **不需要手工把 SMD 拆开**。
+>
+> ⚠️ 但**一个材质**如果本身就有 30 万顶点（真实案例：某改模工程的 `chain`
+> 段有 305,703 顶点），那就**确实编不出来** —— 官方 `studiomdl` 同样拒绝
+> （`ERROR: too many indices in source`）。这是格式的真实上限，不是本实现的
+> 限制。绕过办法见下节。
+
+#### 单个 mesh 超过 65536 顶点怎么办
+
+这是**格式**约束（VTX 的 `origMeshVertID` 是 `uint16`），官方与 mdlc 都会拒绝。
+可选路径：
+
+| 办法 | 说明 |
+|---|---|
+| **把该材质拆成多张材质** | 最省事：一个材质 = 一个 mesh = 一份独立配额。缺点是渲染时多一个 draw call。 |
+| **分多个 `$bodygroup` 子模型** | 每个子模型是独立的 `model`，各自有 65536 配额。 |
+| 用 NekoMDL 的 `$maxverts` | 见下 —— 它是**非官方扩展**，会自动把超限模型切块。 |
+
+> **NekoMDL 的 `$maxverts` 逆向结论**（Ghidra + 产物双向验证，见
+> `docs/_probe/nekomdl_maxverts_findings.js`）：
+> 在 QC 里写 `$maxverts 50000`，NekoMDL 会把超限的模型**按三角形顺序切成
+> 多个模型**，每块 ≤ 该值，新 bodypart 命名 `clamped1`、`clamped2`…
+> 反编译证据：`$maxverts` @ `0x1404f6640` → `FUN_140076778`
+> （`MaxVertexLimit = clamp(atoi, 1024, 511451)`），使用点 `FUN_14007d550`
+> 打印 `"model has too many verts, cutting into multiple models"`。
+> 实测 `$maxverts 50000` 编译一个 305,703 顶点的 mesh：产出 9 个 bodypart
+> （`clamped1..6` + 一个重名 `clamped1`），VTX 里最大单 mesh **49,999 顶点**。
+>
+> **mdlc 目前不实现这个扩展**（它改变 MDL 的 bodypart 结构，属非官方行为）。
+> 遇到超限时 mdlc 会**明确报错并给出上面两条可行路径**，而不是静默产出
+> 一个引擎加载不了的模型。
 
 
 ### 切线、多 LOD、fixup（实测报告）

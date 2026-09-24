@@ -1391,6 +1391,33 @@ pub struct Sequence {
     /// 那段被 `#if 0` 包住了。
     #[serde(default)]
     pub weight_list: Option<String>,
+    /// `$sequence` 块里的 `subtract "<参考动画>" [帧]`
+    /// （官方 `ParseCmdlistToken` 的 `CMD_SUBTRACT`，`studiomdl.cpp:1733-1751`）。
+    ///
+    /// # 为什么 `$sequence` 也有这个选项
+    ///
+    /// 官方 `ParseSequence` 在 `numblends || isAppend` 时把整个 token
+    /// 交给 `ParseAnimationToken`（`studiomdl.cpp:2944`），而后者会走到
+    /// `ParseCmdlistToken` —— 所以 `subtract` / `numframes` / `weightlist`
+    /// 这些「动画选项」在 `$sequence` 里**同样合法**。真实工程大量使用：
+    /// `$sequence "deploy_layer" "al_deploy" snap fadeout 0.2
+    /// subtract "a_idle" 0 delta ...`。
+    ///
+    /// ⚠️ 修复前 `subtract` 被当成**动画名**压进 [`Self::blends`]，
+    /// 于是整条序列被误判成 blend 网格并报
+    /// 「blend 格数 5 不是完全平方数」。见 `PROGRESS.md` §53。
+    #[serde(default)]
+    pub subtract: Option<String>,
+    /// `subtract` 取参考动画的第几帧。缺省 0。
+    #[serde(default)]
+    pub subtract_frame: Option<i32>,
+    /// `$sequence` 块里的 `numframes <N>`
+    /// （官方 `ParseCmdlistToken` 的 `CMD_NUMFRAMES`，`studiomdl.cpp:2104-2111`）。
+    ///
+    /// 官方语义是**强制帧数**（`simplify.cpp` 把动画重采样到 N 帧）。
+    /// 与 [`Self::section_frames`] 无关 —— 后者是「每段多少帧」。
+    #[serde(default)]
+    pub num_frames: Option<i32>,
 }
 
 /// blend 网格的**一格** —— 指向 [`ModelDesc::animations`] 里的一个动画。

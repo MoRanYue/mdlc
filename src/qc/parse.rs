@@ -1287,6 +1287,9 @@ impl<'a> Parser<'a> {
             section_threshold: None,
             extra_flags: None,
             weight_list: None,
+            subtract: None,
+            subtract_frame: None,
+            num_frames: None,
         });
         Ok(())
     }
@@ -1327,6 +1330,9 @@ impl<'a> Parser<'a> {
             section_threshold: None,
             extra_flags: None,
             weight_list: None,
+            subtract: None,
+            subtract_frame: None,
+            num_frames: None,
         };
 
         let mut depth = 0i32;
@@ -1461,17 +1467,66 @@ impl<'a> Parser<'a> {
                     self.skip_rest_of_line();
                 }
                 "subtract" => {
-                    // `$sequence` 块内的 `subtract` 走 `ParseAnimationToken`
-                    // 的路径（官方 `2944`：`numblends||isAppend` 时才走）。
-                    // 单动画序列在 `numblends==0` 时它会被当成**动画名**。
-                    // 这里保持与官方一致：见下面的默认分支。
-                    blend_names.push(t.text.clone());
+                    // `$sequence` 块内的 `subtract` 走官方
+                    // `ParseCmdlistToken` 的 `subtract` 分支
+                    // （`studiomdl.cpp:1733-1751`）：读**两个** token
+                    // —— 参考动画名 + 帧号，并置 `CMD_SUBTRACT`
+                    // （它自带 `STUDIO_POST`，见 `:1750`）。
+                    //
+                    // ⚠️ 修复前这里把 `subtract` **本身**当成动画名压进
+                    // `blend_names`，于是 `"al_deploy" subtract "a_idle" 0`
+                    // 被当成 5 格 blend 网格（`al_deploy/subtract/a_idle/0/1`），
+                    // 报「blend 格数 5 不是完全平方数」。
+                    //
+                    // 语义与 `$animation` 的同名选项一致，所以复用同样的字段。
+                    seq.subtract = Some(self.tok(false)?.text);
+                    seq.subtract_frame = if self.avail() {
+                        let t2 = self.tok(false)?;
+                        match parse_i32(&t2.text) {
+                            Some(v) => Some(v),
+                            None => {
+                                self.lex.unget(t2);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                }
+                "numframes" => {
+                    // `ParseCmdlistToken` 的 `CMD_NUMFRAMES`
+                    // （`studiomdl.cpp:2104-2111`）：**强制**帧数
+                    // （`simplify.cpp` 用它把动画重采样到指定帧数）。
+                    seq.num_frames = Some(self.i()?);
                 }
                 other if other.starts_with("act_") => {
-                    // 官方 `strnicmp(token,"ACT_",4)==0` 时 UnGetToken 后
-                    // 走 `Option_Activity`（只读一个 token，无权重）。
+                    // 官方 `strnicmp(token,"ACT_",4)==0` 时 `UnGetToken()`
+                    // 后走 `Option_Activity`（`studiomdl.cpp:2714-2718`）。
+                    //
+                    // ⚠️ **`Option_Activity` 读两个 token**（`studiomdl.cpp:
+                    // 1165-1178`）：`GetToken(名)` + `GetToken(权重
+                    // verify_atoi)`。所以这里**必须也吃掉权重**，否则
+                    // `"ACT_VM_IDLE" 1` 里的 `1` 会漏进 `blend_names`，
+                    // 变成「找不到动画 "1"」。
+                    //
+                    // ⚠️ 权重**不能**无条件读：`$sequence "x" "ACT_VM_IDLE"`
+                    // （不写权重）官方会 `verify_atoi` 一个不属于本序列的
+                    // token。判据是「下一个 token 是否还在本序列的行内」——
+                    // 与 `["activity"]` 分支同一套逻辑。
                     seq.activity = Some(t.text.clone());
-                    seq.activity_weight = 0;
+                    seq.activity_weight = if self.avail() {
+                        let t2 = self.tok(false)?;
+                        match parse_i32(&t2.text) {
+                            Some(v) => v,
+                            None => {
+                                // 不是数字 ⟹ 它不是权重，退回让它按原样处理。
+                                self.lex.unget(t2);
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
                 }
                 _ => {
                     if t.text.ends_with(".smd") || t.text.ends_with(".SMD") {
@@ -2255,7 +2310,7 @@ impl<'a> Parser<'a> {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // 与官方一致：文件不在 ⟹ 没有程序化骨骼。
-                eprintln!(
+                crate::diagln!(
                     "提示：$proceduralbones 指向的 VRD 不存在，按官方行为跳过：{}",
                     path.display()
                 );
@@ -3004,7 +3059,7 @@ impl<'a> Parser<'a> {
         if !skipped.is_empty() {
             skipped.sort();
             skipped.dedup();
-            eprintln!(
+            crate::diagln!(
                 "提示：$lod 里有 {} 个不存在的骨骼，已按官方行为跳过：{}",
                 skipped.len(),
                 skipped.join(", ")
@@ -3231,3 +3286,225 @@ fn parse_vrd(text: &str) -> Result<Vec<QuatInterpBone>, String> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    // 本模块全部走**完整路径**（`crate::qc::parse_qc_str` /
+    // `crate::model::ModelDesc`），所以**不需要** `use super::*` ——
+    // 加了反而触发 `unused_imports`（CI 的 `-D warnings` 会当错误）。
+
+    /// 一个最小 SMD（2 骨骼 + 1 三角形）。
+    const MIN_SMD: &str = "\
+version 1
+nodes
+0 \"root\" -1
+1 \"bone1\" 0
+end
+skeleton
+time 0
+0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+1 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000
+end
+triangles
+mat
+0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 0 1.000000
+0 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000
+0 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 1.000000 1 1 1.000000
+end
+";
+
+    /// 建一个临时目录，写 `a.smd` / `b.smd` / `c.smd`。
+    ///
+    /// 目录名带 **pid**，避免并行测试互踩（与 `flexrule` 的 e2e 测试同法）。
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mdlc_qcparse_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+        for n in ["a.smd", "b.smd", "c.smd"] {
+            std::fs::write(dir.join(n), MIN_SMD).expect("应能写 SMD");
+        }
+        dir
+    }
+
+    /// 解析一段 QC，返回 `ModelDesc`。
+    fn parse(qc: &str, dir: &std::path::Path) -> crate::model::ModelDesc {
+        crate::qc::parse_qc_str(qc, dir)
+            .unwrap_or_else(|errs| panic!("QC 应解析成功，实际：{errs:?}"))
+    }
+
+    /// ⚠️ **回归**：`ACT_*` 必须吃掉紧跟其后的**权重** token。
+    ///
+    /// 官方 `Option_Activity`（`studiomdl.cpp:1165-1178`）读**两个** token
+    /// （名 + 权重）。修复前本实现只认名字、把权重留在流里，于是
+    /// `$sequence "x" "a_idle" "ACT_VM_IDLE" 1` 里的 `1` 漏进 `blends`，
+    /// 编译时报「找不到动画 "1"」。
+    ///
+    /// 真实影响：`nahida_themed_autoshotgun` 的 39 处错误里 **32 处**是这一条。
+    #[test]
+    fn act_token_consumes_its_weight() {
+        let dir = fixture("act_weight");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$sequence \"seq_idle\" \"a_idle\" \"ACT_VM_IDLE\" 1
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert_eq!(s.activity.as_deref(), Some("ACT_VM_IDLE"));
+        assert_eq!(s.activity_weight, 1, "权重必须被读进来");
+        assert!(
+            s.blends.is_empty(),
+            "单动画序列不该有 blends，实际：{:?}（权重漏进去了）",
+            s.blends
+        );
+    }
+
+    /// `ACT_*` **不带权重**时也必须能解析（不能把下一个 token 硬吃掉）。
+    ///
+    /// 官方会 `verify_atoi` 下一个 token —— 若那是另一条 `$sequence` 的
+    /// 名字就会出错。本实现的做法是「不是数字就退回流」，这条测试钉住它。
+    #[test]
+    fn act_token_without_weight_does_not_eat_next_token() {
+        let dir = fixture("act_noweight");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$sequence \"seq_a\" \"a_idle\" \"ACT_VM_IDLE\"
+$sequence \"seq_b\" \"a_idle\" \"ACT_VM_DRAW\" 1
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.sequences.len(), 2, "两条序列都必须被解析出来");
+        assert_eq!(d.sequences[0].activity.as_deref(), Some("ACT_VM_IDLE"));
+        assert_eq!(d.sequences[0].activity_weight, 0);
+        assert_eq!(d.sequences[1].activity.as_deref(), Some("ACT_VM_DRAW"));
+        assert_eq!(d.sequences[1].activity_weight, 1);
+    }
+
+    /// ⚠️ **回归**：`$sequence` 块里的 `subtract "<动画>" <帧>` 是**命令**，
+    /// 不是动画名。
+    ///
+    /// 官方走 `ParseAnimationToken` → `ParseCmdlistToken`
+    /// （`studiomdl.cpp:1733-1751`，`CMD_SUBTRACT`）。
+    /// 修复前把 `subtract` 本身压进 `blends`，于是
+    /// `"al_deploy" subtract "a_idle" 0` 被当成 5 格 blend 网格，
+    /// 报「blend 格数 5 不是完全平方数」。
+    #[test]
+    fn sequence_subtract_is_a_command_not_an_animation_name() {
+        let dir = fixture("seq_subtract");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$animation \"al_deploy\" \"b.smd\" fps 30
+$sequence \"deploy_layer\" \"al_deploy\" snap fadeout 0.2 subtract \"a_idle\" 0 delta \"ACT_VM_DEPLOY_LAYER\" 1
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert_eq!(s.subtract.as_deref(), Some("a_idle"), "subtract 应记为参考动画名");
+        assert_eq!(s.subtract_frame, Some(0));
+        assert!(
+            s.blends.is_empty(),
+            "单动画序列不该有 blends，实际：{:?}",
+            s.blends
+        );
+        assert_eq!(s.activity.as_deref(), Some("ACT_VM_DEPLOY_LAYER"));
+        assert_eq!(s.activity_weight, 1);
+    }
+
+    /// ⚠️ **回归**：`$sequence` 的 `numframes <N>` 必须被吃掉。
+    ///
+    /// 官方 `ParseCmdlistToken` 的 `CMD_NUMFRAMES`
+    /// （`studiomdl.cpp:2104-2111`）。修复前 `numframes` 与 `90` 都漏进
+    /// `blends`，报「找不到动画 "numframes"」。
+    #[test]
+    fn sequence_numframes_is_consumed() {
+        let dir = fixture("seq_numframes");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_look_mid\" \"a.smd\" fps 30
+$sequence \"fidget\" \"a_look_mid\" \"ACT_VM_FIDGET\" 100 numframes 90 fps 1
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert_eq!(s.num_frames, Some(90), "numframes 的值必须被读进来");
+        assert_eq!(s.activity.as_deref(), Some("ACT_VM_FIDGET"));
+        assert_eq!(s.activity_weight, 100);
+        assert!(s.blends.is_empty(), "不该有 blends，实际：{:?}", s.blends);
+    }
+
+    /// `blendwidth` + `blend` 的**正常**用法不能被上面的修复破坏。
+    ///
+    /// 这是真实 `look_poses` 的写法：3 格 + `blendwidth 3` ⟹ 1×3 网格。
+    #[test]
+    fn blend_grid_still_parses() {
+        let dir = fixture("blend_grid");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_look_down\" \"a.smd\" fps 30
+$animation \"a_look_mid\" \"b.smd\" fps 30
+$animation \"a_look_up\" \"c.smd\" fps 30
+$poseparameter \"ver_aims\" -1 1 loop 0
+$sequence \"look_poses\" \"a_look_down\" \"a_look_mid\" \"a_look_up\" hidden {
+	delta
+	blend \"ver_aims\" 1 -1
+	blendwidth 3
+}
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert_eq!(
+            s.blends,
+            vec!["a_look_down", "a_look_mid", "a_look_up"],
+            "blend 网格的三格必须原样保留"
+        );
+        assert_eq!(s.blend_width, Some(3));
+        assert_eq!(s.blend_params.len(), 1);
+        assert_eq!(s.blend_params[0].parameter, "ver_aims");
+    }
+
+    /// 多条序列混用上述四种写法 —— 整体不串位。
+    ///
+    /// 这是真实工程的最小复现：修复前这种文件会产出几十处错误。
+    #[test]
+    fn mixed_sequence_forms_do_not_bleed_into_each_other() {
+        let dir = fixture("mixed");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$animation \"al_reload\" \"b.smd\" fps 30
+$sequence \"reload\" \"a_idle\" hidden fadein 0.1 fadeout 0 \"ACT_VM_RELOAD\" 1
+$sequence \"reload_layer\" \"al_reload\" fadein 0.1 fadeout 0 addlayer \"reload\" \"ACT_VM_RELOAD_LAYER\" 1
+$sequence \"reload_end\" \"al_reload\" subtract \"a_idle\" 0 delta \"ACT_VM_RELOAD_END\" 1
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.sequences.len(), 3);
+        // 三条都必须是「单动画序列」—— 一条都不该变成 blend 网格。
+        for s in &d.sequences {
+            assert!(
+                s.blends.is_empty(),
+                "序列 {:?} 不该有 blends，实际：{:?}",
+                s.name,
+                s.blends
+            );
+            assert!(
+                s.activity_weight == 1,
+                "序列 {:?} 的 actweight 应为 1，实际 {}",
+                s.name,
+                s.activity_weight
+            );
+        }
+        assert_eq!(d.sequences[2].subtract.as_deref(), Some("a_idle"));
+    }
+}
+

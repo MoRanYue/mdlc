@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mdlc::compile::compile;
+// 诊断输出的路由版（`eprintln!` / `eprint!` 的替代）—— 官方兼容模式下
+// 自动改走 stdout，理由见 [`mdlc::diag`] 模块文档。
+use mdlc::{diagln, diagprint};
 use mdlc::mdl_writer::{flatten_vertices, write_mdl};
 use mdlc::model::ModelDesc;
 use mdlc::phy::{self, PhyHull, PhyParams, PhySolid};
@@ -108,7 +111,7 @@ fn main() -> ExitCode {
         None => {
             // 保持迁移前的契约：**无参数 = 用法错误**（usage 走 stderr、
             // 退出码 2），而不是 clap 默认的「打印帮助、退出 0」。
-            eprint!("{USAGE}");
+            diagprint!("{USAGE}");
             ExitCode::from(2)
         }
         Some(("template", _)) => {
@@ -136,8 +139,8 @@ fn main() -> ExitCode {
             vvd_roundtrip(m.get_one::<String>("file").expect("required"))
         }
         Some((other, _)) => {
-            eprintln!("错误：未知子命令 {other:?}\n");
-            eprint!("{USAGE}");
+            diagln!("错误：未知子命令 {other:?}\n");
+            diagprint!("{USAGE}");
             ExitCode::from(2)
         }
     }
@@ -163,11 +166,19 @@ fn cli_exit(e: clap::Error) -> ExitCode {
 /// 语义与官方 `studiomdl` 对齐（见 [`mdlc::cli`] 模块文档）：
 /// 产物写到 `<gamedir>\models\<$modelname>`。
 fn run_official(argv: &[String]) -> ExitCode {
+    // ⚠️ **诊断改走 stdout**：官方 studiomdl 把 `ERROR:` 也写在 stdout，
+    // 而 Crowbar 的「编译器是否活着」标志只在 stdout 处理器里置位
+    // （`Compiler.vb:751` vs `:785-803`）。写 stderr 会让 Crowbar
+    // 一边显示错误、一边补一句误导的
+    // `The compiler did not return any status messages.`
+    // 详见 [`mdlc::diag`] 模块文档。
+    mdlc::diag::set_to_stdout(true);
+
     let norm = mdlc::cli::normalize_official_args(argv);
 
     // 用户要求：未知选项**一律警告后继续**（不中断编译）。
     if !norm.unknown.is_empty() {
-        eprintln!(
+        diagln!(
             "警告：忽略无法识别的选项 {}（mdlc 未实现或非官方选项）",
             norm.unknown.join(" ")
         );
@@ -186,18 +197,18 @@ fn run_official(argv: &[String]) -> ExitCode {
     // 用它会把「没传的 flag」也报成「已忽略」。
     for name in ["striplods", "definebones", "printbones"] {
         if m.get_flag(name) {
-            eprintln!("警告：官方选项 -{name} 尚未实现，已忽略");
+            diagln!("警告：官方选项 -{name} 尚未实现，已忽略");
         }
     }
     for name in ["minlod", "t", "a"] {
         if m.value_source(name).is_some() {
-            eprintln!("警告：官方选项 -{name} 尚未实现，已忽略");
+            diagln!("警告：官方选项 -{name} 尚未实现，已忽略");
         }
     }
 
     let Some(qc) = m.get_one::<String>("qc") else {
-        eprintln!("错误：缺少 .qc 文件参数");
-        eprintln!("用法：mdlc -game <gamedir> [选项] <model.qc>");
+        diagln!("错误：缺少 .qc 文件参数");
+        diagln!("用法：mdlc -game <gamedir> [选项] <model.qc>");
         return ExitCode::from(2);
     };
 
@@ -210,21 +221,21 @@ fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("错误：读不到 {}：{e}", path.display());
+            diagln!("错误：读不到 {}：{e}", path.display());
             return Err(ExitCode::from(2));
         }
     };
     let desc = match ModelDesc::from_toml(&text) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("错误：{e}");
+            diagln!("错误：{e}");
             return Err(ExitCode::from(2));
         }
     };
     if let Err(errs) = desc.validate() {
-        eprintln!("描述文件有 {} 处错误：", errs.len());
+        diagln!("描述文件有 {} 处错误：", errs.len());
         for e in &errs {
-            eprintln!("  - {e}");
+            diagln!("  - {e}");
         }
         return Err(ExitCode::from(1));
     }
@@ -266,9 +277,9 @@ fn check(p: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(errs) => {
-            eprintln!("{} 有 {} 处错误：", p.display(), errs.len());
+            diagln!("{} 有 {} 处错误：", p.display(), errs.len());
             for e in &errs {
-                eprintln!("  - {e}");
+                diagln!("  - {e}");
             }
             ExitCode::from(1)
         }
@@ -280,9 +291,9 @@ fn load_qc(path: &Path) -> Result<ModelDesc, ExitCode> {
     match mdlc::qc::parse_qc_file(path) {
         Ok(d) => Ok(d),
         Err(errs) => {
-            eprintln!("{} 解析失败，{} 处错误：", path.display(), errs.len());
+            diagln!("{} 解析失败，{} 处错误：", path.display(), errs.len());
             for e in &errs {
-                eprintln!("  - {e}");
+                diagln!("  - {e}");
             }
             Err(ExitCode::from(1))
         }
@@ -299,22 +310,22 @@ fn qc2toml(m: &clap::ArgMatches) -> ExitCode {
     };
     // 与 `build` 一样先校验 —— 「解析成功但描述非法」也应当报出来。
     if let Err(errs) = desc.validate() {
-        eprintln!("解析出的描述有 {} 处错误：", errs.len());
+        diagln!("解析出的描述有 {} 处错误：", errs.len());
         for e in &errs {
-            eprintln!("  - {e}");
+            diagln!("  - {e}");
         }
         return ExitCode::from(1);
     }
     let text = match desc.to_toml() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("错误：{e}");
+            diagln!("错误：{e}");
             return ExitCode::from(1);
         }
     };
     let out = out.unwrap_or_else(|| qc.with_extension("toml"));
     if let Err(e) = std::fs::write(&out, &text) {
-        eprintln!("错误：写不到 {}：{e}", out.display());
+        diagln!("错误：写不到 {}：{e}", out.display());
         return ExitCode::from(2);
     }
     println!("{} → {}", qc.display(), out.display());
@@ -359,9 +370,9 @@ fn compile_and_write(
     let mut compiled = match compile(desc, base) {
         Ok(c) => c,
         Err(errs) => {
-            eprintln!("编译失败，{} 处错误：", errs.len());
+            diagln!("编译失败，{} 处错误：", errs.len());
             for e in &errs {
-                eprintln!("  - {e}");
+                diagln!("  - {e}");
             }
             return ExitCode::from(1);
         }
@@ -382,14 +393,14 @@ fn compile_and_write(
             let text = match std::fs::read_to_string(&p) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("错误：读不到碰撞 SMD {}：{e}", p.display());
+                    diagln!("错误：读不到碰撞 SMD {}：{e}", p.display());
                     return ExitCode::from(2);
                 }
             };
             match mdlc::smd::parse_smd(&text) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("错误：解析碰撞 SMD {} 失败：{e}", p.display());
+                    diagln!("错误：解析碰撞 SMD {} 失败：{e}", p.display());
                     return ExitCode::from(1);
                 }
             }
@@ -423,7 +434,7 @@ fn compile_and_write(
     let out = match write_mdl(&compiled) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("错误：{e}");
+            diagln!("错误：{e}");
             return ExitCode::from(1);
         }
     };
@@ -435,20 +446,20 @@ fn compile_and_write(
     let vvd = match build_vvd(&compiled, out.checksum) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("错误：构造 VVD 失败：{e}");
+            diagln!("错误：构造 VVD 失败：{e}");
             return ExitCode::from(1);
         }
     };
     let vvd_bytes = match vvd.to_bytes() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("错误：写出 VVD 失败：{e}");
+            diagln!("错误：写出 VVD 失败：{e}");
             return ExitCode::from(1);
         }
     };
     // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
     if let Err(e) = check_invariants(&vvd, vvd_bytes.len()) {
-        eprintln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
+        diagln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
         return ExitCode::from(1);
     }
     drop(_t_vvd);
@@ -465,13 +476,13 @@ fn compile_and_write(
     let vtx = match write_vtx_with(&compiled, vtx_opts) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("错误：写出 VTX 失败：{e}");
+            diagln!("错误：写出 VTX 失败：{e}");
             return ExitCode::from(1);
         }
     };
     drop(_t_vtx);
     if let Err(e) = vtx_writer::check_invariants(&vtx, &compiled) {
-        eprintln!("错误：写出的 VTX 不自洽（本实现的 bug）：{e}");
+        diagln!("错误：写出的 VTX 不自洽（本实现的 bug）：{e}");
         return ExitCode::from(1);
     }
 
@@ -573,7 +584,7 @@ fn compile_and_write(
             match built {
                 Ok(b) => Some(b),
                 Err(e) => {
-                    eprintln!("错误：构造 PHY 失败：{e}");
+                    diagln!("错误：构造 PHY 失败：{e}");
                     return ExitCode::from(1);
                 }
             }
@@ -583,7 +594,7 @@ fn compile_and_write(
     if let Some(b) = &phy_bytes
         && let Err(e) = phy::check_invariants(b)
     {
-        eprintln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
+        diagln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
         return ExitCode::from(1);
     }
     let phy_path = phy_bytes.as_ref().map(|_| out_root.join(format!("{stem}.phy")));
@@ -602,7 +613,7 @@ fn compile_and_write(
         if let Some(dir) = p.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
-            eprintln!("错误：建目录 {} 失败：{e}", dir.display());
+            diagln!("错误：建目录 {} 失败：{e}", dir.display());
             return ExitCode::from(2);
         }
     }
@@ -612,20 +623,20 @@ fn compile_and_write(
         (&vtx_path, &vtx.bytes),
     ] {
         if let Err(e) = std::fs::write(path, bytes) {
-            eprintln!("错误：写 {} 失败：{e}", path.display());
+            diagln!("错误：写 {} 失败：{e}", path.display());
             return ExitCode::from(2);
         }
     }
     if let (Some(path), Some(bytes)) = (&ani_path, &out.ani)
         && let Err(e) = std::fs::write(path, bytes)
     {
-        eprintln!("错误：写 {} 失败：{e}", path.display());
+        diagln!("错误：写 {} 失败：{e}", path.display());
         return ExitCode::from(2);
     }
     if let (Some(path), Some(bytes)) = (&phy_path, &phy_bytes)
         && let Err(e) = std::fs::write(path, bytes)
     {
-        eprintln!("错误：写 {} 失败：{e}", path.display());
+        diagln!("错误：写 {} 失败：{e}", path.display());
         return ExitCode::from(2);
     }
 
@@ -679,14 +690,14 @@ fn vvd_info(path: &str) -> ExitCode {
     let buf = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("错误：读不到 {path}：{e}");
+            diagln!("错误：读不到 {path}：{e}");
             return ExitCode::from(2);
         }
     };
     let v = match Vvd::parse(&buf) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("错误：解析失败：{e}");
+            diagln!("错误：解析失败：{e}");
             return ExitCode::from(2);
         }
     };
@@ -733,7 +744,7 @@ fn vvd_roundtrip(path: &str) -> ExitCode {
     let buf = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("错误：读不到 {path}：{e}");
+            diagln!("错误：读不到 {path}：{e}");
             return ExitCode::from(2);
         }
     };
@@ -754,7 +765,7 @@ fn vvd_roundtrip(path: &str) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("错误：{e}");
+            diagln!("错误：{e}");
             ExitCode::from(2)
         }
     }
@@ -835,7 +846,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
     let args = match phy_args_from(m) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("错误：{e}");
+            diagln!("错误：{e}");
             return ExitCode::from(2);
         }
     };
@@ -843,19 +854,19 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
     let text = match std::fs::read_to_string(&args.input) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("错误：读不到 {}：{e}", args.input.display());
+            diagln!("错误：读不到 {}：{e}", args.input.display());
             return ExitCode::from(2);
         }
     };
     let smd = match mdlc::smd::parse_smd(&text) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("错误：解析 {} 失败：{e}", args.input.display());
+            diagln!("错误：解析 {} 失败：{e}", args.input.display());
             return ExitCode::from(1);
         }
     };
     if smd.triangles.is_empty() {
-        eprintln!("错误：{} 里没有任何三角形", args.input.display());
+        diagln!("错误：{} 里没有任何三角形", args.input.display());
         return ExitCode::from(1);
     }
 
@@ -890,7 +901,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
         }
     }
     if vertices.len() < 4 {
-        eprintln!(
+        diagln!(
             "错误：焊接后只有 {} 个不同顶点，凸包至少要 4 个",
             vertices.len()
         );
@@ -955,18 +966,18 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
             Ok(b) => {
                 // 自检后直接落盘，跳过下面通用的写出路径。
                 if let Err(e) = phy::check_invariants(&b) {
-                    eprintln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
+                    diagln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
                     return ExitCode::from(1);
                 }
                 if let Some(dir) = args.output.parent()
                     && !dir.as_os_str().is_empty()
                     && let Err(e) = std::fs::create_dir_all(dir)
                 {
-                    eprintln!("错误：建目录 {} 失败：{e}", dir.display());
+                    diagln!("错误：建目录 {} 失败：{e}", dir.display());
                     return ExitCode::from(2);
                 }
                 if let Err(e) = std::fs::write(&args.output, &b) {
-                    eprintln!("错误：写 {} 失败：{e}", args.output.display());
+                    diagln!("错误：写 {} 失败：{e}", args.output.display());
                     return ExitCode::from(2);
                 }
                 let layout = phy::check_invariants(&b).expect("刚查过");
@@ -983,7 +994,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
-                eprintln!("错误：ragdoll 构造失败：{e}");
+                diagln!("错误：ragdoll 构造失败：{e}");
                 return ExitCode::from(1);
             }
         }
@@ -1004,7 +1015,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
         let hs = match phy::decompose_connected_components(&smd, None) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("错误：$concave 分解失败：{e}");
+                diagln!("错误：$concave 分解失败：{e}");
                 return ExitCode::from(1);
             }
         };
@@ -1017,7 +1028,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
         let hs = match hull_of(&vertices, &all_idx) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("错误：{e}");
+                diagln!("错误：{e}");
                 return ExitCode::from(1);
             }
         };
@@ -1039,7 +1050,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
     let bytes = match phy::write_phy_multi(&grouped, &solids, &params) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("错误：写出 PHY 失败：{e}");
+            diagln!("错误：写出 PHY 失败：{e}");
             return ExitCode::from(1);
         }
     };
@@ -1049,11 +1060,11 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
         && !dir.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
-        eprintln!("错误：建目录 {} 失败：{e}", dir.display());
+        diagln!("错误：建目录 {} 失败：{e}", dir.display());
         return ExitCode::from(2);
     }
     if let Err(e) = std::fs::write(&args.output, &bytes) {
-        eprintln!("错误：写 {} 失败：{e}", args.output.display());
+        diagln!("错误：写 {} 失败：{e}", args.output.display());
         return ExitCode::from(2);
     }
 
@@ -1090,7 +1101,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
+            diagln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
             ExitCode::from(1)
         }
     }
