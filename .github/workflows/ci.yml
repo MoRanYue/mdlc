@@ -63,6 +63,11 @@ jobs:
       - name: cargo clippy（profiling feature）
         run: cargo clippy --release --all-targets --locked --features profiling -- -D warnings
 
+      # 文档链接也会烂（数组下标被当成 intra-doc link、链接到私有项、
+      # 路径改名后没跟着改）。钉住它，免得下次又攒回几十条。
+      - name: cargo doc（零警告）
+        run: cargo doc --no-deps --locked -- -D warnings
+
   msrv:
     name: MSRV（Cargo.toml 的 rust-version 必须是真的）
     runs-on: ubuntu-latest
