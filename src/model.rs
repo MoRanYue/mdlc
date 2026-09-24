@@ -1713,6 +1713,43 @@ pub struct ModelMeta {
     /// 命令行 `--optimize-vtx` 可覆盖本项（见 `main.rs`）。
     #[serde(default)]
     pub optimize_vtx: bool,
+    /// **顶点超限时自动拆分**（默认 **`true`**）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// VTX 的 `Vertex_t.origMeshVertID` 是 `uint16`，所以**一个 mesh 最多
+    /// 65536 个顶点**（见 [`crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH`]）。
+    /// 一个 mesh 对应**一个材质**，所以某个材质如果本身就有几十万顶点
+    /// （真实案例：某改模工程的 `chain` 段有 305,703 顶点），
+    /// 官方 `studiomdl` 会直接拒绝（`ERROR: too many indices in source`）。
+    ///
+    /// 打开本项时，mdlc 会把这种 mesh **按三角形顺序切成多个 mesh**，
+    /// 每块不超过上限，全部放在**同一个 model** 里、**都指向同一个材质**。
+    ///
+    /// # 为什么拆成「同 model 内的多个 mesh」而不是新 bodypart
+    ///
+    /// 第三方 `nekomdl` 的 `$maxverts` 扩展是拆成**新 bodypart**
+    /// （命名 `clamped1`/`clamped2`…，见 `docs/_probe/nekomdl_maxverts_findings.js`）。
+    /// 本实现不那样做，因为：
+    ///
+    /// 1. **bodypart 数量会改变引擎的 bodygroup 语义** ——
+    ///    `$bodygroup` 的选择是按下标走的，凭空多出几个 bodypart 会让
+    ///    原本的 bodygroup 编号错位；
+    /// 2. NekoMDL 自己的产物里出现了**重名 bodypart**（实测两个 `clamped1`），
+    ///    说明那个命名方案本身不够严谨；
+    /// 3. `mesh.material` 只是 `pSkinref[]` 的**下标**，两个 mesh 用同一下标
+    ///    完全合法 —— 引擎渲染结果与拆分前**逐像素相同**。
+    ///
+    /// # 默认打开的理由
+    ///
+    /// 它只在**本来就会编译失败**的情况下生效（mesh 超限），
+    /// 对不超限的模型**完全不碰**（见 `split_oversized_meshes` 的提前返回），
+    /// 所以对既有产物零影响。开着它，用户不必先撞一次墙再去查文档。
+    ///
+    /// 关掉它（`split_oversized_meshes = false`）则遇到超限 mesh 时**直接报错**，
+    /// 报错信息会给出两条可行路径。
+    #[serde(default = "default_true")]
+    pub split_oversized_meshes: bool,
     /// `$keyvalues` 块的内容（**不含外层 `mdlkeyvalue` 包装**）。
     ///
     /// 实测 735/3333 (22.1%) 的真实模型有 keyvalues。落盘格式是：
@@ -2743,6 +2780,14 @@ pub fn default_flex_frame() -> i32 {
 /// `Flex::position` / `Flex::decay` 的缺省值（QC 均为 `1.0`）。
 pub fn default_flex_position() -> f32 {
     1.0
+}
+
+/// `serde` 的 `default = "..."` 用：布尔字段缺省为 **`true`**。
+///
+/// 目前只有 [`ModelMeta::split_oversized_meshes`] 用它 —— 那个开关
+/// 默认打开（见该字段的说明）。
+pub fn default_true() -> bool {
+    true
 }
 
 /// 一个 LOD 档（QC 的 `$lod <阈值> { … }` 块）。
@@ -3954,6 +3999,20 @@ surface_prop = "metal"
 # hull_max = [ 8.0,  8.0, 16.0]
 # 可省略。额外的 STUDIOHDR_FLAGS_* 位（static_prop 会自动置 0x10）。
 # extra_flags = 0
+#
+# ---- 两个「优化 / 兜底」开关 ----
+#
+# 顶点缓存优化：重排每个 strip group 的索引顺序，让 GPU 的后变换顶点缓存
+# 命中率更高。**只改索引顺序**，顶点池与三角形集合都不变（渲染结果相同）。
+# 可省略，默认 false（保持与既有产物逐字节相同）。
+# optimize_vtx = true
+#
+# 顶点超限自动拆分：VTX 的 origMeshVertID 是 uint16 ⟹ **一个 mesh（= 一个
+# 材质）最多 65536 个顶点**。打开本项时，超过上限的 mesh 会被**按三角形
+# 顺序切成多个 mesh**，全部留在**同一个 model** 里、**共用原材质下标**，
+# 所以不改变 $bodygroup 语义，渲染结果与拆分前逐像素相同。
+# 可省略，**默认 true**。关掉它则遇到超限 mesh 直接报错。
+# split_oversized_meshes = false
 
 [materials]
 # 材质搜索目录（$cdmaterials）。落盘时会规范化成反斜杠 + 结尾分隔符。
@@ -4672,6 +4731,42 @@ smd = "minimal-ref.smd"
         d.validate().expect("最小描述必须合法");
     }
 
+    /// **缺省值**必须钉住 —— `serde(default = "default_true")` 一旦写错
+    /// （比如漏了 `#[serde(default)]`），字段会变成 `false`：
+    /// 超限 mesh 又会**直接报错**，而所有单元测试仍会全绿
+    /// （它们都显式构造结构体，不走 serde）。
+    #[test]
+    fn split_oversized_meshes_defaults_to_true() {
+        let d = ModelDesc::from_toml(MINIMAL_TOML).expect("最小描述必须能解析");
+        assert!(
+            d.model.split_oversized_meshes,
+            "`split_oversized_meshes` 的缺省必须是 true（否则用户要先撞一次墙）"
+        );
+        // 显式关掉也要能生效。
+        let off = MINIMAL_TOML.replace(
+            "[model]",
+            "[model]\nsplit_oversized_meshes = false",
+        );
+        let d2 = ModelDesc::from_toml(&off).expect("显式 false 必须能解析");
+        assert!(
+            !d2.model.split_oversized_meshes,
+            "显式 `split_oversized_meshes = false` 必须被尊重"
+        );
+    }
+
+    /// QC 路径（不走 serde）的缺省必须与 TOML 一致 —— 两处漂移会让
+    /// 「同一个模型用 QC 编能过、用 TOML 编报错」。
+    #[test]
+    fn qc_default_matches_toml_default() {
+        assert!(
+            crate::model::default_true(),
+            "QC 与 TOML 必须共用同一个缺省函数"
+        );
+        // 防漂移：`ModelMeta` 走 serde 得到的值也必须一致。
+        let d = ModelDesc::from_toml(MINIMAL_TOML).unwrap();
+        assert_eq!(d.model.split_oversized_meshes, crate::model::default_true());
+    }
+
     #[test]
     fn round_trips_through_toml() {
         let d = ModelDesc::from_toml(MINIMAL_TOML).unwrap();
@@ -4714,6 +4809,28 @@ smd = "minimal-ref.smd"
         assert!(
             TEMPLATE_TOML.contains("weight_list = "),
             "模板应演示序列侧的 weight_list 引用"
+        );
+    }
+
+    /// 两个「优化 / 兜底」开关必须在模板里**可见**。
+    ///
+    /// 它们的缺省很反直觉（`optimize_vtx` 默认 **false**、
+    /// `split_oversized_meshes` 默认 **true**），不写进模板的话用户只能去
+    /// 读源码。`--template` 是主要发现路径。
+    #[test]
+    fn template_documents_both_optimization_switches() {
+        assert!(
+            TEMPLATE_TOML.contains("optimize_vtx = true"),
+            "模板应演示 optimize_vtx（缺省 false）"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("split_oversized_meshes = false"),
+            "模板应演示 split_oversized_meshes（缺省 true）"
+        );
+        // 两处都要说明缺省值，否则用户看不出「注释掉会怎样」。
+        assert!(
+            TEMPLATE_TOML.contains("默认 true"),
+            "模板应写明 split_oversized_meshes 的缺省是 true"
         );
     }
 

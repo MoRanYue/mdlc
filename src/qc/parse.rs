@@ -159,6 +159,9 @@ impl<'a> Parser<'a> {
                     contents: None,
                     skip_bone_in_bbox: false,
                     optimize_vtx: false,
+                    // QC 没有对应的关键字（这是 mdlc 自己的扩展），
+                    // 走**与 TOML 同一个缺省函数**（避免两处各写一遍而漂移）。
+                    split_oversized_meshes: crate::model::default_true(),
                     key_values: None,
                     pose_parameters: Vec::new(),
                     realign_bones: false,

@@ -97,20 +97,36 @@ studiomdl 里有一批**人为**上限（例如单 SMD 65536 顶点、材质 32 
 > **不需要手工把 SMD 拆开**。
 >
 > ⚠️ 但**一个材质**如果本身就有 30 万顶点（真实案例：某改模工程的 `chain`
-> 段有 305,703 顶点），那就**确实编不出来** —— 官方 `studiomdl` 同样拒绝
+> 段有 305,703 顶点），官方 `studiomdl` 会直接拒绝
 > （`ERROR: too many indices in source`）。这是格式的真实上限，不是本实现的
-> 限制。绕过办法见下节。
+> 限制 —— 但 mdlc **会自动帮你拆**（见下节）。
 
 #### 单个 mesh 超过 65536 顶点怎么办
 
-这是**格式**约束（VTX 的 `origMeshVertID` 是 `uint16`），官方与 mdlc 都会拒绝。
-可选路径：
+**默认不用管** —— mdlc 会自动拆。这是**格式**约束
+（VTX 的 `origMeshVertID` 是 `uint16`），官方 `studiomdl` 会拒绝，mdlc 则
+在编译期把超限的 mesh **按三角形顺序切成多个 mesh**：
 
-| 办法 | 说明 |
+| | |
 |---|---|
-| **把该材质拆成多张材质** | 最省事：一个材质 = 一个 mesh = 一份独立配额。缺点是渲染时多一个 draw call。 |
-| **分多个 `$bodygroup` 子模型** | 每个子模型是独立的 `model`，各自有 65536 配额。 |
-| 用 NekoMDL 的 `$maxverts` | 见下 —— 它是**非官方扩展**，会自动把超限模型切块。 |
+| 开关 | TOML `[model] split_oversized_meshes`，**默认 `true`** |
+| 拆到什么粒度 | 每块 ≤ 65536 顶点 |
+| 放在哪里 | **同一个 model** 里（**不新增 bodypart**） |
+| 材质 | 所有块**共用原材质下标**（`mesh.material` 只是 `pSkinref[]` 的下标） |
+| 渲染结果 | 与拆分前**逐像素相同**（只是多几个 draw call） |
+| 关掉它 | `split_oversized_meshes = false` ⟹ 回到「报错并给出替代路径」 |
+
+**为什么不拆成新 bodypart**（第三方 NekoMDL 的 `$maxverts` 是那样做的）：
+bodypart 数量一变，引擎的 `$bodygroup` 选择（**按下标**）就会错位；
+而且 NekoMDL 自己的产物里出现了重名 bodypart（实测两个 `clamped1`）。
+`mesh.material` 只是 `pSkinref[]` 的下标，多个 mesh 共用它完全合法。
+
+> **实测**（某改模工程，单个材质 305,703 顶点，`v_autoshotgun.qc`）：
+> 拆分前 mesh 20 个、最大单 mesh 305,703 顶点 ⟹ 编译**失败**；
+> 拆分后 mesh 24 个、**最大单 mesh 恰好 65,536**、0 个超限，
+> **三角形总数守恒 232,099**，bodypart 数**仍是 2**（未变）。
+> 产物：MDL 849,612 B / VVD 27,620,800 B / VTX 5,278,585 B。
+> 校验探针：`node docs\_probe\verify_split_output.js <out_dir>`（7 项结构判据）。
 
 > **NekoMDL 的 `$maxverts` 逆向结论**（Ghidra + 产物双向验证，见
 > `docs/_probe/nekomdl_maxverts_findings.js`）：
@@ -122,9 +138,16 @@ studiomdl 里有一批**人为**上限（例如单 SMD 65536 顶点、材质 32 
 > 实测 `$maxverts 50000` 编译一个 305,703 顶点的 mesh：产出 9 个 bodypart
 > （`clamped1..6` + 一个重名 `clamped1`），VTX 里最大单 mesh **49,999 顶点**。
 >
-> **mdlc 目前不实现这个扩展**（它改变 MDL 的 bodypart 结构，属非官方行为）。
-> 遇到超限时 mdlc 会**明确报错并给出上面两条可行路径**，而不是静默产出
-> 一个引擎加载不了的模型。
+> **mdlc 不实现 `$maxverts`**（它改变 MDL 的 bodypart 结构，属非官方行为），
+> 改为上面那个「同 model 内多 mesh」的等价且更安全的行为。
+
+其他仍可用的替代路径：
+
+| 办法 | 说明 |
+|---|---|
+| **把该材质拆成多张材质** | 一个材质 = 一个 mesh = 一份独立配额。缺点是渲染时多一个 draw call。 |
+| **分多个 `$bodygroup` 子模型** | 每个子模型是独立的 `model`，各自有 65536 配额。 |
+| 关掉自动拆分 | `split_oversized_meshes = false` ⟹ 报错并提示上面两条路径（适合想自己控制拆分方式的场合）。 |
 
 
 ### 切线、多 LOD、fixup（实测报告）
