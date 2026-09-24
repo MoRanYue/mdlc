@@ -84,19 +84,18 @@ jobs:
       - name: cargo test（profiling feature）
         run: cargo test --release --locked --features profiling
 
-      # ⚠️ 显式把 clippy 的**默认与 pedantic 之外的全部 lint** 提到 deny，
-      # 而不是只靠 `-D warnings` —— 理由见文件头注释（缓存会让
-      # `-D warnings` 静默复用旧结果，漏掉 allow-by-default 的 lint）。
-      # `-W clippy::all` 把整组推成 warning，再由 `-D warnings` 变 error。
+      # ⚠️ 显式把 clippy 的 lint 组推到 deny，而不是只靠裸的 `-D warnings`
+      # —— 理由见文件头注释（缓存会让 `-D warnings` 静默复用旧结果，
+      # 漏掉 allow-by-default 的 lint，如 `chunks_exact_to_as_chunks`）。
+      #
+      # ⚠️ **必须写成单行**：Windows runner 的 shell 是 pwsh，而 pwsh 的
+      # 续行符是反引号，不是 bash 的反斜杠 —— 用 `\` 续行会被当成一个
+      # 普通参数，导致 Windows 上 clippy 直接失败（Ubuntu 却能过）。
       - name: cargo clippy
-        run: |
-          cargo clippy --release --all-targets --locked -- \
-            -W clippy::all -D warnings
+        run: cargo clippy --release --all-targets --locked -- -W clippy::all -D warnings
 
       - name: cargo clippy（profiling feature）
-        run: |
-          cargo clippy --release --all-targets --locked --features profiling -- \
-            -W clippy::all -D warnings
+        run: cargo clippy --release --all-targets --locked --features profiling -- -W clippy::all -D warnings
 
       # 文档链接也会烂（数组下标被当成 intra-doc link、链接到私有项、
       # 路径改名后没跟着改）。钉住它，免得下次又攒回几十条。
