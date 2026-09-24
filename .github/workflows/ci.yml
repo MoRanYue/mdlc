@@ -58,6 +58,28 @@ jobs:
       - name: cargo test
         run: cargo test --release --locked
 
+      # ⚠️ 防止 CI 变成**空洞的绿**：如果有人把测试大量标 `#[ignore]`
+      # （或测试被误删），上一步依然退出 0。这里显式要求
+      # 「通过数 ≥ 520 且 ignored ≤ 6」。
+      # 本项目被空洞测试坑过多次，所以对 CI 自己也设一条非空洞判据。
+      - name: 断言测试计数（防空洞绿）
+        shell: bash
+        run: |
+          set -o pipefail
+          out=$(cargo test --release --locked 2>&1)
+          echo "$out" | tail -5
+          passed=$(echo "$out" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '[0-9]+')
+          ignored=$(echo "$out" | grep -oE '[0-9]+ ignored' | head -1 | grep -oE '[0-9]+')
+          echo "passed=$passed ignored=$ignored"
+          if [ "${passed:-0}" -lt 520 ]; then
+            echo "::error::通过数只有 $passed（期望 ≥520）—— 测试被跳过或删除了？"
+            exit 1
+          fi
+          if [ "${ignored:-99}" -gt 6 ]; then
+            echo "::error::ignored 有 $ignored 个（期望 ≤6）—— 新增了跳过的测试？"
+            exit 1
+          fi
+
       # profiling feature 也必须能编过（探针配置的回归纪律）。
       - name: cargo test（profiling feature）
         run: cargo test --release --locked --features profiling
@@ -78,8 +100,14 @@ jobs:
 
       # 文档链接也会烂（数组下标被当成 intra-doc link、链接到私有项、
       # 路径改名后没跟着改）。钉住它，免得下次又攒回几十条。
+      #
+      # ⚠️ rustdoc 的参数**不能**放在 `cargo doc --` 后面
+      # （`cargo doc -- -D warnings` 会报 `unexpected argument '-D'`，
+      # 因为 `cargo doc` 本身不接受尾随参数）。必须用 `RUSTDOCFLAGS`。
       - name: cargo doc（零警告）
-        run: cargo doc --no-deps --locked -- -D warnings
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   msrv:
     name: MSRV（Cargo.toml 的 rust-version 必须是真的）
