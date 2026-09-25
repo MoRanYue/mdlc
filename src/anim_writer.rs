@@ -1338,7 +1338,46 @@ fn write_chain_body(
                 q[2] * rot_scale[b][2],
             ]
         });
-        let use_rawrot2 = rot_angle.is_some_and(|a| a != [0.0; 3]);
+        // ⚠️ **`RAWROT2` 的两个条件必须来自同一个判据。**
+        //
+        // 早先这里只判「量化后的常量非零」：
+        // ```rust
+        // let use_rawrot2 = rot_angle.is_some_and(|a| a != [0.0; 3]);
+        // ```
+        // 而**载荷** `rot_const_raw` 是在 `ch.rot` 构造处按「原始差值逐帧
+        // **精确浮点相等**」填的（见 `write_animations` 里
+        // `rot_frames.iter().all(|r| *r == *first)`）。两个判据在
+        // 「原始差值有极小抖动、但量化后落在同一个整数」时分道扬镳 ——
+        // 于是 `flags` 置了 `RAWROT2`（声明后面有 8 字节 `Quaternion64`），
+        // 却**一个字节都没写**。
+        //
+        // 实测 `v_silenced_smg` `a_run` `b40 ValveBiped.Bip01_R_Finger2`：
+        // 原始 `rot[1]` 逐帧抖动 `1.2e-3°`（约半个量化步长），量化后恒定
+        // （复刻官方 `simplify.cpp:6545-6591` 得 `numanim=[2,2,2]`）；
+        // mdlc 写 `flags=0x20` 但 `nextoffset=4`。引擎 `pQuat64()` 读到的是
+        // **下一条记录的 4 字节头**，拼出的四元数 `x²+y²+z² = 1.505 > 1`
+        // ⟹ `w = 0` ⟹ 退化成一个 **180°** 旋转。
+        //
+        // 判据（`probe_chain_dump.js`，同一骨骼同一动画）：
+        //
+        // | | `flags` | `nextoffset` | 旋转载荷 |
+        // |---|---|---|---|
+        // | 官方 | `0x8`（`ANIMROT`） | **72** | 三轴 RLE |
+        // | mdlc（修前） | `0x20`（`RAWROT2`） | **4** | **无** ❌ |
+        //
+        // 官方那条 `ANIMROT` 的三轴：axis0 恒定（`1463`）、axis1/axis2
+        // 各差 1 个量化单位 ⟹ **官方要求三轴都恒定才用 `RAWROT2`**。
+        //
+        // 所以判据加上 `rot_const_raw.is_some()`：原始差值不精确恒定就
+        // 退回 `ANIMROT` —— 既消除了「有标志无载荷」的自相矛盾，
+        // 也与官方在该骨骼上的选择一致。
+        //
+        // ⚠️ **位移侧没有这个问题**：`pos_delta_is_const` 与
+        // `pos_const_raw` 在 `write_animations` 里由**同一个 `if`** 同时置位
+        // （`pos_frames.iter().all(|t| *t == *first)`），天然自洽。
+        // 旋转侧是「判据用 `ch.rot`（量化后）、载荷用 `rot_const_raw`
+        // （原始）」两套来源 ⟹ 又一处**不对称路径** bug（HANDBOOK §45.28）。
+        let use_rawrot2 = ch.rot_const_raw.is_some() && rot_angle.is_some_and(|a| a != [0.0; 3]);
         // ⚠️ **旋转完全无数据时不能写 `ANIMROT`。**
         //
         // 早先这里是 `use_animrot = !use_rawrot2 && n > 1` —— 只看帧数，
@@ -5214,11 +5253,205 @@ mod tests {
         assert_eq!(xs, vec![0, 10922, 21844, 32767], "应复刻官方 exp50 的 X 轴采样");
     }
 
+    /// **`RAWROT2` 的 flags 与载荷必须同时存在** —— 声明了载荷就不能一个字节都不写。
+    ///
+    /// # 这条测试为什么必要
+    ///
+    /// `RAWROT2` 的「要不要写」与「写什么」来自**两个不同的判据**：
+    ///
+    /// | | 判据 | 来源 |
+    /// |---|---|---|
+    /// | 要不要写（`flags`） | 量化后三轴恒定且非零 | `ch.rot`（`fold_axis` 的产物） |
+    /// | 写什么（载荷） | **原始**差值逐帧**精确浮点相等** | `ch.rot_const_raw` |
+    ///
+    /// 两者在「原始差值有极小抖动、但量化后落在同一个整数」时分道扬镳 ——
+    /// 于是 `flags` 置了 `RAWROT2`（`studio.h:586` 的 `pPos()` 会据此
+    /// 跳过 8 字节），却一个字节都没写。引擎 `pQuat64()` 读到的是
+    /// **下一条记录的 4 字节头**，拼出的四元数模长 > 1 ⟹ `w = 0`
+    /// ⟹ 退化成一个 **180°** 旋转。
+    ///
+    /// 实测（`v_silenced_smg` `a_run` `b40`，见 `probe_chain_dump.js`）：
+    ///
+    /// | | `flags` | `nextoffset` | 载荷 |
+    /// |---|---|---|---|
+    /// | 官方 | `0x8`（`ANIMROT`） | **72** | 三轴 RLE |
+    /// | mdlc（修前） | `0x20`（`RAWROT2`） | **4** | **无** ❌ |
+    ///
+    /// 夹具的抖动幅度必须**远小于一个量化步长**才落在「量化后恒定」这一侧。
+    /// 步长的下限是 `ROT_SCALE_MIN / QUANT_DIVISOR` = `π/8/32767` ≈
+    /// **`1.198e-5` rad**（窗口只会被拉伸 ⟹ 实际步长只会更大）。
+    ///
+    /// ⚠️ **参考姿态必须显式传，不能走 `write_with_f0_refs`。**
+    /// 那个 helper 把参考姿态取成**第 0 帧**，于是第 0 帧的差值恒为 0、
+    /// 其余帧是 `±2·JITTER` —— 量化后**全是 0** ⟹ 三轴全 `Absent`
+    /// ⟹ 根本走不到目标路径。第一版就是这么写的，被「非空洞」硬门当场抓住。
+    ///
+    /// # 两个分支都要覆盖（这是本测试的第二版）
+    ///
+    /// 第一版只造了「原始差值有抖动」的夹具，断言它必须走 `RAWROT2` ——
+    /// 那**正是旧 bug 的行为**。修好之后它落到 `ANIMROT`，测试反而红了。
+    /// 正确做法是把「抖动 ⟹ `ANIMROT`」也写成断言（那才是官方在
+    /// `v_silenced_smg` `b40` 上的选择），再另造一个「原始差值精确相等」
+    /// 的夹具覆盖 `RAWROT2` 分支。
+    ///
+    /// 两个分支共同的不变量：**`flags` 声明了载荷就必须真的写出那些字节。**
+    #[test]
+    fn rawrot2_flag_implies_payload_is_written() {
+        // 走一遍链，逐记录检查「flags 声明的载荷大小」与 `nextoffset` 自洽。
+        let check = |out: &AnimWriteOutcome, what: &str| -> Vec<(u8, u8, usize)> {
+            let chain = walk_chain(&out.anim_data, 0);
+            assert!(!chain.is_empty(), "{what}：夹具非空（至少要有一条记录）");
+            let d = &out.anim_data;
+            for (i, &(bone, flags, payload)) in chain.iter().enumerate() {
+                let need = 4
+                    + if flags & STUDIO_ANIM_RAWROT2 != 0 { 8 } else { 0 }
+                    + if flags & STUDIO_ANIM_RAWROT != 0 { 6 } else { 0 }
+                    + if flags & STUDIO_ANIM_RAWPOS != 0 { 6 } else { 0 }
+                    + if flags & STUDIO_ANIM_ANIMROT != 0 { 6 } else { 0 }
+                    + if flags & STUDIO_ANIM_ANIMPOS != 0 { 6 } else { 0 };
+                let next = i16::from_le_bytes([d[payload - 2], d[payload - 1]]);
+                if next == 0 {
+                    continue; // 末条：`nextoffset` 置 0 是官方约定
+                }
+                // `ANIMROT`/`ANIMPOS` 后面还跟着各轴的流 ⟹ `next` 只会
+                // **大于等于** `need`；`RAWROT2`/`RAWPOS` 无流时应当相等。
+                assert!(
+                    next as usize >= need,
+                    "{what} 记录 {i}（bone {bone}，flags=0x{flags:02x}）：`nextoffset`={next} \
+                     小于载荷所需 {need} 字节 ⟹ flags 声明了载荷却没写"
+                );
+                if flags & (STUDIO_ANIM_ANIMROT | STUDIO_ANIM_ANIMPOS) == 0 {
+                    assert_eq!(
+                        next as usize, need,
+                        "{what} 记录 {i}（bone {bone}，flags=0x{flags:02x}）：无流时 \
+                         `nextoffset` 应恰好等于载荷大小 {need}"
+                    );
+                }
+            }
+            chain
+        };
+
+        // ---- 分支 A：原始差值**有**抖动（量化后仍恒定）⟹ 必须走 `ANIMROT` ----
+        //
+        // 这就是官方 `v_silenced_smg` `a_run` `b40` 的形态（原始 `rot[1]`
+        // 抖动 `1.2e-3°`，量化后恒定）。官方在那里写的是 `ANIMROT`，
+        // 因为 `RAWROT2` 的载荷要求「一个**确定的**常量旋转」，而抖动的
+        // 差值取哪一帧都不对。
+        //
+        // ⚠️ **夹具必须有 ≥ 2 根骨骼。** 只有 1 根时它是链上唯一（也是最后）
+        // 一条记录，`nextoffset` 按官方约定被置 0 —— 而 `check` 会跳过
+        // `nextoffset == 0` 的记录 ⟹ **变异逃逸**。第一版就是 1 根骨骼，
+        // 把修复回退成旧代码后测试**照样全绿**。
+        //
+        // ⚠️ **抖动幅度必须相对 `rotscale` 足够小，而 `rotscale` 由极值决定。**
+        // 第二版让 bone0 自己既提供极值又提供抖动：极值 `0.3` ⟹
+        // `rotscale = 0.3/32767`，于是 `0.3/rotscale` 恰好压在桶边界
+        // `32767.0` 上，`−1e-7` 一侧截断成 `32766` ⟹ 量化后**不恒定**
+        // ⟹ 走 `ANIMROT`、**测不到目标路径**（变异逃逸，第二次）。
+        // 正确做法：**另用一条序列把极值抬高**（`1.0`），让 `0.3` 落在
+        // 桶中间。此时 `rotscale = 1.0/32767`，抖动 `1e-7` 只占
+        // `0.0033` 个桶 ⟹ 量化后恒定。
+        const BASE: f32 = 0.3;
+        const BIG: f32 = 1.0;
+        const JITTER: f32 = 1e-7;
+        // bone0 抖动；bone1 精确相等（保证它是一条真实的、有载荷的记录）。
+        let jittery: Vec<Vec<SmdPose>> = (0..6)
+            .map(|f| {
+                let d = BASE + if f % 2 == 0 { JITTER } else { -JITTER };
+                vec![
+                    pose([0.0; 3], [d, d, d]),
+                    pose([0.0; 3], [BASE, BASE, BASE]),
+                ]
+            })
+            .collect();
+        // 第二条序列：只用来**抬高极值**（`rotscale` 是全局一份）。
+        let scaler: Vec<Vec<SmdPose>> = (0..6)
+            .map(|_| {
+                vec![
+                    pose([0.0; 3], [BIG, BIG, BIG]),
+                    pose([0.0; 3], [BASE, BASE, BASE]),
+                ]
+            })
+            .collect();
+        let c = compiled(
+            vec![seq("idle", false, jittery), seq("run", false, scaler)],
+            2,
+        );
+        // 参考姿态 = 原点（**不是**第 0 帧），理由见上。
+        let refs2 = [([0.0f32; 3], [0.0f32; 3]), ([0.0f32; 3], [0.0f32; 3])];
+        let out = write_animations(&c, &[-1, 0], &refs2, 0).expect("写出动画");
+        let chain = check(&out, "抖动夹具");
+        assert!(
+            chain.len() >= 2,
+            "夹具应有 ≥ 2 条记录（否则 `nextoffset` 恒为 0、测不到自洽性）"
+        );
+        // ⚠️ 断言必须**按骨骼**，不能「全部记录都不得是 `RAWROT2`」——
+        // bone1 是精确常量，它**应该**走 `RAWROT2`（那是正确行为）。
+        // 第一版写成 `chain.iter().all(...)`，于是被 bone1 误伤。
+        let b0 = chain
+            .iter()
+            .find(|&&(b, _, _)| b == 0)
+            .expect("bone0 必须在链上（它抖动 ⟹ 有数据）");
+        assert_eq!(
+            b0.1 & STUDIO_ANIM_RAWROT2,
+            0,
+            "bone0 原始差值有抖动 ⟹ 不能写 `RAWROT2`（官方在此形态下写 `ANIMROT`）"
+        );
+        assert_eq!(
+            b0.1 & STUDIO_ANIM_ANIMROT,
+            STUDIO_ANIM_ANIMROT,
+            "bone0 应退化为 `ANIMROT`"
+        );
+
+        // ---- 分支 B：原始差值**精确相等**且非零 ⟹ `RAWROT2` + 8 字节载荷 ----
+        let exact: Vec<Vec<SmdPose>> = (0..6)
+            .map(|_| {
+                vec![
+                    pose([0.0; 3], [BASE, BASE, BASE]),
+                    pose([0.0; 3], [BASE, BASE, BASE]),
+                ]
+            })
+            .collect();
+        let c2 = compiled(vec![seq("idle", false, exact)], 2);
+        let out2 = write_animations(&c2, &[-1, 0], &refs2, 0).expect("写出动画");
+        let chain2 = check(&out2, "精确相等夹具");
+        let (bone2, flags2, payload2) = chain2[0];
+        assert_eq!(bone2, 0);
+        assert_eq!(
+            flags2 & STUDIO_ANIM_RAWROT2,
+            STUDIO_ANIM_RAWROT2,
+            "原始差值精确相等 ⟹ 应写 `RAWROT2`（否则分支 B 是空洞的）"
+        );
+        // 两条记录时 `nextoffset` 有真值 ⟹ 可以精确断言记录长度。
+        let next2 =
+            i16::from_le_bytes([out2.anim_data[payload2 - 2], out2.anim_data[payload2 - 1]]);
+        assert_eq!(
+            next2, 12,
+            "`RAWROT2` 记录总长应为 4（头）+ 8（`Quaternion64`）= 12 \
+             （4 说明 flags 声明了载荷却没写）"
+        );
+        // 且四元数必须是**有效**的（模长 1，`w != 0`）—— 旧 bug 下
+        // `pQuat64()` 读到的是下一条记录的头（或对齐填充），模长 ≥ 1 ⟹ `w = 0`。
+        let bits =
+            u64::from_le_bytes(out2.anim_data[payload2..payload2 + 8].try_into().unwrap());
+        let mask = (1u64 << 21) - 1;
+        let q = |shift: u32| (bits >> shift & mask) as f64 / 1048576.5 - 1.0;
+        let (qx, qy, qz) = (q(0), q(21), q(42));
+        let sum = qx * qx + qy * qy + qz * qz;
+        assert!(
+            sum < 1.0,
+            "四元数模长平方 {sum} 应 < 1（`w` 才有实数解）；\
+             ≥ 1 说明读到了别的字节（旧 bug：载荷未写）"
+        );
+        assert!(
+            sum > 0.5,
+            "四元数模长平方 {sum} 太小 ⟹ 载荷是全 0 或垃圾字节"
+        );
+    }
+
     /// 静止的非根骨骼完全不进链（姿态回落到骨骼表）。
     #[test]
     fn still_bone_stays_out_of_chain() {
-        // bone0 是根（有 π/2 偏置 → 恒定非 0 → 进链）；
-        // bone1 完全不动 → 不进链。
         let c = compiled(
             vec![seq(
                 "idle",
