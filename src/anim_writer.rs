@@ -556,7 +556,21 @@ fn delta_frames(
         return (rot_frames, pos_frames);
     }
     for f in 0..n {
-        let p = frames[f][b];
+        // ⚠️ **帧行可能比骨骼池短。**
+        //
+        // 序列级 `subtract` 之后写出器改读**序列**的帧（见
+        // [`AnimSpec::cell_frames`]），而序列的帧行由 SMD 决定 ——
+        // 受控夹具里常见「1 根骨骼的 SMD + 2 根骨骼的模型」。
+        // 直接 `frames[f][b]` 会 panic（实测
+        // `single_frame_animation_writes_fixed_cycles` 崩在 len=1/index=1）。
+        //
+        // 缺失的骨骼按「零增量」处理 —— 与官方 `Grab_Animation`
+        // （`studiomdl.cpp:1065-1135`，`kalloc` 打底、缺的骨骼留 0）一致。
+        let Some(p) = frames.get(f).and_then(|r| r.get(b)) else {
+            rot_frames.push([0.0f32; 3]);
+            pos_frames.push([0.0f32; 3]);
+            continue;
+        };
         let loop_tail = looping && f == n - 1;
         let mut r = [0.0f32; 3];
         if loop_tail {
@@ -670,8 +684,14 @@ fn delta_stored_frames(
     for f in 0..n {
         let loop_tail = looping && f == n - 1;
         let src = if loop_tail { 0 } else { f };
-        rot_frames.push(crate::bone_math::canonical_euler(frames[src][b].rotation));
-        pos_frames.push(frames[src][b].position);
+        // 帧行可能比骨骼池短 —— 缺的骨骼按零增量（同 `delta_frames`）。
+        let Some(p) = frames.get(src).and_then(|r| r.get(b)) else {
+            rot_frames.push([0.0f32; 3]);
+            pos_frames.push([0.0f32; 3]);
+            continue;
+        };
+        rot_frames.push(crate::bone_math::canonical_euler(p.rotation));
+        pos_frames.push(p.position);
     }
     (rot_frames, pos_frames)
 }
@@ -689,7 +709,11 @@ pub(crate) fn frame_stored_rot(
     f: usize,
     ref_rot: [f32; 3],
 ) -> [f32; 3] {
-    let canon = crate::bone_math::canonical_euler(frames[f][b].rotation);
+    // 帧行可能比骨骼池短 —— 缺的骨骼按零增量（同 `delta_frames`）。
+    let Some(p) = frames.get(f).and_then(|r| r.get(b)) else {
+        return [0.0f32; 3];
+    };
+    let canon = crate::bone_math::canonical_euler(p.rotation);
     let mut r = [0.0f32; 3];
     for (k, rk) in r.iter_mut().enumerate() {
         *rk = wrap_to_pi(canon[k] - ref_rot[k]);
@@ -1560,9 +1584,48 @@ struct AnimSpec {
 }
 
 impl AnimSpec {
-    /// 该动画的**逐帧姿态**（直接取自动画池）。
+    /// 该动画的**逐帧姿态**。
+    ///
+    /// # ⚠️ 必须优先读**序列**的帧，不能只读动画池
+    ///
+    /// `$sequence` 级的 `subtract "<动画>" <帧>`（`simplify.cpp:163-166` 的
+    /// `CMD_SUBTRACT`）在 `compile.rs` 里作用于**该序列自己的帧副本**
+    /// （`CompiledSequence::frames`），**不写回**共享的
+    /// `compiled.animations[].frames`（那样会让「同一动画被两条序列引用」时
+    /// 减除被叠加两次）。
+    ///
+    /// 早先这里读 `compiled.animations[self.anim_index].frames` ⟹
+    /// **序列级 `subtract` 的结果对写出器完全不可见**，动画按**未减除**的
+    /// 绝对姿态写出。
+    ///
+    /// # 实测症状（`v_snip_awp`，6/6 个官方 viewmodel 都受影响）
+    ///
+    /// `@awm_fire_layer` 的 `b7`：
+    ///
+    /// | | `RAWROT2` 反解欧拉 |
+    /// |---|---|
+    /// | 官方 | `[0.00°, 0.00°, 0.00°]` ← **差值**（减除生效） |
+    /// | mdlc（修前） | `[-179.99°, 0.20°, -175.49°]` ← **SMD 原始绝对值** |
+    ///
+    /// 于是 30~51 根骨骼本该「减除后恒 0 ⟹ 官方不写记录」，
+    /// mdlc 却把它们按原值写进了链 ⟹ 这些层**整体错位**。
+    ///
+    /// 判据：`probe_anim_bones.js` 报「多写 2669 条记录」（153 条动画）。
+    ///
+    /// # 只在「该序列单格引用本动画」时才用序列帧
+    ///
+    /// blend 序列（`blend_width > 1`）的**每个格是独立动画**，
+    /// `CompiledSequence::frames` 只存**第一格** —— 用它会让其余格全错。
+    /// 所以只在 `cells == [anim_index]`（本序列只引用这一个动画）时走序列帧；
+    /// 其余情况退回动画池（blend 的 `subtract` 走 `animations[].subtract`，
+    /// 已经写回了动画池）。
     fn cell_frames<'a>(&self, compiled: &'a CompiledModelDesc) -> &'a [Vec<crate::smd::SmdPose>] {
-        &compiled.animations[self.anim_index].frames
+        compiled
+            .sequences
+            .get(self.seq_index)
+            .filter(|s| s.cells.as_slice() == [self.anim_index])
+            .map(|s| s.frames.as_slice())
+            .unwrap_or_else(|| compiled.animations[self.anim_index].frames.as_slice())
     }
 
     /// `usesource` 要用的帧：**减除之前**的原始 SMD 姿态。
@@ -2236,13 +2299,27 @@ fn frame_worlds_for(
     }
     if use_source {
         let frames = spec.source_frames(compiled);
-        return Ok(crate::compile::frame_worlds(
-            &compiled.desc,
-            parents,
-            &frames[f as usize],
-        ));
+        // ⚠️ `spec.frames` 来自**动画池**，而 `source_frames`/`cell_frames`
+        // 可能来自**序列**（帧行可能更短）⟹ 上面的范围检查不足以保证可索引。
+        // 取不到时退回最后一帧（官方 `CalcBoneTransforms` 对越界帧
+        // 会 clamp 到 `numframes - 1`）。
+        let row = frames.get(f as usize).or_else(|| frames.last());
+        let Some(row) = row else {
+            return Err(AnimWriteError::IkRule {
+                sequence: seq.name.clone(),
+                message: format!("ikrule 取帧 {f} 时源帧表为空（\"{}\"）", seq.name),
+            });
+        };
+        return Ok(crate::compile::frame_worlds(&compiled.desc, parents, row));
     }
     let frames = spec.cell_frames(compiled);
+    let row = frames.get(f as usize).or_else(|| frames.last());
+    let Some(row) = row else {
+        return Err(AnimWriteError::IkRule {
+            sequence: seq.name.clone(),
+            message: format!("ikrule 取帧 {f} 时帧表为空（\"{}\"）", seq.name),
+        });
+    };
     // `STUDIO_DELTA` 动画必须**重建**（官方 `simplify.cpp:4562-4578`）。
     // 直接喂增量会让所有骨骼塌到原点 —— 见
     // [`crate::compile::delta_local_matrices`] 的实测判据。
@@ -2252,14 +2329,10 @@ fn frame_worlds_for(
             &compiled.desc,
             parents,
             &base,
-            &frames[f as usize],
+            row,
         ));
     }
-    Ok(crate::compile::frame_worlds(
-        &compiled.desc,
-        parents,
-        &frames[f as usize],
-    ))
+    Ok(crate::compile::frame_worlds(&compiled.desc, parents, row))
 }
 
 /// `g_panimation[0]->sanim[0]` —— DELTA 重建的**基准帧**。
@@ -2935,8 +3008,39 @@ pub fn write_animations(
     // ---- 1b. 用**最终** scale 量化 ----
     let mut per_seq: Vec<Vec<BoneChannels>> = Vec::with_capacity(compiled.sequences.len());
     for (si, table) in per_seq_frames.iter().enumerate() {
+        // ⚠️ **逐骨骼的权重门**（`simplify.cpp:6475-6477`）：
+        //
+        // ```c
+        // // skip bones that have no influence
+        // if (g_panimation[i]->weight[j] < 0.001)
+        //     continue;                       // ← 整根骨骼跳过，**不写记录**
+        // ```
+        //
+        // 缺了它，`$weightlist` 把权重设成 0 的序列会把**全部**骨骼都写进链。
+        // 实测 `v_snip_awp`：`weights_helping_hand_extend` 把 64 根骨骼
+        // 全设成 0，官方 `@helping_hand_extend` 写 **0 条**记录，
+        // mdlc 写 **63 条** —— 多出的骨骼会被推离参考姿态。
+        //
+        // 权重的来源：`$weightlist`（`Sequence::weights`，缺省全 1）。
+        // 这里用**该动画所属序列**的权重 —— 与 `panim->weight[]` 同源。
+        let seq_weights: &[f32] = &compiled.sequences
+            [specs[si].seq_index.min(compiled.sequences.len().saturating_sub(1))]
+            .weights;
         let mut channels: Vec<BoneChannels> = Vec::with_capacity(bone_count);
         for (b, (rot_frames, pos_frames)) in table.iter().enumerate() {
+            // 权重 < 0.001 ⟹ 该骨骼整根不进链（官方 `continue`）。
+            // 缺省（表比骨骼数短 / 空表）按 1.0 处理。
+            let w = seq_weights.get(b).copied().unwrap_or(1.0);
+            if w < 0.001 {
+                channels.push(BoneChannels {
+                    rot: [AxisData::Absent, AxisData::Absent, AxisData::Absent],
+                    pos: [AxisData::Absent, AxisData::Absent, AxisData::Absent],
+                    pos_const_raw: None,
+                    pos_delta_is_const: false,
+                    rot_const_raw: None,
+                });
+                continue;
+            }
             let mut ch = BoneChannels {
                 rot: [AxisData::Absent, AxisData::Absent, AxisData::Absent],
                 pos: [AxisData::Absent, AxisData::Absent, AxisData::Absent],
@@ -4073,6 +4177,97 @@ mod tests {
             position: p,
             rotation: r,
         }
+    }
+
+    /// **`$sequence` 级 `subtract` 的结果必须对写出器可见。**
+    ///
+    /// # 这是「动画里骨骼姿态不正确」的第二个根因
+    ///
+    /// `compile.rs` 把序列级 `subtract` 作用在**该序列自己的帧副本**
+    /// （`CompiledSequence::frames`）上，**不写回**共享的
+    /// `compiled.animations[].frames`。而 `AnimSpec::cell_frames` 早先只读
+    /// 动画池 ⟹ **减除结果对写出器完全不可见**，动画按**未减除**的绝对
+    /// 姿态写出。
+    ///
+    /// # 实测症状（`v_snip_awp` `@awm_fire_layer` 的 `b7`）
+    ///
+    /// | | `RAWROT2` 反解欧拉 |
+    /// |---|---|
+    /// | 官方 | `[0.00°, 0.00°, 0.00°]` ← 差值（减除生效） |
+    /// | mdlc（修前） | `[-179.99°, 0.20°, -175.49°]` ← SMD 原始值 |
+    ///
+    /// 汇总：`probe_anim_bones.js` 报「**多写 2669 条记录**」（153 条动画）。
+    ///
+    /// # 夹具设计（关键）
+    ///
+    /// 必须让「序列帧」与「动画池帧」**不同**，否则两种取法恒等、测试空洞。
+    /// 这里把序列帧设成「全 0」，动画池设成「非 0」——
+    /// 取错来源时写出的载荷会明显不同。
+    #[test]
+    fn cell_frames_reads_sequence_not_animation_pool() {
+        // 序列帧：全 0（模拟「减除之后」）。
+        let seq_frames: Vec<Vec<SmdPose>> = (0..3)
+            .map(|_| vec![pose([0.0; 3], [0.0; 3])])
+            .collect();
+        let mut s = seq("layered", false, seq_frames);
+        // `cells == [anim_index]` 是走序列帧的前提。
+        s.cells = vec![0];
+        let mut c = compiled(vec![s], 1);
+        // 动画池：非 0（模拟「未减除的原始 SMD 值」）。
+        c.animations[0].frames = (0..3)
+            .map(|_| vec![pose([9.0, 9.0, 9.0], [1.5, 0.0, 0.0])])
+            .collect();
+
+        let spec = AnimSpec {
+            seq_index: 0,
+            anim_index: 0,
+            frames: 3,
+            fps: 30.0,
+            looping: false,
+            identity: false,
+        };
+        let got = spec.cell_frames(&c);
+        assert_eq!(got.len(), 3);
+        for row in got {
+            assert_eq!(
+                row[0].position,
+                [0.0, 0.0, 0.0],
+                "必须读**序列**的帧（已减除），不能读动画池（未减除）"
+            );
+            assert_eq!(row[0].rotation, [0.0, 0.0, 0.0]);
+        }
+    }
+
+    /// blend 序列（`cells` 多于一个）**必须**退回动画池。
+    ///
+    /// `CompiledSequence::frames` 只存**第一格**，用它会让其余格全错。
+    #[test]
+    fn cell_frames_falls_back_to_pool_for_blend_sequences() {
+        let seq_frames: Vec<Vec<SmdPose>> = (0..3)
+            .map(|_| vec![pose([0.0; 3], [0.0; 3])])
+            .collect();
+        let mut s = seq("blend", false, seq_frames);
+        // 两个格 ⟹ 不是「单动画序列」。
+        s.cells = vec![0, 1];
+        let mut c = compiled(vec![s], 1);
+        c.animations[0].frames = (0..3)
+            .map(|_| vec![pose([9.0, 9.0, 9.0], [1.5, 0.0, 0.0])])
+            .collect();
+
+        let spec = AnimSpec {
+            seq_index: 0,
+            anim_index: 0,
+            frames: 3,
+            fps: 30.0,
+            looping: false,
+            identity: false,
+        };
+        let got = spec.cell_frames(&c);
+        assert_eq!(
+            got[0][0].position,
+            [9.0, 9.0, 9.0],
+            "blend 序列必须退回动画池（序列帧只存第一格）"
+        );
     }
 
     fn compiled(seqs: Vec<CompiledSequence>, bone_count: usize) -> CompiledModelDesc {
