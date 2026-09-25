@@ -369,50 +369,106 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     continue;
                 }
 
-                // 顶点行：12 个 token。
-                if t.len() < 12 {
+                // 顶点行：**至少 9 个 token**。
+                //
+                // # 为什么是 9 而不是 12
+                //
+                // VDC 规范把顶点行写成
+                // `<parentBone> <pos3> <nrm3> <uv2> <links> <bone> <weight> [...]`
+                // 并明确注明「**最后三个值只有 Source 支持，且是可选的**」。
+                // 所以必填只有前 9 个。
+                //
+                // 官方 SDK 同口径（`v1support.cpp:92-101`）：`sscanf` 有 18 个
+                // 转换，但下限检查是
+                // ```c
+                // if (i < 9) continue;   // i = 成功转换的字段数
+                // ```
+                // 缺字段时 `sscanf` 就少转换，`i` 自然变小 —— 9 个就够。
+                //
+                // # 实测（真 studiomdl，`docs/_probe/oracle_smd_token_min.js`）
+                //
+                // | 顶点行 token 数 | studiomdl | 结果 |
+                // |---|---|---|
+                // | **9**（无 links） | ✅ 接受 | `boneCount=1 bone=[token0] weight=1.0` |
+                // | **10**（`links=0`） | ✅ 接受 | 同上 |
+                // | 12（`links=1 b w`） | ✅ 接受 | `bone=[b]` |
+                //
+                // # `links = 0` 的语义是「绑到 parent bone」，**不是**「无绑定」
+                //
+                // 这是本文件早先**写错**的一条（注释与测试都错）：
+                // `v1support.cpp:166` 是
+                // ```c
+                // if (i == 9 || iCount == 0) {
+                //     g_bone[index[j]].numbones = 1;
+                //     g_bone[index[j]].bone[0] = bone;   // ← token 0（parent bone）
+                //     g_bone[index[j]].weight[0] = 1.0;
+                // }
+                // ```
+                // ⟹ `links = 0`（`iCount == 0`）与「只有 9 个 token」（`i == 9`）
+                // 走**同一条**分支：单骨骼、绑 token0、权重 1。
+                //
+                // 实测裁决（`docs/_probe/oracle_links_zero.js`）：
+                // ```text
+                // 骨架 root(0) → mid(1)，顶点行 token0 = 1
+                // links=0（10 token）  ⟹ boneCount=1 bone=[1] weight=[1.0]   ← token0
+                // links=0（13 token）  ⟹ boneCount=1 bone=[1] weight=[1.0]   ← 同上
+                // links=1 bone=0       ⟹ boneCount=1 bone=[0] weight=[1.0]   ← 对照
+                // ```
+                // 若按「无绑定」处理，碰撞网格会**停在参考姿态不跟随骨骼**，
+                // 而官方让它跟随 token0 —— 那是**静默的几何错误**。
+                if t.len() < 9 {
                     return Err(err(
                         line,
                         format!(
-                            "三角形顶点行需要至少 12 个 token（parentBone + pos3 + nrm3 + uv2 + links + bone + weight），实际 {}",
-                            t.len()
+                            "三角形顶点行需要至少 9 个 token\
+                             （`<parentBone> <px py pz> <nx ny nz> <u v>`；\
+                             `links`/`bone`/`weight` 是 Source 的可选扩展），\
+                             实际 {} 个：{:?}。\
+                             若这是 OBJ 风格的 `0 1 2` 索引行，说明该文件不是 SMD。",
+                            t.len(),
+                            t.iter().take(4).copied().collect::<Vec<_>>().join(" ")
                         ),
                     ));
                 }
-                let links_count = parse_i32(t[9], line, "links 数")?;
-                // `links == 0` 是**合法**的：顶点没有任何骨骼权重。
-                //
-                // # 判据（oracle 实测）
-                //
-                // `docs/_probe/smdl/tb1.smd` 的三个顶点都写 `links = 0`，
-                // 官方 studiomdl 正常产出 `.mdl`（1732 字节，重编可复现），
-                // 且 `.vvd` 里第 3 个顶点是 **`boneCount = 0`**：
-                //
-                // ```text
-                // v2 weights=[0.0000,0.0000,0.0000] bones=[0,0,0] boneCount=0
-                // ```
-                //
-                // ⟹ 官方允许「无权重顶点」，`boneCount = 0`。
-                // 早先这里 `links_count < 1` 直接报错，比官方**更严**，
-                // 会让官方能编的 QC 在 mdlc 侧失败（853 个真实 QC 的普查
-                // 暴露了 `tb1`）。
-                if links_count < 0 {
-                    return Err(err(line, format!("links 数不能为负，实际 {links_count}")));
-                }
-                let mut links = Vec::with_capacity(links_count as usize);
-                let mut k = 10usize;
-                for n in 0..links_count as usize {
-                    if k + 1 >= t.len() {
-                        return Err(err(
-                            line,
-                            format!("声明了 {links_count} 组绑定，但第 {} 组不完整", n + 1),
-                        ));
-                    }
+                // `links` 字段缺失（只有 9 个 token）⟹ 与显式 0 走同一分支。
+                let links_count = if t.len() > 9 {
+                    parse_i32(t[9], line, "links 数")?
+                } else {
+                    0
+                };
+                let mut links: Vec<SmdBoneLink> = Vec::with_capacity(links_count.max(0) as usize);
+                if links_count == 0 {
+                    // 官方 `i == 9 || iCount == 0` 分支：**单骨骼绑定到
+                    // token 0（parent bone）、权重 1.0**。
+                    //
+                    // ⚠️ 这里**不是**「无绑定」。空 `links` 会让下游
+                    // （`compile.rs` 的 `smd_vertex_to_ir`、`phy.rs` 的
+                    // `world_point`）把顶点当成「不跟随任何骨骼」，与官方不同。
+                    // 所以显式补一组 `(token0, 1.0)`。
+                    //
+                    // 显式 `links = 0` 且后面还跟着 token 时，那些 token 是
+                    // 多余的（官方 `iCount == 0` 根本不读它们）—— 忽略即可。
                     links.push(SmdBoneLink {
-                        bone: parse_i32(t[k], line, "绑定骨骼")?,
-                        weight: parse_f32(t[k + 1], line, "绑定权重")?,
+                        bone: parse_i32(t[0], line, "parentBone")?,
+                        weight: 1.0,
                     });
-                    k += 2;
+                } else if links_count < 0 {
+                    return Err(err(line, format!("links 数不能为负，实际 {links_count}")));
+                } else {
+                    let mut k = 10usize;
+                    for n in 0..links_count as usize {
+                        if k + 1 >= t.len() {
+                            return Err(err(
+                                line,
+                                format!("声明了 {links_count} 组绑定，但第 {} 组不完整", n + 1),
+                            ));
+                        }
+                        links.push(SmdBoneLink {
+                            bone: parse_i32(t[k], line, "绑定骨骼")?,
+                            weight: parse_f32(t[k + 1], line, "绑定权重")?,
+                        });
+                        k += 2;
+                    }
                 }
 
                 // 材质名只在**收满一个三角形时**克隆一次，而不是每个顶点
@@ -600,23 +656,27 @@ end
     #[test]
     fn rejects_index_lines_instead_of_vertices() {
         // 写成 OBJ 风格的索引行 → token 数不足，必须报错而不是静默读错。
+        //
+        // ⚠️ 断言的是**下限 9**（VDC 规范 / SDK `if (i < 9) continue;`），
+        // 不是早先误用的 12 —— 12 会把规范的合法写法（9/10 token）一起拒掉。
         let bad = MINIMAL.replace(
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
             "0 1 2",
         );
         let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("12 个 token"), "{e}");
+        assert!(e.message.contains("9 个 token"), "{e}");
+        assert!(e.message.contains("索引行"), "应提示可能是 OBJ 索引行：{e}");
     }
 
     #[test]
-    fn rejects_vertex_line_with_11_tokens() {
-        // 漏掉行首 parentBone 的经典写法。
+    fn rejects_vertex_line_with_8_tokens() {
+        // 漏掉行首 parentBone 的经典写法（位置/法线/UV 只有 8 个 token）。
         let bad = MINIMAL.replace(
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000",
-            "  -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000",
+            "  -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000",
         );
         let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("12 个 token"), "{e}");
+        assert!(e.message.contains("9 个 token"), "{e}");
     }
 
     /// **不足一组的顶点行必须被静默丢弃**（官方实测行为）。
@@ -846,17 +906,104 @@ end
         );
     }
 
+    /// **`links == 0` 的语义是「绑到 parent bone」，不是「无绑定」。**
+    ///
+    /// ⚠️ 这条测试**曾经写反过**：旧版断言 `links=0` ⟹ `v.links.is_empty()`，
+    /// 依据是「tb1.smd 的官方产物里 `boneCount = 0`」。
+    /// **那个依据是错的** —— 用真 studiomdl 重测
+    /// （`docs/_probe/oracle_links_zero.js`）：
+    ///
+    /// ```text
+    /// 骨架 root(0) → mid(1)，顶点行 token0 = 1
+    /// links=0（10 token）  ⟹ boneCount=1 bone=[1] weight=[1.0]
+    /// links=0（13 token）  ⟹ boneCount=1 bone=[1] weight=[1.0]
+    /// links=1 bone=0       ⟹ boneCount=1 bone=[0] weight=[1.0]   ← 对照
+    /// ```
+    ///
+    /// 与 SDK `v1support.cpp:166` 的 `if (i == 9 || iCount == 0)` 分支一致：
+    /// **单骨骼、绑 token0（parent bone）、权重 1.0**。
+    ///
+    /// 按「无绑定」处理会让碰撞网格**停在参考姿态不跟随骨骼** ——
+    /// 静默的几何错误。
+    #[test]
+    fn zero_links_binds_to_parent_bone_not_empty() {
+        // `links = 0`，且**不带**尾随占位（BlenderSourceTools 的物理写法）。
+        let text = MINIMAL.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
+            "  1 -8 -8 0 0 0 1 0 0 0\n  1 8 -8 0 0 0 1 1 0 0\n  1 0 8 0 0 0 1 0.5 1 0",
+        );
+        let s = parse_smd(&text).unwrap();
+        assert_eq!(s.triangles.len(), 1);
+        for v in &s.triangles[0].vertices {
+            assert_eq!(
+                v.links.len(),
+                1,
+                "links=0 必须补成**一组**绑定（官方 `iCount == 0` 分支）"
+            );
+            assert_eq!(
+                v.links[0].bone, v.parent_bone,
+                "补的那一组必须绑 **token0（parent bone）**，不是 root 或空"
+            );
+            assert_eq!(v.links[0].weight, 1.0, "权重必须是 1.0");
+        }
+
+        // 显式 `links = 0` 且**带**尾随占位（tb1.smd 的 13-token 写法）
+        // ⟹ 与上面**逐字段相同**（官方 `iCount == 0` 根本不读那几个 token）。
+        let text2 = MINIMAL.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
+            "  1 -8 -8 0 0 0 1 0 0 0 0 0\n  1 8 -8 0 0 0 1 1 0 0 0 0\n  1 0 8 0 0 0 1 0.5 1 0 0 0",
+        );
+        let s2 = parse_smd(&text2).unwrap();
+        assert_eq!(
+            s2.triangles[0].vertices[0].links, s.triangles[0].vertices[0].links,
+            "10-token 与 13-token 的 `links=0` 必须解析成同一结果"
+        );
+    }
+
+    /// **只有 9 个 token 的顶点行必须被接受**（VDC 规范 / SDK 的必填下限）。
+    ///
+    /// 旧版要求 ≥ 12 ⟹ 真实语料里 **5,490 行 9-token + 2,512 行 10-token**
+    /// 会被拒（`docs/_probe/scan_smd_tokens.js` 全量扫描）。
+    /// 实测这些文件官方 studiomdl 都能编。
+    #[test]
+    fn nine_token_vertex_line_is_accepted() {
+        let text = MINIMAL.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
+            // 9 token：parentBone + pos3 + nrm3 + uv2，**无** links
+            "  1 -8 -8 0 0 0 1 0 0\n  1 8 -8 0 0 0 1 1 0\n  1 0 8 0 0 0 1 0.5 1",
+        );
+        let s = parse_smd(&text).expect("9 token 是规范下限，必须接受");
+        assert_eq!(s.triangles.len(), 1);
+        for v in &s.triangles[0].vertices {
+            assert_eq!(v.links.len(), 1, "缺 links ⟹ 官方 `i == 9` 分支补一组");
+            assert_eq!(v.links[0].bone, v.parent_bone, "绑 token0");
+            assert_eq!(v.links[0].weight, 1.0);
+        }
+        // 位置/法线/UV 必须读对（别因为少 token 就错位）。
+        assert_eq!(s.triangles[0].vertices[0].position, [-8.0, -8.0, 0.0]);
+        assert_eq!(s.triangles[0].vertices[1].uv[0], 1.0);
+
+        // 8 token 必须**仍然被拒**（那是真的残缺）。
+        let bad = MINIMAL.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
+            "  1 -8 -8 0 0 0 1 0\n  1 8 -8 0 0 0 1 1 0\n  1 0 8 0 0 0 1 0.5 1",
+        );
+        let e = parse_smd(&bad).unwrap_err();
+        assert!(
+            e.message.contains("9 个 token"),
+            "8 token 必须报错且说明下限是 9：{e}"
+        );
+    }
+
     /// **`links == 0` 与「残留不足一组」两种边界在优化后仍然成立。**
     ///
     /// 优化改动了 `pending` 的清空逻辑（`end` 分支与文件结束两处），
     /// 这两条边界正是最容易被动坏的地方。
     #[test]
     fn zero_links_and_trailing_partial_group_survive_optimization() {
-        // 一个三角形：全部 3 个顶点 links=0（官方允许，boneCount=0）。
-        //
-        // ⚠️ 顶点行**仍然需要 12 个 token**（`t.len() < 12` 的检查先于
-        // `links` 解析）—— 所以 `links=0` 时后面还要凑够占位 token。
-        // 这正是 `docs/_probe/smdl/tb1.smd` 的写法。
+        // 一个三角形：全部 3 个顶点 links=0。
+        // 见 `zero_links_binds_to_parent_bone_not_empty` —— 语义是
+        // **绑 parent bone**，不是空绑定。
         let text = MINIMAL.replace(
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
             "  1 -8 -8 0 0 0 1 0 0 0 0 0\n  1 8 -8 0 0 0 1 1 0 0 0 0\n  1 0 8 0 0 0 1 0.5 1 0 0 0",
@@ -864,7 +1011,8 @@ end
         let s = parse_smd(&text).unwrap();
         assert_eq!(s.triangles.len(), 1);
         for v in &s.triangles[0].vertices {
-            assert!(v.links.is_empty(), "links=0 必须解析成空绑定");
+            assert_eq!(v.links.len(), 1, "links=0 ⟹ 补一组（绑 parent bone）");
+            assert_eq!(v.links[0].bone, v.parent_bone);
         }
 
         // 残留不足一组：删掉 3 行中的 1 行 ⟹ 必须静默丢弃，不报错。
