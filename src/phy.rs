@@ -99,21 +99,30 @@
 //! 2. **不自己写凸包算法。** 用 parry3d 的 quickhull
 //!    （`parry3d::transformation::try_convex_hull`）。
 //!
-//! # 与 §10.2 的偏离：`rotation_inertia` 用真实值而不是 `[1,1,1]`
+//! # `rotation_inertia` 的官方口径是 `√(B²+C²)`（R24）
 //!
-//! §10.2 建议保守填 `[1,1,1]`。我实测了 774 个真实 solid：`[1,1,1]` 与真实值
-//! 的比值跨度达 **6.8 倍**（q10=0.0011，q90=0.0390），而用 hull 自身的
-//! 均匀密度惯性张量（parry3d 的 [`MassProperties`]）与真实值的比值跨度只有
-//! **1.3 倍**（q10=0.709，q90=0.948，中位 0.77）。
+//! 早先这里写的是「故意偏离规格、用 parry 的密度 1 惯性张量对角元」。
+//! **那是错的** —— 实测语料 404 个 solid 后定死了官方公式（见
+//! [`rotation_inertia_of`]）：
 //!
-//! 既然已经引入了 parry3d，就没有理由填一个更差的值。写入的物理量是
-//! **无量纲**的：IVP 用的是 `inv_inertia`，会连同 `inv_mass` 一起按
-//! `mass × inertia` 缩放，所以单位取 kg·m² 还是别的都无所谓，
-//! **只有三个主轴之间的比例有意义**。因此这里写 parry 在**密度 1** 下算出的
-//! 惯性张量对角元（`I`，不是 `I/m`），既保留正确的各向异性比例，
-//! 又与真实文件的量级一致。
+//! ```text
+//!   A = ∫x'²dV / V      B = ∫y'²dV / V      C = ∫z'²dV / V
+//!   rotation_inertia = [ √(B²+C²),  √(A²+C²),  √(A²+B²) ]
+//! ```
 //!
-//! 需要绝对保守时把 [`PhyParams::inertia_scale`] 设成 `0.0`，三个分量就都是 0。
+//! 两处与旧实现不同：
+//!
+//! 1. **要除以体积**（`I/V`，单位 m²），不是写 `I`。用户的枪 `V = 3.36e-3 m³`
+//!    ⟹ 旧实现整体小 **290×**。
+//! 2. **用 `√(B²+C²)` 而不是 `B+C`**。旧实现写的是真惯量对角元。
+//!
+//! 旧注释声称「IVP 只用三个主轴之间的比例，整体缩放会被 `inv_mass` 吸收」
+//! —— **前半句对、后半句错**：`inv_mass` 只吸收**质量**，不吸收**长度量纲**。
+//! 差一个体积因子就是差一个 `L³`，那会把角响应放大 290 倍。
+//!
+//! 验收（官方 `docs/_probe/artifacts/msh1.phy`，50×10×50 inch）：
+//! 修后 `rotation_inertia` 与官方相对差 **1.3e-7 ~ 4.7e-7**；
+//! 语料 404 个 solid 上 **91.3% 命中 1e-4**、中位 **1.00000005**（旧口径 0.2%）。
 
 use std::collections::HashMap;
 
@@ -2372,6 +2381,102 @@ pub fn write_phy_multi(
 }
 
 // ---------------------------------------------------------------------------
+// `rotation_inertia` 的官方口径
+// ---------------------------------------------------------------------------
+
+/// 算出写进 `IVP_Compact_Surface::rotation_inertia` 的三个分量（R24）。
+///
+/// # 官方公式（语料 404 个 solid 上 **91.3% 命中到 1e-4**，中位 1.00000005）
+///
+/// ```text
+///   A = ∫x'²dV / V      （关于质心、密度 1、已除以体积；单位 m²）
+///   B = ∫y'²dV / V
+///   C = ∫z'²dV / V
+///
+///   rotation_inertia = [ √(B² + C²),  √(A² + C²),  √(A² + B²) ]
+/// ```
+///
+/// ⚠️ **不是**真惯量 `[B+C, A+C, A+B]` —— 而是「两项的**斜边**」。
+/// IVP 把每个主惯量写成 `√(A_y² + A_z²)` 而不是 `A_y + A_z`。
+///
+/// # 三条独立渐近线（全部**精确**吻合，不是拟合）
+///
+/// | 形状 | `A:B:C` | 真惯量 `B+C` | 本公式 `√(B²+C²)` | `g = 官方/(B+C)` |
+/// |---|---|---|---|---|
+/// | 立方体 | `1:1:1` | `2A` | `√2·A` | **`1/√2 = 0.70710678`** |
+/// | `t=2` 长方体 | `4:1:1` | `5` | `√17` | **`√17/5 = 0.8246211`** |
+/// | 细长杆 | `t²:1:ε` | `≈t²` | `≈t²` | **`→ 1`** |
+///
+/// 实测锚点（`docs/_probe/artifacts/msh1.phy`，官方产物，50×10×50 inch）：
+///
+/// ```text
+///   A = 5.376333e-3   B = C = 1.099017e-1
+///   官方 rot = [1.554245e-1, 1.100331e-1, 1.100331e-1]
+///   预测     = [1.554244e-1, 1.100331e-1, 1.100331e-1]   相对误差 1.3e-7 ~ 2.2e-7
+///   rot[0]/(B+C) = 0.707107  ← x 轴垂直两边相等（50/50）⟹ 恰好 1/√2
+///   rot[1]/(A+C) = 0.954502  ← y 轴垂直两边 10/50 ⟹ t=5
+/// ```
+///
+/// # 修前的两处错误（R24）
+///
+/// `phy.rs` 原先写的是 `I = [B·V, A·V, C·V]` 的**对角元**（即未除以体积的
+/// `[B+C, A+C, A+B]`）：
+///
+/// 1. **没除体积** ⟹ 整体差 `1/V` 倍。用户的枪 `V = 3.36e-3 m³` ⟹ **290×**
+///    偏小（实测 mdlc `6.14e-6` vs Valve `1.78e-3`）。
+/// 2. **用 `B+C` 而不是 `√(B²+C²)`** ⟹ 各向异性也差（枪上 y 轴差 **2.05%**）。
+///
+/// # 物理后果
+///
+/// IVP 用 `inv_inertia`：`rotation_inertia` 小 290× ⟹ 角冲量响应大 290×
+/// ⟹ 一次接触就把物体转飞 ⟹ 一堆枪互相弹开、散得很远。
+/// 这正是用户报的「好像有 1 个隐藏的巨大碰撞盒」——**是惯性问题，不是几何问题**
+/// （hull 已独立确认为枪尺寸 `1.009 × 0.177 × 0.025 m`，
+/// `upper_limit_radius` 两边相同，ledgetree 逐位相同）。
+///
+/// # 参数
+///
+/// * `inertia_mat` —— `MassProperties::from_trimesh(1.0, …)` 的
+///   `reconstruct_inertia_matrix()`（**含质量**，即 `I = m·r²`）。
+/// * `volume` —— 同一组 `MassProperties` 的 `mass()`，**就是体积**（m³）。
+///   密度固定 1.0 ⟹ `mass == volume`。
+/// * `inertia_scale` —— 安全阀（[`PhyParams::inertia_scale`]），默认 1.0。
+///
+/// ⚠️ **不要再乘/除 [`SOURCE_TO_IVP`]**：`all_pts` 已经是**米**，
+/// 所以 `I/V` 直接就是官方口径（m²）。点缩放 `k` 时 `I → I·k⁵`、`V → V·k³`
+/// ⟹ **`I/V → (I/V)·k²`**。
+fn rotation_inertia_of(
+    inertia_mat: &parry3d::math::Matrix3,
+    volume: f32,
+    inertia_scale: f32,
+) -> [f32; 3] {
+    // 二阶矩的对角元 ÷ 体积 = `A`、`B`、`C`（单位 m²）。
+    //
+    // `reconstruct_inertia_matrix()` 给的是**真惯量**：
+    //   `I_xx = ∫(y²+z²)dV = B·V + C·V`
+    // 而我们只要 `B` 和 `C` 各自 —— 用 `(I_yy + I_zz − I_xx)/2` 反解：
+    //   `I_yy + I_zz − I_xx = 2·A·V`  ⟹ `A = (I_yy+I_zz−I_xx)/(2V)`
+    //
+    // ⚠️ **不能**直接用 `reconstruct_inertia_matrix()` 的对角元当 `A`/`B`/`C`
+    // —— 那三个是「另两项之和」。这是本函数最容易写错的一步。
+    let (ixx, iyy, izz) = (
+        inertia_mat.x_axis.x,
+        inertia_mat.y_axis.y,
+        inertia_mat.z_axis.z,
+    );
+    let inv2v = if volume != 0.0 { 1.0 / (2.0 * volume) } else { 0.0 };
+    let a = (iyy + izz - ixx) * inv2v;
+    let b = (ixx + izz - iyy) * inv2v;
+    let c = (ixx + iyy - izz) * inv2v;
+
+    [
+        (b * b + c * c).sqrt() * inertia_scale,
+        (a * a + c * c).sqrt() * inertia_scale,
+        (a * a + b * b).sqrt() * inertia_scale,
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // 预处理
 // ---------------------------------------------------------------------------
 
@@ -2619,11 +2724,7 @@ fn prepare_solid(
     let solid_props = MassProperties::from_trimesh(1.0, &all_pts, &all_tris);
     let mass_center_v = solid_props.local_com;
     let inertia_mat = solid_props.reconstruct_inertia_matrix();
-    let rotation_inertia = [
-        inertia_mat.x_axis.x * inertia_scale,
-        inertia_mat.y_axis.y * inertia_scale,
-        inertia_mat.z_axis.z * inertia_scale,
-    ];
+    let rotation_inertia = rotation_inertia_of(&inertia_mat, solid_props.mass(), inertia_scale);
 
     // upper_limit_radius 以 mass_center 为中心、覆盖**共享点数组全部点**。
     let upper_limit_radius = points
@@ -5937,53 +6038,36 @@ mod tests {
         }
     }
 
-    /// `rotation_inertia` 的默认值是立方体的真实单位质量惯性张量对角元。
+    /// `rotation_inertia` = 官方的 `[√(B²+C²), √(A²+C²), √(A²+B²)]`（R24）。
     ///
-    /// 这个立方体的坐标是 ±1，**边长是 2**（不是 1）。
-    /// 边长 `a` 的立方体：`I = m·(a²+a²)/12 = m·a²/6`，
-    /// 所以 `I/m = 4/6 = 2/3`... 但那是绕**质心**且边长取 2 的情形：
-    /// `I/m = (2² + 2²)/12 = 8/12 = 2/3`。
+    /// 这个立方体的坐标是 ±1，**边长是 2**。
+    /// 边长 `a` 的立方体、密度 1：`A = B = C = a²/12`（单位 m²，**已除以体积**）。
     ///
-    /// 实测值是 5.3333 = 16/3，正好是 `2/3` 的 8 倍 —— 因为 parry 的
-    /// `from_convex_polyhedron(1.0, ...)` 用**密度 1**，而我们的 `I/m`
-    /// 里 `m` 也是体积 8，`I` 是密度 1 下的真实惯量 `8 · (2/3) = 16/3`，
-    /// 所以 `I/m = 16/3 / 8 = 2/3`？不对 —— 实测就是 16/3。
+    /// ⚠️ **除以体积后数值随 `SOURCE_TO_IVP²` 缩放，不是 `⁵`。**
+    /// 点缩放 `k`：`I → I·k⁵`、`V → V·k³` ⟹ `I/V → (I/V)·k²`。
+    /// （旧注释写的 `k⁵` 是**未除体积**时的口径 —— R24 之前这里就是错的。）
     ///
-    /// 结论：**parry 返回的 `reconstruct_inertia_matrix` 已经是"密度 1 的
-    /// 惯量张量"**，即 `I = ρ·V·(a²/6) = 8 · 4/6 = 16/3`。我们不再除以质量，
-    /// 所以写进去的是 `I`（密度 1）而不是 `I/m`。
+    /// 边长 2（inch 口径）：`A = B = C = 4/12 = 1/3`（inch²）。
+    /// 换算成米：`1/3 × 0.0254² = 2.150533e-4`（m²）。
+    /// 三个轴相同（各向同性）⟹ `√(A²+A²) = A·√2`。
     ///
-    /// 这不影响正确性：IVP 只用三个主轴之间的**比例**，整体缩放会被
-    /// `inv_mass` 吸收（见模块文档）。测试按实测值钉住，防止未来改动
-    /// 悄悄换了归一化口径。
-    ///
-    /// ⚠️ **数值随 `SOURCE_TO_IVP⁵` 缩放**，不是 `²`。
-    ///
-    /// `reconstruct_inertia_matrix` 返回的是**含质量**的惯量
-    /// （`I = m·r²`），而 `parry` 的密度固定 1.0 ⟹ `m = 体积`。
-    /// 点缩放 `k` 后：`体积 → k³`、`r² → k²`，所以 `I → I·k⁵`。
-    ///
-    /// **实测印证**（官方 `msh1.phy`，源 50×10×50 inch）：
-    ///
-    /// ```text
-    /// 官方 rotation_inertia[1] = 1.100331e-1
-    /// 手算（米、密度 1）：V·(x²+z²)/12 = 0.409677 × (1.27²+1.27²)/12 = 1.101279e-1
-    /// inch 口径：25000 × (50²+50²)/12 = 1.041667e7
-    ///   1.041667e7 × 0.0254⁵ = 0.110133   ← 与官方一致
-    /// ```
+    /// 实测锚点（官方 `docs/_probe/artifacts/msh1.phy`）：
+    /// `A = 5.376333e-3`、`B = C = 1.099017e-1`
+    /// ⟹ `rot[0] = √(B²+C²) = 1.554245e-1`（官方实测 `1.554245e-1`，相对差 **1.3e-7**）。
     #[test]
-    fn cube_rotation_inertia_matches_density_one_tensor() {
+    fn cube_rotation_inertia_matches_official_hypotenuse_law() {
         let b = write_cube();
         let body = 16 + SOLID_HEADER_SIZE;
-        // 边长 2、体积 8 的立方体，密度 1：I = 8 · (2²+2²)/12 = 16/3（inch 口径）。
-        // 点换算成米后 I 乘 k⁵（见上）。
-        let expect = 16.0f32 / 3.0 * SOURCE_TO_IVP.powi(5);
+        // 边长 2、密度 1：A = B = C = a²/12 = 4/12 = 1/3（inch²）
+        let second_moment = (2.0f32 * 2.0 / 12.0) * SOURCE_TO_IVP.powi(2);
+        // 立方体各向同性 ⟹ rot[k] = √(A²+A²) = A·√2
+        let expect = second_moment * std::f32::consts::SQRT_2;
         for a in 0..3 {
             let got = read_f32(&b, body + 12 + a * 4);
             let rel = if expect != 0.0 { (got - expect).abs() / expect } else { 0.0 };
             assert!(
                 rel < 1e-4,
-                "立方体密度 1 的 I 应为 16/3 × 0.0254⁵ ≈ {expect}，rotation_inertia[{a}] = {got}"
+                "立方体的 rot[{a}] 应为 A·√2 = {expect}（A = a²/12 × 0.0254²），实际 {got}"
             );
         }
         // 三个轴必须相同（立方体各向同性）—— 这是真正重要的性质。
@@ -5997,8 +6081,116 @@ mod tests {
         );
     }
 
+    /// **`rotation_inertia` 必须已除以体积**（R24 的核心回归）。
+    ///
+    /// 判据：把同一个几何**整体缩放 `k` 倍**，`I/V` 必须随 `k²` 缩放
+    /// （因为 `I → I·k⁵`、`V → V·k³`）。
+    ///
+    /// ⚠️ 修前写的是**未除体积**的 `I` ⟹ 随 `k⁵` 缩放。
+    /// 这条测试**只靠缩放指数**就能分辨两种口径，不需要 oracle ——
+    /// 是「自相矛盾的文件自己就能证明自己坏」那一类判据。
+    #[test]
+    fn rotation_inertia_scales_as_squared_length() {
+        let read_rot = |scale: f32| -> [f32; 3] {
+            let mut vs = cube_vertices();
+            for v in &mut vs {
+                for c in v.iter_mut() {
+                    *c *= scale;
+                }
+            }
+            let h = PhyHull {
+                vertices: vs,
+                faces: cube_faces(),
+            };
+            let s = [PhySolid::prop("scaled")];
+            let p = PhyParams::new("scaled", 0);
+            let b = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+            let body = 16 + SOLID_HEADER_SIZE;
+            [
+                read_f32(&b, body + 12),
+                read_f32(&b, body + 16),
+                read_f32(&b, body + 20),
+            ]
+        };
+        let r1 = read_rot(1.0);
+        let r3 = read_rot(3.0);
+        assert!(r1[0] > 0.0 && r3[0] > 0.0, "两个缩放下都应写出正惯量");
+        // 期望 r3/r1 == 3² = 9（`I/V` 是 m²）。
+        let ratio = r3[0] / r1[0];
+        assert!(
+            (ratio - 9.0).abs() / 9.0 < 1e-3,
+            "`I/V` 应随 `k²` 缩放：k=3 时比值应为 9，实际 {ratio}（\
+             若约 243 = 3⁵ 则说明**忘了除以体积**）"
+        );
+    }
+
+    /// **`rotation_inertia` 用 `√(B²+C²)` 而不是 `B+C`**（R24 的第二处）。
+    ///
+    /// 判据：**长方体**（各向异性）上，`√(B²+C²) < B+C` 严格成立
+    /// ⟹ 若实现写成 `B+C`，写出值会**偏大**，且比值恰为 `(B+C)/√(B²+C²)`。
+    ///
+    /// 用 4:1:1 的长方体（X 拉长 4 倍，Y/Z 不变）：
+    /// `A=4α, B=C=α` ⟹ `rot[0] = √(α²+α²) = α√2`，而 `B+C = 2α`。
+    /// 比值 `2α/(α√2) = √2 = 1.4142136` —— 用这个**精确常数**判定。
+    #[test]
+    fn rotation_inertia_uses_hypotenuse_not_sum() {
+        // X 方向拉长 4 倍的长方体。
+        let mut vs = cube_vertices();
+        for v in &mut vs {
+            v[0] *= 4.0;
+        }
+        let h = PhyHull {
+            vertices: vs,
+            faces: cube_faces(),
+        };
+        let s = [PhySolid::prop("aniso")];
+        let p = PhyParams::new("aniso", 0);
+        let b = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+        let body = 16 + SOLID_HEADER_SIZE;
+        let got = [
+            read_f32(&b, body + 12),
+            read_f32(&b, body + 16),
+            read_f32(&b, body + 20),
+        ];
+        // 参考：立方体（±1，边长 2）的 A = B = C = 4/12 = 1/3（inch²）。
+        // 拉长 4 倍后 X 轴二阶矩 ×16 ⟹ A = 16/3，B = C = 1/3（inch²）。
+        let k2 = SOURCE_TO_IVP * SOURCE_TO_IVP;
+        let a = 16.0f32 / 3.0 * k2;
+        let bc = 1.0f32 / 3.0 * k2;
+        let expect = [
+            (bc * bc + bc * bc).sqrt(), // √(B²+C²)
+            (a * a + bc * bc).sqrt(),   // √(A²+C²)
+            (a * a + bc * bc).sqrt(),   // √(A²+B²)
+        ];
+        for i in 0..3 {
+            let rel = (got[i] - expect[i]).abs() / expect[i];
+            assert!(
+                rel < 1e-3,
+                "rot[{i}] 应为 √(两项²) = {}，实际 {}（相对差 {rel}）",
+                expect[i],
+                got[i]
+            );
+        }
+        // 关键判据：x 轴必须**小于** `B+C`，且比值恰为 √2。
+        let sum_bc = 2.0 * bc;
+        let ratio = sum_bc / got[0];
+        assert!(
+            (ratio - std::f32::consts::SQRT_2).abs() < 1e-3,
+            "x 轴应为 √(B²+C²) 而非 B+C：`(B+C)/rot[0]` 应为 √2 = {}，实际 {ratio}",
+            std::f32::consts::SQRT_2
+        );
+    }
+
     /// 长方体（非立方体）的 `rotation_inertia` 必须体现各向异性，
     /// 且长轴方向的惯量最小。
+    ///
+    /// ⚠️ **`ix < iy` 这条判据对 `B+C` 与 `√(B²+C²)` 两种口径都成立**
+    /// （两者都是单调的），所以它**测不出** R24 —— 变异测试实测：
+    /// 三个变异体下这条都通过。它的价值是钉住「各向异性方向」，
+    /// 不是钉住「用和还是斜边」。后者由
+    /// [`rotation_inertia_uses_hypotenuse_not_sum`] 负责。
+    ///
+    /// 这里**额外**用 4:1:1 的精确闭式值钉住数值本身，让它也能抓到 R24。
     #[test]
     fn box_rotation_inertia_is_anisotropic() {
         // X 方向拉长 4 倍。
@@ -6022,6 +6214,25 @@ mod tests {
         // 边长 (8, 2, 2)：I_x = m(2²+2²)/12 最小，I_y = I_z = m(8²+2²)/12 最大。
         assert!(ix < iy, "绕长轴的惯量应最小：Ix={ix} Iy={iy}");
         assert!((iy - iz).abs() < 1e-3, "另外两轴应相同：Iy={iy} Iz={iz}");
+        // 精确闭式：立方体（±1）的 A = B = C = 1/3 inch²；X 拉长 4 倍 ⟹ A ×16。
+        let k2 = SOURCE_TO_IVP * SOURCE_TO_IVP;
+        let a = 16.0f32 / 3.0 * k2;
+        let bc = 1.0f32 / 3.0 * k2;
+        let expect = [
+            (bc * bc + bc * bc).sqrt(),
+            (a * a + bc * bc).sqrt(),
+            (a * a + bc * bc).sqrt(),
+        ];
+        for (i, (got, want)) in [(ix, expect[0]), (iy, expect[1]), (iz, expect[2])]
+            .into_iter()
+            .enumerate()
+        {
+            let rel = (got - want).abs() / want;
+            assert!(
+                rel < 1e-3,
+                "rot[{i}] 应为 √(两项²) = {want}，实际 {got}（相对差 {rel}）"
+            );
+        }
     }
 
     /// 质量分配：多 solid 时按体积比例分，且下限钳到 1.0。
