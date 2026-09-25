@@ -1693,6 +1693,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 continue;
             }
 
+            // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23），见
+            // [`sequence_ik_rules_attach_to_first_cell`] 的说明。
+            if let Some(&first_cell) = cell_idx.first() {
+                anims[first_cell].ik_rules.extend(s.ik_rules.iter().cloned());
+            }
+
             let first = anims[cell_idx[0]].frames.clone();
             let nf_i = first.len() as i32;
             let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
@@ -1751,6 +1757,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // （实测 `numlocalanim` 17 vs 官方 29）。
         let smd_path = resolve_smd_path(base_dir, &s.smd);
         let by_name = anim_index.get(s.smd.as_str()).copied();
+        let reused = by_name.is_some();
         let (anim_ix, frames) = match by_name {
             Some(i) => (i, anims[i].frames.clone()),
             None => {
@@ -1785,6 +1792,15 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 (i, frames)
             }
         };
+
+        // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23）。
+        //
+        // 隐含动画在上面构造时已经把 `s.ik_rules` 放进去了；只有**复用**
+        // 已声明动画（`$sequence "reload" "a_reload"`）时才需要补 ——
+        // 那种写法下规则在 `$animation` 块里没有，只能从序列搬过来。
+        if reused {
+            anims[anim_ix].ik_rules.extend(s.ik_rules.iter().cloned());
+        }
 
         // ---- `$sequence` 块里的 `subtract`（`CMD_SUBTRACT`）----
         //
@@ -9396,6 +9412,232 @@ name = "root"
             (tip_pos[2] - 8.0).abs() < 0.01,
             "`tip` 的参考姿态应来自 SMD 第 0 帧（z=8），实际 {}",
             tip_pos[2]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R23：`$sequence` 块里的 `ikrule` 必须落到**第一格动画**上
+    // ------------------------------------------------------------------
+
+    /// 一份能跑通「序列级 ikrule」的最小 SMD（3 根骨骼、2 帧、1 个三角形）。
+    const IKR23_SMD: &str = r#"version 1
+nodes
+0 "root" -1
+1 "hip" 0
+2 "ankle" 1
+end
+skeleton
+time 0
+0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+1 0.000000 0.000000 10.000000 0.000000 0.000000 0.000000
+2 0.000000 0.000000 20.000000 0.000000 0.000000 0.000000
+time 1
+0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+1 0.000000 0.000000 10.000000 0.000000 0.000000 0.000000
+2 0.000000 0.000000 22.000000 0.000000 0.000000 0.000000
+end
+triangles
+mat
+0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000 0.0 0.0 1 0 1.000000
+0 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000 1.0 0.0 1 0 1.000000
+0 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000 0.0 1.0 1 0 1.000000
+end
+"#;
+
+    /// 写三份 SMD（供 3 格 blend 使用）。
+    ///
+    /// ⚠️ **每份都要落盘** —— `parse_qc_str` 在收尾时会真的去磁盘读
+    /// `$animation` / `$model` 引用的 SMD，漏一个就整条 QC 解析失败。
+    fn ikr23_dir(tag: &str) -> PathBuf {
+        let d = tmpdir(tag);
+        write(&d, "a.smd", IKR23_SMD);
+        write(&d, "b.smd", IKR23_SMD);
+        write(&d, "c.smd", IKR23_SMD);
+        d
+    }
+
+    /// **`$sequence` 块里的 `ikrule` 属于该序列引用的第一格动画。**
+    ///
+    /// # 官方依据（`studiomdl.cpp:2944`）
+    ///
+    /// ```c
+    /// else if ((numblends || isAppend) && ParseAnimationToken( animations[0] ))
+    /// ```
+    ///
+    /// `$sequence` 块里的**动画选项**（`ikrule` / `subtract` / `weightlist` /
+    /// `numframes`…）全部转交给 `ParseAnimationToken(animations[0])` ——
+    /// `animations[0]` 是**本序列引用的第一个动画**。而 `CMD_IKRULE` 把规则
+    /// 记进 `panim->cmds[]`（`studiomdl.cpp:1931`），`ProcessIKRules`
+    /// 之后只遍历**动画池** `g_panimation[]`（`simplify.cpp:5828`）。
+    ///
+    /// ⟹ 规则最终落在**第一格动画**的 `ikrule[]` 上，序列对象本身
+    /// **不存**规则（`write.cpp` 只从 `panim->ikrule[]` 取数据）。
+    ///
+    /// # 实测症状（用户的真实工程，37 条动画里 17 条错）
+    ///
+    /// mdlc 修前把规则留在 `sequences[..].ik_rules`，而
+    /// `build_ik_rules` 只读 `animations[..].ik_rules` ⟹ 规则**从未写出**：
+    ///
+    /// | 动画 | QC 所在序列 | mdlc 修前 | NekoMDL |
+    /// |---|---|---|---|
+    /// | `a_run`（`idle` 的第 1 格） | `idle` | `REL:12x` | `touch:0,1 REL:10x` |
+    /// | `al_melee` | `melee_layer` | **0 条** | `REL:0 touch:1` |
+    ///
+    /// 两者恰好就是用户报的两个症状：「行走（`a_run`）时手部扭曲」
+    /// 与「`melee_layer` 动画时手部扭曲」。
+    ///
+    /// ⚠️ **`a_run` 是 `idle` 的「第 1 格」，但 `idle` 的 blends 是
+    /// `"a_run" "a_idle" "a_run"`** —— 第一格是 `a_run`，所以规则落在
+    /// `a_run` 上。这正是「必须按 blends[0] 而不是按名字猜」的证据。
+    #[test]
+    fn sequence_ik_rules_attach_to_first_cell() {
+        let d = ikr23_dir("r23-first-cell");
+        // 3 格 blend，第一格是 `a`（不是名字最靠前的那个）。
+        let qc = "\
+$modelname \"r23.mdl\"\n\
+$ikchain \"leg\" \"ankle\"\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"multi\" \"a\" \"b\" \"c\" {\n\
+ikrule \"leg\" touch \"hip\"\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let by_name = |n: &str| {
+            c.animations
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap_or_else(|| panic!("动画 {n} 应存在"))
+        };
+        // 先证明夹具非空 —— 否则下面的断言会**空洞通过**。
+        assert_eq!(c.animations.len(), 3, "夹具应有 3 条动画（a/b/c）");
+
+        assert_eq!(
+            by_name("a").ik_rules.len(),
+            1,
+            "`$sequence` 的 ikrule 必须落到**第一格**动画 `a` 上"
+        );
+        assert_eq!(by_name("a").ik_rules[0].chain, "leg");
+        assert_eq!(
+            by_name("b").ik_rules.len(),
+            0,
+            "第二格动画 `b` 不该拿到规则"
+        );
+        assert_eq!(
+            by_name("c").ik_rules.len(),
+            0,
+            "第三格动画 `c` 不该拿到规则"
+        );
+    }
+
+    /// **单动画序列**：`$sequence` 的 `ikrule` 落在它引用的那条动画上。
+    ///
+    /// 这里刻意让序列**复用**已声明的 `$animation`（而不是建隐含动画），
+    /// 走的是 `compile.rs` 里 `reused == true` 的那条分支 ——
+    /// 与 [`sequence_ik_rules_attach_to_first_cell`] 覆盖的 blend 分支**不同**。
+    ///
+    /// ⚠️ **这正是 `melee_layer` 的形态**：`$sequence "melee_layer" "al_melee" …`
+    /// 引用的 `al_melee` 是**已声明**的 `$animation`，且它的
+    /// `$animation` 块里**没有** ikrule —— 规则只写在 `$sequence` 块里。
+    /// mdlc 修前这条路径**一条规则都不写**（实测 `al_melee` 0 条 vs
+    /// NekoMDL 2 条）。
+    #[test]
+    fn sequence_ik_rules_attach_to_reused_declared_animation() {
+        let d = ikr23_dir("r23-reused");
+        let qc = "\
+$modelname \"r23b.mdl\"\n\
+$ikchain \"leg\" \"ankle\"\n\
+$animation \"decl\" \"a.smd\" fps 30\n\
+$sequence \"layer\" \"decl\" {\n\
+ikrule \"leg\" release\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert_eq!(c.animations.len(), 1, "夹具应恰好 1 条动画（复用 `decl`）");
+        assert_eq!(
+            c.animations[0].ik_rules.len(),
+            1,
+            "`$sequence` 的 ikrule 必须落到被复用的 `decl` 上（`al_melee` 的形态）"
+        );
+        assert_eq!(
+            c.animations[0].ik_rules[0].kind,
+            crate::model::IkRuleType::Release,
+            "规则类型应原样保留"
+        );
+    }
+
+    /// **`$animation` 块里的 ikrule 不受影响**（回归护栏）。
+    ///
+    /// 官方两条路径都写 `panim->cmds[]`，所以「写在 `$animation` 里」
+    /// 与「写在 `$sequence` 里」最终都进同一条动画。这条钉住
+    /// **不要**为了修 R23 而把 `$animation` 级的规则搬走或复制一份。
+    #[test]
+    fn animation_block_ik_rules_are_not_duplicated() {
+        let d = ikr23_dir("r23-animblock");
+        let qc = "\
+$modelname \"r23c.mdl\"\n\
+$ikchain \"leg\" \"ankle\"\n\
+$animation \"decl\" \"a.smd\" fps 30 {\n\
+ikrule \"leg\" touch \"hip\"\n\
+}\n\
+$sequence \"s\" \"decl\"\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert_eq!(c.animations.len(), 1);
+        assert_eq!(
+            c.animations[0].ik_rules.len(),
+            1,
+            "`$animation` 块里的规则应恰好 1 条 —— 序列没有规则可补，\
+             不得因 R23 的修复而复制成 2 条"
+        );
+    }
+
+    /// **`$animation` 与 `$sequence` 都写了规则时，两条都要在**（且顺序稳定）。
+    ///
+    /// 官方 `ParseAnimation` 先收 `$animation` 块的 `cmds[]`，
+    /// `ParseSequence` 之后再把序列块的追加进去
+    /// （`studiomdl.cpp:2944` → `ParseCmdlistToken` 往 `panim->numcmds` 尾部加）。
+    /// 所以落盘顺序 = **动画块在前、序列块在后**。
+    #[test]
+    fn animation_and_sequence_ik_rules_concatenate_in_order() {
+        let d = ikr23_dir("r23-both");
+        let qc = "\
+$modelname \"r23d.mdl\"\n\
+$ikchain \"leg\" \"ankle\"\n\
+$animation \"decl\" \"a.smd\" fps 30 {\n\
+ikrule \"leg\" touch \"hip\"\n\
+}\n\
+$sequence \"s\" \"decl\" {\n\
+ikrule \"leg\" release\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert_eq!(c.animations.len(), 1);
+        let kinds: Vec<_> = c.animations[0].ik_rules.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::model::IkRuleType::Touch,
+                crate::model::IkRuleType::Release
+            ],
+            "顺序必须是「动画块在前、序列块在后」（官方往 `panim->numcmds` 尾部追加）"
         );
     }
 }
