@@ -2362,10 +2362,12 @@ pub fn write_phy_multi(
         put_u16(&mut out, VPHYSICS_COLLISION_VERSION);
         put_i16(&mut out, COLLIDE_POLY);
         put_i32(&mut out, p.surface_size);
-        // dragAxisAreas：实测都在 (0, 1]，保守填 1。只影响空气阻力。
-        put_f32(&mut out, 1.0);
-        put_f32(&mut out, 1.0);
-        put_f32(&mut out, 1.0);
+        // dragAxisAreas（R25）：官方 `params.buildDragAxisAreas = true`，
+        // 由 `ConvertConvexToCollideParams` 算出「拖拽分数」。
+        // 修前恒写 [1,1,1]（语料只有 9.2% 的 solid 真的三轴都是 1）。
+        for v in p.drag_axis_areas {
+            put_f32(&mut out, v);
+        }
         put_i32(&mut out, 0); // axisMapSize：源码注释 "not yet supported"
         out.extend_from_slice(body);
     }
@@ -2511,6 +2513,15 @@ struct PreparedSolid {
     mass_center: [f32; 3],
     /// `rotation_inertia`。
     rotation_inertia: [f32; 3],
+    /// `dragAxisAreas`（R25）—— 三个「拖拽分数」，恒在 `(0, 1]`。
+    ///
+    /// 见 [`drag_axis_areas`]。修前恒写 `[1,1,1]`。
+    drag_axis_areas: [f32; 3],
+    /// 本 solid 是否命中 `sizeRatio > 9` 的 `rotdamping` HACKHACK（R25）。
+    ///
+    /// 见 [`long_skinny_rotdamping`]。命中时文本段的 `rotdamping` 被**覆盖**
+    /// 成 `1.0`（即使 QC 写了 0）。
+    long_skinny: bool,
     /// `upper_limit_radius` = `max‖p − mass_center‖`，对**共享点数组全部点**取。
     upper_limit_radius: f32,
     /// solid 体积（各凸块之和）。
@@ -2741,6 +2752,20 @@ fn prepare_solid(
 
     let volume = prepared_hulls.iter().map(|h| h.volume).sum();
 
+    // ---- dragAxisAreas（R25）----
+    //
+    // ⚠️ 官方用 **Source 单位（inch）** 的包围盒算（`dragAreaEpsilon` 的
+    // 默认值是 `0.25f = 0.5in × 0.5in`）。而 `points` 是**米**。
+    // 但 `drag_axis_areas` 是**比值**（投影面积 / 截面积）⟹ 长度单位**约掉**，
+    // 用米算与用 inch 算逐位等价。这里直接用米，不引入换算。
+    let drag_axis_areas = drag_axis_areas(&points, &prepared_hulls, solid)?;
+
+    // ---- `rotdamping` 的 HACKHACK（R25）----
+    //
+    // ⚠️ 这一条**也**用 Source 单位的包围盒 —— 但 `sizeRatio` 是
+    // **尺度不变量**（分子分母同量纲）⟹ 用米算同样等价。
+    let long_skinny = long_skinny_rotdamping(&points);
+
     Ok(PreparedSolid {
         points,
         hulls: prepared_hulls,
@@ -2749,11 +2774,249 @@ fn prepare_solid(
         surface_size,
         mass_center: [mass_center_v.x, mass_center_v.y, mass_center_v.z],
         rotation_inertia,
+        drag_axis_areas,
+        long_skinny,
         upper_limit_radius,
         volume,
     })
 }
 
+// ---------------------------------------------------------------------------
+// `dragAxisAreas` 与 `rotdamping` 的 HACKHACK（R25）
+// ---------------------------------------------------------------------------
+
+/// `dragAxisAreas[3]` —— 三个「拖拽分数」（R25）。
+///
+/// # 官方出处（`collisionmodel.cpp:1162-1228`，`CreateCollide`）
+///
+/// ```c
+/// convertconvexparams_t params;
+/// params.Defaults();                       // dragAreaEpsilon = 0.25f（0.5in×0.5in）
+/// params.buildOuterConvexHull = true;
+/// params.buildDragAxisAreas   = true;      // ← mdlc 修前没做，恒写 [1,1,1]
+/// ...
+/// pBase->m_pCollisionData = physcollision->ConvertConvexToCollideParams( ... );
+/// ```
+///
+/// `#if 0` 的调试输出（`:1222-1227`）说明了这两个字段是什么：
+///
+/// ```c
+/// Msg("Drag epsilon is %.3f\n", params.dragAreaEpsilon );
+/// Vector areas = physcollision->CollideGetOrthographicAreas( pBase->m_pCollisionData );
+/// Msg("Drag fractions are %.3f %.3f %.3f\n", areas.x, areas.y, areas.z );
+/// ```
+///
+/// **「Drag fractions」** ⟹ 是**比值**（分数），不是绝对面积。
+///
+/// # 公式
+///
+/// ```text
+///   areas[k] = A_proj(k) / (size[j] · size[l])      {j,l} = 另两轴
+/// ```
+///
+/// 其中 `A_proj(k)` 是凸体沿轴 `k` 的**正交投影面积**（轮廓面积），
+/// 分母是 **OBB 在垂直 `k` 的平面上的截面积**。
+///
+/// # 轴序：`[0, 2, 1]`（**推导出来的，不是拟合**）
+///
+/// ⚠️ 官方的 `size` 来自 `bv.maxs - bv.mins`，是 **Source 轴序**的包围盒；
+/// 而 `ConvertConvexToCollideParams` 收到的凸块已经过
+/// `BuildConvexFromVerts` 的轴映射 `out = (x, −z, y)`。
+/// 两个轴序之间差一个置换，推导如下：
+///
+/// ```text
+///   Source size  S = (sx, sy, sz)
+///   IVP    bbox  I = (sx, sz, sy)          ← 我的点数组量到的是这个
+///   crossS = (sy·sz, sz·sx, sx·sy)
+///   crossI = (I1·I2, I0·I2, I0·I1) = (sz·sy, sx·sy, sx·sz)
+///          = (crossS[0], crossS[2], crossS[1])
+/// ⟹ areas[k] = A_proj(S_k) / crossS[k] = ratioI[perm[k]],  perm = [0, 2, 1]
+/// ```
+///
+/// 实测吻合：语料「可判别」子集（三轴两两差 > 5%，199 个 solid）上
+/// `[0,2,1]` 的 `<5%` 命中率 **83.1%**，而恒等置换只有 **32.0%**。
+///
+/// # 投影面积：散度定理闭式（不需要网格射线投射）
+///
+/// ```text
+///   A_proj(n) = 0.25 · Σ_tri |n · ((v1−v0) × (v2−v0))|
+/// ```
+///
+/// ⚠️ **是 `0.25` 不是 `0.5`**：`(v1−v0)×(v2−v0)` 的模长 = **2×三角形面积**，
+/// 而 `Σ|n·normal| = 2·A_proj` ⟹ 合起来乘 `0.25`。
+/// 写成 `0.5` 的症状是**每个轴的相对误差都恰好 ≈ 0.5** —— 那不是「公式错」，
+/// 是少乘了一个 2。
+///
+/// # 残差（已知，可接受）
+///
+/// 实测中位相对误差 **8.4e-3**、`q90` **5.2e-2**、`<1%` 命中 **53.9%**、
+/// `<5%` **89.6%**（单 hull，n=2316）。残差来自官方用**网格射线投射近似**
+/// （`dragAreaEpsilon` 的注释：「Basically you get a ray cast through each
+/// square of epsilon surface area on each OBB side」），而这里用的是**精确闭式**。
+/// 官方 38.9% 的轴偏小 ⟹ 射线投射**低估**投影面积（网格边界效应）。
+///
+/// **解析锚点**：轴对齐长方体上 `A_proj(k) == size[j]·size[l]` ⟹ 恒为 `1.0`。
+/// 实测 **64/64 = 100%** —— 这条不依赖任何近似。
+///
+/// 需要绝对保守时把 [`PhyParams::inertia_scale`] 设成 `0.0` 不影响这里；
+/// `dragAxisAreas` 没有对应的开关（官方也没有）。
+fn drag_axis_areas(
+    points: &[[f32; 3]],
+    hulls: &[PreparedHull],
+    solid: usize,
+) -> Result<[f32; 3], PhyError> {
+    if points.is_empty() {
+        return Ok([1.0; 3]);
+    }
+    // 整个 solid 的 AABB（官方用 `bv`，也是整个 solid 的）。
+    let mut mn = points[0];
+    let mut mx = points[0];
+    for p in points {
+        for a in 0..3 {
+            if p[a] < mn[a] {
+                mn[a] = p[a];
+            }
+            if p[a] > mx[a] {
+                mx[a] = p[a];
+            }
+        }
+    }
+    let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+
+    // 投影面积：`0.25 · Σ|n_k|`，`n = (v1−v0) × (v2−v0)`（模长 = 2×面积）。
+    let mut proj = [0.0f64; 3];
+    for h in hulls {
+        for t in &h.tris {
+            let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            let (Some(p), Some(q), Some(r)) = (points.get(i0), points.get(i1), points.get(i2))
+            else {
+                return Err(PhyError::BadParameter {
+                    what: "dragAxisAreas",
+                    detail: format!("solid[{solid}] 三角形引用了越界的点下标"),
+                });
+            };
+            let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+            let v = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            for k in 0..3 {
+                proj[k] += f64::from(n[k]).abs();
+            }
+        }
+    }
+    for v in &mut proj {
+        *v *= 0.25;
+    }
+
+    // ⚠️ **`size` 是 IVP 轴序**（`points` 已经过 `out = (x,−z,y)` 映射）。
+    //
+    // 官方 `areas` 的三个分量是 **Source 轴序**，而 `proj`/`cross` 都是 IVP 轴序
+    // ⟹ 只需在最后按 `SRC` 把 IVP 轴映射到 Source 轴**一次**：
+    //
+    // ```text
+    //   drag[k] = proj[SRC[k]] / crossI[SRC[k]]      SRC = [0, 2, 1]
+    // ```
+    //
+    // ⚠️ **踩过的坑**：第一版写成 `proj[SRC[k]] / crossS[SRC[k]]`，
+    // 其中 `crossS` 是**按 Source 轴序**定义的 `(s1·s2, s2·s0, s0·s1)`。
+    // 但 `crossS[SRC[k]] == crossI[k]`（因为 `SRC` 自逆），
+    // 于是分子按 `SRC` 索引、分母没按 ⟹ 两者错开一个 `SRC`
+    // ⟹ **长方体上给出 0.0003 而不是 1.0**（本该是解析锚点）。
+    // 判据：长方体必须给出**精确 1.0** —— 这条自检门当场抓住了它。
+    //
+    // `crossI[i] = size[(i+1)%3] · size[(i+2)%3]`（另两轴之积，与轴序无关的形式）。
+    let cross_i = [
+        f64::from(size[1]) * f64::from(size[2]),
+        f64::from(size[2]) * f64::from(size[0]),
+        f64::from(size[0]) * f64::from(size[1]),
+    ];
+    // IVP 轴 k 对应 Source 轴 `SRC[k]`。
+    const SRC: [usize; 3] = [0, 2, 1];
+
+    let mut out = [1.0f32; 3];
+    for k in 0..3 {
+        let j = SRC[k];
+        let c = cross_i[j];
+        if c > 0.0 {
+            out[k] = (proj[j] / c) as f32;
+            // 官方约定是分数，钳到 (0, 1]（浮点边界可能给出 1.0000001）。
+            out[k] = out[k].clamp(f32::MIN_POSITIVE, 1.0);
+        }
+    }
+    Ok(out)
+}
+
+/// 官方 `rotdamping` 的 HACKHACK：`sizeRatio > 9` ⟹ 强制 `1.0`（R25）。
+///
+/// # 官方出处（`collisionmodel.cpp:1206-1218`）
+///
+/// ```c
+/// Vector tmp = size;
+/// tmp[largest] = 0;
+/// float len = tmp.Length();
+/// if ( len > 0 ) {
+///     float sizeRatio = size[largest] / len;
+///     // HACKHACK: Hardcoded size ratio to induce damping
+///     // This prevents long skinny objects from rolling endlessly
+///     if ( sizeRatio > 9 ) pBase->m_rotdamping = 1.0f;
+/// }
+/// ```
+///
+/// `largest` 是**最长轴**的下标（`:1184-1191` 的循环里算出来的）。
+/// 所以 `sizeRatio = size[largest] / |size 去掉 largest 分量|`。
+///
+/// # 这是**覆盖**，不是默认值
+///
+/// `m_rotdamping` 在 `SetCollisionModelDefaults`（`:579-581`）里已被
+/// QC 的 `$rotdamping` 填过，`CreateCollide` 在这之后才跑 ⟹ QC 写了 `0`
+/// 也会被改成 `1.0`。而文本段（`:2374`）写的是**覆盖后**的值。
+///
+/// # 判据（**不需要 oracle**：`sizeRatio` 是尺度与轴序不变量）
+///
+/// 分子分母同量纲 ⟹ 用米算与用 inch 算等价；轴序置换也不变。
+/// 语料实测（`probe_phy_damping.js`，600 文件）：
+///
+/// | 组 | n | 文本段 `rotdamping == 1.0` |
+/// |---|---|---|
+/// | `sizeRatio > 9` | 32 | **32 (100.0%)** |
+/// | `sizeRatio ≤ 9` | 623 | 10 (1.6%) |
+///
+/// 两组差 60 倍 ⟹ 规律成立。（`≤9` 那 10 个是 QC **自己**写了 `$rotdamping 1`。）
+fn long_skinny_rotdamping(points: &[[f32; 3]]) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    let mut mn = points[0];
+    let mut mx = points[0];
+    for p in points {
+        for a in 0..3 {
+            if p[a] < mn[a] {
+                mn[a] = p[a];
+            }
+            if p[a] > mx[a] {
+                mx[a] = p[a];
+            }
+        }
+    }
+    let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+    let mut largest = 0;
+    for i in 0..3 {
+        if size[i] > size[largest] {
+            largest = i;
+        }
+    }
+    let mut tmp = size;
+    tmp[largest] = 0.0;
+    let len = (tmp[0] * tmp[0] + tmp[1] * tmp[1] + tmp[2] * tmp[2]).sqrt();
+    if len <= 0.0 {
+        return false;
+    }
+    let size_ratio = size[largest] / len;
+    size_ratio > 9.0
+}
 // ---------------------------------------------------------------------------
 // 碰撞树
 // ---------------------------------------------------------------------------
@@ -3113,7 +3376,14 @@ fn build_text_section(
         s.push_str(&format!("\"surfaceprop\" \"{}\"\n", params.surface_prop));
         // 逐 solid 的值 = 本 solid 的覆盖（`$jointdamping` 等）否则全局默认。
         let damping = solid.damping.unwrap_or(params.damping);
-        let rot_damping = solid.rot_damping.unwrap_or(params.rot_damping);
+        let mut rot_damping = solid.rot_damping.unwrap_or(params.rot_damping);
+        // R25：官方 `CreateCollide`（`collisionmodel.cpp:1206-1218`）的 HACKHACK
+        // **覆盖** `m_rotdamping = 1.0f`（长条形物体不无限打滚）。
+        // 它跑在 `SetCollisionModelDefaults`（`:579-581`，填 QC 值）**之后**
+        // ⟹ 即使 QC 写了 `$rotdamping 0` 也会被改成 `1.0`。
+        if p.long_skinny {
+            rot_damping = 1.0;
+        }
         let inertia = solid.inertia.unwrap_or(params.inertia);
         s.push_str(&format!("\"damping\" \"{damping:.6}\"\n"));
         s.push_str(&format!("\"rotdamping\" \"{rot_damping:.6}\"\n"));
@@ -4088,6 +4358,28 @@ mod tests {
         let p = PhyParams::new("cube", 0xdead_beef);
         write_phy(std::slice::from_ref(&h), &s, &p).expect("立方体必须能写出")
     }
+
+    /// **`dragAxisAreas` 在文件里的绝对偏移**。
+    ///
+    /// ⚠️ **不是** `16 + SOLID_HEADER_SIZE`（= 48，那是 `IVP_Compact_Surface`
+    /// 的起点）。`dragAxisAreas` 在 **solid 的 32 字节头**里、`+16` 处：
+    ///
+    /// ```text
+    /// +0   i32 size
+    /// +4   u32 VPHYSICS_ID
+    /// +8   u16 version
+    /// +10  i16 modelType
+    /// +12  i32 surfaceSize
+    /// +16  f32 dragAxisAreas[3]     ← 这里
+    /// +28  i32 axisMapSize
+    /// ```
+    ///
+    /// 所以绝对偏移 = `16（phyheader）+ 16` = **32**。
+    ///
+    /// 写成 `body + 16`（= 64）会读到 `rotation_inertia` —— 症状是
+    /// 「立方体上得到 0.0003 而不是 1.0」，**看起来像公式错，其实是偏移错**。
+    /// （与 §45.41「偏移错是最会伪装的一类探针 bug」同族。）
+    const DRAG_AREAS_OFFSET: usize = 16 + 16;
 
     // -----------------------------------------------------------------
     // 1. 立方体 → 13 条硬约束自检
@@ -6233,6 +6525,325 @@ mod tests {
                 "rot[{i}] 应为 √(两项²) = {want}，实际 {got}（相对差 {rel}）"
             );
         }
+    }
+
+    /// **`dragAxisAreas` 必须算出真的分数，而不是恒 `[1,1,1]`**（R25）。
+    ///
+    /// # 解析锚点（**不需要 oracle**）
+    ///
+    /// 轴对齐长方体上，沿轴 `k` 的正交投影面积**恰好等于** OBB 截面积
+    /// `size[j]·size[l]` ⟹ 三个分数**必须全是 `1.0`**。
+    ///
+    /// 这条是「公式对不对」的最强判据：它不依赖官方那套射线投射近似。
+    /// 语料实测 **64/64 长方体全 1**。
+    #[test]
+    fn drag_axis_areas_are_one_for_boxes() {
+        // 立方体（±1，边长 2）。
+        let b = write_cube();
+        for k in 0..3 {
+            let got = read_f32(&b, DRAG_AREAS_OFFSET + k * 4);
+            assert!(
+                (got - 1.0).abs() < 1e-5,
+                "长方体/立方体的 drag[{k}] 应为 1.0（投影面积 == OBB 截面积），实际 {got}"
+            );
+        }
+        // 非立方体的长方体（X 拉长 4 倍）也必须是全 1 —— 这条才排除
+        // 「只是碰巧立方体对称」的解释。
+        let mut vs = cube_vertices();
+        for v in &mut vs {
+            v[0] *= 4.0;
+        }
+        let h = PhyHull {
+            vertices: vs,
+            faces: cube_faces(),
+        };
+        let s = [PhySolid::prop("box")];
+        let p = PhyParams::new("box", 0);
+        let b2 = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+        for k in 0..3 {
+            let got = read_f32(&b2, DRAG_AREAS_OFFSET + k * 4);
+            assert!(
+                (got - 1.0).abs() < 1e-5,
+                "4:1:1 长方体的 drag[{k}] 应为 1.0，实际 {got}"
+            );
+        }
+    }
+
+    /// **轴序必须是 `[0, 2, 1]`**（R25）。
+    ///
+    /// 官方的 `size` 是 **Source 轴序**的包围盒，而点数组已经过
+    /// `to_ivp` 的 `(x,−z,y)` 映射 ⟹ 两个轴序差一个 `[0,2,1]`。
+    /// 推导见 [`drag_axis_areas`] 的文档。
+    ///
+    /// 夹具用**两个尺寸不同的长方体**（都按 IVP 轴序给，再逆映射回去），
+    /// 使三个 `ratioI` 两两不同 —— 否则长方体/八面体/棱柱**都测不出轴序**
+    /// （它们的投影面积恰好等于 OBB 截面积，`ratioI` 恒等）。
+    ///
+    /// 手算（IVP 轴序）：
+    ///
+    /// ```text
+    ///   hull A: x∈[0,1] y∈[0,1] z∈[0,1]   → proj (1, 1, 1)
+    ///   hull B: x∈[0,1] y∈[0,2] z∈[3,4]   → proj (2, 1, 2)
+    ///   合并 bbox size = (1, 2, 4)
+    ///   proj   = (3, 2, 3)
+    ///   crossI = (2·4, 4·1, 1·2) = (8, 4, 2)
+    ///   ratioI = (0.375, 0.5, 1.5 → 钳 1)
+    ///   drag   = (ratioI[0], ratioI[2], ratioI[1]) = (0.375, 1.0, 0.5)
+    /// ```
+    ///
+    /// 轴序若写成恒等，`drag[1]` 与 `drag[2]` 会**互换**。
+    #[test]
+    fn drag_axis_areas_use_the_source_axis_order() {
+        // `to_ivp(v) = 0.0254 · (−v.y, −v.z, v.x)` 的逆。
+        let inv = |q: [f32; 3]| -> [f32; 3] {
+            [q[2] / SOURCE_TO_IVP, -q[0] / SOURCE_TO_IVP, -q[1] / SOURCE_TO_IVP]
+        };
+        let mk = |ivp: [[f32; 3]; 8]| PhyHull {
+            vertices: ivp.iter().map(|q| inv(*q)).collect(),
+            faces: cube_faces(),
+        };
+        // 两个长方体，**IVP 轴序**给出。
+        let hull_a = mk([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ]);
+        let hull_b = mk([
+            [0.0, 0.0, 3.0],
+            [1.0, 0.0, 3.0],
+            [1.0, 2.0, 3.0],
+            [0.0, 2.0, 3.0],
+            [0.0, 0.0, 4.0],
+            [1.0, 0.0, 4.0],
+            [1.0, 2.0, 4.0],
+            [0.0, 2.0, 4.0],
+        ]);
+        let s = [PhySolid::prop("axisorder")];
+        let p = PhyParams::new("axisorder", 0);
+        // 两个凸块**同属一个 solid**（`write_phy` 把 `hulls` 当一个 solid 的凸块表，
+        // 但要求 `solids.len() == hulls.len()`）⟹ 用 `write_phy_multi` 显式分组。
+        let b = write_phy_multi(&[vec![hull_a, hull_b]], &s, &p).unwrap();
+        let got = [
+            read_f32(&b, DRAG_AREAS_OFFSET),
+            read_f32(&b, DRAG_AREAS_OFFSET + 4),
+            read_f32(&b, DRAG_AREAS_OFFSET + 8),
+        ];
+        // 核心判据：第 1 与第 2 位必须不同（轴序写错时互换）。
+        assert!(
+            (got[1] - got[2]).abs() > 0.05,
+            "drag[1] 与 drag[2] 必须不同（期望 1.0 vs 0.5）—— \
+             若相同说明夹具对称、测不出轴序；实际 {got:?}"
+        );
+        let expect = [0.375f32, 1.0, 0.5];
+        for k in 0..3 {
+            assert!(
+                (got[k] - expect[k]).abs() < 0.02,
+                "drag[{k}] 应为 {:.3}（手算 ratioI[SRC[{k}]]），实际 {:.6}",
+                expect[k],
+                got[k]
+            );
+        }
+    }
+
+    #[test]
+    fn drag_axis_areas_drop_below_one_for_octahedron() {
+        // 八面体：6 个顶点在 ±1 轴上，8 个三角面。
+        let vs = vec![
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        let faces = vec![
+            [0, 2, 4],
+            [2, 1, 4],
+            [1, 3, 4],
+            [3, 0, 4],
+            [2, 0, 5],
+            [1, 2, 5],
+            [3, 1, 5],
+            [0, 3, 5],
+        ];
+        let h = PhyHull {
+            vertices: vs,
+            faces,
+        };
+        let s = [PhySolid::prop("octa")];
+        let p = PhyParams::new("octa", 0);
+        let b = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+        let got = [
+            read_f32(&b, DRAG_AREAS_OFFSET),
+            read_f32(&b, DRAG_AREAS_OFFSET + 4),
+            read_f32(&b, DRAG_AREAS_OFFSET + 8),
+        ];
+        // 八面体各轴等价 ⟹ 三个分数都应为 0.5（菱形/正方形）。
+        for (k, v) in got.iter().enumerate() {
+            assert!(
+                (v - 0.5).abs() < 1e-4,
+                "八面体的 drag[{k}] 应为 0.5（菱形投影面积 2 / 正方形 4），实际 {v}"
+            );
+        }
+    }
+
+    /// **`dragAxisAreas` 必须随几何缩放不变**（R25）。
+    ///
+    /// 它是**比值**（投影面积 / 截面积，量纲相消）⟹ 整体缩放 `k` 倍后
+    /// 三个分数**逐位不变**。
+    ///
+    /// ⚠️ 这条能抓住「误把长度单位换算进去」这类错误 ——
+    /// 若实现里混进了 `SOURCE_TO_IVP` 的幂次，缩放就会改变结果。
+    #[test]
+    fn drag_axis_areas_are_scale_invariant() {
+        // 八面体（`|x|+|y|+|z| ≤ 1`）缩放 `scale` 倍 —— 三个分数都应为 0.5，
+        // 与 `scale` 无关。用八面体而不是切角立方体，因为**切角不改变投影面积**
+        // （见 `drag_axis_areas_drop_below_one_for_octahedron` 的说明）。
+        let read_drag = |scale: f32| -> [f32; 3] {
+            let vs = vec![
+                [scale, 0.0, 0.0],
+                [-scale, 0.0, 0.0],
+                [0.0, scale, 0.0],
+                [0.0, -scale, 0.0],
+                [0.0, 0.0, scale],
+                [0.0, 0.0, -scale],
+            ];
+            let faces = vec![
+                [0, 2, 4],
+                [2, 1, 4],
+                [1, 3, 4],
+                [3, 0, 4],
+                [2, 0, 5],
+                [1, 2, 5],
+                [3, 1, 5],
+                [0, 3, 5],
+            ];
+            let h = PhyHull {
+                vertices: vs,
+                faces,
+            };
+            let s = [PhySolid::prop("scaled")];
+            let p = PhyParams::new("scaled", 0);
+            let b = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+            [
+                read_f32(&b, DRAG_AREAS_OFFSET),
+                read_f32(&b, DRAG_AREAS_OFFSET + 4),
+                read_f32(&b, DRAG_AREAS_OFFSET + 8),
+            ]
+        };
+        let d1 = read_drag(1.0);
+        let d7 = read_drag(7.0);
+        // 先证明夹具非空：分数必须都不是 1（否则不变性判据恒真）。
+        for (k, v) in d1.iter().enumerate() {
+            assert!(
+                (v - 0.5).abs() < 1e-4,
+                "夹具的 drag[{k}] = {v} 应为 0.5 —— 否则不变性判据空洞"
+            );
+        }
+        for k in 0..3 {
+            assert!(
+                (d1[k] - d7[k]).abs() < 1e-4,
+                "drag[{k}] 是比值，缩放后必须不变：scale=1 时 {}，scale=7 时 {}",
+                d1[k],
+                d7[k]
+            );
+        }
+    }
+
+    /// **`sizeRatio > 9` ⟹ 文本段 `rotdamping` 被覆盖成 `1.0`**（R25）。
+    ///
+    /// 官方 `collisionmodel.cpp:1206-1218` 的 HACKHACK：
+    ///
+    /// ```c
+    /// Vector tmp = size; tmp[largest] = 0;
+    /// float len = tmp.Length();
+    /// if ( len > 0 ) {
+    ///     float sizeRatio = size[largest] / len;
+    ///     if ( sizeRatio > 9 ) pBase->m_rotdamping = 1.0f;
+    /// }
+    /// ```
+    ///
+    /// 判据（**不需要 oracle**）：`sizeRatio` 是尺度/轴序不变量。
+    /// 语料实测 `>9` 的 32 个 solid **全部** `rotdamping == 1.0`，
+    /// 而 `≤9` 的 623 个里只有 1.6%（QC 自己写的）。
+    ///
+    /// ⚠️ **这是覆盖，不是默认值**：QC 写 `$rotdamping 0` 也会被改成 `1.0`。
+    /// 所以夹具里**显式把 QC 值设成 0**，判据才是「覆盖」而不是「恰好等于默认」。
+    #[test]
+    fn long_skinny_forces_rot_damping_to_one() {
+        let read_rd = |verts: Vec<[f32; 3]>| -> f32 {
+            let h = PhyHull {
+                vertices: verts,
+                faces: cube_faces(),
+            };
+            let s = [PhySolid::prop("skinny")];
+            let mut p = PhyParams::new("skinny", 0);
+            p.rot_damping = 0.0; // ← QC 显式写 0，用来判「覆盖」
+            let b = write_phy(std::slice::from_ref(&h), &s, &p).unwrap();
+            let sc = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+            let mut off = 16usize;
+            for _ in 0..sc {
+                let sz = i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]);
+                off += sz as usize + 4;
+            }
+            let t = String::from_utf8_lossy(&b[off..]).to_string();
+            let re_at = t.find("\"rotdamping\"").expect("文本段应有 rotdamping");
+            let rest = &t[re_at + 12..];
+            let a = rest.find('"').unwrap() + 1;
+            let bq = rest[a..].find('"').unwrap() + a;
+            rest[a..bq].parse::<f32>().expect("rotdamping 应是数字")
+        };
+
+        // 细长杆：size = (2, 2, 40) ⟹ largest = z(40)，
+        // |size 去掉 z| = |(2,2,0)| = 2.828 ⟹ sizeRatio = 40/2.828 = 14.14 > 9 ✅
+        let mut skinny = cube_vertices();
+        for v in &mut skinny {
+            v[2] *= 20.0; // z 从 ±1 变成 ±20 ⟹ size_z = 40
+        }
+        let sz = [2.0f32, 2.0, 40.0];
+        let sr = sz[2] / (sz[0] * sz[0] + sz[1] * sz[1]).sqrt();
+        assert!(sr > 9.0, "夹具的 sizeRatio 应为 {sr} > 9 —— 否则本测试空洞");
+        let rd = read_rd(skinny);
+        assert!(
+            (rd - 1.0).abs() < 1e-6,
+            "sizeRatio = {sr} > 9 ⟹ rotdamping 应被**覆盖**成 1.0，实际 {rd}"
+        );
+
+        // 对照：不细长的立方体（sizeRatio = 2/2.828 = 0.707 < 9）应保留 QC 的 0。
+        let rd_cube = read_rd(cube_vertices());
+        assert!(
+            rd_cube.abs() < 1e-6,
+            "sizeRatio < 9 时不得改动 QC 值：应保留 0.0，实际 {rd_cube}"
+        );
+
+        // ⚠️ **阈值必须是 9，不是别的数** —— 上面两组只证明「有个阈值」，
+        // 抓不到「阈值写成 1」这类变异（变异测试实测 D 逃逸）。
+        //
+        // 构造一个 `1 < sizeRatio < 9` 的中间样本：阈值 1 会让它变成 1.0，
+        // 阈值 9 会保留 QC 的 0。**这条才是阈值数值的判据。**
+        //
+        // `size = (2, 2, 2k)` ⟹ `sizeRatio = 2k / √8 = k/√2`。
+        // 取 `k = 2` ⟹ `sizeRatio = 1.414`（在 (1, 9) 内）✅
+        let mut mid = cube_vertices();
+        for v in &mut mid {
+            v[2] *= 2.0; // z 从 ±1 变成 ±2 ⟹ size_z = 4 ⟹ sizeRatio = 4/2.828 = 1.414
+        }
+        let sr_mid = 4.0f32 / (2.0f32 * 2.0 + 2.0 * 2.0).sqrt();
+        assert!(
+            sr_mid > 1.0 && sr_mid < 9.0,
+            "中间样本的 sizeRatio 应为 {sr_mid}，必须落在 (1, 9) 内 —— 否则本判据无意义"
+        );
+        let rd_mid = read_rd(mid);
+        assert!(
+            rd_mid.abs() < 1e-6,
+            "sizeRatio = {sr_mid}（1 与 9 之间）⟹ 不得覆盖，应保留 QC 的 0.0，实际 {rd_mid}。\
+             若得到 1.0 说明阈值被写成了 1 而不是 9"
+        );
     }
 
     /// 质量分配：多 solid 时按体积比例分，且下限钳到 1.0。
