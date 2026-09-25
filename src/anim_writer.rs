@@ -3458,17 +3458,24 @@ pub fn write_animations(
         // 官方 `flags == 0x01` —— 而块里没有任何 `loop`。mdlc 早先按
         // `seq.looping` 单独算，写成 0x00。
         //
-        // `animdesc.flags` 的算法与下面第 3 节**同一处**（`spec.looping` +
-        // `subtract → STUDIO_DELTA`），所以这里照同样两条位算，
-        // 不另建一份映射表。
+        // ⚠️ **但这里只能补 `STUDIO_LOOPING`，绝不能补 `STUDIO_DELTA`。**
+        //
+        // 上面那行官方代码跑在**解析期**（`ParseSequence` 尾部），而
+        // `subtract` 在解析期**只往动画的 `cmds[]` 里记一条 `CMD_SUBTRACT`**
+        // （`:1733-1751`），**完全不碰 `panim->flags`**；
+        // `panim->flags |= STUDIO_DELTA` 要到 `simplify.cpp:164`
+        // **执行**那条 cmd 时才发生 —— 那时序列的 flags 早已定稿。
+        //
+        // ⟹ 序列**永远**不会因为 `subtract` 拿到 `DELTA`。
+        // 实测（`docs/_probe/probe_r9_delta_flags.js`）：6 条只有 `subtract`
+        // 而无 `delta` 的 `*_layer` 序列，官方 `0x000` / `0x001`；
+        // 照 `animations[].delta` 补位会写成 `0x004` / `0x005`（6/23 差异）。
+        //
+        // `LOOPING` 之所以**能**在这里补，是因为 `loop` 走的是
+        // `ParseAnimationToken`（`:2226`），**解析期当场**就置位了。
         for cell in &seq.cells {
-            if let Some(sp) = specs.get(*cell) {
-                if sp.looping {
-                    flags |= STUDIO_LOOPING;
-                }
-                if compiled.animations[sp.anim_index].delta {
-                    flags |= STUDIO_DELTA;
-                }
+            if specs.get(*cell).is_some_and(|sp| sp.looping) {
+                flags |= STUDIO_LOOPING;
             }
         }
         seqdescs[o + 0x0C..o + 0x10].copy_from_slice(&flags.to_le_bytes());
@@ -5459,6 +5466,82 @@ mod tests {
         // animdesc 自己的 flags 同样置位（同一条规则的另一半）。
         let aflags = i32::from_le_bytes(out.animdescs[0x0C..0x10].try_into().unwrap());
         assert_eq!(aflags, STUDIO_LOOPING, "animdesc.flags");
+    }
+
+    /// **`seqdesc.flags` 不得从 `animdesc.flags` 补 `STUDIO_DELTA`**（R11）。
+    ///
+    /// 官方两处跑在**不同阶段**：
+    ///
+    /// | 事件 | 时机 | 能否进 `pseq->flags` |
+    /// |---|---|---|
+    /// | `pseq->flags \|= animations[i]->flags`（`studiomdl.cpp:3037`） | **解析期** | 基准 |
+    /// | `loop` → `panim->flags \|= STUDIO_LOOPING`（`:2226`） | **解析期当场** | ✅ |
+    /// | `subtract` → 只记 `CMD_SUBTRACT`（`:1733-1751`） | **解析期**，不碰 flags | ❌ |
+    /// | `panim->flags \|= STUDIO_DELTA`（`simplify.cpp:164`） | **执行期** | ❌ 太晚 |
+    ///
+    /// 所以「只有 `subtract`（无 `delta` 关键字）的序列」在官方产物里
+    /// `seqdesc.flags` **没有** `DELTA`，而它的 `animdesc.flags` **有**。
+    /// 实测（`docs/_probe/probe_r9_delta_flags.js`）：6 条 `*_layer` 序列，
+    /// 官方 `0x000` / `0x001`，照 `animations[].delta` 补位会写成
+    /// `0x004` / `0x005`（6/23 差异）。
+    ///
+    /// ⚠️ **本测试必须同时断言 `animdesc` 有 `DELTA`** —— 否则把 R9 一起
+    /// 改坏（`delta` 不再传播到动画）时它仍会通过，就退化成了「两边都 0」的
+    /// 空洞测试。
+    #[test]
+    fn seqdesc_flags_do_not_inherit_delta_from_animation() {
+        // 序列块**没有** `delta` 关键字 ⟹ `seq.delta == false`。
+        let mut s = seq("reload_layer", false, Vec::new());
+        s.cells = vec![0];
+        s.delta = false;
+        let mut c = compiled(vec![s], 1);
+        // 但动画池里那条**是** delta（等价于 `$sequence ... subtract "a_idle_1" 0`
+        // 被 `simplify.cpp:164` 执行后的结果）。
+        c.animations[0].delta = true;
+
+        let out = write_with_f0_refs(&c, &[-1]).expect("写出动画");
+        let seq_flags = i32::from_le_bytes(out.seqdescs[0x0C..0x10].try_into().unwrap());
+        let anim_flags = i32::from_le_bytes(out.animdescs[0x0C..0x10].try_into().unwrap());
+
+        assert_eq!(
+            anim_flags & STUDIO_DELTA,
+            STUDIO_DELTA,
+            "animdesc 必须带 DELTA（R9）—— 这一半坏了本测试就失去判别力"
+        );
+        assert_eq!(
+            seq_flags & STUDIO_DELTA,
+            0,
+            "seqdesc 绝不能带 DELTA（R11）：subtract 在执行期才置动画的位，\
+             那时序列 flags 早已定稿"
+        );
+    }
+
+    /// **`seqdesc.flags` 的 `LOOPING` 却**必须**从动画补**（与 R11 成对）。
+    ///
+    /// 这条与上一条是同一个机制的两面：`loop` 在**解析期当场**置
+    /// `panim->flags`（`studiomdl.cpp:2226`），所以它能赶上 `:3037` 那行；
+    /// 而 `subtract` 赶不上。**两条测试合起来才钉住「时机」这个根因** ——
+    /// 只留一条的话，「整个 OR 循环都删掉」这种过度修复会被漏过。
+    #[test]
+    fn seqdesc_flags_do_inherit_looping_from_animation() {
+        let mut s = seq("idle_raw", false, Vec::new());
+        s.cells = vec![0];
+        let mut c = compiled(vec![s], 1);
+        c.animations[0].looping = true;
+        c.animations[0].delta = true; // 同时是 delta，验证只有 LOOPING 会传播
+
+        let out = write_with_f0_refs(&c, &[-1]).expect("写出动画");
+        let seq_flags = i32::from_le_bytes(out.seqdescs[0x0C..0x10].try_into().unwrap());
+        assert_eq!(
+            seq_flags & STUDIO_LOOPING,
+            STUDIO_LOOPING,
+            "loop 在解析期就置位 ⟹ 序列必须拿到 LOOPING"
+        );
+        assert_eq!(
+            seq_flags & STUDIO_DELTA,
+            0,
+            "同一条动画的 DELTA 不能跟着一起传过来"
+        );
     }
 
     /// **`seqdesc.numikrules` 是「该序列每一格动画取 MAX」，不是

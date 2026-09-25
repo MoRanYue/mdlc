@@ -118,6 +118,27 @@ pub struct Parser<'a> {
     errors: Vec<QcError>,
     /// `$bonemerge` 的骨骼名（骨骼表建好后回填）。
     bonemerge_names: Vec<String>,
+    /// `$unlockdefinebones` 是否出现（`g_bOverridePreDefinedBones`）。
+    ///
+    /// # L4D2 的语义与 darkm SDK **相反**
+    ///
+    /// L4D2 `studiomdl.exe` 的命令表里有 `$unlockdefinebones`
+    /// （`0x578F99`），**没有** `$lockdefinebones`；且 `-overridedefinebones`
+    /// 的 help 写着 `equivalent to specifying $unlockdefinebones in .qc file`。
+    ///
+    /// ⟹ **默认锁定** `$definebone` 给的参考姿态，写了本命令才让 **SMD 赢**。
+    ///
+    /// 真 studiomdl 裁决（`docs/_probe/oracle_unlockdefinebones.js`）：
+    ///
+    /// | 变体 | 官方骨骼 `b1.z` | 官方顶点 z |
+    /// |---|---|---|
+    /// | 无 flag | **20**（`$definebone` 赢） | 20 |
+    /// | `$unlockdefinebones` | **10**（SMD 赢） | 10 |
+    ///
+    /// > darkm SDK 的 `g_bOverridePreDefinedBones` **默认 true**
+    /// > （`studiomdl.cpp:59`），只有 `$lockdefinebones` 置 false
+    /// > （`:5733`）—— 那是**旧版**语义，**不要照抄**。
+    unlock_define_bones: bool,
     /// `$attachment` 里哪些带 `absolute`（写出器需要按 `g_defaultrotation` 反转）。
     attachment_absolute: Vec<bool>,
     /// `$jointsurfaceprop` 的待办（骨骼表建好后回填）。
@@ -205,6 +226,7 @@ impl<'a> Parser<'a> {
             referenced_files: Vec::new(),
             errors: Vec::new(),
             bonemerge_names: Vec::new(),
+            unlock_define_bones: false,
             attachment_absolute: Vec::new(),
             joint_surface_props: Vec::new(),
             pending_lods: Vec::new(),
@@ -401,11 +423,19 @@ impl<'a> Parser<'a> {
                 let _ = self.f()?;
                 Ok(())
             }
+            // ---- `$unlockdefinebones`：让 SMD 骨架覆盖 `$definebone` ----
+            //
+            // L4D2 的语义与 darkm SDK 相反（详见字段文档）。这里只置标志，
+            // 真正的覆盖在 `finish()` 建骨骼表时做。
+            "$unlockdefinebones" => {
+                self.unlock_define_bones = true;
+                Ok(())
+            }
             // ---- 忽略（无产物痕迹 / 语料 0 次）----
             "$autocenter" | "$zbrush" | "$cliptotextures" | "$externaltextures" | "$obsolete"
             | "$minlod" | "$allowrootlods" | "$skinnedLODs" | "$motionrollback" | "$subd"
             | "$lcaseallsequences" | "$addsearchdir" | "$centerbonesonverts" | "$gamma"
-            | "$hgroup" | "$decal" | "$ignorez" | "$vertexcolor" | "$unlockdefinebones"
+            | "$hgroup" | "$decal" | "$ignorez" | "$vertexcolor"
             | "$lockbonelengths" | "$jigglebonerealign" | "$bonesaveframe"
             | "$declareanimation" | "$calctransitions" | "$skiptransition" | "$forcerealign"
             | "$collapsebones" | "$collapsebonesaggressive" | "$alwayscollapse" | "$screenalign"
@@ -1832,17 +1862,59 @@ impl<'a> Parser<'a> {
     }
 
     /// `$definebone <名> <父> <x> <y> <z> <pitch> <yaw> <roll> [<rx> <ry> <rz> <rp> <ry2> <rr>]`。
+    ///
+    /// # ⚠️ 参数顺序是 `QAngle`，而落盘字段是 `RadianEuler` —— 必须重排
+    ///
+    /// 官方 `Cmd_DefineBone`（`studiomdl.cpp:5920-5925`）把这 3 个数字
+    /// **按顺序**读进 `QAngle angles`，再 `AngleMatrix(angles, pos, rawLocal)`
+    /// （`:5926`）。`QAngle` 是 `{pitch, yaw, roll}`（= `{x, y, z}`）。
+    ///
+    /// 而 `mstudiobone_t.rotation` 是 **`RadianEuler`** `{roll, pitch, yaw}`
+    /// —— `RebuildLocalPose` 用 `MatrixAngles`（`simplify.cpp:4415`）反解，
+    /// 落盘就是这个顺序。
+    ///
+    /// 实测（`docs/_probe/oracle_definebone_rotorder.js`，真 `studiomdl`）：
+    ///
+    /// ```text
+    /// QC  : $definebone "b1" "b0" 0 0 5 11 22 33     ← pitch=11 yaw=22 roll=33
+    /// 官方: rot = [33.0000, 11.0000, 22.0000]°        ← [roll, pitch, yaw]
+    /// ```
+    ///
+    /// 所以 `[roll, pitch, yaw] = [输入[2], 输入[0], 输入[1]]`。
+    /// 后 6 个数字的旋转部分**同理**（`AngleMatrix(angles, pos, srcRealign)`，
+    /// `:5945`）—— 官方 `-definebones` 的 dump 用 `MatrixAngles(srcRealign)`
+    /// 打印成 `QAngle`，实测给 `11 22 33` 就打印 `11 22 33`
+    /// （`oracle_realign_rotorder.js`），所以它与前 3 个数字同序。
+    ///
+    /// 重排在这里做（而不是在 `explicit_src_realign`）是为了让
+    /// **QC 与 TOML 两条路径产出同一个 `Bone`** —— TOML 的 `rotation` /
+    /// `realign_rotation` 本来就是 `[roll, pitch, yaw]`（实测
+    /// `parity/refpose.toml` 与官方产物逐位相同）。
+    ///
+    /// # `bPreAligned` **总是** true
+    ///
+    /// `Cmd_DefineBone` 只在 12 数字形式里写 `g_importbone[].bPreAligned`
+    /// （`:5930`），但那只影响 `g_importbone` 这个**中间**结构。骨骼表里的
+    /// `bPreAligned` 由 `BuildGlobalBonetable` 对**每一条** `$definebone`
+    /// **无条件**置位（`simplify.cpp:3653`），与数字个数无关。
+    ///
+    /// 实测（`ipq2` = 6 数字 + `$realignbones`）：官方产物 `a.pos=[0,0,10]`
+    /// ——**没有**被重排（对照组 `ipq1` 不写 `$definebone`，同样写
+    /// `$realignbones`，`a.pos` 变成 `[10,0,0]`）。
+    ///
+    /// > 早先这里按「有没有后 6 个数字」置 `pre_aligned`，于是 6 数字形式
+    /// > 被当成**未**预对齐 ⟹ 走了 `RealignBones` ⟹ 参考姿态被改写。
+    /// > 症状：`ipq2` 走 QC 路径得 `[10,0,0]`，走 TOML 路径得 `[0,0,10]`，
+    /// > 而官方是后者 —— **同一个夹具两条路径不一致**。
     fn cmd_definebone(&mut self) -> Result<(), QcError> {
         let name = self.tok(false)?.text;
         let parent = self.tok(false)?.text;
         let pos = self.v3()?;
         let rot = self.v3()?;
-        // 官方：本行还有 token ⟹ `bPreAligned = true` + 读 srcRealign。
-        let mut pre_aligned = false;
+        // 官方：本行还有 token ⟹ 读 `srcRealign`（后 6 个数字）。
         let mut realign_pos = None;
         let mut realign_rot = None;
         if self.avail() {
-            pre_aligned = true;
             realign_pos = Some(self.v3()?);
             realign_rot = Some(self.v3()?);
         }
@@ -1850,13 +1922,15 @@ impl<'a> Parser<'a> {
             name,
             parent: if parent.is_empty() { None } else { Some(parent) },
             position: Some(pos),
-            rotation: Some(rot),
+            // `QAngle{pitch,yaw,roll}` → `RadianEuler{roll,pitch,yaw}`。
+            rotation: Some([rot[2], rot[0], rot[1]]),
             flags: None,
             surface_prop: None,
             bonemerge: false,
-            pre_aligned: Some(pre_aligned),
+            // 见上：官方对每条 `$definebone` 都置位，与数字个数无关。
+            pre_aligned: Some(true),
             realign_position: realign_pos,
-            realign_rotation: realign_rot,
+            realign_rotation: realign_rot.map(|r| [r[2], r[0], r[1]]),
         });
         Ok(())
     }
@@ -1887,12 +1961,40 @@ impl<'a> Parser<'a> {
                 "rigid" => flags |= 0x0002, // IS_RIGID
                 "world_align" => flags |= 0x0004,
                 "rotate" => {
-                    for slot in rotation.iter_mut() {
+                    // ⚠️ **官方读进来的是 `QAngle{pitch, yaw, roll}`**，
+                    // 而 `Attachment.rotation` 的约定是 `RadianEuler{roll, pitch, yaw}`
+                    // （写出器 `to_radians()` 后喂 `bone_math::angle_matrix`）。
+                    // **必须重排**，否则附着点朝向错 90°。
+                    //
+                    // 官方 `Cmd_Attachment`（`studiomdl.cpp:5260-5272`）：
+                    // ```cpp
+                    // else if (stricmp(token,"rotate") == 0) {
+                    //     QAngle angles;
+                    //     for (int i = 0; i < 3; ++i) { GetToken(false); angles[i] = verify_atof(token); }
+                    //     AngleMatrix( angles, g_attachment[...].local );
+                    // }
+                    // ```
+                    // `QAngle` 的成员顺序是 `x=pitch, y=yaw, z=roll`，而
+                    // `AngleMatrix(QAngle)`（`mathlib_base.cpp:2837`）按
+                    // `angles[PITCH/YAW/ROLL]` 组装。
+                    //
+                    // 真 studiomdl 裁决（`docs/_probe/oracle_attachment_rotate.js`）：
+                    // `rotate 0 0 -90` / `90 0 0` / `0 90 0` 三个受控夹具，
+                    // 官方落盘的 `local` 旋转与 **QAngle 口径**吻合到 `4.37e-8`，
+                    // 与 RadianEuler 口径差 **1.0**（正好 90°）。
+                    //
+                    // 影响面：真实语料里 `$attachment` 带 `rotate` 的有 **315 处**，
+                    // 而 parity 唯一用到它的夹具写的是 `rotate 0 0 0`（恒等）
+                    // ⟹ **parity 测不出来**。
+                    let mut q = [0.0f32; 3];
+                    for slot in q.iter_mut() {
                         if !self.avail() {
                             break;
                         }
                         *slot = self.f()?;
                     }
+                    // `QAngle{pitch, yaw, roll}` → `RadianEuler{roll, pitch, yaw}`
+                    rotation = [q[2], q[0], q[1]];
                 }
                 "x_and_z_axes" => {
                     let _ = self.v3()?;
@@ -2761,8 +2863,13 @@ impl<'a> Parser<'a> {
         // `$definebone` 先，然后各 SMD 的 nodes（按**引用顺序**）。
         let mut bones: Vec<Bone> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // 记住哪些名字来自 `$definebone`（`g_bonetable[].bPreDefined`），
+        // 供下面的 `$unlockdefinebones` 覆盖使用。
+        let mut predefined: HashSet<String> = HashSet::new();
         for b in std::mem::take(&mut self.import_bones) {
-            if seen.insert(b.name.to_ascii_lowercase()) {
+            let key = b.name.to_ascii_lowercase();
+            if seen.insert(key.clone()) {
+                predefined.insert(key);
                 bones.push(b);
             }
         }
@@ -2784,6 +2891,44 @@ impl<'a> Parser<'a> {
                         realign_position: None,
                         realign_rotation: None,
                     });
+                }
+            }
+        }
+
+        // ---- `$unlockdefinebones`：SMD 骨架**覆盖** `$definebone` ----
+        //
+        // 官方 `BuildGlobalBonetable`（`simplify.cpp:3688-3706`）：
+        //
+        // ```c
+        // else if (g_bOverridePreDefinedBones && g_bonetable[k].bPreDefined)
+        // {
+        //     g_bonetable[k].bPreDefined = false;      // ← 不再是 pre-aligned
+        //     MatrixCopy( srcBoneToWorld[j], g_bonetable[k].boneToPose );
+        //     // rawLocal = parent.boneToPose⁻¹ ∘ srcBoneToWorld[j]  ← 即 SMD 的局部姿态
+        // }
+        // ```
+        //
+        // 对「`$definebone` 声明的骨骼同时也在 SMD 里」这一常见情形，
+        // 结果就是**取 SMD 的局部姿态**。mdlc 的 IR 里「`position`/`rotation`
+        // 为 `None`」正是这个语义（`resolve_bone_pose` 会回退到 SMD 第 0 帧），
+        // 所以这里把它们清空，并把 `pre_aligned` 显式置 false
+        // （否则 `is_pre_aligned()` 会按「有显式姿态」推断出 true）。
+        //
+        // ⚠️ **只对「也在 SMD nodes 里」的骨骼生效** —— 官方那条分支由
+        // `psource->boneref[j]` 把关，SMD 里没有的骨骼根本不会走到。
+        if self.unlock_define_bones {
+            let smd_nodes: HashSet<String> = files
+                .iter()
+                .filter_map(|f| smd_cache.get(f).and_then(|x| x.as_ref()))
+                .flat_map(|info| info.nodes.iter())
+                .map(|n| n.to_ascii_lowercase())
+                .collect();
+            for b in &mut bones {
+                let key = b.name.to_ascii_lowercase();
+                if predefined.contains(&key) && smd_nodes.contains(&key) {
+                    b.position = None;
+                    b.rotation = None;
+                    b.pre_aligned = Some(false);
                 }
             }
         }
@@ -3508,6 +3653,99 @@ $sequence \"reload_end\" \"al_reload\" subtract \"a_idle\" 0 delta \"ACT_VM_RELO
             );
         }
         assert_eq!(d.sequences[2].subtract.as_deref(), Some("a_idle"));
+    }
+
+    /// ⚠️ **回归**：`$attachment ... rotate` 的三个数是 **`QAngle{pitch, yaw, roll}`**，
+    /// 必须重排成 `RadianEuler{roll, pitch, yaw}` 再存。
+    ///
+    /// 官方 `Cmd_Attachment`（`studiomdl.cpp:5260-5272`）把三个 token 读进
+    /// `QAngle angles`（成员顺序 `x=pitch, y=yaw, z=roll`），再交给
+    /// `AngleMatrix(QAngle)`（`mathlib_base.cpp:2837`，按 `angles[PITCH/YAW/ROLL]` 组装）。
+    /// 而本实现 `Attachment.rotation` 的约定是 `RadianEuler{roll, pitch, yaw}`
+    /// （写出器 `to_radians()` 后喂 `bone_math::angle_matrix`）。
+    ///
+    /// 修复前把三个数**原样**存 ⟹ 附着点朝向错 **90°**。
+    ///
+    /// # 为什么 parity 测不出来
+    ///
+    /// 真实语料里 `$attachment` 带 `rotate` 的有 **315 处**，但 parity 唯一
+    /// 用到它的夹具（`docs/_probe/smdl/myprop.qc`）写的是 `rotate 0 0 0` ——
+    /// 恒等旋转，两种口径结果相同。
+    ///
+    /// 真 studiomdl 裁决：`docs/_probe/oracle_attachment_rotate.js`
+    /// （`rotate 0 0 -90` / `90 0 0` / `0 90 0` 三个受控夹具，**3/3** 与
+    /// QAngle 口径吻合到 `4.37e-8`，与 RadianEuler 口径差 **1.0**）。
+    ///
+    /// # 真实影响
+    ///
+    /// 用户的 `v_autoshotgun.qc` 第 19 行：
+    /// `$attachment "attach_camera" "ValveBiped.attach_camera" 0 0 0 rotate 0 0 -90`
+    /// —— 引擎用 `attach_camera` 定位第一人称相机 ⟹ 朝向错 90°
+    /// ⟹ **游戏内相机被顺时针旋转 90°**（用户实测截图）。
+    #[test]
+    fn attachment_rotate_is_reordered_from_qangle() {
+        let dir = fixture("attach_rotate");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"cam\" \"tip\" 0 0 0 rotate 0 0 -90
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = &d.attachments[0];
+        assert_eq!(at.name, "cam");
+        assert_eq!(
+            at.rotation,
+            Some([-90.0, 0.0, 0.0]),
+            "QC 的 `rotate 0 0 -90`（QAngle{{pitch,yaw,roll}}）必须重排成 \
+             RadianEuler{{roll,pitch,yaw}} = `[-90, 0, 0]`；\
+             若得到 `[0, 0, -90]` 说明没重排（朝向会错 90°）"
+        );
+    }
+
+    /// `$attachment ... rotate` 的三个分量**各自**都要落到正确位置。
+    ///
+    /// 上面那条只用了 `0 0 -90`（只有一个分量非零）—— 把 `[p,y,r]` 重排成
+    /// `[r,p,y]` 时，若误写成 `[y,r,p]` 之类，单分量夹具**照样通过**。
+    /// 这条用**三个互不相同**的值把位置钉死。
+    #[test]
+    fn attachment_rotate_places_each_component() {
+        let dir = fixture("attach_rotate3");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"cam\" \"tip\" 0 0 0 rotate 11 22 33
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        // `QAngle{pitch=11, yaw=22, roll=33}` → `RadianEuler{roll=33, pitch=11, yaw=22}`
+        assert_eq!(
+            d.attachments[0].rotation,
+            Some([33.0, 11.0, 22.0]),
+            "`rotate 11 22 33` 应重排成 `[roll=33, pitch=11, yaw=22]`"
+        );
+    }
+
+    /// **不写 `rotate` 时旋转必须是零** —— 这是「重排不波及绝大多数附着点」的依据。
+    ///
+    /// 语料里 315 处带 `rotate`，而 `$attachment` 总数远大于此 ⟹
+    /// 绝大多数没有 `rotate`，必须保持 `[0,0,0]`。
+    #[test]
+    fn attachment_without_rotate_has_zero_rotation() {
+        let dir = fixture("attach_norotate");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"muzzle\" \"tip\" 1 2 3
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = &d.attachments[0];
+        assert_eq!(at.position, Some([1.0, 2.0, 3.0]));
+        assert_eq!(at.rotation, Some([0.0, 0.0, 0.0]), "没写 rotate 时旋转应为零");
     }
 }
 

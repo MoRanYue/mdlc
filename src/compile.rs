@@ -854,23 +854,51 @@ fn load_smd_frames(
         });
     }
     let mut frames: Vec<Vec<crate::smd::SmdPose>> = Vec::with_capacity(smd.frames.len());
+    // 官方 `Grab_Animation`（`studiomdl.cpp:1065-1135`）的行构造顺序：
+    //
+    // ```cpp
+    // psource->rawanim[t] = (s_bone_t *)kalloc( 1, size );   // kalloc = calloc ⟹ **零填充**
+    // if (t > 0 && psource->rawanim[t-1]) {                  // 再**逐骨骼**拷贝上一帧
+    //     for (int j = 0; j < psource->numbones; j++) { VectorCopy(...); }
+    // }
+    // // 最后才用本帧的骨骼行覆盖
+    // ```
+    //
+    // ⚠️ **官方从不检查「每根骨骼都有数据」** —— 本帧没写的骨骼就保留
+    // 「上一帧的值」（第 0 帧则是 `(0,0,0)` / 单位旋转）。
+    //
+    // # 这条曾经写错过（且把真实模型挡在门外）
+    //
+    // 早先的实现要求「每帧每根骨骼都必须有姿态行」，否则报
+    // 「缺少部分骨骼的姿态（1 / 64 根有数据）」并**拒绝编译**。
+    //
+    // 真实反例（`vm_test_group`，6 个官方 viewmodel 全部命中）：
+    // Crowbar 反编译出的 `*_corrective_animation.smd` 只有
+    // **一行**骨架数据（bone 0），而 `nodes` 段列了全部 64 根 ——
+    // 真 `studiomdl.exe` **静默接受**（编译日志里只有 `SMD MODEL xxx`，
+    // 零告警），mdlc 却 6/6 编译失败。
+    //
+    // 这类 SMD 的语义正是「除 bone 0 外全为零」：它们是 `subtract` 用的
+    // 修正动画（去掉参考姿态里的 −90°），其余骨骼保持 0 ⟹ 相减后不变。
+    //
+    // 对照证据：`docs/_probe/cmp_vm_test_group.js`、
+    // `docs/_probe/oracle_partial_frame_smd.js`。
+    let zero_pose = crate::smd::SmdPose {
+        bone: 0,
+        position: [0.0; 3],
+        rotation: [0.0; 3],
+    };
+    let mut prev: Vec<crate::smd::SmdPose> = vec![zero_pose; bone_count];
     for f in &smd.frames {
-        let mut row = vec![
-            crate::smd::SmdPose {
-                bone: 0,
-                position: [0.0; 3],
-                rotation: [0.0; 3],
-            };
-            bone_count
-        ];
-        let mut seen = vec![false; bone_count];
-        // 先铺 `$definebone` 的兜底姿态，SMD 里有数据的会覆盖它。
+        // ① 从上一帧继承（第 0 帧 = 零填充）。
+        let mut row = prev.clone();
+        // ② `$definebone` 的兜底姿态（描述里有、SMD `nodes` 里没有的骨骼）。
         for (di, fb) in fallback.iter().enumerate() {
             if let Some(p) = fb {
                 row[di] = *p;
-                seen[di] = true;
             }
         }
+        // ③ 本帧显式给出的骨骼行覆盖之。
         for p in &f.poses {
             let Some(node) = smd.nodes.get(p.bone.max(0) as usize) else {
                 continue;
@@ -883,18 +911,9 @@ fn load_smd_frames(
                 position: p.position,
                 rotation: p.rotation,
             };
-            seen[di] = true;
         }
-        if seen.iter().any(|s| !s) {
-            errs.push(e(format!(
-                "{} 的帧 {} 缺少部分骨骼的姿态（{} / {bone_count} 根有数据）",
-                smd_path.display(),
-                f.time,
-                seen.iter().filter(|s| **s).count()
-            )));
-            return None;
-        }
-        frames.push(row);
+        frames.push(row.clone());
+        prev = row;
     }
     Some((frames, smd))
 }
@@ -1142,9 +1161,42 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
 
             let name = model_name(m, &smd_path);
             // 参考姿态：SMD 第 0 帧（用于自动补全描述里没写的骨骼姿态）。
+            //
+            // ⚠️ **必须把 `p.bone` 从「SMD node 下标」改写成「骨骼表下标」。**
+            //
+            // `f.poses[].bone` 是 **SMD `nodes` 段的下标**，而骨骼表是
+            // `[$definebone 顺序] ++ [SMD node 顺序]`（`$definebone` 的骨骼
+            // 会被提到前面）。两者**不同**，例如 `v_autoshotgun`：
+            //
+            // | 骨骼表 | 名字 | SMD node |
+            // |---|---|---|
+            // | 2 | `ValveBiped.Camera` | 84 |
+            // | 84 | `attachment_jiggle_19` | 22 |
+            //
+            // 而 `resolve_bone_pose` 是按**骨骼表下标**查的
+            // （`m.poses.iter().find(|p| p.bone == bone_index)`）。
+            // 不改写的话，表[84] 会拿到 SMD node 84（= `ValveBiped.Camera`）
+            // 的姿态 —— **静默的骨骼姿态错位**，实测让 `weapon` 的参考位置
+            // 偏 `50.965` 单位、附着点世界位置偏 `70.9` 单位。
+            //
+            // 用**名字**建映射（与上面 `missing` 检查同一份 `desc_index`），
+            // 这样 SMD 的 node 顺序与描述里的 `[[bones]]` 顺序无关。
             let poses: Vec<SmdPose> = smd
                 .reference_frame()
-                .map(|f| f.poses.clone())
+                .map(|f| {
+                    f.poses
+                        .iter()
+                        .filter_map(|p| {
+                            let node = smd.nodes.get(p.bone.max(0) as usize)?;
+                            let &di = desc_index.get(node.name.as_str())?;
+                            Some(SmdPose {
+                                bone: di as i32,
+                                position: p.position,
+                                rotation: p.rotation,
+                            })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let _ = pose_for; // 保留该辅助函数供后续「按名取姿态」使用
 
@@ -1579,6 +1631,50 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // `*_layer` 序列各有独立动画），但改共享状态是更差的选择。
         let mut frames = frames;
         let mut seq_pre_subtract: Option<Vec<Vec<crate::smd::SmdPose>>> = None;
+        // ⚠️ **`$sequence` 的 `delta` / `subtract` 必须把
+        // `anims[anim_ix].delta` 也置上** —— 官方是**同一个**标志。
+        //
+        // 官方 `ParseSequence`（`studiomdl.cpp:2827-2831`）把 `delta` 置到
+        // `pseq->flags`（**seqdesc**）；而 `ParseAnimationToken` 的
+        // `CMD_SUBTRACT`（`simplify.cpp:163-166`）把 `panim->flags` 置上
+        // `STUDIO_DELTA`。**两条路径最终都作用到动画的 `flags`** ——
+        // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags`，
+        // 而 `anim_writer.rs:3110` 正是照抄这条。
+        //
+        // # 实测症状（R9）
+        //
+        // `vm_test_group` 的 6 个官方 viewmodel 里，`@*_layer` 动画：
+        // ```text
+        //   animdesc.flags   mdlc = 0x000        官方 = 0x004 (STUDIO_DELTA)
+        //   seqdesc.flags    mdlc = 0x014        官方 = 0x014   ✅ 已对
+        // ```
+        // 即 **seqdesc 说「我是增量」，animdesc 却说「我是绝对姿态」** ——
+        // 两者矛盾。`.mdl` 体积也因此差 ~16 KB（3/6 个模型）。
+        //
+        // `delta` 同时驱动**动画数据的编码方式**（`anim_writer.rs:2154/2690/2876`），
+        // 所以这不只是标志位不一致 —— **动画数据本身按错误的方式写了**。
+        // 这正是用户报的「动画错乱」的一个具体成因。
+        //
+        // ⚠️ **但 `subtract` 与 `delta` 对 seqdesc 的影响不同**（R11）：
+        //
+        // | QC 写法 | `animdesc.flags` | `seqdesc.flags` |
+        // |---|---|---|
+        // | 只有 `subtract` | **有** DELTA | **无** DELTA |
+        // | `delta`（可同时有 `subtract`） | 有 DELTA | **有** DELTA |
+        //
+        // 因为官方两条路径落在**不同对象**上：
+        //   * `CMD_SUBTRACT`（`simplify.cpp:163-166`）→ `panim->flags`（**动画**）
+        //   * `delta` 关键字（`studiomdl.cpp:2827-2831`）→ `pseq->flags`（**序列**）
+        // 而 `write.cpp:436` 是 `pseqdesc->flags = g_sequence[i].flags`、
+        // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags` —— 各写各的。
+        //
+        // 实测（更新后的 `vm_test_group`）：`helping_hand_extend_layer` /
+        // `item_extend_layer` 等 6 条只有 `subtract` 没有 `delta`，
+        // 官方 seqdesc = `0x000`，而第一版修复给了 `0x004`。
+        let seq_is_delta = s.delta || s.subtract.is_some();
+        if seq_is_delta {
+            anims[anim_ix].delta = true;
+        }
         if let Some(ref_name) = s.subtract.as_deref() {
             match anim_index.get(ref_name) {
                 Some(&j) => {
@@ -1733,6 +1829,28 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     if compiled.realigned.is_some() {
         realign_sequence_frames(&mut compiled);
     }
+
+    // ---- 顶点搬到最终参考姿态的空间（`RemapVerticesToGlobalBones`）----
+    //
+    // 官方时序：`RealignBones()`（`:7237`）→ **本步**（`:7258`）→
+    // `UnifyLODs()`（`:7262`）。
+    //
+    // ⚠️ mdlc 的 `build_model_lods`（LOD 统一池）是在上面的 bodypart 循环里
+    // 跑的，**早于**这里 —— 但它把 `mesh.vertices` **克隆**进 LOD 0 池
+    // （`compile.rs:244` 的 `per_mesh[ki].push((mesh.vertices.clone(), …))`），
+    // 所以统一池里的 LOD 0 顶点是**当时**的值。若在这里才改
+    // `mesh.vertices`，统一池就与它分叉了。
+    //
+    // 因此本步必须在**读 LOD 之前**做。但 `resolve_bone_pose` 需要
+    // `compiled.bodyparts[].models[].poses`（SMD 第 0 帧），而那是 bodypart
+    // 循环里才填的 —— 循环依赖。
+    //
+    // 解法：本函数**同时**改 `mesh.vertices` 与 `lods.meshes[].vertices`
+    // （两者都要改，各恰好一次）。见 `remap_vertices_to_reference_pose`。
+    let _t_remap = crate::prof::Span::new("remap_vertices_to_reference_pose");
+    let remapped = remap_vertices_to_reference_pose(&mut compiled);
+    drop(_t_remap);
+    let _ = remapped;
 
     // ---- flex / eyeball / mouth 解析（在重排定稿后）----
     //
@@ -2329,6 +2447,239 @@ fn realign_sequence_frames(compiled: &mut CompiledModelDesc) {
                 frame[i].position = [local[3], local[7], local[11]];
                 frame[i].rotation = crate::bone_math::matrix_angles(&local);
             }
+        }
+    }
+}
+
+/// 把每个顶点搬到**最终参考姿态**的空间（`RemapVerticesToGlobalBones`，
+/// `simplify.cpp:5156-5241`）。
+///
+/// # 为什么必须做
+///
+/// SMD 里的顶点位置是在 **SMD 自己的骨架空间**里画的。一旦参考姿态被改写
+/// （`$definebone` 给了不同的 `pos`/`rot`、`$unlockdefinebones` 让 SMD 覆盖、
+/// 或 `$realignbones`/`$ikchain` 触发重排），**骨骼表**与**顶点**就处在
+/// 两个不同的空间里。引擎算 `boneToWorld · poseToBone⁻¹ · v` 时，
+/// 参考姿态下看着还行，一动起来整体偏掉 —— 表现就是**模型炸开**。
+///
+/// 官方逐顶点、逐权重骨骼累加（`:5179-5231`）：
+///
+/// ```c
+/// BuildRawTransforms( psource, 0, srcBoneToWorld );        // SMD 骨架第 0 帧
+/// TranslateAnimations( psource, srcBoneToWorld, destBoneToWorld );
+/// //   destBoneToWorld[k] = srcBoneToWorld[q] ∘ g_bonetable[k].srcRealign   (:1527)
+///
+/// VectorITransform( vertex.position, destBoneToWorld[k], tmp1 );  // → 骨骼局部
+/// VectorTransform( tmp1, g_bonetable[k].boneToPose, tmp2 );       // → 新参考世界
+/// VectorMA( vdest, weight[n], tmp2, vdest );                      // 按权重累加
+/// ```
+///
+/// 即 `v_new = Σ_k w_k · M_k · v_old`，其中
+/// **`M_k = boneToPose[k] ∘ destBoneToWorld[k]⁻¹`**。
+///
+/// 法线同理，但只用旋转部分（`VectorIRotate` / `VectorRotate`），
+/// 累加后统一 `VectorNormalize`（`:5226-5237`）。
+///
+/// # 两个矩阵在 mdlc 里的来源
+///
+/// | 官方 | mdlc |
+/// |---|---|
+/// | `destBoneToWorld[k]` | [`internal_bone_world`]（已含 `srcRealign` 口径） |
+/// | `g_bonetable[k].boneToPose` | [`resolve_bone_pose`] 算出的**骨骼表**世界矩阵 |
+///
+/// 两者的差别恰好就是「参考姿态是否被改写」—— 没有改写时 `M_k` 是**精确**
+/// 单位阵（`destBoneToWorld[k] == boneToPose[k]`），所以本函数可以直接返回
+/// `false` 跳过，产物逐字节不变。
+///
+/// # 为什么判「单位阵」必须逐位比较
+///
+/// 用 `abs() < eps` 会把「几乎不改写」的情形也判成恒等，于是**漏掉**真实的
+/// 重映射；而 `M_k = A⁻¹ ∘ A` 在浮点下**未必**逐位等于单位阵，用逐位比较
+/// 可能把恒等情形误判成需要重映射（多算一次，引入 1 ulp 误差）。
+/// 这里取**逐位**判据并配 `parity` 101 个产物做兜底 —— 一旦某个既有夹具
+/// 被误判，`parity_snapshot.js` 会立刻变红。
+///
+/// # 调用时序
+///
+/// 官方 `SimplifyModel()`（`simplify.cpp:7220-7262`）里它在
+/// `RealignBones()` **之后**、`UnifyLODs()` **之前**。mdlc 的
+/// `build_model_lods` 是在 bodypart 循环里跑的（早于重排定稿），
+/// 但它**克隆** `mesh.vertices` 当 LOD 0 池（`compile.rs:244`），
+/// 所以只要在克隆**之前**改好 `mesh.vertices`，统一池自然跟着对。
+fn remap_vertices_to_reference_pose(compiled: &mut CompiledModelDesc) -> bool {
+    let desc = &compiled.desc;
+    let n = desc.bones.len();
+    if n == 0 {
+        return false;
+    }
+
+    // ---- 结构判据：参考姿态**有没有被改写** ----
+    //
+    // 官方对**每根**骨骼都算 `M_k = boneToPose[k] ∘ destBoneToWorld[k]⁻¹`，
+    // 但只有在「参考姿态与源姿态不同」时它才不是恒等。没有下列任一触发时
+    // 两者语义相同，**必须整个跳过** —— 否则 `A ∘ A⁻¹` 的浮点残差会经法线
+    // 归一化写进 VVD，让**所有**既有产物变字节。
+    //
+    // ⚠️ 判据必须用**结构信号**，不能用「矩阵是否逐位相同」：
+    // `resolve_bone_pose` 会做 `canonical_euler` 规范化（四元数→矩阵→欧拉），
+    // 而 `source_bone_pose` 原样返回 SMD 弧度 —— 两者**语义相同但浮点不同**
+    // （实测 `blend3` 夹具：无任何 `$definebone`，却因这一条让产物变字节）。
+    //
+    // 三类触发（与官方会分叉的三条路径一一对应）：
+    //   1. `$definebone` / `$importbone` → 骨骼表取了显式姿态
+    //   2. `$realignbones` / `$ikchain`  → `RealignBones` 改写了世界矩阵
+    //   3. 12 数字形式 → 显式 `srcRealign` 搬动源骨架
+    let has_explicit_pose = desc
+        .bones
+        .iter()
+        .any(|b| b.position.is_some() || b.rotation.is_some());
+    let has_explicit_realign = desc
+        .bones
+        .iter()
+        .any(|b| b.explicit_src_realign().is_some());
+    if !has_explicit_pose && !has_explicit_realign && compiled.realigned.is_none() {
+        return false;
+    }
+
+    let parents = bone_parents(desc);
+
+    // `boneToPose[k]`：骨骼表最终的参考世界矩阵。
+    let table: Vec<([f32; 3], [f32; 3])> =
+        (0..n).map(|i| resolve_bone_pose(desc, compiled, i)).collect();
+    let table_world = crate::bone_math::compute_world(
+        &table.iter().map(|p| p.0).collect::<Vec<_>>(),
+        &table.iter().map(|p| p.1).collect::<Vec<_>>(),
+        &parents,
+    );
+
+    // `destBoneToWorld[k]`：**源骨架** ∘ `srcRealign`（`simplify.cpp:1527`）。
+    //
+    // ⚠️ **不能用 [`internal_bone_world`]** —— 那个函数的口径是官方的
+    // `g_bonetable[k].boneToPose`（hitbox / 姿态包围盒用），它对
+    // **非** pre-aligned 骨骼返回的正是 `table_world[k]`，于是与本函数的
+    // `boneToPose[k]` **逐位相同** ⟹ `M_k` 被判成单位阵 ⟹ **漏掉重映射**。
+    //
+    // 真实反例（`v_autoshotgun`，实测顶点差 **62.886765**）：顶点绑在
+    // SMD-only 的 `weapon` 上，而 `weapon` 的祖先是 `$definebone` 覆盖过的
+    // `ValveBiped.ValveBiped`。`weapon` 自己没被重排（`srcRealign = I`），
+    // 但它的**源**世界矩阵带着根骨骼的 `z = −62.886765`，而骨骼表里根骨骼
+    // 被 `$definebone` 挪到了原点 —— 两者不同，顶点必须跟着挪。
+    //
+    // 官方定义对**每根**骨骼都是 `srcBoneToWorld[q] ∘ srcRealign[k]`，
+    // 与 `realign_sequence_frames`（`compile.rs:2315-2319`）是同一个式子。
+    let src: Vec<([f32; 3], [f32; 3])> =
+        (0..n).map(|i| source_bone_pose(compiled, i)).collect();
+    let src_world = crate::bone_math::compute_world(
+        &src.iter().map(|p| p.0).collect::<Vec<_>>(),
+        &src.iter().map(|p| p.1).collect::<Vec<_>>(),
+        &parents,
+    );
+    let dest: Vec<crate::bone_math::Matrix3x4> = (0..n)
+        .map(|k| {
+            // `compiled.realigned.src_realign` 已把 `$definebone` 的显式值
+            // 覆盖进去了（`compute_realigned_poses` 末尾的 `explicit` 循环），
+            // 所以有它就优先用；否则退回骨骼自己声明的 `srcRealign`
+            // （12 数字形式，或 `$unlockdefinebones` 下 `$definebone` 仍在
+            // 骨骼表里的情形）。
+            let sr = compiled
+                .realigned
+                .as_ref()
+                .map(|r| r.src_realign[k])
+                .or_else(|| desc.bones[k].explicit_src_realign())
+                .unwrap_or(crate::bone_math::IDENTITY);
+            crate::bone_math::concat(&src_world[k], &sr)
+        })
+        .collect();
+
+    // `M_k = boneToPose[k] ∘ destBoneToWorld[k]⁻¹`。
+    //
+    // ⚠️ **逐骨骼判「两个世界矩阵是否逐位相同」**，相同就直接取**精确**单位阵。
+    //
+    // 不能一律算 `concat(table_world[k], invert(dest[k]))`：对「参考姿态没被
+    // 改写」的骨骼，`dest[k]` 与 `table_world[k]` 是**同一个矩阵**，
+    // 但 `A ∘ A⁻¹` 在浮点下**不**逐位等于单位阵（约 1 ulp 残差）。
+    // 那点残差经法线归一化后会写进 VVD ⟹ 让**所有**既有产物变字节。
+    //
+    // 判据用 `dest[k]` 与 `table_world[k]` 的**逐位相等**（而不是判 `M_k`
+    // 是否接近单位阵）—— 前者是「官方这一步对这根骨骼确实是恒等」的
+    // 充分条件，且与浮点误差无关。
+    let identity = crate::bone_math::IDENTITY;
+    let mats: Vec<crate::bone_math::Matrix3x4> = (0..n)
+        .map(|k| {
+            let same = dest[k]
+                .iter()
+                .zip(table_world[k].iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            if same {
+                identity
+            } else {
+                crate::bone_math::concat(&table_world[k], &crate::bone_math::invert(&dest[k]))
+            }
+        })
+        .collect();
+
+    // 全是精确单位阵 ⟹ 官方这一步是恒等变换，直接跳过（产物逐字节不变）。
+    if mats
+        .iter()
+        .all(|m| m.iter().zip(identity.iter()).all(|(a, b)| a.to_bits() == b.to_bits()))
+    {
+        return false;
+    }
+
+    for bp in &mut compiled.bodyparts {
+        for m in &mut bp.models {
+            for mesh in &mut m.meshes {
+                remap_vertex_slice(&mut mesh.vertices, &mats, n);
+            }
+            // 多 LOD 的统一池是**独立**的一份（`build_model_lods` 在
+            // bodypart 循环里跑，早于本步），所以必须**同样**改一次 ——
+            // 只改 `meshes` 会让 LOD 0 与其它 LOD 处在不同空间。
+            if let Some(lods) = &mut m.lods {
+                for ml in &mut lods.meshes {
+                    remap_vertex_slice(&mut ml.vertices, &mats, n);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// 把一组顶点按 `M_k` 重映射（[`remap_vertices_to_reference_pose`] 的内层）。
+///
+/// 抽出来是为了让 `mesh.vertices` 与 `lods.meshes[].vertices` 走**同一条**
+/// 代码 —— 两处各写一份迟早会分叉，而分叉的后果是 LOD 之间空间不一致。
+fn remap_vertex_slice(
+    verts: &mut [crate::model::Vertex],
+    mats: &[crate::bone_math::Matrix3x4],
+    n: usize,
+) {
+    for v in verts.iter_mut() {
+        let mut p = [0.0f32; 3];
+        let mut nr = [0.0f32; 3];
+        for pair in &v.bones {
+            let k = pair[0] as usize;
+            let w = pair[1];
+            if k >= n || w == 0.0 {
+                continue;
+            }
+            let mm = &mats[k];
+            let t = transform_point(mm, v.pos);
+            // 法线只用旋转部分（不含平移列）。
+            let r = [
+                mm[0] * v.normal[0] + mm[1] * v.normal[1] + mm[2] * v.normal[2],
+                mm[4] * v.normal[0] + mm[5] * v.normal[1] + mm[6] * v.normal[2],
+                mm[8] * v.normal[0] + mm[9] * v.normal[1] + mm[10] * v.normal[2],
+            ];
+            for a in 0..3 {
+                p[a] += w * t[a];
+                nr[a] += w * r[a];
+            }
+        }
+        v.pos = p;
+        // `VectorNormalize`（`:5237`）—— 零向量时保持原值。
+        let len = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
+        if len > 0.0 {
+            v.normal = [nr[0] / len, nr[1] / len, nr[2] / len];
         }
     }
 }
@@ -4758,6 +5109,30 @@ smd = "{smd}"
         )
     }
 
+    /// 与 [`desc_toml`] 相同，但给 `tip` 注入一个**与 SMD 冲突**的参考姿态
+    /// （等价于 QC 的 `$definebone "tip" "root" 0 0 20 0 0 0`）。
+    ///
+    /// 用于验证顶点重映射：SMD 把 `tip` 放在 `z=8`、顶点也画在 `z=8`；
+    /// 真 studiomdl 实测产物是**骨骼 z=20 且顶点 z=20**
+    /// （`docs/_probe/oracle_vertex_space2.js`）。
+    fn desc_toml_with_tip_pose(smd: &str, tip_z: f32) -> String {
+        // 在 `[[bones]] name = "tip"` 之后插入 `position`/`rotation`。
+        // 用字符串替换而不是重写整份 TOML —— 这样与 `desc_toml` 永远同源。
+        let base = desc_toml(smd);
+        let needle = "[[bones]]\nname = \"tip\"\nparent = \"root\"\n";
+        assert!(
+            base.contains(needle),
+            "desc_toml 的骨架变了，本辅助函数需要同步更新"
+        );
+        base.replace(
+            needle,
+            &format!(
+                "[[bones]]\nname = \"tip\"\nparent = \"root\"\n\
+                 position = [0.0, 0.0, {tip_z}]\nrotation = [0.0, 0.0, 0.0]\n"
+            ),
+        )
+    }
+
     const SMD: &str = r#"version 1
 nodes
   0 "root" -1
@@ -4775,6 +5150,45 @@ myprop
   1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000
 end
 "#;
+
+    /// 与 [`SMD`] 同形，但骨架带**非平凡旋转**（`pitch` 非零）。
+    ///
+    /// # 为什么单要这一份
+    ///
+    /// `remap_vertices_is_noop_without_reference_pose_override` 必须用它：
+    /// 旋转全 0 时 `canonical_euler` 产出的 `-0.0` 与原始 `0.0` 在矩阵里
+    /// 恰好抵消，于是**抓不到**「用矩阵逐位比较当恒等判据」这个 bug ——
+    /// 第一版就是零旋转，变异测试时逃逸了。
+    ///
+    /// 这里给 `root` 一个 `Rx(17.188734°)`（= 0.3 rad）、`tip` 一个
+    /// `Ry(-11.459156°)`（= -0.2 rad）—— 都取自 `parity/refpose.toml`
+    /// 的受控实验值，保证 `canonical_euler` 真的走一遍分解。
+    const SMD_ROT: &str = r#"version 1
+nodes
+  0 "root" -1
+  1 "tip" 0
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.300000 0.000000 0.000000
+    1 0.000000 0.000000 8.000000 0.000000 -0.200000 0.000000
+end
+triangles
+myprop
+  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000
+  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000
+  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000
+end
+"#;
+
+    /// [`SMD_ROT`] 里三个三角形顶点的**位置**（逐位可比的 `f32`）。
+    ///
+    /// 手抄自上面的 SMD 文本 —— 与 `SMD_ROT` 一起改，否则测试会误报。
+    const SMD_ROT_VERTEX_POS: [[f32; 3]; 3] = [
+        [-8.0, -8.0, 0.0],
+        [8.0, -8.0, 0.0],
+        [0.0, 8.0, 0.0],
+    ];
 
     // ---- `$animation` 的 `subtract` ----
     //
@@ -7895,5 +8309,576 @@ switch_point = 30.0
         }
         s.push_str("end\n");
         s
+    }
+
+    // ---- 顶点重映射（`RemapVerticesToGlobalBones`）----
+    //
+    // 起因：用户的 `nahida_themed_autoshotgun` 用 mdlc 编译后游戏内
+    // **顶点错乱**。真 studiomdl 裁决见
+    // `docs/_probe/oracle_vvd_vertices.js`（4/4）与
+    // `docs/_probe/oracle_vertex_space2.js`。
+
+    /// **无参考姿态改写时必须是 no-op** —— 这是「不影响既有产物」的依据。
+    ///
+    /// ⚠️ 判据必须是**结构信号**（有没有 `$definebone` / `$realignbones` /
+    /// `$ikchain` / 显式 `srcRealign`），**不能**是「矩阵是否逐位相同」：
+    /// `resolve_bone_pose` 走 `canonical_euler` 规范化、`source_bone_pose`
+    /// 原样返回 SMD 弧度，两者**语义相同但浮点不同** —— `canonical_euler`
+    /// 会把 `pitch` 规范化成 **`-0.0`**（`rot=[0,0,0]` → bits
+    /// `[0, 0x80000000, 0]`），而 `f32::to_bits()` **区分** `0.0`/`-0.0`
+    /// ⟹ 逐位比较恒为 false ⟹ `M_k` 恒被算成非单位阵。
+    ///
+    /// 实测踩过：只看矩阵时 `blend3` / `rr1_r45` / `zb90z` 三个**无任何覆盖**
+    /// 的夹具产物变了字节（顶点被挪 1.2e-7 ~ 4.8e-7）。
+    ///
+    /// ⚠️ **本测试必须用「非平凡旋转」的夹具**（[`SMD_ROT`]）：旋转全 0 时
+    /// `canonical_euler` 的 `-0.0` 恰好抵消，**抓不到**上面那个 bug ——
+    /// 第一版就是零旋转，变异测试时逃逸了。
+    #[test]
+    fn remap_vertices_is_noop_without_reference_pose_override() {
+        let d = tmpdir("remap-noop");
+        write(&d, "a.smd", SMD_ROT);
+        let toml = desc_toml("a.smd");
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let mut c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 直接调必须返回 `false` —— 结构判据生效的直接证据。
+        let moved = remap_vertices_to_reference_pose(&mut c);
+        assert!(
+            !moved,
+            "没有 $definebone / $realignbones / $ikchain 时不该做重映射"
+        );
+
+        // 顶点必须**逐位**停在 SMD 的位置。
+        // ⚠️ 不能用 `abs() < eps`：这个 bug 的位移只有 1e-7 量级，
+        // 任何合理容差都会放过它（第一版就是这么逃逸的）。
+        let got: Vec<u32> = c.bodyparts[0].models[0].meshes[0]
+            .vertices
+            .iter()
+            .flat_map(|v| v.pos.iter().map(|x| x.to_bits()))
+            .collect();
+        let want: Vec<u32> = SMD_ROT_VERTEX_POS
+            .iter()
+            .flat_map(|p| p.iter().map(|x| x.to_bits()))
+            .collect();
+        assert_eq!(
+            got, want,
+            "顶点位置必须逐位不变（no-op）；逐位不等说明重映射被误触发"
+        );
+    }
+
+    /// **`$definebone` 改写参考姿态时，顶点必须跟着搬到新空间。**
+    ///
+    /// 夹具形状：SMD 把 `tip` 放在 `z=8`，而三个顶点都画在 **`z=0`**；
+    /// `$definebone` 把 `tip` 改到 `z=20`。
+    ///
+    /// 逐骨骼规则 ⟹ `M = table(tip@20) ∘ src(tip@8)⁻¹ = translate(+12)`
+    /// ⟹ 顶点 `z = 0 + 12 = `**`12`**。
+    ///
+    /// **真 studiomdl 实测正是 12.0000**（`docs/_probe/oracle_remap_unit_fixture.js`，
+    /// 该探针把本夹具逐字节复刻成 QC 后跑官方）。
+    ///
+    /// 注意 `compile()` **内部已经调过**重映射（`compile.rs` 里
+    /// `realign_sequence_frames` 之后那一步），所以这里直接断言 `compile()`
+    /// 的产物 —— 再调一次会得到 24（这正是下面那条 LOD 测试要钉住的事）。
+    #[test]
+    fn remap_vertices_moves_geometry_when_definebone_overrides_pose() {
+        let d = tmpdir("remap-definebone");
+        write(&d, "a.smd", SMD);
+        let toml = desc_toml_with_tip_pose("a.smd", 20.0);
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let z = c.bodyparts[0].models[0].meshes[0].vertices[0].pos[2];
+        assert!(
+            (z - 12.0).abs() < 0.01,
+            "顶点应被搬到 z≈12（官方实测值 = SMD 的 0 + (20−8)），实际 {z}"
+        );
+    }
+
+    /// **多 LOD 的统一池也要搬，且只搬一次。**
+    ///
+    /// 统一池是**独立**的一份（`build_model_lods` 在 bodypart 循环里跑，
+    /// 早于重排定稿），只改 `meshes` 会让 LOD 0 与其它 LOD 处在不同空间。
+    /// 反之，若池是从 `mesh.vertices` 派生的就会**重复应用**。
+    ///
+    /// 这条测试用「再跑一次必须变成 24」反证「第一次恰好加了一次 12」——
+    /// 若实现里漏掉了池（或对池做了两次），读数就不是 12/24 这组。
+    #[test]
+    fn remap_vertices_applies_once_to_mesh_and_lod_pool() {
+        let d = tmpdir("remap-lod");
+        write(&d, "a.smd", SMD);
+        let toml = desc_toml_with_tip_pose("a.smd", 20.0);
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let mut c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // `compile()` 已搬过一次 ⟹ z = 12。
+        let mesh_z = c.bodyparts[0].models[0].meshes[0].vertices[0].pos[2];
+        assert!(
+            (mesh_z - 12.0).abs() < 0.01,
+            "meshes 应搬到 z≈12（恰好一次），实际 {mesh_z}"
+        );
+
+        // 造一份「与 meshes 同源」的多 LOD 池（模拟 `build_model_lods`
+        // 在重排前克隆出来的那份），再调一次：两者都必须变成 24 —— 相等
+        // 即证明「池与 meshes 走的是同一条路径、各恰好一次」。
+        let src = c.bodyparts[0].models[0].meshes[0].vertices.clone();
+        let tris = c.bodyparts[0].models[0].meshes[0].triangles.clone();
+        c.bodyparts[0].models[0].lods = Some(crate::model::ModelLods {
+            meshes: vec![crate::lod::MeshLods::single(src, tris)],
+            num_lods: 1,
+            switch_points: vec![0.0],
+            bone_lod_usage: vec![0; c.desc.bones.len()],
+            no_facial: vec![false],
+        });
+
+        assert!(remap_vertices_to_reference_pose(&mut c));
+
+        let mesh_z2 = c.bodyparts[0].models[0].meshes[0].vertices[0].pos[2];
+        let pool_z2 = c.bodyparts[0].models[0].lods.as_ref().unwrap().meshes[0].vertices[0].pos[2];
+        assert!(
+            (mesh_z2 - 24.0).abs() < 0.01,
+            "第二次调用后 meshes 应为 z≈24，实际 {mesh_z2}"
+        );
+        assert!(
+            (pool_z2 - 24.0).abs() < 0.01,
+            "LOD 统一池必须与 meshes **同步**（各恰好一次），实际 {pool_z2}"
+        );
+    }
+
+    /// **多骨骼权重必须按 `w` 加权累加**，不能只取一根骨骼。
+    ///
+    /// # 为什么单要这一条
+    ///
+    /// 上面三条测试用的夹具**每个顶点只绑一根骨骼**（SMD 顶点行末尾是
+    /// `1 1.0`，只有一组 `links`）。于是「`p[a] += w * t[a]`」里的 `w`
+    /// 是 `1.0`，**乘与不乘结果相同** —— 变异测试实测：把 `w *` 删掉，
+    /// 三条测试**全部照常通过**（逃逸）。
+    ///
+    /// 这条测试补上缺口：两个顶点各绑两根骨骼、权重各半，且两根骨骼在
+    /// 参考姿态里被搬到**不同的 z**。只有真正按权重累加，结果才落在中间。
+    ///
+    /// # 夹具的构造
+    ///
+    /// - SMD：`root` 在原点、`tip` 在 `z=8`；顶点 0 绑 `(root, tip)` 各
+    ///   0.5、顶点 1 绑 `(tip, root)` 各 0.5（顺序相反，专门验证「与顺序无关」）。
+    /// - TOML：`tip` 的 `position` 改成 `z=20` ⟹ 骨骼表里 `tip` 在 `z=20`，
+    ///   而 `root` 仍在原点。
+    ///
+    /// `M_root` 是单位阵（`root` 在两边都是原点），`M_tip` 把 `z=8` 映射到
+    /// `z=20`（平移 +12）。顶点原在 `z=0`：
+    ///
+    /// ```text
+    /// v_new = 0.5 · M_root · 0 + 0.5 · M_tip · 0 = 0.5·0 + 0.5·12 = 6
+    /// ```
+    ///
+    /// 而「只取一根骨骼」的实现会得到 **0**（取 root）或 **12**（取 tip），
+    /// 都远离 6 ⟹ 变异必被抓到。
+    #[test]
+    fn remap_vertices_weights_each_bone_contribution() {
+        let d = tmpdir("remap-weights");
+        // 顶点行末尾的 `<links> <bone> <weight>`：这里给两组。
+        // 顶点 0：绑 root(0) 0.5 + tip(1) 0.5
+        // 顶点 1：绑 tip(1) 0.5 + root(0) 0.5（顺序反过来）
+        let smd = SMD.replace(
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000",
+            "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 2 0 0.500000 1 0.500000",
+        )
+        .replace(
+            "  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000",
+            "  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 2 1 0.500000 0 0.500000",
+        );
+        // 夹具必须真的被改到了（否则测试会空洞通过）。
+        assert!(
+            smd.contains("2 0 0.500000 1 0.500000") && smd.contains("2 1 0.500000 0 0.500000"),
+            "SMD 夹具的顶点行没被替换成功 —— 本测试会空洞通过，必须修"
+        );
+        write(&d, "a.smd", &smd);
+        let toml = desc_toml_with_tip_pose("a.smd", 20.0);
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let verts = &c.bodyparts[0].models[0].meshes[0].vertices;
+
+        // ⚠️ **按骨骼绑定（而不是位置）挑顶点** —— 位置正是本测试要检验的量，
+        // 用位置来定位会让变异改变定位结果本身，失败信息就指向了错误的原因
+        // （实测踩过：把权重删掉后报的是「应有 x≈-8 的顶点」，而不是「z 不是 6」）。
+        // 夹具里三个顶点只有两个是**双骨骼**的，这个签名不受重映射影响。
+        let two_bone: Vec<&crate::model::Vertex> =
+            verts.iter().filter(|v| v.bones.len() == 2).collect();
+        assert_eq!(
+            two_bone.len(),
+            2,
+            "夹具应有 2 个双骨骼顶点（实际 {}）—— 夹具坏了，不是实现坏了",
+            two_bone.len()
+        );
+
+        // 加权累加 ⟹ z = 0.5·M_root·z₀ + 0.5·M_tip·z₀。
+        // `M_root` 是单位阵（root 两边都在原点）⟹ 贡献 0；
+        // `M_tip` 把 z=8 映射到 z=20 ⟹ 对 z=0 的顶点贡献平移 +12。
+        // 所以 z 必须是 6。只取一根骨骼的变异会给出 0 或 12。
+        for (i, v) in two_bone.iter().enumerate() {
+            assert!(
+                (v.pos[2] - 6.0).abs() < 0.01,
+                "双骨骼顶点[{i}].z 必须是两根骨骼的**加权**结果 6.0\
+                 （root 贡献 0、tip 贡献 12），实际 {} —— \
+                 若为 0 或 12，说明漏了权重（只取了一根骨骼）",
+                v.pos[2]
+            );
+        }
+        // 两组权重的**顺序相反**（v0 是 root 在前、v1 是 tip 在前），
+        // 结果必须相同 —— 加权累加与顺序无关。
+        assert!(
+            (two_bone[0].pos[2] - two_bone[1].pos[2]).abs() < 1e-6,
+            "权重顺序不该影响结果：{} vs {}",
+            two_bone[0].pos[2],
+            two_bone[1].pos[2]
+        );
+    }
+
+    /// **法线必须跟着一起搬，并归一化。**
+    ///
+    /// # 为什么单要这一条
+    ///
+    /// 上面四条测试**都只断言 `pos`** —— 变异测试实测：把法线归一化整段删掉，
+    /// 四条测试**全绿**（逃逸）。
+    ///
+    /// # 夹具为什么必须「两根骨骼、旋转不同」
+    ///
+    /// 第一版夹具只用**一根**骨骼、且 `M` 是纯旋转 —— 那时法线天然是单位
+    /// 长度，**删掉归一化照样通过**（实测逃逸）。要真正钉住归一化，累加结果
+    /// 必须**短于 1**：
+    ///
+    /// - `root` 的参考旋转给 `Rx(90°)` ⟹ `M_root` 把 `(0,0,1)` 转成
+    ///   `(0,∓1,0)`（z 分量变 0）；
+    /// - `tip` 只改 `position`（旋转 0）⟹ `M_tip` 不动法线，仍是 `(0,0,1)`；
+    /// - 顶点绑两者**各 0.5** ⟹ 累加得 `(0,∓0.5,0.5)`，**长度 `0.7071`**。
+    ///
+    /// 官方在这一步之后调 `VectorNormalize`（`simplify.cpp:5237`）⟹ 产物长度
+    /// 必须是 **1.0**。不归一化的变异会留下 `0.7071` ⟹ **被抓到**。
+    ///
+    /// 同时断言法线**不再等于** SMD 原值 `(0,0,1)` —— 钉住「法线确实跟着
+    /// 参考姿态转了」（只搬位置不搬法线的变异会留下 `(0,0,1)`）。
+    #[test]
+    fn remap_vertices_accumulates_and_normalizes_normals() {
+        let d = tmpdir("remap-normals");
+        // 顶点绑 root(0) + tip(1) 各 0.5（两个顶点权重顺序相反）。
+        let smd = SMD
+            .replace(
+                "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000",
+                "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 2 0 0.500000 1 0.500000",
+            )
+            .replace(
+                "  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000",
+                "  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 2 1 0.500000 0 0.500000",
+            );
+        assert!(
+            smd.contains("2 0 0.500000 1 0.500000") && smd.contains("2 1 0.500000 0 0.500000"),
+            "SMD 夹具的顶点行没被替换成功 —— 本测试会空洞通过，必须修"
+        );
+        write(&d, "a.smd", &smd);
+
+        // 两根骨骼必须把 `(0,0,1)` 转到**不同**方向，加权和才会短于 1。
+        //
+        // ⚠️ 关键：`tip` 是 `root` 的**子**骨骼，参考旋转会沿层级传播 ——
+        // 只给 `root` 一个 `Rx(90°)` 时，`M_root` 与 `M_tip` 的旋转部分
+        // **都是** `Rx(90°)`，加权和长度仍是 1 ⟹ 归一化无法被区分
+        // （实测踩过：z 恒为 0）。
+        //
+        // 正确构造：`root` 给 `Rx(+90°)`、`tip` 给 `Rx(−90°)` ⟹
+        //   `M_root` 旋转 = `Rx(+90°)`            ⟹ `(0,0,1) → (0,−1,0)`
+        //   `M_tip`  旋转 = `Rx(+90°)∘Rx(−90°)` = 单位 ⟹ `(0,0,1) → (0,0,1)`
+        // 两者各 0.5 ⟹ `(0,−0.5,0.5)`，**长度 0.7071** ⟹ 归一化可被区分。
+        //
+        // `rotation` 是 `[roll, pitch, yaw]` ⟹ `Rx(θ)` 写作 `[θ, 0, 0]`。
+        let mut toml = desc_toml_with_tip_pose("a.smd", 20.0);
+        let root_needle = "[[bones]]\nname = \"root\"\n";
+        assert!(
+            toml.contains(root_needle),
+            "desc_toml 的 root 块变了 —— 本测试会空洞通过，必须修"
+        );
+        toml = toml.replace(
+            root_needle,
+            "[[bones]]\nname = \"root\"\nrotation = [90.0, 0.0, 0.0]\n",
+        );
+        // `desc_toml_with_tip_pose` 给 `tip` 写的是 `rotation = [0.0, 0.0, 0.0]`，
+        // 改成立 `Rx(−90°)`。它只出现一次（root 的那行是刚插入的 `[90.0, …]`）。
+        let n_zero_rot = toml.matches("rotation = [0.0, 0.0, 0.0]").count();
+        assert_eq!(
+            n_zero_rot, 1,
+            "应恰好有 1 行 `rotation = [0.0, 0.0, 0.0]`（tip 的），实际 {n_zero_rot}"
+        );
+        toml = toml.replace("rotation = [0.0, 0.0, 0.0]", "rotation = [-90.0, 0.0, 0.0]");
+        assert!(
+            toml.contains("rotation = [90.0, 0.0, 0.0]")
+                && toml.contains("rotation = [-90.0, 0.0, 0.0]"),
+            "夹具没被改到 —— 本测试会空洞通过，必须修"
+        );
+
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let verts = &c.bodyparts[0].models[0].meshes[0].vertices;
+        // 按骨骼绑定挑顶点（位置正是被测的量，不能用来定位）。
+        let two_bone: Vec<&crate::model::Vertex> =
+            verts.iter().filter(|v| v.bones.len() == 2).collect();
+        assert_eq!(
+            two_bone.len(),
+            2,
+            "夹具应有 2 个双骨骼顶点（实际 {}）—— 夹具坏了，不是实现坏了",
+            two_bone.len()
+        );
+
+        for (i, v) in two_bone.iter().enumerate() {
+            let n = v.normal;
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            // ① 归一化生效：长度必须是 1。累加原始值是 0.7071 ⟹ 不归一化必红。
+            assert!(
+                (len - 1.0).abs() < 1e-4,
+                "顶点[{i}] 法线长度必须是 1（`VectorNormalize`，`simplify.cpp:5237`），\
+                 实际 {len} —— 若为 0.7071 说明漏了归一化"
+            );
+            // ② 法线确实跟着参考姿态转了（不再是 SMD 原值 `(0,0,1)`）。
+            let still_z = n[0].abs() < 1e-4 && n[1].abs() < 1e-4 && (n[2] - 1.0).abs() < 1e-4;
+            assert!(
+                !still_z,
+                "顶点[{i}] 法线仍是 (0,0,1) —— 说明法线没跟着重映射（只搬了位置）。\
+                 实际 [{}, {}, {}]",
+                n[0], n[1], n[2]
+            );
+            // ③ 两根骨骼各占一半：累加原始值是 `(0, ∓0.5, 0.5)`，
+            //    **归一化后**是 `(0, ∓0.7071, 0.7071)`。
+            //    所以 z 分量必须是 ±0.7071（= 1/√2）。
+            //
+            //    ⚠️ 这里能同时区分两种变异：
+            //      * 漏归一化 ⟹ z = 0.5（而不是 0.7071）
+            //      * 只取一根骨骼 ⟹ z = 0（取 root）或 1（取 tip）
+            assert!(
+                (n[2].abs() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+                "顶点[{i}] 法线 z 分量应是两根骨骼加权并**归一化**后的 ±0.7071，\
+                 实际 {} —— 若为 0.5 说明漏了归一化；若为 0 或 1 说明漏了权重",
+                n[2]
+            );
+        }
+    }
+
+    // ---- SMD 参考姿态的下标空间（`resolve_bone_pose`）----
+    //
+    // 起因：用户的 `v_autoshotgun` 里 20 根骨骼的参考姿态取自**别的骨骼**
+    // （`attachment_jiggle_19` 拿到了 `ValveBiped.Camera` 的姿态），
+    // 让 `weapon` 的参考位置偏 50.965 单位、附着点世界位置偏 70.9 单位。
+    // 真 studiomdl 裁决见 `docs/_probe/probe_pose_index_bug.js`。
+
+    /// **SMD 的 `nodes` 顺序与 `[[bones]]` 顺序不同时，参考姿态必须按名字对齐。**
+    ///
+    /// # 这个 bug 的形状
+    ///
+    /// `m.poses` 存的是 **SMD 第 0 帧的原始 `SmdPose`**，其 `bone` 字段是
+    /// **SMD `nodes` 段的下标**；而 `resolve_bone_pose(desc, compiled, k)`
+    /// 按**骨骼表下标** `k` 去查它。
+    ///
+    /// 两者只有在「`[[bones]]` 顺序 == SMD `nodes` 顺序」时才一致 ——
+    /// 而真实工程里 `$definebone` 的骨骼会被**提到骨骼表前面**
+    /// （`v_autoshotgun`：表[2] = `ValveBiped.Camera` 对应 SMD node **84**，
+    /// 表[84] = `attachment_jiggle_19` 对应 SMD node **22**）。
+    ///
+    /// # 夹具
+    ///
+    /// SMD 的 `nodes` 顺序是 `root, tip, mid`（`mid` 在 z=4）；
+    /// `[[bones]]` 里把 **`mid` 提到 `tip` 前面** —— 但**保持 `root` 在首位**
+    /// （父骨骼必须先声明，否则 `validate()` 报「找不到父骨骼」——实测踩过）。
+    ///
+    /// | 骨骼表 | 名字 | 应取的 SMD node | 若按**下标**取会拿到 |
+    /// |---|---|---|---|
+    /// | 0 | `root` | 0 | node 0（对） |
+    /// | 1 | `mid` | **2** | node 1 = `tip` 的姿态（z=8，**错**） |
+    /// | 2 | `tip` | **1** | node 2 = `mid` 的姿态（z=4，**错**） |
+    #[test]
+    fn smd_reference_pose_is_matched_by_name_not_node_index() {
+        let d = tmpdir("pose-by-name");
+        // SMD 的 nodes 顺序：root(0), tip(1), mid(2)；mid 在 z=4。
+        let smd = SMD.replace(
+            "nodes\n  0 \"root\" -1\n  1 \"tip\" 0\nend",
+            "nodes\n  0 \"root\" -1\n  1 \"tip\" 0\n  2 \"mid\" 0\nend",
+        )
+        .replace(
+            "    1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\nend",
+            "    1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\n    \
+             2 0.000000 0.000000 4.000000 0.000000 0.000000 0.000000\nend",
+        );
+        assert!(
+            smd.contains("\"mid\" 0") && smd.contains("2 0.000000 0.000000 4.000000"),
+            "SMD 夹具没被改到 —— 本测试会空洞通过，必须修"
+        );
+        write(&d, "a.smd", &smd);
+
+        // `[[bones]]`：root 先（父必须先声明），然后 **mid 在 tip 之前**。
+        let toml = desc_toml("a.smd").replace(
+            "[[bones]]\nname = \"tip\"\nparent = \"root\"\n",
+            "[[bones]]\nname = \"mid\"\nparent = \"root\"\n\n\
+             [[bones]]\nname = \"tip\"\nparent = \"root\"\n",
+        );
+        assert!(
+            toml.find("name = \"mid\"").unwrap() < toml.find("name = \"tip\"").unwrap(),
+            "夹具没被改到（`mid` 应在 `tip` 之前）—— 本测试会空洞通过，必须修"
+        );
+
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let idx = c.desc.bone_index();
+        // 按**名字**取姿态 —— 表下标与 SMD node 下标已经不同。
+        for (name, want_z) in [("root", 0.0f32), ("mid", 4.0f32), ("tip", 8.0f32)] {
+            let k = idx[name] as usize;
+            let (pos, _) = resolve_bone_pose(&c.desc, &c, k);
+            assert!(
+                (pos[2] - want_z).abs() < 0.01,
+                "`{name}`（骨骼表下标 {k}）的参考姿态应来自 SMD 里**同名**的 node\
+                 （z={want_z}），实际 z={}。若拿到了别的 z，说明按 node 下标取了\
+                 **另一根骨骼**的姿态（下标空间不一致）",
+                pos[2]
+            );
+        }
+    }
+
+    /// **`[[bones]]` 顺序与 SMD 顺序一致时（绝大多数情况）结果不变。**
+    ///
+    /// 这是「按名字对齐」不破坏既有行为」的依据 —— parity 的 101 个夹具
+    /// 全部属于这一类（实测改动前后**逐字节相同**）。
+    #[test]
+    fn smd_reference_pose_by_name_matches_by_index_when_orders_agree() {
+        let d = tmpdir("pose-order-agree");
+        write(&d, "a.smd", SMD);
+        let toml = desc_toml("a.smd");
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let idx = c.desc.bone_index();
+        // `desc_toml` 的 `[[bones]]` 顺序与 `SMD` 的 `nodes` 顺序一致
+        // （root=0, tip=1）⟹ 按名字与按下标应当给出**同一**结果。
+        for (name, want_z) in [("root", 0.0f32), ("tip", 8.0f32)] {
+            let k = idx[name] as usize;
+            let (pos, _) = resolve_bone_pose(&c.desc, &c, k);
+            assert!(
+                (pos[2] - want_z).abs() < 0.01,
+                "`{name}` 的 z 应为 {want_z}，实际 {}",
+                pos[2]
+            );
+        }
+    }
+
+    // ---- 帧内骨骼不全的 SMD（官方静默接受）----
+
+    /// **`nodes` 列了 N 根、`skeleton` 只写 1 根的 SMD 必须能编译。**
+    ///
+    /// # 官方语义（`Grab_Animation`，`studiomdl.cpp:1065-1135`）
+    ///
+    /// ```cpp
+    /// psource->rawanim[t] = (s_bone_t *)kalloc( 1, size );   // kalloc = calloc ⟹ 零填充
+    /// if (t > 0 && psource->rawanim[t-1]) {                  // 再逐骨骼拷贝上一帧
+    ///     for (int j = 0; j < psource->numbones; j++) { VectorCopy(...); }
+    /// }
+    /// // 最后用本帧的骨骼行覆盖
+    /// ```
+    ///
+    /// 官方**从不检查「每根骨骼都有数据」** —— 本帧没写的骨骼保留
+    /// 「上一帧的值」（第 0 帧则是 `(0,0,0)` / 单位旋转）。
+    ///
+    /// # 这条曾经写错过
+    ///
+    /// 早先要求「每帧每根骨骼都必须有姿态行」，否则报
+    /// 「缺少部分骨骼的姿态（1 / N 根有数据）」并**拒绝编译**。
+    ///
+    /// **真实影响**（`vm_test_group`）：Crowbar 反编译出的
+    /// `*_corrective_animation.smd` 只有**一行**骨架数据（bone 0），
+    /// 而 `nodes` 段列了全部 63~65 根 —— 真 `studiomdl.exe` 静默接受
+    /// （编译日志零告警），mdlc 却 **6/6 编译失败**。
+    ///
+    /// 对照证据：`docs/_probe/cmp_vm_test_group.js`（修后 **6/6 一致**，
+    /// 顶点 miss=0、最大距离 0.0000）。
+    #[test]
+    fn smd_frame_with_partial_bones_is_accepted() {
+        let d = tmpdir("partial-frame");
+        // `nodes` 有 root + tip，`skeleton` 只有 root 一行。
+        // `tip` 在描述里声明了 `position`，所以它有兜底姿态。
+        let smd = SMD.replace(
+            "skeleton\n  time 0\n    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n    \
+             1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\nend",
+            "skeleton\n  time 0\n    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\nend",
+        );
+        assert!(
+            smd.contains("0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\nend"),
+            "SMD 夹具没被改到（tip 的骨架行应已删除）—— 本测试会空洞通过，必须修"
+        );
+        write(&d, "a.smd", &smd);
+
+        // `desc_toml` 给 `tip` 写了 `position`（= `$definebone` 语义），
+        // 所以「SMD 里没有 tip」不会触发「无法确定参考姿态」那条错误。
+        let toml = desc_toml_with_tip_pose("a.smd", 8.0);
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect(
+            "帧内骨骼不全的 SMD 必须能编译（官方 `Grab_Animation` 用 calloc \
+             零填充、从不检查每根骨骼都有数据）",
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 关键判据：`tip` 的参考姿态来自 `$definebone` 的兜底值（z=8），
+        // 不是被「缺失」判成错误、也不是被静默置零。
+        let idx = c.desc.bone_index();
+        let (tip_pos, _) = resolve_bone_pose(&c.desc, &c, idx["tip"] as usize);
+        assert!(
+            (tip_pos[2] - 8.0).abs() < 0.01,
+            "`tip` 的兜底姿态应来自 `$definebone`（z=8），实际 {}",
+            tip_pos[2]
+        );
+    }
+
+    /// **缺骨骼的帧继承上一帧的值**（不是恒为零）。
+    ///
+    /// 官方 `Grab_Animation` 的注释就是 `// duplicate previous frames keys`。
+    /// 这条钉住「继承」而不是「置零」—— 两者在第 0 帧无法区分，
+    /// 必须有**两帧**才能分辨。
+    #[test]
+    fn smd_partial_frame_inherits_previous_frame() {
+        let d = tmpdir("partial-inherit");
+        // 第 0 帧：root 与 tip 都有数据（tip 在 z=8）。
+        // 第 1 帧：**只有** root 一行 ⟹ tip 应继承第 0 帧的 z=8。
+        let smd = SMD.replace(
+            "skeleton\n  time 0\n    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n    \
+             1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\nend",
+            "skeleton\n  time 0\n    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n    \
+             1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\n  \
+             time 1\n    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\nend",
+        );
+        assert!(
+            smd.contains("time 1"),
+            "SMD 夹具没被改到（应有两帧）—— 本测试会空洞通过，必须修"
+        );
+        write(&d, "a.smd", &smd);
+
+        // `tip` 不给 `position`，纯靠 SMD —— 这样「继承」与「置零」才可分辨。
+        let toml = desc_toml("a.smd");
+        let desc: ModelDesc = toml::from_str(&toml).unwrap();
+        let c = compile(&desc, &d).expect("两帧夹具应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let idx = c.desc.bone_index();
+        let tip = idx["tip"] as usize;
+        let frames = &c.bodyparts[0].models[0].poses; // 参考姿态（第 0 帧）
+        let _ = frames;
+        // 直接查 `tip` 的参考姿态（来自 SMD 第 0 帧）—— z=8。
+        let (tip_pos, _) = resolve_bone_pose(&c.desc, &c, tip);
+        assert!(
+            (tip_pos[2] - 8.0).abs() < 0.01,
+            "`tip` 的参考姿态应来自 SMD 第 0 帧（z=8），实际 {}",
+            tip_pos[2]
+        );
     }
 }
