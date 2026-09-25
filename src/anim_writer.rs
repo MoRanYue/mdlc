@@ -645,6 +645,40 @@ fn delta_frames(
             // 在拿到新判据前按真实项目走。
             *tk = p.position[k] - ref_pos[k];
         }
+        if is_root {
+            // ⚠️ **根骨骼的位移要按 `rootxform` 的 yaw +90° 旋转** ——
+            // 即 `(x, y) → (−y, x)`（`simplify.cpp:1461`
+            // `VectorRotate(tmp, rootxform, pos)`）。
+            //
+            // # 这条规则对**两种**位移编码都成立
+            //
+            // 官方把 `rootxform` 作用在 `sanim` 上，而 `sanim` 是**所有**
+            // 位移编码的共同来源：
+            //
+            // | 编码 | 存的量 | 是否含 `rootxform` |
+            // |---|---|---|
+            // | `RAWPOS`（绝对值） | `sanim.pos` | ✅ |
+            // | `ANIMPOS`（差值） | `(sanim.pos − bonetable.pos) / posscale` | ✅ |
+            //
+            // ⚠️ 早先 mdlc **只对 `RAWPOS` 旋转**（在 `per_seq_abs_pos`
+            // 里做），`ANIMPOS` 的差值流**没有旋转** ⟹ 根骨骼的 X/Y
+            // **互换**。
+            //
+            // # 实测判据（`v_snip_awp` `a_run` 根骨骼，`probe_rootbone.js`）
+            //
+            // | | `pos[0]` 采样 | `pos[1]` 采样 |
+            // |---|---|---|
+            // | 官方 | **−1227** | **+50** |
+            // | mdlc（修前） | +51 | **+1227** |
+            //
+            // 两者恰好是「交换 + 变号」的关系 ⟹ 位移差 **4.99**。
+            // 注意 `RAWPOS` 那条路径是对的（`a_idle_1` 的 `RAWPOS`
+            // 与官方逐字节相同），所以这个 bug **只在走 `ANIMPOS` 时显形**
+            // —— 「同一条规则只在一半的代码路径上实现」。
+            let (x, y) = (t[0], t[1]);
+            t[0] = -y;
+            t[1] = x;
+        }
         pos_frames.push(t);
     }
     (rot_frames, pos_frames)
@@ -2929,6 +2963,11 @@ pub fn write_animations(
             // 注意 `bone 0` 的参考位移恰好是 0，**无法区分**「绝对值」与
             // 「差值」—— 又是「参考为零导致两种实现重合」。`bone 63`/`64`
             // 的参考位移非零，才把这条规则区分出来。
+            //
+            // ⚠️ **这里的 `(x,y) → (−y,x)` 不能删** —— 它是 `RAWPOS` 的
+            // **绝对值**载荷（`write.cpp:765` 直接存 `sanim.pos`）。
+            // `delta_frames` 里对**差值**也做同样的旋转（`ANIMPOS` 走那条），
+            // 两者是**不同的量**、各自独立旋转，不会重复。
             abs_pos.push(
                 spec.cell_frames(compiled)
                     .first()
