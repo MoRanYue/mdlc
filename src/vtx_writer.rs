@@ -127,6 +127,11 @@ pub enum VtxWriteError {
     TooManyVertices { model: String, count: usize },
     /// 单个 strip 的索引数超过 `int32`。
     TooManyIndices { model: String, count: usize },
+    /// 单个 strip 的骨骼调色板超过有符号 `char` 能表达的范围。
+    ///
+    /// 见 [`MAX_STRIP_BONES`]：`Vertex_t.boneID[]` 是 `char`，
+    /// 槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误骨骼。
+    TooManyStripBones { model: String, count: usize },
     /// 内部不一致 —— 属本实现的 bug。
     Internal(String),
 }
@@ -153,6 +158,18 @@ impl std::fmt::Display for VtxWriteError {
             Self::TooManyIndices { model, count } => {
                 write!(f, "{model} 的三角形索引数 {count} 超出 int32")
             }
+            Self::TooManyStripBones { model, count } => write!(
+                f,
+                "{model} 的某个 strip 用到 {count} 根骨骼，超过 VTX 的每 strip 上限 {}\n\
+                 VTX 的 `Vertex_t.boneID[]` 是**有符号 char**（`optimize.h:51`），\
+                 硬件槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误的骨骼。\n\
+                 \n\
+                 这是**格式**上限，不是本实现的选择。官方把这种 mesh 拆成多个\
+                 strip（每个 ≤ `maxBonesPerStrip` = 53 根）；mdlc 目前每个\
+                 strip group 只写一个 strip，所以需要先把 mesh 按骨骼分组拆开。\n\
+                 最直接的办法是按材质/骨骼把 SMD 拆成多个 mesh。",
+                MAX_STRIP_BONES
+            ),
             Self::Internal(m) => write!(f, "内部错误（请报告）：{m}"),
         }
     }
@@ -304,6 +321,107 @@ fn optimize_group_indices(
     Ok(out)
 }
 
+/// 一个 strip 的骨骼调色板（`BoneStateChangeHeader_t[]`）与顶点的硬件下标。
+///
+/// 见 [`build_strip_palette`] 的语义说明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StripPalette {
+    /// 硬件槽位 `i` → **全局**骨骼下标。写出时 `hardwareID` 直接写 `i`。
+    bsc: Vec<i32>,
+    /// 每个顶点（按传入顺序）三个槽位的**硬件**下标；未用槽位恒为 0。
+    hw: Vec<[u8; 3]>,
+    /// `StripHeader_t.numBones`。
+    num_bones: u16,
+}
+
+/// 按官方语义构造 strip 的骨骼调色板。
+///
+/// # 官方语义（`optimize.h:33-52` + `optimize.cpp:2153-2183`）
+///
+/// ```c
+/// struct BoneStateChangeHeader_t { int hardwareID; int newBoneID; };
+/// struct Vertex_t {
+///     unsigned char boneWeightIndex[MAX_NUM_BONES_PER_VERT];
+///     unsigned char numBones;
+///     unsigned short origMeshVertID;
+///     char boneID[MAX_NUM_BONES_PER_VERT];
+/// };
+/// ```
+///
+/// - `hardwareID` 是**硬件槽位**，实测**恒等于条目下标** `i`。
+/// - `newBoneID` 是**全局骨骼下标**，strip 内互不相同。
+/// - `Vertex_t.boneID[k]` 是**硬件下标**（`optimize.cpp:2181`：
+///   `vert->boneID[boneID] = globalToHardwareBoneIndex[globalBoneID]`），
+///   要经 `boneStateChange[boneID[k]].newBoneID` 才是全局骨骼。
+/// - 未用槽位（`k >= numBones`）写 **0**。
+/// - `numBones` = **max(顶点骨骼数)**，不是唯一骨骼数
+///   （`optimize.cpp:1484-1487` 的非 fixed-function 分支）。
+///
+/// # 语料实测（`docs/_probe/survey_vtx_bonestate.js`，3302 文件 / 6677 strip）
+///
+/// | 判据 | 结果 |
+/// |---|---|
+/// | `hardwareID == i` | 6677/6677 |
+/// | `newBoneID ∈ [0,126]`、strip 内不重复 | 6677/6677 |
+/// | `boneID[k] ∈ [0, numBoneStateChanges)` | 6677/6677 |
+/// | 未用槽位为 0 | 6677/6677 |
+/// | `numBoneStateChanges == 顶点用到的唯一全局骨骼数` | **6677/6677** |
+/// | `numBones == max(顶点 numBones)` | **6677/6677** |
+///
+/// # ⚠️ 这个 bug 的症状
+///
+/// 早先这里把 `boneID[k]` 写成**全局**骨骼下标、且 `numBoneStateChanges` 恒写 1。
+/// 于是引擎读 `boneStateChange[3]`（调色板只有 1 项）拿到**越界的垃圾骨骼**，
+/// 顶点被蒙皮到错误的骨骼上 —— 表现为**顶点错乱 / 模型撕裂**。
+///
+/// `boneID` 是**有符号** `char`（`optimize.h:51`），所以硬件槽位也必须 ≤ 127；
+/// 但槽位数受 `maxBonesPerStrip`（53）约束，正常远小于它。
+///
+/// # 顺序
+///
+/// 官方按「洪泛分配次序」排列 `newBoneID`（`optimize.cpp:814-885`），
+/// 本实现按「顶点序 × 槽位序的首次出现次序」。**两者语义等价** ——
+/// 引擎只用 `boneStateChange` 建双向映射（`optimize.cpp:2153-2163`），
+/// 不依赖顺序；但**不逐字节相同**。
+fn build_strip_palette(vertices: &[&crate::model::Vertex]) -> StripPalette {
+    let mut bsc: Vec<i32> = Vec::new();
+    let mut hw: Vec<[u8; 3]> = Vec::with_capacity(vertices.len());
+    let mut num_bones = 0u16;
+
+    for v in vertices {
+        let n = v.bones.len().min(3);
+        num_bones = num_bones.max(n as u16);
+        // 未用槽位保持 0（官方口径）。
+        let mut slot = [0u8; 3];
+        for (k, b) in v.bones.iter().take(3).enumerate() {
+            // SMD 里的骨骼下标是浮点，这里按官方口径取整。
+            let gb = b[0] as i32;
+            let pos = match bsc.iter().position(|&x| x == gb) {
+                Some(p) => p,
+                None => {
+                    bsc.push(gb);
+                    bsc.len() - 1
+                }
+            };
+            slot[k] = pos as u8;
+        }
+        hw.push(slot);
+    }
+
+    StripPalette { bsc, hw, num_bones }
+}
+
+/// 一个 strip 的骨骼调色板上限。
+///
+/// `Vertex_t.boneID[]` 是**有符号 `char`**（`optimize.h:51`），
+/// 所以硬件槽位必须 ≤ 127。官方另有 `MAX_NUM_BONES_PER_STRIP = 512`
+/// （`optimize.h:20`）与 `maxBonesPerStrip = 53`（L4D2 实测值）两层约束，
+/// 但它们都**大于** `char` 能表达的范围 —— 真正卡住的是这个 127。
+///
+/// 语料实测最大 `boneStateChangeCount` 是 **53**（`survey_vtx_bonestate.js`），
+/// 离上限很远；这里只做**格式**兜底。
+pub const MAX_STRIP_BONES: usize = 127;
+
 /// 把编译结果写成 VTX 字节（**默认选项** —— 不做缓存优化）。
 ///
 /// 等价于 `write_vtx_with(compiled, VtxOptions::default())`。
@@ -409,13 +527,27 @@ fn write_vtx_single(
             }
         }
     }
-    // bone state change 区紧跟索引区。每个 strip 一个条目。
+    // bone state change 区紧跟索引区。**每个 strip 一个调色板**，
+    // 大小 = 该 strip 用到的唯一全局骨骼数（语料实测 6677/6677 恒等，
+    // 见 [`build_strip_palette`]）。
     let mut bsc_cursor = icursor;
+    let mut mesh_palette: Vec<StripPalette> = Vec::with_capacity(mesh_total);
     for bp in &compiled.bodyparts {
         for m in &bp.models {
-            for _mesh in &m.meshes {
+            for mesh in &m.meshes {
+                // 单 LOD 路径下每个 mesh 恰好一个 strip group / 一个 strip，
+                // 顶点次序就是 mesh 顶点原序（`origMeshVertID == i`）。
+                let refs: Vec<&crate::model::Vertex> = mesh.vertices.iter().collect();
+                let pal = build_strip_palette(&refs);
+                if pal.bsc.len() > MAX_STRIP_BONES {
+                    return Err(VtxWriteError::TooManyStripBones {
+                        model: m.name.clone(),
+                        count: pal.bsc.len(),
+                    });
+                }
                 mesh_bsc_at.push(bsc_cursor);
-                bsc_cursor += BONE_STATE_CHANGE_SIZE;
+                bsc_cursor += pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
+                mesh_palette.push(pal);
             }
         }
     }
@@ -507,6 +639,7 @@ fn write_vtx_single(
 
                 let nv = mesh.vertices.len();
                 let ni = mesh.triangles.len() * 3;
+                let pal = &mesh_palette[mi];
 
                 // strip group
                 put_i32(&mut buf, sg_abs, nv as i32);
@@ -551,9 +684,12 @@ fn write_vtx_single(
                 put_i32(&mut buf, st_abs + 4, 0); // indexOffset（组内起点）
                 put_i32(&mut buf, st_abs + 8, nv as i32); // vertexCount
                 put_i32(&mut buf, st_abs + 12, 0); // vertOffset（组内起点）
-                put_u16(&mut buf, st_abs + 16, 1); // boneCount
+                // `numBones` = **max(顶点 numBones)**，不是唯一骨骼数
+                // （`optimize.cpp:1484-1487` 的非 fixed-function 分支；
+                //  语料 6677/6677 成立）。
+                put_u16(&mut buf, st_abs + 16, pal.num_bones);
                 put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
-                put_i32(&mut buf, st_abs + 19, 1); // boneStateChangeCount
+                put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
                 put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
 
                 // 顶点：boneWeightIndex 指向该 VVD 顶点自己的权重数组槽位。
@@ -569,15 +705,9 @@ fn write_vtx_single(
                     buf[o + 2] = 2;
                     buf[o + 3] = bone_count.max(1);
                     put_u16(&mut buf, o + 4, vi as u16); // origMeshVertID
-                    // boneId：**全局**骨骼下标（与 VVD 顶点的 bone[] 一致）。
-                    for k in 0..3usize {
-                        let b = v
-                            .bones
-                            .get(k)
-                            .map(|p| p[0] as u8)
-                            .unwrap_or(0);
-                        buf[o + 6 + k] = b;
-                    }
+                    // boneId：**硬件**下标（见 [`build_strip_palette`]）。
+                    // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
+                    buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
                 }
 
                 // 索引：tri-list，每三角形三个 u16。
@@ -608,9 +738,14 @@ fn write_vtx_single(
                     }
                 }
 
-                // bone state change：{hardwareID, newBoneID}。
-                put_i32(&mut buf, bsc_abs, 0);
-                put_i32(&mut buf, bsc_abs + 4, 0);
+                // bone state change：`{hardwareID, newBoneID}`。
+                // `hardwareID` **恒等于条目下标**（`optimize.cpp:876`；
+                // 语料 6677/6677 实测），所以直接写 `i`。
+                for (k, &gb) in pal.bsc.iter().enumerate() {
+                    let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
+                    put_i32(&mut buf, q, k as i32);
+                    put_i32(&mut buf, q + 4, gb);
+                }
 
                 mi += 1;
             }
@@ -824,9 +959,23 @@ fn write_vtx_multi(
         icursor += it.tris.len() * 6;
     }
     let mut bsc_cursor = icursor;
-    for _ in &items {
+    let mut item_palette: Vec<StripPalette> = Vec::with_capacity(items.len());
+    for it in &items {
+        let refs: Vec<&crate::model::Vertex> = it
+            .verts
+            .iter()
+            .map(|&u| &all[it.unified_mesh].vertices[u as usize])
+            .collect();
+        let pal = build_strip_palette(&refs);
+        if pal.bsc.len() > MAX_STRIP_BONES {
+            return Err(VtxWriteError::TooManyStripBones {
+                model: format!("mesh {}", it.unified_mesh),
+                count: pal.bsc.len(),
+            });
+        }
         item_bsc_at.push(bsc_cursor);
-        bsc_cursor += BONE_STATE_CHANGE_SIZE;
+        bsc_cursor += pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
+        item_palette.push(pal);
     }
     // material replacement list：**每 LOD 一个**。
     let mat_repl_off = bsc_cursor;
@@ -913,6 +1062,7 @@ fn write_vtx_multi(
         let bsc_abs = item_bsc_at[ii];
         let nv = it.verts.len();
         let ni = it.tris.len() * 3;
+        let pal = &item_palette[ii];
 
         put_i32(&mut buf, sg_abs, nv as i32);
         put_i32(&mut buf, sg_abs + 4, (v_abs - sg_abs) as i32);
@@ -949,9 +1099,10 @@ fn write_vtx_multi(
         put_i32(&mut buf, st_abs + 4, 0);
         put_i32(&mut buf, st_abs + 8, nv as i32);
         put_i32(&mut buf, st_abs + 12, 0);
-        put_u16(&mut buf, st_abs + 16, 1); // boneCount
+        // `numBones` = max(顶点 numBones)（见 [`build_strip_palette`]）。
+        put_u16(&mut buf, st_abs + 16, pal.num_bones);
         put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
-        put_i32(&mut buf, st_abs + 19, 1); // boneStateChangeCount
+        put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
         put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
 
         // 顶点：`origMeshVertID` 用 `finalMeshVertID`（多 LOD 的关键）。
@@ -978,26 +1129,9 @@ fn write_vtx_multi(
                 });
             }
             put_u16(&mut buf, o + 4, local as u16);
-            for k in 0..3usize {
-                let b = v.bones.get(k).map(|p| p[0] as u8).unwrap_or(0);
-                // ⚠️ VTX 的 `boneID[]` 也是 **`char`（有符号）**
-                // （`optimize.h:48`，v49 = `hl2sdk-doi`；与 VVD 的 `bone[]`
-                // 同宽度）⟹ 骨骼下标同样必须 ≤ 127，越界会被读成负数。
-                //
-                // 真正的拒绝在 VVD 写出时（`vvd::Vvd::to_bytes` 逐顶点查
-                // `MAX_BONE_INDEX_IN_VERTEX`）—— VTX 与 VVD 共用同一份顶点，
-                // 所以那边先触发。这里只做 debug 断言。
-                debug_assert!(
-                    v.bones.get(k).is_none_or(|p| {
-                        p[0] >= 0.0
-                            && p[0] <= crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX as f32
-                    }),
-                    "骨骼下标 {} 超出有符号 char 的范围（≤ {}）",
-                    v.bones.get(k).map_or(0.0, |p| p[0]),
-                    crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
-                );
-                buf[o + 6 + k] = b;
-            }
+            // `boneID[]`：**硬件**下标（见 [`build_strip_palette`]）。
+            // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
+            buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
         }
 
         // 索引（逐 strip group 可选做缓存优化，见单 LOD 路径的说明）。
@@ -1023,8 +1157,12 @@ fn write_vtx_multi(
             }
         }
 
-        put_i32(&mut buf, bsc_abs, 0);
-        put_i32(&mut buf, bsc_abs + 4, 0);
+        // bone state change：`{hardwareID, newBoneID}`，`hardwareID` 恒为条目下标。
+        for (k, &gb) in pal.bsc.iter().enumerate() {
+            let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
+            put_i32(&mut buf, q, k as i32);
+            put_i32(&mut buf, q + 4, gb);
+        }
     }
 
     // ---- material replacement list：每 LOD 一个空表 ----
@@ -1195,6 +1333,55 @@ end
         std::fs::write(d.join("myprop-ref.smd"), SMD).unwrap();
         let desc = ModelDesc::from_toml(TOML).unwrap();
         let c = compile(&desc, &d).expect("测试模型应能编译");
+        std::fs::remove_dir_all(&d).ok();
+        c
+    }
+
+    /// 造一个**多骨骼**模型：4 根骨骼、4 个顶点各绑不同骨骼。
+    ///
+    /// 用来验证「调色板项数 == 顶点用到的唯一全局骨骼数」这条恒等式
+    /// （语料 6677/6677 成立）—— 单骨骼夹具（[`minimal`]）上它**恒真**，
+    /// 是**空洞测试**，测不出任何东西。
+    fn multi_bone() -> CompiledModelDesc {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mdlc-vtxmb-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let smd = r#"version 1
+nodes
+  0 "root" -1
+  1 "b1" 0
+  2 "b2" 1
+  3 "b3" 2
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    1 0.000000 0.000000 4.000000 0.000000 0.000000 0.000000
+    2 0.000000 4.000000 8.000000 0.000000 0.000000 0.000000
+    3 4.000000 4.000000 12.000000 0.000000 0.000000 0.000000
+end
+triangles
+myprop
+  0 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 0 1.000000
+  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000
+  2 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 2 1.000000
+  3 0.000000 8.000000 4.000000 0.000000 0.000000 1.000000 0.500000 0.500000 1 3 1.000000
+end
+"#;
+        std::fs::write(d.join("myprop-ref.smd"), smd).unwrap();
+        // 骨骼表必须与 SMD 的 `nodes` 段一致 —— 否则编译器会拒绝
+        // （「有 3 根骨骼不在 [[bones]] 中」）。
+        let toml = TOML.replace(
+            "[[bones]]\nname = \"tip\"\nparent = \"root\"\n",
+            "[[bones]]\nname = \"b1\"\nparent = \"root\"\n\n\
+             [[bones]]\nname = \"b2\"\nparent = \"b1\"\n\n\
+             [[bones]]\nname = \"b3\"\nparent = \"b2\"\n",
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("多骨骼夹具应能编译");
         std::fs::remove_dir_all(&d).ok();
         c
     }
@@ -1667,15 +1854,139 @@ smd = "myprop-ref.smd"
         let l_abs = m_abs + g(m_abs + 4) as usize;
         let k_abs = l_abs + g(l_abs + 4) as usize;
         let sg_abs = k_abs + g(k_abs + 4) as usize;
+        let st_abs = sg_abs + g(sg_abs + 20) as usize;
         let v_abs = sg_abs + g(sg_abs + 4) as usize;
+        // `boneStateChange` 区在索引区之后；偏移由 strip 给出。
+        let bsc_abs = st_abs + g(st_abs + 23) as usize;
+        let num_bsc = g(st_abs + 19) as usize;
+        // 调色板：`hardwareID` **恒等于条目下标**，`newBoneID` 是全局骨骼。
+        let palette: Vec<i32> = (0..num_bsc)
+            .map(|i| {
+                let q = bsc_abs + i * BONE_STATE_CHANGE_SIZE;
+                assert_eq!(g(q), i as i32, "hardwareID 必须等于条目下标");
+                g(q + 4)
+            })
+            .collect();
         for i in 0..3usize {
             let o = v_abs + i * VERTEX_SIZE;
             let id = u16::from_le_bytes([b[o + 4], b[o + 5]]);
             assert_eq!(id as usize, i, "origMeshVertID 必须等于 mesh 内顶点序号");
             assert_eq!(b[o + 3], 1, "boneCount");
-            // boneId 应指向 VVD 顶点里绑定的骨骼（SMD 里是 1 = tip）
-            assert_eq!(b[o + 6], 1, "boneId 应为全局骨骼下标 1");
+            // ⚠️ `boneID` 是**硬件下标**，不是全局骨骼下标。
+            // 要经 `boneStateChange[boneID].newBoneID` 才是全局骨骼。
+            let hw = b[o + 6] as usize;
+            assert!(hw < num_bsc, "硬件下标 {hw} 越出调色板（{num_bsc} 项）");
+            assert_eq!(
+                palette[hw], 1,
+                "boneID 经调色板应还原为全局骨骼 1（SMD 里是 1 = tip）"
+            );
         }
+    }
+
+    /// `boneStateChange` 必须是**逐 strip 的调色板**，且能覆盖全部顶点。
+    ///
+    /// 早先这里恒写 1 项 `{0,0}`、并把 `boneID` 写成**全局**骨骼下标 ⟹
+    /// 引擎读 `boneStateChange[3]`（越界）拿到垃圾骨骼，顶点蒙皮到错误骨骼
+    /// —— 表现为**顶点错乱 / 模型撕裂**。
+    #[test]
+    fn bone_state_change_is_a_per_strip_palette() {
+        let c = minimal();
+        let out = write_vtx(&c).unwrap();
+        let b = &out.bytes;
+        let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let bp = g(0x20) as usize;
+        let m_abs = bp + g(bp + 4) as usize;
+        let l_abs = m_abs + g(m_abs + 4) as usize;
+        let k_abs = l_abs + g(l_abs + 4) as usize;
+        let sg_abs = k_abs + g(k_abs + 4) as usize;
+        let st_abs = sg_abs + g(sg_abs + 20) as usize;
+        let v_abs = sg_abs + g(sg_abs + 4) as usize;
+        let bsc_abs = st_abs + g(st_abs + 23) as usize;
+        let num_bsc = g(st_abs + 19) as usize;
+        let num_verts = g(sg_abs) as usize;
+
+        // 调色板必须非空，且 newBoneID 互不相同。
+        assert!(num_bsc > 0, "调色板不能为空");
+        let globals: Vec<i32> = (0..num_bsc).map(|i| g(bsc_abs + i * 8 + 4)).collect();
+        let uniq: std::collections::HashSet<i32> = globals.iter().copied().collect();
+        assert_eq!(uniq.len(), num_bsc, "调色板内 newBoneID 必须互不相同");
+
+        // 每个顶点用到的硬件下标都必须落在调色板内（越界 = 引擎读到垃圾）。
+        for i in 0..num_verts {
+            let o = v_abs + i * VERTEX_SIZE;
+            let n = b[o + 3] as usize;
+            for k in 0..n {
+                let hw = b[o + 6 + k] as usize;
+                assert!(hw < num_bsc, "顶点 {i} 槽位 {k} 的硬件下标 {hw} 越界（{num_bsc}）");
+            }
+            // 未用槽位必须为 0（官方口径，语料 6677/6677）。
+            for k in n..3 {
+                assert_eq!(b[o + 6 + k], 0, "顶点 {i} 未用槽位 {k} 应为 0");
+            }
+        }
+        // `numBones` = max(顶点 numBones)，不是唯一骨骼数。
+        let max_vb = (0..num_verts)
+            .map(|i| b[v_abs + i * VERTEX_SIZE + 3] as i32)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(i32::from(i16::from_le_bytes([b[st_abs + 16], b[st_abs + 17]])), max_vb);
+    }
+
+    /// 调色板项数必须等于「strip 顶点用到的唯一全局骨骼数」，
+    /// 而 `numBones` 必须等于「max(顶点 numBones)」—— **两者不是一回事**。
+    ///
+    /// 语料实测两条都 6677/6677 成立（`docs/_probe/survey_vtx_bonestate.js`）。
+    ///
+    /// ⚠️ **夹具必须让这两个量不等**，否则变异测试会逃逸：
+    /// 本测试第一版用 [`minimal`]（1 顶点骨骼 / 1 唯一骨骼），
+    /// 把 `numBones` 从 `max(顶点 numBones)` 变异成 `bsc.len()` 时
+    /// **测试照样全绿**（两个值恒等）。[`multi_bone`] 的 4 个顶点各绑
+    /// 1 根**不同**骨骼 ⟹ max=1 而 unique=4，才能真正区分。
+    #[test]
+    fn palette_size_equals_unique_bones_used() {
+        let c = multi_bone();
+        let out = write_vtx(&c).unwrap();
+        let b = &out.bytes;
+        let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let bp = g(0x20) as usize;
+        let m_abs = bp + g(bp + 4) as usize;
+        let l_abs = m_abs + g(m_abs + 4) as usize;
+        let k_abs = l_abs + g(l_abs + 4) as usize;
+        let sg_abs = k_abs + g(k_abs + 4) as usize;
+        let st_abs = sg_abs + g(sg_abs + 20) as usize;
+        let v_abs = sg_abs + g(sg_abs + 4) as usize;
+        let bsc_abs = st_abs + g(st_abs + 23) as usize;
+        let num_bsc = g(st_abs + 19) as usize;
+        let num_verts = g(sg_abs) as usize;
+        let palette: Vec<i32> = (0..num_bsc).map(|i| g(bsc_abs + i * 8 + 4)).collect();
+
+        let mut used = std::collections::HashSet::new();
+        let mut max_vb = 0i32;
+        for i in 0..num_verts {
+            let o = v_abs + i * VERTEX_SIZE;
+            let n = b[o + 3] as i32;
+            max_vb = max_vb.max(n);
+            for k in 0..n as usize {
+                used.insert(palette[b[o + 6 + k] as usize]);
+            }
+        }
+        assert_eq!(
+            used.len(),
+            num_bsc,
+            "调色板项数 {num_bsc} 应等于顶点用到的唯一全局骨骼数 {}",
+            used.len()
+        );
+        // 夹具前提：这两个量必须**不等**，否则本测试是空洞的。
+        assert_ne!(
+            used.len() as i32, max_vb,
+            "夹具无效：唯一骨骼数 == max(顶点 numBones)，区分不出两种口径"
+        );
+        let num_bones = i32::from(i16::from_le_bytes([b[st_abs + 16], b[st_abs + 17]]));
+        assert_eq!(
+            num_bones, max_vb,
+            "numBones 必须是 max(顶点 numBones)={max_vb}，而不是唯一骨骼数 {}",
+            used.len()
+        );
     }
 
     #[test]
