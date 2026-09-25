@@ -1993,7 +1993,20 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     put_bytes(&mut buf, off::ID, b"IDST");
     put_i32(&mut buf, off::VERSION, version);
     put_i32(&mut buf, off::CHECKSUM, checksum);
-    put_cstr(&mut buf, off::NAME, off::NAME_LEN, &desc.output_name())?;
+    // ⚠️ **头部的 `name[64]` 用 `$modelname` 的原文，不做分隔符规范化。**
+    //
+    // 官方 `Cmd_Modelname`（`studiomdl.cpp:890-910`）把 token **原样**拷进
+    // `g_pname`，`write.cpp` 再原样写进 `name[64]` ⟹ QC 写 `\` 就落 `\`。
+    //
+    // 实测语料：**含反斜杠 1780 个、含正斜杠 1503 个**（`survey_mdl_name_kneedir.js`）
+    // —— 两种都有，取决于当年编译时 QC 里写的是什么。
+    // `vm_test_group` 的 QC 写的是 `v_models\v_smg.mdl`，官方产物就是
+    // `v_models\v_smg.mdl`，而 mdlc 的 `output_name()` 规范化成了 `/`。
+    //
+    // ⚠️ **不能改 `output_name()`** —— 它同时是**磁盘输出路径**的构造依据
+    // （`v_models/v_smg.mdl`），改成反斜杠会破坏输出布局。
+    // 所以这里单独用原文。
+    put_cstr(&mut buf, off::NAME, off::NAME_LEN, &desc.model.name)?;
     put_i32(&mut buf, off::LENGTH, total_len as i32);
 
     // 包围盒：显式值优先，否则用**摆好姿势**的序列包围盒

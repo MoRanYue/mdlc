@@ -1921,9 +1921,43 @@ fn build_ik_rules(
             if *c != 0 {
                 continue;
             }
-            // `panim->weight[g_ikchain[j].link[2].bone] > 0.0` ——
-            // mdlc 不实现 `$weightlist`，所以权重恒为 1（见
-            // [`crate::model::Sequence::no_auto_ik`] 的说明）。
+            // ⚠️ **还要看该链末端骨骼在本动画里的权重 > 0**
+            // （`simplify.cpp:6269`）：
+            //
+            // ```c
+            // if (count[j] == 0 && panim->weight[g_ikchain[j].link[2].bone] > 0.0)
+            // ```
+            //
+            // `link[2]` 是链的**末端骨骼**（`simplify.cpp:6084` 的
+            // `g_ikchain[j].link[2].bone`）。权重来自 `$weightlist`。
+            //
+            // # 为什么这条判据是必需的（实测）
+            //
+            // `vm_test_group` 的 `v_smg_mp5` 等模型里，
+            // `weights_helping_hand_extend` 把**全部 64 根骨骼的权重都设成 0**。
+            // 于是 `helping_hand_*` / `item_*` 这 6 条序列在官方产物里
+            // `numikrules == 0`（**一条自动规则都不补**），而 mdlc 补了 2 条
+            // （`lhand` + `rhand`）。
+            //
+            // 实测对照（`docs/_probe/probe_mdl_diff_detail.js v_smg_mp5`）：
+            // `@helping_hand_extend` 官方 0 / mdlc 2、`@item_retract` 官方 0 / mdlc 2
+            // —— **6 个动画 / 6 个模型**受影响。
+            //
+            // ⚠️ 早先这里的注释写的是「mdlc 不实现 `$weightlist`，所以权重恒为 1」
+            // —— **那句话早已过期**：`resolve_weight_lists` 从 §53 起就实现了，
+            // `Sequence::weights` 也一直写进了 seqdesc 的 `weightlistindex`。
+            // 只有这一处判据没跟上。
+            //
+            // `link2[j]` 就是上面算好的 `g_ikchain[j].link[2].bone` 下标。
+            let w = link2
+                .get(j)
+                .and_then(|b| usize::try_from(*b).ok())
+                .and_then(|b| seq.weights.get(b))
+                .copied()
+                .unwrap_or(1.0);
+            if w <= 0.0 {
+                continue;
+            }
             rules.push(PendingIkRule {
                 type_code: 4,
                 chain: j as i32,

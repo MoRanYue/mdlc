@@ -3080,8 +3080,31 @@ impl<'a> Parser<'a> {
 
         // ---- 5. 事件 cycle ----
         //
-        // `cycle = frame / (numframes - 1)`（`write.cpp:494-497`），
-        // 帧数取自该序列**第一格**动画的 SMD。
+        // 官方（`write.cpp:492-504`）：
+        //
+        // ```c
+        // k = g_sequence[i].panim[0][0]->numframes - 1;   // ← **动画对象**，不是名字
+        // if (event.frame <= k)          cycle = frame / (float)k;
+        // else if (k == 0 && frame == 0) cycle = 0;
+        // else                           MdlWarning("Event out of range") + bErrors;
+        // ```
+        //
+        // ⚠️ **`panim[0][0]` 是「该序列第一格动画」，它未必等于 `seq.smd`。**
+        // 两种形态要分开取：
+        //
+        // | 形态 | 第一格动画 |
+        // |---|---|
+        // | 单动画序列（`blends` 为空） | **`seq.smd`**（IR 约定，见 `cmd_sequence` 尾注） |
+        // | blend 网格（`blends` 非空） | `seq.blends[0]` |
+        //
+        // **早先只查了 `seq.blends.first()`** —— 对单动画序列它恒为空 ⟹
+        // `nf = 0` ⟹ `k = 0` ⟹ **所有事件的 cycle 被写成 0**。
+        //
+        // 实测症状（`docs/_probe/probe_event_cycle.js`，v_silenced_smg）：
+        // `deploy_layer` 的 3 个事件官方 cycle 反推帧号 = `1, 10, 21`
+        // （与 QC 里写的 `{ event 5004 1 … }` 逐字吻合），mdlc 全写 **0**。
+        // **8 条序列 / 59 个事件受影响**，且**只影响 `*_layer` 这类
+        // 「单动画 + 有事件」的序列** —— 因为多格 blend 序列走的是另一支。
         let anim_smds: Vec<(String, String)> = self
             .desc
             .animations
@@ -3089,19 +3112,29 @@ impl<'a> Parser<'a> {
             .map(|a| (a.name.clone(), a.smd.clone()))
             .collect();
         for seq in &mut self.desc.sequences {
-            let first = seq.blends.first().cloned().unwrap_or_default();
-            let nf = anim_smds
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(&first))
-                .and_then(|(_, s)| smd_cache.get(s).and_then(|x| x.as_ref()))
-                .map(|i| i.num_frames)
-                .or_else(|| {
-                    smd_cache
-                        .get(&first)
-                        .and_then(|x| x.as_ref())
-                        .map(|i| i.num_frames)
-                })
-                .unwrap_or(0);
+            // ① 显式 `numframes` 优先（`ParseCmdlistToken` 的 `CMD_NUMFRAMES`）。
+            // ② 否则取「第一格动画」的 SMD 帧数。
+            let first = if seq.blends.is_empty() {
+                seq.smd.clone()
+            } else {
+                seq.blends.first().cloned().unwrap_or_default()
+            };
+            let nf: i32 = seq
+                .num_frames
+                .unwrap_or_else(|| {
+                    anim_smds
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&first))
+                        .and_then(|(_, s)| smd_cache.get(s).and_then(|x| x.as_ref()))
+                        .map(|i| i.num_frames as i32)
+                        .or_else(|| {
+                            smd_cache
+                                .get(&first)
+                                .and_then(|x| x.as_ref())
+                                .map(|i| i.num_frames as i32)
+                        })
+                        .unwrap_or(0)
+                });
             let k = if nf > 0 { nf as f32 - 1.0 } else { 0.0 };
             for ev in &mut seq.events {
                 let frame = ev.cycle;

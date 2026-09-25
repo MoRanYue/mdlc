@@ -145,6 +145,115 @@ fn vertex_key(v: &Vertex) -> VertexKey {
     }
 }
 
+/// 官方 `lookup_index` 的**法线焊接阈值**：`cos(2°)`。
+///
+/// `studiomdl.cpp:6895`：
+/// ```c
+/// normal_blend = cos( DEG2RAD( 2.0 ));   // ≈ 0.99939083
+/// ```
+///
+/// 可由 `-a <normal_blend_angle>` 覆盖（`studiomdl.cpp:7044`），mdlc 只实现缺省值。
+const NORMAL_BLEND: f32 = 0.999_390_8;
+
+/// 「位置 + UV」次级索引的键 —— 法线容差查找用它把候选集缩到极小。
+///
+/// 官方是**线性扫全池**（`for (i = 0; i < numvlist; i++)`），
+/// 那在 30 万顶点上是 O(n²)。用位置+UV 建桶后，候选只剩同位置的几个顶点，
+/// **语义完全等价**（官方那三个判据里，位置与 UV 都是**精确相等**，
+/// 所以桶内就是官方的候选集，只是顺序可能不同 —— 而官方取「第一个命中」，
+/// 我们取「桶里第一个命中的」，对同一位置而言结果一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PosUvKey {
+    pos: [u32; 3],
+    uv: [u32; 2],
+}
+
+/// **按官方 `lookup_index` 的口径**在池里找一个可复用的顶点，找不到就追加。
+///
+/// # 官方规则（`v1support.cpp:32-47`）
+///
+/// ```c
+/// for (i = 0; i < numvlist; i++) {
+///     if (v_listdata[i].m == material
+///         && DotProduct( g_normal[i], normal ) > normal_blend   // ← **2° 容差**
+///         && VectorCompare( g_vertex[i], vertex )               // ← 位置**精确**
+///         && g_texcoord[i][0] == texcoord[0]                    // ← UV **精确**
+///         && g_texcoord[i][1] == texcoord[1])
+///         return i;                                             // 复用
+/// }
+/// ```
+///
+/// # 为什么不能只用法线精确相等（实测）
+///
+/// SMD 里同一位置的相邻面，法线常差 **1 ULP**（十进制最后一位）：
+///
+/// ```text
+///   studio: 16.326813,0.516793,45.696392|0.004434,-0.000006,-0.999990|…
+///   mdlc  : 16.326813,0.516799,45.696400|0.004435,-0.000001,-0.999990|…
+/// ```
+///
+/// 官方用 2° 容差**焊掉**它们；mdlc 原先要求法线**逐位相等** ⟹ 多留顶点。
+///
+/// 实测（`docs/_probe/verify_normal_blend_weld.js`）：按官方口径重算，
+/// **6/6 模型的顶点数与官方精确相同**；其中 `v_sniper_military` 从 13518 → **13515**
+/// （官方值）。「因法线容差而焊接」的次数是 1266~16786 次/模型 ——
+/// **绝大多数焊接靠的是这条容差**，不是精确相等。
+///
+/// > ⚠️ 官方**不比骨骼绑定**。6 个测试模型里「几何相同但骨骼不同」的情形
+/// > 出现 0 次（`probe_weld_bones.js`），所以这里保留骨骼比较 ——
+/// > 它更安全（不会把不同蒙皮的顶点合并），且在真实数据上等价。
+fn weld_or_push(
+    pool: &mut Vec<Vertex>,
+    table: &mut HashMap<VertexKey, u32>,
+    secondary: &mut HashMap<PosUvKey, Vec<u32>>,
+    v: &Vertex,
+) -> u32 {
+    let key = vertex_key(v);
+    // ① 精确命中（绝大多数顶点走这条，O(1)）。
+    if let Some(&i) = table.get(&key) {
+        return i;
+    }
+    // ② 法线容差命中：同位置 + 同 UV，且法线夹角 < 2°。
+    //
+    // ⚠️ 这一步必须**只在精确未命中时**做 —— 否则每个顶点都要线性扫描池子，
+    // 25 万顶点的模型会退化成 O(n²)。精确命中是主路径，容差是补漏。
+    //
+    // 用「位置 + UV」做**次级索引**，把候选集缩到极小（同一位置的顶点数通常是个位数）。
+    let posuv = PosUvKey {
+        pos: key.pos,
+        uv: key.uv,
+    };
+    let bones = key.bones_slice();
+    if let Some(cands) = secondary.get(&posuv) {
+        for &i in cands {
+            let e = &pool[i as usize];
+            if e.bones.len() != bones.len() {
+                continue;
+            }
+            // 骨骼必须一致（见上面的说明）。
+            let mut same_bones = true;
+            for (k, p) in e.bones.iter().enumerate() {
+                if p[0] as i32 != bones[k].0 || fbits(p[1]) != bones[k].1 {
+                    same_bones = false;
+                    break;
+                }
+            }
+            if !same_bones {
+                continue;
+            }
+            let d = e.normal[0] * v.normal[0] + e.normal[1] * v.normal[1] + e.normal[2] * v.normal[2];
+            if d > NORMAL_BLEND {
+                return i;
+            }
+        }
+    }
+    let i = pool.len() as u32;
+    pool.push(v.clone());
+    table.insert(key, i);
+    secondary.entry(posuv).or_default().push(i);
+    i
+}
+
 /// `$staticprop` 的几何旋转：绕 Z 轴 +90°。
 ///
 /// # 来源
@@ -500,8 +609,9 @@ fn build_meshes(
     let mut order: Vec<usize> = Vec::new();
     let mut per_mesh: HashMap<usize, Vec<Vertex>> = HashMap::new();
     let mut tris_per_mesh: HashMap<usize, Vec<[u32; 3]>> = HashMap::new();
-    // 每个 mesh 自己的顶点去重表。
+    // 每个 mesh 自己的顶点去重表 + 「位置+UV」次级索引（法线容差焊接用）。
     let mut dedup: HashMap<usize, HashMap<VertexKey, u32>> = HashMap::new();
+    let mut secondary: HashMap<usize, HashMap<PosUvKey, Vec<u32>>> = HashMap::new();
 
     // 骨骼查找表**只建一次**（原先在 `smd_vertex_to_ir` 里逐顶点重建）。
     let bone_map = VertexBoneMap::new(smd, desc);
@@ -513,22 +623,15 @@ fn build_meshes(
             e.insert(Vec::new());
             tris_per_mesh.insert(mi, Vec::new());
             dedup.insert(mi, HashMap::new());
+            secondary.insert(mi, HashMap::new());
         }
         let pool = per_mesh.get_mut(&mi).unwrap();
         let table = dedup.get_mut(&mi).unwrap();
+        let sec = secondary.get_mut(&mi).unwrap();
         let mut corner = [0u32; 3];
         for (c, sv) in t.vertices.iter().enumerate() {
             let v = smd_vertex_to_ir(sv, desc, &bone_map, smd_path, at)?;
-            let key = vertex_key(&v);
-            let idx = match table.get(&key) {
-                Some(&i) => i,
-                None => {
-                    let i = pool.len() as u32;
-                    pool.push(v);
-                    table.insert(key, i);
-                    i
-                }
-            };
+            let idx = weld_or_push(pool, table, sec, &v);
             corner[c] = idx;
         }
         // 退化三角形（去重后有两个角相同）直接跳过 —— 它们在 VVD/VTX 里
@@ -958,12 +1061,50 @@ fn subtract_base_frames(
     frames: &mut [Vec<crate::smd::SmdPose>],
     base: &[Vec<crate::smd::SmdPose>],
     base_frame: usize,
+    weights: &[f32],
 ) {
     let Some(src) = base.get(base_frame) else {
         return;
     };
     for row in frames.iter_mut() {
         for (k, pose) in row.iter_mut().enumerate() {
+            // ⚠️ **权重 ≤ 0 的骨骼不做减除。**
+            //
+            // 官方 `subtractBaseAnimations`（`simplify.cpp:1084-1120`）：
+            //
+            // ```c
+            // for (k = 0; k < g_numbones; k++)
+            //     for (j = 0; j < pdest->numframes; j++)
+            //         if (pdest->weight[k] > 0)      // ← 判据在这里
+            //         {
+            //             QuaternionSMAngles( -1, src[k].rot, pdest->sanim[j][k].rot, ... );
+            //             VectorSubtract( pdest->sanim[j][k].pos, src[k].pos, ... );
+            //         }
+            // ```
+            //
+            // # 实测影响（`v_smg_mp5` / `v_snip_awp` / `v_snip_scout`）
+            //
+            // 这三个模型的 `weights_helping_hand_extend` 把**全部骨骼的权重
+            // 设成 0**，用于 `helping_hand_*` / `item_*` 共 6 条序列。
+            // 官方那边 `weight[k] > 0` **全部为假** ⟹ **减除一次都不做**
+            // ⟹ 动画保留 SMD 的原始姿态。
+            //
+            // 后果（`docs/_probe/probe_bbox_weightlist.js`）：
+            //
+            // | | 官方 bbmin[2] | mdlc（忽略权重时） |
+            // |---|---|---|
+            // | `helping_hand_extend_layer` | **−59.8125** | −9.2092 |
+            //
+            // 而 `−59.8125` 正是 `a_idle_1.smd` 第 0 帧骨骼 0 的 `pos[2]`
+            // —— 即**未减除**的原始值。18 条序列受影响，Δ 达 **50.6**。
+            //
+            // > ⚠️ 这不只影响包围盒：**写进动画链的姿态本身也不同**
+            // > （官方保留原值，mdlc 减掉了参考姿态）⟹ 游戏里这些
+            // > 「全 0 权重」的层会**整体偏移**。这是真实的渲染差异。
+            let w = weights.get(k).copied().unwrap_or(1.0);
+            if w <= 0.0 {
+                continue;
+            }
             let Some(s) = src.get(k) else { continue };
             // 旋转：`conj(src) · dest`，再转回欧拉角。
             //
@@ -1347,7 +1488,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let before = anims[i].frames.clone();
         anims[i].pre_subtract_frames = Some(before.clone());
         pre_subtract[i] = Some(before);
-        subtract_base_frames(&mut anims[i].frames, &src, bf);
+        // 权重来自 `$weightlist`；`weight[k] <= 0` 的骨骼**不减除**
+        // （`simplify.cpp:1088` 的 `if (pdest->weight[k] > 0)`）。
+        subtract_base_frames(&mut anims[i].frames, &src, bf, &anim_weights[i]);
     }
     if !seq_errors.is_empty() {
         return Err(seq_errors);
@@ -1692,7 +1835,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     }
                     // 包围盒用**减除前**的姿态（与 `[[animations]]` 同规则）。
                     seq_pre_subtract = Some(frames.clone());
-                    subtract_base_frames(&mut frames, &src, bf);
+                    // 权重 ≤ 0 的骨骼不减除（`simplify.cpp:1088`）。
+                    let w = weights_of(s.weight_list.as_deref());
+                    subtract_base_frames(&mut frames, &src, bf, &w);
                 }
                 None => {
                     seq_errors.push(CompileError {
@@ -1851,6 +1996,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     let remapped = remap_vertices_to_reference_pose(&mut compiled);
     drop(_t_remap);
     let _ = remapped;
+
+    // ---- `$ikchain` 的 kneeDir 自动推导 ----
+    //
+    // 官方 `simplify.cpp:2839-2912`：QC 没写 `knee` 时，**从动画里算**出来。
+    // 语料里 272 条链有 **263 条非零**，所以这条不是可选项。
+    derive_ikchain_knee_dirs(&mut compiled);
 
     // ---- flex / eyeball / mouth 解析（在重排定稿后）----
     //
@@ -2448,6 +2599,228 @@ fn realign_sequence_frames(compiled: &mut CompiledModelDesc) {
                 frame[i].rotation = crate::bone_math::matrix_angles(&local);
             }
         }
+    }
+}
+
+/// 推导 `$ikchain` 的 `kneeDir`（官方 `simplify.cpp:2839-2912`）。
+///
+/// # 官方语义
+///
+/// ```c
+/// Vector kneeDir = g_ikchain[k].link[0].kneeDir;
+/// if (kneeDir.Length() > 0.0) { hasKnees = true; }   // QC 写了 `knee` ⟹ 直接用
+/// else {
+///     for (每个动画 i) {
+///         if (panim->flags & STUDIO_DELTA)  continue;   // ← 跳过 delta 动画
+///         if (panim->flags & STUDIO_HIDDEN) continue;   // ← 跳过 hidden 动画
+///         for (每帧 j) {
+///             CalcBoneTransforms( panim, j, boneToWorld );
+///             MatrixPosition( boneToWorld[link[0].bone], worldThigh );
+///             MatrixPosition( boneToWorld[link[1].bone], worldKnee  );
+///             MatrixPosition( boneToWorld[link[2].bone], worldFoot  );
+///             l1 = |worldKnee - worldThigh|;  l2 = |worldFoot - worldKnee|;
+///             l3 = |worldFoot - worldThigh|;
+///             ikHalf    = (worldFoot + worldThigh) * 0.5;
+///             ikKneeDir = normalize( worldKnee - ikHalf );
+///             if (l3 > (l1 + l2) * 0.999)  needsFixup = true;   // 腿太直 ⟹ 标记
+///             else {
+///                 VectorIRotate( ikKneeDir, boneToWorld[link[0].bone], tmp );
+///                 bend = ((dot(worldThigh - worldKnee, worldFoot - worldKnee) / (l1*l3)) + 1) / 2;
+///                 kneeDir += tmp * bend;      // ← **累加**（不是平均）
+///                 hasKnees = true;
+///             }
+///         }
+///     }
+/// }
+/// if (!needsFixup) continue;              // ⚠️ 没有任何一帧「太直」⟹ **不写回**
+/// if (!hasKnees) { printf("ik rules but no clear knee direction\n"); continue; }
+/// VectorNormalize( kneeDir );
+/// g_ikchain[k].link[0].kneeDir = kneeDir;  // ← 归一化后写回
+/// ```
+///
+/// # ⚠️ 两个反直觉之处（都实测过）
+///
+/// ① **`needsFixup` 是「写回」的开关，不是「出错」的开关。**
+///    只有当**至少有一帧**满足 `l3 > (l1+l2)*0.999`（腿几乎伸直）时，
+///    官方才把累加出来的 `kneeDir` 归一化写回。若所有帧都不满足，
+///    算出来的 `kneeDir` **被丢弃**，保持 QC 的原值（此处是 0）。
+///
+/// ② **`kneeDir += tmp * bend` 是累加，不是加权平均。**
+///    所以「帧数多」会让方向被放大 —— 归一化后等价于「按 bend 加权求和的方向」。
+///
+/// 实测（`vm_test_group`）：QC 里 **6 个模型全部没写 `knee`**，
+/// 而官方产物的 `links[0].kneeDir` 是**非零单位向量**
+/// （如 `v_silenced_smg` 的 `[0.611487, 0.622407, 0.488562]`）
+/// —— 25 个分量差异全出自这里。
+///
+/// 语料普查（`survey_mdl_name_kneedir.js`，272 条链）：
+/// **非零 263 条 / 零 9 条** ⟹ 这条规则影响**绝大多数真实模型**。
+fn derive_ikchain_knee_dirs(compiled: &mut CompiledModelDesc) {
+    if compiled.desc.ikchains.is_empty() {
+        return;
+    }
+    // 只处理「QC 没写 `knee`」的链。
+    let pending: Vec<usize> = compiled
+        .desc
+        .ikchains
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.knee_dir.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let bone_index = compiled.desc.bone_index();
+    // 链末端骨骼下标（`link[2]`），父、祖父由骨骼表推出（与写出器同口径）。
+    let parents = bone_parents(&compiled.desc);
+    let mut chains: Vec<(usize, usize, usize)> = Vec::new();
+    for &ci in &pending {
+        let c = &compiled.desc.ikchains[ci];
+        let Some(&tip) = bone_index.get(c.bone.as_str()) else {
+            continue;
+        };
+        let Ok(mid) = usize::try_from(parents[tip]) else {
+            continue;
+        };
+        let Ok(root) = usize::try_from(parents[mid]) else {
+            continue;
+        };
+        chains.push((root, mid, tip));
+    }
+    if chains.is_empty() {
+        return;
+    }
+
+    // 逐链累加（`kneeDir += tmp * bend`）与「是否出现过太直的帧」。
+    let mut acc: Vec<[f64; 3]> = vec![[0.0; 3]; chains.len()];
+    let mut needs_fixup = vec![false; chains.len()];
+    let mut has_knees = vec![false; chains.len()];
+
+    // 世界矩阵的父链缓存（逐帧重建）。
+    for anim in &compiled.animations {
+        // `STUDIO_DELTA` / `STUDIO_HIDDEN` 的动画整个跳过（`simplify.cpp:2855-2859`）。
+        if anim.delta {
+            continue;
+        }
+        // `hidden` 在 mdlc 里由 `extra_flags` 承载（`STUDIO_HIDDEN` = 0x0080）。
+        let seq = &compiled.sequences[anim
+            .name
+            .strip_prefix('@')
+            .and_then(|n| compiled.sequences.iter().position(|s| s.name.eq_ignore_ascii_case(n)))
+            .unwrap_or(0)];
+        if seq.extra_flags.is_some_and(|f| f & 0x0080 != 0) {
+            continue;
+        }
+        for frame in &anim.frames {
+            // 每帧的世界矩阵（`CalcBoneTransforms`）。
+            let positions: Vec<[f32; 3]> = frame.iter().map(|p| p.position).collect();
+            let rotations: Vec<[f32; 3]> = frame.iter().map(|p| p.rotation).collect();
+            let world = crate::bone_math::compute_world(&positions, &rotations, &parents);
+            for (ci, &(root, mid, tip)) in chains.iter().enumerate() {
+                let Some((wr, wm, wt)) = world
+                    .get(root)
+                    .zip(world.get(mid))
+                    .zip(world.get(tip))
+                    .map(|((a, b), c)| (a, b, c))
+                else {
+                    continue;
+                };
+                let thigh = [f64::from(wr[3]), f64::from(wr[7]), f64::from(wr[11])];
+                let knee = [f64::from(wm[3]), f64::from(wm[7]), f64::from(wm[11])];
+                let foot = [f64::from(wt[3]), f64::from(wt[7]), f64::from(wt[11])];
+                let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+                let len = |a: [f64; 3]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+                let l1 = len(sub(knee, thigh));
+                let l2 = len(sub(foot, knee));
+                let l3 = len(sub(foot, thigh));
+                // ⚠️ **不要在这里 `continue` 跳过 `l1 == 0` / `l3 == 0`。**
+                //
+                // 官方没有这个保护：`bend = ((dot / (l1*l3)) + 1) / 2`
+                // 在 `l1 == 0` 时算的是 `0/0 = NaN`，然后
+                // `kneeDir += tmp * NaN` 让**累加器整体变成 NaN**，
+                // 最后 `VectorNormalize` 把 NaN 原样写进产物。
+                //
+                // 实测（`docs/_probe/probe_kneedir_nan.js`）：`v_smg_mp5` 的
+                // `rhand` 链官方 `kneeDir = [NaN, NaN, NaN]`，
+                // 而「发现非法就跳过」的写法会写出一个**有限的单位向量**。
+                //
+                // ⚠️ `VectorNormalize` **不会**把 0 变成 NaN ——
+                // `mathlib_base.cpp:70-73` 有 `1/(radius + FLT_EPSILON)` 保护。
+                // 所以 NaN 只可能来自**输入已经是 NaN**。
+                // **「除法有保护」和「结果有限」是两件事。**
+                let half = [
+                    (foot[0] + thigh[0]) * 0.5,
+                    (foot[1] + thigh[1]) * 0.5,
+                    (foot[2] + thigh[2]) * 0.5,
+                ];
+                let mut ikd = sub(knee, half);
+                let n = len(ikd);
+                if n > 0.0 {
+                    ikd = [ikd[0] / n, ikd[1] / n, ikd[2] / n];
+                }
+                if l3 > (l1 + l2) * 0.999 {
+                    needs_fixup[ci] = true;
+                } else {
+                    // `VectorIRotate(ikKneeDir, boneToWorld[root], tmp)` ——
+                    // **世界 → 骨骼局部**。
+                    //
+                    // ⚠️ `VectorIRotate` 是 `VectorRotate` 的**转置**：
+                    // ```c
+                    // void VectorIRotate( const Vector& in1, const matrix3x4_t& in2, Vector& out ) {
+                    //     out[0] = in1[0]*in2[0][0] + in1[1]*in2[1][0] + in1[2]*in2[2][0];
+                    //     out[1] = in1[0]*in2[0][1] + in1[1]*in2[1][1] + in1[2]*in2[2][1];
+                    //     out[2] = in1[0]*in2[0][2] + in1[1]*in2[1][2] + in1[2]*in2[2][2];
+                    // }
+                    // ```
+                    // 而 `matrix3x4_t` 是 `float m[3][4]`（**列主**），所以
+                    // `in2[j][i]` = 第 j 列第 i 行 = 本仓库扁平表示的 `m[j*4 + i]`。
+                    //
+                    // 用错成 `VectorRotate`（正向旋转）会得到一个**模长仍为 1
+                    // 但方向错**的向量 —— 实测点积 −0.29 ~ −0.77，
+                    // **看起来「像」对的，很难发现**。
+                    let m = wr;
+                    let tmp = [
+                        ikd[0] * f64::from(m[0]) + ikd[1] * f64::from(m[4]) + ikd[2] * f64::from(m[8]),
+                        ikd[0] * f64::from(m[1]) + ikd[1] * f64::from(m[5]) + ikd[2] * f64::from(m[9]),
+                        ikd[0] * f64::from(m[2]) + ikd[1] * f64::from(m[6]) + ikd[2] * f64::from(m[10]),
+                    ];
+                    let vt = sub(thigh, knee);
+                    let vf = sub(foot, knee);
+                    let dot = vt[0] * vf[0] + vt[1] * vf[1] + vt[2] * vf[2];
+                    let bend = ((dot / (l1 * l3)) + 1.0) / 2.0;
+                    for k in 0..3 {
+                        acc[ci][k] += tmp[k] * bend;
+                    }
+                    has_knees[ci] = true;
+                }
+            }
+        }
+    }
+
+    for (ci, &(_, _, _)) in chains.iter().enumerate() {
+        // ⚠️ 没有任何一帧「太直」⟹ 官方**不写回**（`simplify.cpp:2902-2903`）。
+        if !needs_fixup[ci] || !has_knees[ci] {
+            continue;
+        }
+        let n = (acc[ci][0] * acc[ci][0] + acc[ci][1] * acc[ci][1] + acc[ci][2] * acc[ci][2]).sqrt();
+        // ⚠️ **`n` 可能是 NaN**（累加器被 `0/0` 污染，见上面 `bend` 的说明）。
+        // `NaN <= 0.0` 是 **false** ⟹ 会走到下面的除法，
+        // `NaN / NaN = NaN` ⟹ 写出 NaN —— 与官方一致。
+        //
+        // 这里**故意**不写 `if !n.is_finite() { continue; }`：
+        // 那会让 mdlc 写出一个有限值，而官方写的是 NaN。
+        // 引擎对 NaN 与有限值的处理不同（NaN 会让 IK 解算整体失效），
+        // **复刻官方行为比「修正」它更正确**。
+        if n == 0.0 {
+            continue;
+        }
+        let d = [
+            (acc[ci][0] / n) as f32,
+            (acc[ci][1] / n) as f32,
+            (acc[ci][2] / n) as f32,
+        ];
+        compiled.desc.ikchains[pending[ci]].knee_dir = Some(d);
     }
 }
 
@@ -6628,7 +7001,7 @@ end
         // 手写一份可能与实现分叉的减法。
         let mut delta = [raw.clone()];
         // `std::slice::from_ref` 而不是 `&[base.clone()]` —— `base` 下面还要用。
-        subtract_base_frames(&mut delta, std::slice::from_ref(&base), 0);
+        subtract_base_frames(&mut delta, std::slice::from_ref(&base), 0, &[1.0; 64]);
         let delta = &delta[0];
 
         // 增量确实是「小」的 —— 塌陷 bug 下误差会趋近 0。
