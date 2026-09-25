@@ -1989,8 +1989,24 @@ smd = "myprop-ref.smd"
         );
     }
 
+    /// tri-list 按三角形顺序写出，且**绕序是 Source 约定（CW）**。
+    ///
+    /// # ⚠️ 这条测试的期望值改过一次（R21）
+    ///
+    /// 原期望是 `[0, 1, 2]` —— 即「原样透传 SMD 顺序」。那是**错的**：
+    /// Source 的正面是 CW（与 Blender/OpenGL 的 CCW 相反），官方在导入时
+    /// 就把每个三角形的第 2、3 个顶点交换（`v1support.cpp:192-196`，
+    /// `flip_triangles` **默认 1**）。
+    ///
+    /// 原样透传 ⟹ **每个三角形都反向** ⟹ 面法向整体朝内 ——
+    /// 这就是用户报的「Blender 里面法向是反的」。
+    ///
+    /// 现在期望是 `[0, 2, 1]`（第 2、3 个交换）。**这条测试本身不会
+    /// 告诉你哪个对** —— 它只是锁住当前行为；真正的判据是
+    /// `docs/_probe/probe_winding_order.js` 对 6 个 `vm_test_group` 模型
+    /// 的实测（官方与 SMD「同序 0 / 逆序 12996」）。
     #[test]
-    fn indices_are_tri_list_in_order() {
+    fn indices_are_tri_list_in_source_winding() {
         let c = minimal();
         let out = write_vtx(&c).unwrap();
         let b = &out.bytes;
@@ -2004,7 +2020,17 @@ smd = "myprop-ref.smd"
         let idx: Vec<u16> = (0..3)
             .map(|k| u16::from_le_bytes([b[i_abs + k * 2], b[i_abs + k * 2 + 1]]))
             .collect();
-        assert_eq!(idx, vec![0, 1, 2], "tri-list 应按三角形顺序写出");
+        assert_eq!(
+            idx,
+            vec![0, 2, 1],
+            "tri-list 应按 Source 约定（CW）写出 —— 第 2、3 个角交换。\
+             得到 [0,1,2] 说明 `flip_triangles` 没生效（面法向会朝内）"
+        );
+        // 非空洞硬门：这三个下标必须**互不相同**，否则「交换」不可观测。
+        assert!(
+            idx[0] != idx[1] && idx[1] != idx[2] && idx[0] != idx[2],
+            "三个角下标必须互异，否则测不出绕序：{idx:?}"
+        );
     }
 
     #[test]

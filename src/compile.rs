@@ -436,7 +436,7 @@ fn build_model_lods(
             ));
             continue;
         }
-        let meshes = match build_meshes(&smd, desc, &smd_path, &lpath) {
+        let meshes = match build_meshes(&smd, desc, &smd_path, &lpath, m.flip_triangles) {
             Ok(v) => v,
             Err(err) => {
                 errs.push(err);
@@ -563,11 +563,31 @@ impl<'s, 'd> VertexBoneMap<'s, 'd> {
     }
 }
 
+/// 由 SMD 的三角形构建逐材质的 mesh。
+///
+/// # `flip_triangles` —— **Source 的正面是 CW**
+///
+/// 官方 `v1support.cpp:192-196`（`Grab_UpdateFace`）：
+/// ```c
+/// if (flip_triangles) { j = pFace->b;  pFace->b = pFace->c;  pFace->c = j; }
+/// ```
+/// 即交换第 2、3 个顶点。`flip_triangles` **默认为 1**（`studiomdl.cpp:6893`），
+/// 只有 QC 写了 `reverse` 才置 0（`:935`）。
+///
+/// ⚠️ **漏掉它 ⟹ 每个三角形的绕序都反向 ⟹ 面法向整体朝内。**
+/// 逐顶点法线（VVD 的 `normal`）**仍然完全正确**，所以
+/// `cmp_vtx_vvd_full.js` 那类「按属性比顶点」的探针**测不出来** ——
+/// 它把三角形当**无序**三元组比（`vtxlib.js` 的 `triSet`），
+/// 绕序反了照样全绿。
+///
+/// 判据（`docs/_probe/probe_winding_order.js`，6 个 `vm_test_group` 模型）：
+/// 官方与 SMD 原始顺序「同序 0 / 逆序 12996」，mdlc 修前「同序 6905 / 逆序 0」。
 fn build_meshes(
     smd: &Smd,
     desc: &ModelDesc,
     smd_path: &Path,
     at: &str,
+    flip_triangles: bool,
 ) -> Result<Vec<Mesh>, CompileError> {
     let names = smd.materials_in_order();
     if names.is_empty() {
@@ -633,6 +653,11 @@ fn build_meshes(
             let v = smd_vertex_to_ir(sv, desc, &bone_map, smd_path, at)?;
             let idx = weld_or_push(pool, table, sec, &v);
             corner[c] = idx;
+        }
+        // ⚠️ **绕序翻转**（`v1support.cpp:192-196`）：交换第 2、3 个角。
+        // 见 [`build_meshes`] 的文档 —— 漏掉它会让整个模型的面法向朝内。
+        if flip_triangles {
+            corner.swap(1, 2);
         }
         // 退化三角形（去重后有两个角相同）直接跳过 —— 它们在 VVD/VTX 里
         // 是零面积面，会让 strip 生成器产出无效数据。
@@ -1277,7 +1302,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 continue;
             }
 
-            let meshes = match build_meshes(&smd, desc, &smd_path, &at) {
+            let meshes = match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
                 Ok(v) => v,
                 Err(err) => {
                     errors.push(err);
@@ -8660,6 +8685,125 @@ switch_point = 30.0
             );
             assert_eq!(ml.triangles.len(), 2, "第 {i} 块应保留 2 档 LOD");
         }
+    }
+
+    // ---- 三角形绕序（`flip_triangles`）----
+    //
+    // 起因：用户把 mdlc 的产物反编译进 Blender 后报「**面法向是反的**」，
+    // 而官方产物完全正确。根因是 Source 的**正面是 CW**（与 Blender/OpenGL
+    // 的 CCW 相反），官方在导入 SMD 时就把每个三角形的第 2、3 个顶点交换
+    // （`v1support.cpp:192-196`，`flip_triangles` **默认 1**）。
+    //
+    // ⚠️ **这类 bug 逃过了所有「比顶点属性」的探针** ——
+    // `cmp_vtx_vvd_full.js` 用 `vtxlib.js` 的 `triSet`（**无序**三元组集合）
+    // 比三角形，绕序反了照样全绿。**判据必须显式比「顶点顺序」。**
+
+    /// SMD 里一个三角形的三个顶点，**顺序**必须按 Source 约定翻转。
+    ///
+    /// 判据用**几何面法线**：SMD 的顶点行自带法线 `(0,0,1)`，
+    /// 而三角形按 CCW 摆放时 `cross(v1−v0, v2−v0)` 指向 `+Z`。
+    /// 官方翻转后绕序变 CW ⟹ 叉积指向 `−Z`。
+    ///
+    /// 夹具特意让「叉积」在翻转前后**符号相反且非零**（面积足够大），
+    /// 否则会退化成空洞测试。
+    #[test]
+    fn flip_triangles_reverses_winding_by_default() {
+        let d = tmpdir("flip-triangles");
+        // 一个 CCW 三角形（从 +Z 看是逆时针）：叉积 = +Z
+        //   v0=(0,0,0)  v1=(1,0,0)  v2=(0,1,0)
+        //   e1=(1,0,0)  e2=(0,1,0)  cross = (0*0-0*1, 0*0-1*0, 1*1-0*0) = (0,0,1)
+        let smd = r#"version 1
+nodes
+  0 "root" -1
+end
+skeleton
+  time 0
+    0 0 0 0 0 0 0
+end
+triangles
+myprop
+  0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 0 1.000000
+  0 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 0 1.000000
+  0 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 1.000000 1 0 1.000000
+end
+"#;
+        write(&d, "m.smd", smd);
+        // `flip_triangles = true`（默认）
+        let toml_on = r#"
+[[materials.textures]]
+name = "myprop"
+[model]
+name = "m"
+[[bodyparts]]
+name = "b"
+[[bodyparts.models]]
+smd = "m.smd"
+[[bones]]
+name = "root"
+"#;
+        write(&d, "on.toml", toml_on);
+        let desc_on = ModelDesc::from_toml(toml_on).expect("解析 TOML");
+        let c_on = compile(&desc_on, &d).expect("编译（flip=true）");
+        let tri_on = &c_on.bodyparts[0].models[0].meshes[0].triangles[0];
+        let vs_on = &c_on.bodyparts[0].models[0].meshes[0].vertices;
+        let n_on = tri_normal(vs_on, *tri_on);
+
+        // `flip_triangles = false`（等价于 QC 写了 `reverse`）
+        let toml_off = toml_on.replace("smd = \"m.smd\"", "smd = \"m.smd\"\nflip_triangles = false");
+        write(&d, "off.toml", &toml_off);
+        let desc_off = ModelDesc::from_toml(&toml_off).expect("解析 TOML");
+        let c_off = compile(&desc_off, &d).expect("编译（flip=false）");
+        let tri_off = &c_off.bodyparts[0].models[0].meshes[0].triangles[0];
+        let vs_off = &c_off.bodyparts[0].models[0].meshes[0].vertices;
+        let n_off = tri_normal(vs_off, *tri_off);
+
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 非空洞硬门：两个法线都必须非零（面积够大）。
+        assert!(
+            n_on[2].abs() > 0.5,
+            "flip=true 的叉积 Z = {}，夹具面积太小 ⟹ 空洞测试",
+            n_on[2]
+        );
+        assert!(
+            n_off[2].abs() > 0.5,
+            "flip=false 的叉积 Z = {}，夹具面积太小 ⟹ 空洞测试",
+            n_off[2]
+        );
+        // 核心判据：两者**符号相反**。
+        assert!(
+            n_on[2] * n_off[2] < 0.0,
+            "flip=true 叉积 Z={} 与 flip=false 叉积 Z={} 应异号（绕序被翻转）",
+            n_on[2],
+            n_off[2]
+        );
+        // 且 `flip=false` 应保持 SMD 的原始 CCW（+Z）。
+        assert!(
+            n_off[2] > 0.0,
+            "flip=false 应保持 SMD 原始绕序（叉积 +Z），实际 {}",
+            n_off[2]
+        );
+        // `flip=true`（默认）应得到 CW（−Z）—— 这才是 Source 的约定。
+        assert!(
+            n_on[2] < 0.0,
+            "flip=true（**默认**）应翻转成 CW（叉积 −Z），实际 {} \
+             —— 这是「Blender 里面法向反了」的根因",
+            n_on[2]
+        );
+    }
+
+    /// 三角形 `(v0, v1, v2)` 的几何面法线（未归一化，符号即绕序）。
+    fn tri_normal(verts: &[crate::model::Vertex], t: [u32; 3]) -> [f32; 3] {
+        let a = verts[t[0] as usize].pos;
+        let b = verts[t[1] as usize].pos;
+        let c = verts[t[2] as usize].pos;
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ]
     }
 
     /// 把一个 `Mesh` 渲染成最小合法 SMD（材质名与 `desc_toml` 的材质一致）。

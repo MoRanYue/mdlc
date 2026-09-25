@@ -310,12 +310,46 @@ pub fn matrix_quaternion(m: &Matrix3x4) -> [f32; 4] {
 }
 
 /// `matrix_quaternion` 的 f64 版本（内部用）。
+///
+/// # ⚠️ 存储是**行主序**（`f[r*4 + c] == m[r][c]`）—— 注释曾写反
+///
+/// `angle_matrix` 写的是 `[cp*cy, sr*sp*cy−cr*sy, cr*sp*cy+sr*sy, 0, cp*sy, …]`，
+/// 与官方 `AngleMatrix(RadianEuler)` 的 `matrix[row][col]` 逐一对应：
+///
+/// | 下标 | mdlc 值 | 官方 |
+/// |---|---|---|
+/// | `f[0]` | `cp*cy` | `m[0][0]` |
+/// | `f[1]` | `sr*sp*cy−cr*sy` | `m[0][1]` |
+/// | `f[4]` | `cp*sy` | `m[1][0]` |
+/// | `f[9]` | `sr*cp` | `m[2][1]` |
+///
+/// ⟹ `f[r*4+c] = m[r][c]`，**行主序**。
+///
+/// # R22：`m12` 与 `m21` 曾经互换（真 bug）
+///
+/// 原实现按「列主序」取下标：
+/// ```text
+/// let (m10, m12) = (f[4], f[9]);   // m12 取了 f[9]（那是 m[2][1]）
+/// let (m20, m21) = (f[8], f[6]);   // m21 取了 f[6]（那是 m[1][2]）
+/// ```
+/// 行主序下正确的下标是 `m12 = f[6]`、`m21 = f[9]` —— **恰好互换**。
+///
+/// 后果：四元数的 `x` 分量用 `m21 − m12` 算（`mathlib_base.cpp:1129`），
+/// 互换后变成 `m12 − m21` ⟹ **x 分量符号翻转**，`w` 也受影响 ⟹
+/// 解出的旋转是**另一个旋转**（实测 IK 误差的旋转三轴差最大 **1.24 rad**）。
+///
+/// 判据（`docs/_probe/probe_ik_error_census.js`）：
+/// `v_silenced_smg` `a_idle_1` 的 `rhand touch` 规则，
+/// 位置三轴**逐位相同**、旋转三轴差 `0.98 / 1.24 / 0.19`。
+///
+/// ⚠️ 之所以长期没被发现：这条路径**只被 IK 误差用到**，而
+/// 「无 IK rule 的动画」和「`IK_RELEASE`（载荷全 0）」都碰不到它。
 fn matrix_quaternion_f64(f: &[f64; 12]) -> [f64; 4] {
-    // mdlc 的 `Matrix3x4` 是**列主序**扁平数组：`f[c*4 + r] == m[r][c]`。
+    // `f[r*4 + c] == m[r][c]`（行主序）。
     let (m00, m11, m22) = (f[0], f[5], f[10]);
     let (m01, m02) = (f[1], f[2]);
-    let (m10, m12) = (f[4], f[9]);
-    let (m20, m21) = (f[8], f[6]);
+    let (m10, m12) = (f[4], f[6]);
+    let (m20, m21) = (f[8], f[9]);
 
     let mut trace = m00 + m11 + m22 + 1.0;
     let mut q;
@@ -788,6 +822,76 @@ pub fn compute_pose_to_bone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- `matrix_quaternion` 的 `m12` / `m21`（R22）----
+
+    /// **`m12` / `m21` 不能互换** —— 存储是**行主序** `f[r*4+c] == m[r][c]`。
+    ///
+    /// # 这条测试为什么必要
+    ///
+    /// `matrix_quaternion` 只被 **IK 误差**用到，而 IK 误差只在
+    /// 「有 `ikrule` 且不是 `release`」的动画上出现 ⟹ 绝大多数夹具碰不到它。
+    /// 一旦下标写错（R22：`m12` 取了 `f[9]`、`m21` 取了 `f[6]`，恰好互换），
+    /// 四元数的 `x` 分量符号翻转，解出**另一个旋转**，
+    /// 而所有「比顶点 / 比参考姿态 / 比逐帧欧拉角」的探针**全都测不出来**
+    /// —— 实测只表现为 IK 误差的旋转三轴差 0.98/1.24/0.19 rad。
+    ///
+    /// # 判据
+    ///
+    /// 用一个**非对称**旋转（绕 X 30°）：`m[1][2] = −sin30 = −0.5`、
+    /// `m[2][1] = +sin30 = +0.5` ⟹ 互换**可观测**。
+    /// （对称矩阵上互换是恒等变换，那就是**空洞测试** —— 下面有硬门挡它。）
+    #[test]
+    fn matrix_quaternion_round_trips_angle_matrix() {
+        let e = [30f32.to_radians(), 0.0, 0.0];
+        let m = angle_matrix(e);
+        // 非空洞硬门：`m[1][2]`（f[6]）与 `m[2][1]`（f[9]）必须真的不同。
+        assert!(
+            (m[6] - m[9]).abs() > 0.5,
+            "夹具的 m[1][2]={} 与 m[2][1]={} 太接近 ⟹ 互换不可观测（空洞测试）",
+            m[6],
+            m[9]
+        );
+
+        let got = matrix_quaternion(&m);
+        let want = angle_quaternion(e);
+        // 四元数 `q` 与 `-q` 等价，所以比绝对值点积。
+        let dot: f32 = (0..4).map(|k| got[k] * want[k]).sum();
+        assert!(
+            dot.abs() > 0.9999,
+            "matrix_quaternion(angle_matrix([30°,0,0])) 应还原该旋转：\
+             得到 {got:?}，应为 {want:?}（|dot| = {}）",
+            dot.abs()
+        );
+        // 反证：`x` 分量必须非零**且与期望同号** —— 互换会让它翻号。
+        assert!(got[0].abs() > 0.2, "x 分量 {} 太小", got[0]);
+        assert!(
+            got[0] * want[0] > 0.0,
+            "x 分量符号反了（{} vs {}）⟹ `m12`/`m21` 被互换（R22 回来了）",
+            got[0],
+            want[0]
+        );
+    }
+
+    /// 绕 Y、绕 Z、复合旋转也要往返（覆盖 `MatrixAngles` 的其余分支）。
+    #[test]
+    fn matrix_quaternion_round_trips_all_axes() {
+        for e in [
+            [0f32, 40f32.to_radians(), 0.0],
+            [0f32, 0.0, 55f32.to_radians()],
+            [20f32.to_radians(), 35f32.to_radians(), 15f32.to_radians()],
+        ] {
+            let m = angle_matrix(e);
+            let got = matrix_quaternion(&m);
+            let want = angle_quaternion(e);
+            let dot: f32 = (0..4).map(|k| got[k] * want[k]).sum();
+            assert!(
+                dot.abs() > 0.9999,
+                "euler {e:?}：得到 {got:?}，应为 {want:?}（|dot| = {}）",
+                dot.abs()
+            );
+        }
+    }
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5

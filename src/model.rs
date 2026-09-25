@@ -2657,6 +2657,44 @@ pub struct BodyModel {
     /// 不写则自动取 `smd` 的文件名部分，与 studiomdl 行为一致。
     #[serde(default)]
     pub name: Option<String>,
+    /// **是否翻转三角形绕序**（`flip_triangles`）。
+    ///
+    /// # 默认是 `true` —— 官方**默认翻转**
+    ///
+    /// `studiomdl.cpp:6893`（`ResetModel`）：
+    /// ```c
+    /// flip_triangles = 1;                    // ← 全局默认**开**
+    /// ```
+    /// `Cmd_Body` / `Cmd_Studio`（`:926` / `:7040`）在**每条** `$body`/`$studio`
+    /// 开头都重置成 `1`，只有显式写了 `reverse` 才置 `0`（`:935`）。
+    ///
+    /// 翻转发生在 `v1support.cpp:192-196`（`Grab_UpdateFace`）：
+    /// ```c
+    /// if (flip_triangles) { j = pFace->b; pFace->b = pFace->c; pFace->c = j; }
+    /// ```
+    /// 即**交换第 2、3 个顶点**（`a` 不动）。
+    ///
+    /// # 为什么必须有这一位（这是「Blender 里面法向反了」的根因）
+    ///
+    /// Source 引擎的**正面是 CW**（顺时针）—— 与 Blender/OpenGL 的 CCW 约定
+    /// **相反**。官方在**导入时**就把绕序翻过来，所以产物里存的是 CW；
+    /// mdlc 原先原样透传 SMD 顺序（CCW）⟹ **每个三角形都反向**
+    /// ⟹ 逐顶点法线仍然正确、但**面法向整体朝内**。
+    ///
+    /// 判据（`docs/_probe/probe_winding_order.js`，6 个 `vm_test_group` 模型）：
+    ///
+    /// | | 与 SMD 原始顺序「同序」 | 「逆序」 |
+    /// |---|---|---|
+    /// | 官方 | **0** | 12996（逐三角形精确反转） |
+    /// | mdlc（修前） | 6905 | **0** |
+    ///
+    /// 另：官方语料 **396/398** 个模型的「几何面法线 vs 顶点法线」是**反向**
+    /// ⟹ 这就是 Source 的正确约定，不是数据错。
+    ///
+    /// ⚠️ **TOML 侧默认也是 `true`**（与 QC 一致）。要复刻「SMD 本身已是
+    /// CW」的老资产才需要设 `false`。
+    #[serde(default = "default_true")]
+    pub flip_triangles: bool,
     /// **LOD 1..N 的网格**（QC 的 `$lod <距离> replacemodel <lodN.smd> <lod0.smd>`）。
     ///
     /// 顺序即 LOD 顺序：`lods[0]` 是 LOD 1，`lods[1]` 是 LOD 2……

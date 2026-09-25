@@ -819,12 +819,19 @@ impl<'a> Parser<'a> {
         let t = self.tok(false)?;
         let filename = t.text.clone();
         let mut model_name = name_override;
+        // ⚠️ **`flip_triangles` 默认是 `true`（翻转），`reverse` 把它关掉。**
+        //
+        // `studiomdl.cpp:926`（`Cmd_Body`）/ `:7040`（`Cmd_Studio`）在每条
+        // `$body`/`$studio` 开头都 `flip_triangles = 1;`，只有写了 `reverse`
+        // 才置 `0`（`:935`）。**方向容易记反** —— 写 `reverse` 是
+        // 「**不要**翻转」，不是「翻转」。
+        let mut flip_triangles = true;
 
         // 行内选项。
         while self.avail() {
             let o = self.tok(false)?;
             match o.text.to_ascii_lowercase().as_str() {
-                "reverse" => {}
+                "reverse" => flip_triangles = false,
                 "scale" => {
                     let _ = self.f()?;
                 }
@@ -849,7 +856,9 @@ impl<'a> Parser<'a> {
         self.referenced_files.push(smd.clone());
         Ok(BodyModel {
             smd,
-            name: model_name.take(),            lods: Vec::new(),
+            name: model_name.take(),
+            flip_triangles,
+            lods: Vec::new(),
             eyeballs: Vec::new(),
             flexes: Vec::new(),
         })
