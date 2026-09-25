@@ -267,6 +267,47 @@ pub struct BoneChannels {
     /// 与 [`Self::pos_const_raw`]（绝对值载荷）分开存放，理由见
     /// `write_chain_body` 里 `use_rawpos` 的说明。
     pub pos_delta_is_const: bool,
+    /// 旋转三轴都恒定时，`RAWROT2` 要写的**绝对**欧拉角（弧度）。
+    ///
+    /// # 为什么必须有这一份（这是「动画里骨骼旋转不正确」的根因）
+    ///
+    /// `RAWROT2`（`Quaternion64`）是**常量**，引擎**逐字返回**它、
+    /// **不加**参考旋转：
+    ///
+    /// ```c
+    /// // bone_setup.cpp:367-372
+    /// if ( panim->flags & STUDIO_ANIM_RAWROT2 ) {
+    ///     q = *(panim->pQuat64());
+    ///     return;                     // ← 直接返回，不碰 baseRot
+    /// }
+    /// ```
+    ///
+    /// 对比 `ANIMROT`（`bone_setup.cpp:398-406`）**会**加 `baseRot`：
+    /// ```c
+    /// if (!(panim->flags & STUDIO_ANIM_DELTA)) angle1.x += baseRot.x;  // ← 加参考
+    /// ```
+    ///
+    /// 而官方写出时用的是**绝对**旋转（`write.cpp:756`）：
+    /// ```c
+    /// AngleQuaternion( srcanim->sanim[0][j].rot, q );   // sanim = 绝对值
+    /// ```
+    ///
+    /// ⟹ **`RAWROT2` 必须存绝对值**；存差值会让该骨骼整体少转一个
+    /// 参考旋转。实测 `v_snip_awp` 根骨骼 `b0` 的参考旋转是
+    /// **`[π/2, 0, 0]`**，于是动画里根骨骼**整整少转 90°**
+    /// —— 与用户 HLMV 观察到的「参考姿态对、动画里旋转不对」完全吻合。
+    ///
+    /// 判据（`probe_const_dump.js` + 四元数点积）：
+    /// | 侧 | 根骨骼 `b0` 的 `RAWROT2` 反解欧拉 |
+    /// |---|---|
+    /// | 官方 | `[π/2, 0, π/2]` = 参考 `[π/2,0,0]` **+** 差值 `[0,0,π/2]` |
+    /// | mdlc（修前） | `[0, 0, π/2]` = **只有差值** ❌ |
+    ///
+    /// `aq(ref + delta)` 与官方四元数的 `|dot| = 1.0000005` ⟹ 精确命中。
+    ///
+    /// ⚠️ **`DELTA` 动画（`subtract` 出来的）例外**：它的 `sanim` 本身就是
+    /// 增量、引擎也不加参考，所以绝对值 == 差值。
+    pub rot_const_raw: Option<[f32; 3]>,
 }
 
 impl BoneChannels {
@@ -440,6 +481,12 @@ type BoneFrameTable = Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>)>;
 /// 与 `per_seq_frames` **同下标**平行存放 —— 见 `write_animations`
 /// 里 1b 段的说明（`RAWPOS` 存绝对值、`ANIMPOS` 存差值，两者语义不同）。
 type AbsPosTable = Vec<[f32; 3]>;
+
+/// `RAWROT2` 要写的**绝对**旋转欧拉角（弧度）。
+///
+/// 与 [`AbsPosTable`] 完全对称 —— `RAWROT2` 也是常量载荷，引擎不加参考旋转。
+/// 详见 [`BoneChannels::rot_const_raw`]。
+type AbsRotTable = Vec<[f32; 3]>;
 
 /// 把逐帧同值的量化序列折叠成常量；全 0 折叠成 [`AxisData::Absent`]。
 ///
@@ -1118,6 +1165,9 @@ fn write_one_chain(
                     pos: [c(&ch.pos[0]), c(&ch.pos[1]), c(&ch.pos[2])],
                     pos_const_raw: ch.pos_const_raw,
                     pos_delta_is_const: ch.pos_delta_is_const,
+                    // 旋转常量载荷照用：`c` 只把 `Sampled` 降级成 `Absent`，
+                    // 不改变「该常量是什么」。
+                    rot_const_raw: ch.rot_const_raw,
                 }
             })
             .collect();
@@ -1160,6 +1210,7 @@ fn write_one_chain(
             // 切出来的每一段也恒定，常量位移可以照用。
             pos_const_raw: ch.pos_const_raw,
             pos_delta_is_const: ch.pos_delta_is_const,
+            rot_const_raw: ch.rot_const_raw,
         })
         .collect();
 
@@ -1335,7 +1386,17 @@ fn write_chain_body(
         let next_pos = anim_data.len();
         anim_data.extend_from_slice(&0i16.to_le_bytes());
 
-        if let Some(a) = rot_angle.filter(|_| use_rawrot2) {
+        // `RAWROT2` 的**载荷**必须是**绝对**旋转，不是差值 ——
+        // 引擎对 `RAWROT2` **逐字返回**、不加参考旋转
+        // （`bone_setup.cpp:367-372`；而 `ANIMROT` 的流**会**加，
+        // 见 `:398-406`）。详见 [`BoneChannels::rot_const_raw`]。
+        //
+        // ⚠️ **判据仍用差值**（`rot_angle`）：要不要写 `RAWROT2` 取决于
+        // 「差值是否恒定且非零」（`write.cpp:736-740` 的 `numanim` 全 0 跳过），
+        // 而**写什么**取决于绝对旋转。两者是不同的量 —— 混用会让
+        // 「差值恒 0 但参考旋转非 0」的骨骼少转一个参考旋转
+        // （实测根骨骼 `b0` 少转 **90°**）。
+        if let Some(a) = ch.rot_const_raw.filter(|_| use_rawrot2) {
             let q = crate::bone_math::angle_quaternion(a);
             anim_data.extend_from_slice(&encode_quaternion64(q));
         }
@@ -2690,6 +2751,12 @@ pub fn write_animations(
     let mut per_seq_frames: Vec<BoneFrameTable> = Vec::with_capacity(specs.len());
     // 与 `per_seq_frames` 同下标：每根骨骼 `RAWPOS` 要写的绝对值。
     let mut per_seq_abs_pos: Vec<AbsPosTable> = Vec::with_capacity(specs.len());
+    // 与 `per_seq_frames` 同下标：每根骨骼 `RAWROT2` 要写的**绝对**旋转。
+    //
+    // ⚠️ 与 `per_seq_abs_pos` 完全对称 —— `RAWROT2` 也是**常量载荷**，
+    // 引擎同样**不加**参考旋转（见 `BoneChannels::rot_const_raw` 的说明）。
+    // 缺了它，凡走 `RAWROT2` 的骨骼都会少转一个参考旋转。
+    let mut per_seq_abs_rot: Vec<AbsRotTable> = Vec::with_capacity(specs.len());
     let mut pos_scale = vec![[0.0f32; 3]; bone_count];
     let mut rot_scale = vec![[0.0f32; 3]; bone_count];
 
@@ -2703,6 +2770,7 @@ pub fn write_animations(
         }
         let mut table: BoneFrameTable = Vec::with_capacity(bone_count);
         let mut abs_pos: AbsPosTable = Vec::with_capacity(bone_count);
+        let mut abs_rot: AbsRotTable = Vec::with_capacity(bone_count);
         for (b, (ref_pos, ref_rot)) in ref_poses.iter().enumerate().take(bone_count) {
             let is_root = bone_parents.get(b).copied().unwrap_or(-1) < 0;
             let (rot_frames, pos_frames) = if spec.identity {
@@ -2734,6 +2802,33 @@ pub fn write_animations(
                         *ref_pos,
                     )
                 }
+            };
+            // `RAWROT2` 的载荷：**绝对**旋转欧拉角。
+            //
+            // ⚠️ **与 `RAWPOS` 完全对称** —— `RAWROT2` 是常量，引擎
+            // **逐字返回**、不加参考旋转（`bone_setup.cpp:367-372`），
+            // 而 `ANIMROT` 的流**会**加（`bone_setup.cpp:398-406`）。
+            // 所以常量形态必须自己把参考旋转烘进去。
+            //
+            // 官方口径（`write.cpp:756`）：
+            // ```c
+            // AngleQuaternion( srcanim->sanim[0][j].rot, q );   // sanim = 绝对值
+            // ```
+            //
+            // 用「差值 + 参考」而不是直接取 `p.rotation`，是为了与
+            // `delta_frames` **走同一条路径**（含 `wrap_to_pi` 与根骨骼
+            // 的 +π/2 偏置），否则根骨骼会差一个整圈。
+            //
+            // `DELTA` 动画（`subtract`）例外：`sanim` 本身就是增量，
+            // 引擎也不加参考 ⟹ 绝对值 == 差值。
+            //
+            // ⚠️ 必须在 `table.push` **之前**取（`rot_frames` 会被移动）。
+            let abs_rot_v = if compiled.animations[spec.anim_index].delta {
+                rot_frames.first().copied().unwrap_or([0.0; 3])
+            } else {
+                [0, 1, 2].map(|k| {
+                    wrap_to_pi(rot_frames.first().map_or(0.0, |r| r[k]) + ref_rot[k])
+                })
             };
             table.push((rot_frames, pos_frames));
             // `RAWPOS` 的载荷：**绝对**局部位移（根骨骼按 yaw +90° 旋转）。
@@ -2774,9 +2869,11 @@ pub fn write_animations(
                     })
                     .unwrap_or([0.0; 3]),
             );
+            abs_rot.push(abs_rot_v);
         }
         per_seq_frames.push(table);
         per_seq_abs_pos.push(abs_pos);
+        per_seq_abs_rot.push(abs_rot);
     }
 
     // ---- 1a-2. 全局 (max_abs, extreme) ----
@@ -2845,7 +2942,15 @@ pub fn write_animations(
                 pos: [AxisData::Absent, AxisData::Absent, AxisData::Absent],
                 pos_const_raw: None,
                 pos_delta_is_const: false,
+                rot_const_raw: None,
             };
+            // 旋转**差值**逐帧同值 ⇒ 可以写常量 `RAWROT2`。
+            // 同时记下要写的**绝对**旋转（见 `BoneChannels::rot_const_raw`）。
+            if let Some(first) = rot_frames.first()
+                && rot_frames.iter().all(|r| *r == *first)
+            {
+                ch.rot_const_raw = Some(per_seq_abs_rot[si][b]);
+            }
             // 位移**差值**逐帧同值 ⇒ 可以写常量 `RAWPOS`。
             // 同时记下 `RAWPOS` 要写的**绝对**位移
             // （见上面 `per_seq_abs_pos` 的构造与说明）。
@@ -4495,6 +4600,7 @@ mod tests {
             ],
             pos_const_raw: None,
             pos_delta_is_const: false,
+            rot_const_raw: None,
         };
         assert!(ch.constant_rot().is_none());
     }
@@ -4514,9 +4620,92 @@ mod tests {
             ],
             pos_const_raw: None,
             pos_delta_is_const: false,
+            rot_const_raw: None,
         };
         let a = ch.constant_rot().expect("三轴都不随时间变化 → 常量");
         assert_eq!(a, [0.0, 0.0, 100.0]);
+    }
+
+    /// **`RAWROT2` 的载荷必须是绝对旋转，不是差值。**
+    ///
+    /// # 这是「动画里骨骼旋转不正确」的根因
+    ///
+    /// 引擎对 `RAWROT2`（常量 `Quaternion64`）**逐字返回**、**不加**参考旋转
+    /// （`bone_setup.cpp:367-372`）：
+    /// ```c
+    /// if ( panim->flags & STUDIO_ANIM_RAWROT2 ) { q = *(panim->pQuat64()); return; }
+    /// ```
+    /// 而 `ANIMROT` 的流**会**加（`bone_setup.cpp:398-406`）：
+    /// ```c
+    /// if (!(panim->flags & STUDIO_ANIM_DELTA)) angle1.x += baseRot.x;
+    /// ```
+    ///
+    /// 官方写出时用**绝对**旋转（`write.cpp:756`）：
+    /// ```c
+    /// AngleQuaternion( srcanim->sanim[0][j].rot, q );
+    /// ```
+    ///
+    /// ⟹ 常量形态若写差值，该骨骼会**整体少转一个参考旋转**。
+    /// 实测 `v_snip_awp` 根骨骼 `b0` 的参考旋转是 `[π/2, 0, 0]`
+    /// ⟹ 动画里根骨骼**整整少转 90°**（用户 HLMV 实测症状）。
+    ///
+    /// 本测试钉住「载荷 = 参考 + 差值」，且与 `RAWPOS` 的绝对语义**对称**。
+    #[test]
+    fn rawrot2_payload_is_absolute_not_delta() {
+        // 参考旋转 roll = π/2（v_snip_awp 根骨骼的真实值）。
+        let ref_rot = [std::f32::consts::FRAC_PI_2, 0.0, 0.0];
+        // 差值：只有 yaw 变化 π/2（根骨骼的 +90° 偏置）。
+        let delta = [0.0f32, 0.0, std::f32::consts::FRAC_PI_2];
+        // 官方 = 参考 + 差值 = [π/2, 0, π/2]。
+        let want = [std::f32::consts::FRAC_PI_2, 0.0, std::f32::consts::FRAC_PI_2];
+
+        let abs: [f32; 3] = [0, 1, 2].map(|k| wrap_to_pi(delta[k] + ref_rot[k]));
+        assert_eq!(abs, want, "RAWROT2 载荷应为「参考 + 差值」");
+
+        // 编码出来的四元数必须**等价于** `want`（四元数点积 = ±1）。
+        //
+        // ⚠️ 不要在这里硬写「官方字节」—— `encode_quaternion64` 的位序
+        // 与探针 `probe_const_dump.js` 打印的 hex 是**两种排布**，
+        // 手抄会得到假失败（本测试第一版就抄错了 8 个字节）。
+        // 真正的逐字节判据在 `probe_const_dump.js`（实测两侧
+        // `hex=fffff7fffffaff5f` 完全相同）。
+        let q = crate::bone_math::angle_quaternion(abs);
+        let want_q = crate::bone_math::angle_quaternion(want);
+        let dot: f32 = q.iter().zip(want_q.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            (dot.abs() - 1.0).abs() < 1e-5,
+            "编码前四元数应等价于「参考+差值」，点积 = {dot}"
+        );
+
+        // 反证：只写差值会得到**不同**的四元数（旧 bug 的产物）。
+        let q_delta = crate::bone_math::angle_quaternion(delta);
+        let dot_delta: f32 = q_delta.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            (dot_delta.abs() - 1.0).abs() > 0.1,
+            "只写差值必须与绝对旋转明显不同 —— 否则本测试是空洞的（点积 {dot_delta}）"
+        );
+        // 并且差的角度应当接近 90°（参考旋转的 roll = π/2）。
+        let ang = 2.0 * dot_delta.abs().clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI;
+        assert!(
+            (ang - 90.0).abs() < 1.0,
+            "差值版与绝对值版的夹角应 ≈ 90°（参考 roll = π/2），实测 {ang}°"
+        );
+    }
+
+    /// `DELTA` 动画的 `RAWROT2` 例外：`sanim` 本身就是增量，
+    /// 引擎也不加参考 ⟹ **绝对值 == 差值**。
+    ///
+    /// 判据：官方 `blend1.mdl` 的 `look_down` 是 `0x30`（`RAWROT2|DELTA`）。
+    #[test]
+    fn rawrot2_is_delta_for_subtract_animations() {
+        let ref_rot = [std::f32::consts::FRAC_PI_2, 0.0, 0.0];
+        let delta = [0.0f32, 0.0, std::f32::consts::FRAC_PI_2];
+        // DELTA 分支：直接用差值，**不**加参考。
+        let abs = delta;
+        assert_eq!(abs, delta, "DELTA 动画的 RAWROT2 载荷 == 差值");
+        // 与「加参考」的结果必须不同 —— 否则这条分支没有意义。
+        let non_delta = [0, 1, 2].map(|k| wrap_to_pi(delta[k] + ref_rot[k]));
+        assert_ne!(abs, non_delta);
     }
 
     // ---- 常量旋转的判定 ----
@@ -4685,6 +4874,74 @@ mod tests {
         assert_eq!(y, 0, "y 应为 0");
         let qz = z as f64 / 1048576.5;
         assert!((qz - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-5, "z = {qz}，应为 +90° 的 sin(45°)");
+    }
+
+    /// **端到端**：`RAWROT2` 的载荷必须是**绝对**旋转（参考 + 差值）。
+    ///
+    /// # 为什么必须是端到端
+    ///
+    /// 本测试的第一版只断言「公式 `wrap_to_pi(delta + ref)` 等于期望值」——
+    /// 那是**纯函数测试**，把 `write_chain_body` 里的载荷改回差值时
+    /// **它照样全绿**（变异逃逸）。判据必须落在**写出的字节**上。
+    ///
+    /// # 夹具设计（关键）
+    ///
+    /// ⚠️ **参考旋转必须非零**，否则 `ref + delta == delta`，
+    /// 两种实现**恒等** ⟹ 又是空洞测试。
+    /// 这里让第 0 帧（= 参考姿态）的 roll = **π/2**，
+    /// 且三轴差值恒为 0（逐帧同姿态）⟹ 走 `RAWROT2`。
+    ///
+    /// 于是：
+    /// · 正确实现 ⟹ `RAWROT2` = `aq([π/2, 0, 0])`（**参考姿态本身**）
+    /// · 旧 bug   ⟹ `RAWROT2` = `aq([0, 0, 0])`（单位四元数）
+    ///
+    /// 两者相差 **90°**，正是用户 HLMV 观察到的症状。
+    #[test]
+    fn rawrot2_payload_is_absolute_end_to_end() {
+        // 4 帧全同、roll = π/2。参考姿态取自第 0 帧 ⟹ ref_rot = [π/2, 0, 0]。
+        let frames: Vec<Vec<SmdPose>> = (0..4)
+            .map(|_| vec![pose([0.0; 3], [std::f32::consts::FRAC_PI_2, 0.0, 0.0])])
+            .collect();
+        let c = compiled(vec![seq("idle", false, frames)], 1);
+        let out = write_with_f0_refs(&c, &[-1]).expect("写出动画");
+        let (bone, flags, payload) = walk_chain(&out.anim_data, 0)[0];
+        assert_eq!(bone, 0);
+        assert_eq!(flags, STUDIO_ANIM_RAWROT2, "逐帧同姿态应写 RAWROT2");
+
+        let bits = u64::from_le_bytes(out.anim_data[payload..payload + 8].try_into().unwrap());
+        let mask = (1u64 << 21) - 1;
+        let dec = |shift: u32| ((bits >> shift) & mask) as i64 - 1048576;
+        let (x, y, z) = (dec(0), dec(21), dec(42));
+        let s = 1048576.5f64;
+
+        // 期望 = `aq([π/2, 0, π/2])` —— **参考 roll π/2 ＋ 根骨骼 yaw 偏置 π/2**。
+        //
+        // ⚠️ 不是 `aq([π/2, 0, 0])`：`delta_frames` 对根骨骼会**额外**加
+        // `FRAC_PI_2` 到 Z 轴（`r[2] = wrap_to_pi(r[2] + FRAC_PI_2)`），
+        // 因为 `sanim` 已经过 `rootxform`（`simplify.cpp:1461`）。
+        // 这与官方 `v_snip_awp` anim[0] b0 的实测完全一致 ——
+        // 官方 `RAWROT2` 反解正是 `[π/2, 0, π/2]`（见 `probe_const_dump.js`）。
+        let want = crate::bone_math::angle_quaternion([
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+        ]);
+        let got = [x as f64 / s, y as f64 / s, z as f64 / s];
+        for k in 0..3 {
+            assert!(
+                (got[k] - want[k] as f64).abs() < 1e-4,
+                "分量 {k}：得到 {}，应为 {}（参考 roll π/2 + 根 yaw 偏置）",
+                got[k], want[k]
+            );
+        }
+        // 反证：旧 bug（只写差值 = 只有 yaw 偏置、丢了参考 roll）会给
+        // `aq([0, 0, π/2])` = (0, 0, 0.7071, 0.7071) ⟹ x 分量会是 0。
+        assert!(
+            got[0].abs() > 0.4,
+            "x = {} 太小 ⟹ 只写了差值、丢了参考旋转（旧 bug 回来了）", got[0]
+        );
+        // 官方的 `w` 符号位应为 0（正）。
+        assert_eq!((bits >> 63) & 1, 0, "w 应为正");
     }
 
     /// 有骨骼逐帧旋转时走 `ANIMROT`，且恒定轴写偏移 0。
