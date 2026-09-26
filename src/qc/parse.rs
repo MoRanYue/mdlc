@@ -668,6 +668,40 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `LookupPoseParameter`（`studiomdl.cpp:2333-2352`）—— 按名查姿势参数，
+    /// **查不到就新建一个**并返回新下标。
+    ///
+    /// ```c
+    /// for (i = 0; i < g_numposeparameters; i++)
+    ///     if (!stricmp( name, g_pose[i].name )) return i;
+    /// strcpyn( g_pose[i].name, name );      // ← 就地新建（min/max 保持 0）
+    /// g_numposeparameters = i + 1;
+    /// return i;
+    /// ```
+    ///
+    /// ⚠️ **不区分大小写**（`stricmp`），且**不去重**同名（与
+    /// [`Self::cmd_poseparameter`] 的注释一致：`ipp3.qc` 写两次同名会得到
+    /// 两条 —— 但那是 `$poseparameter` 命令本身的行为；`LookupPoseParameter`
+    /// 走的是**先查后建**，所以它能命中已存在的那条）。
+    fn poseparam_index(&mut self, name: &str) -> usize {
+        if let Some(i) = self
+            .desc
+            .model
+            .pose_parameters
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(name))
+        {
+            return i;
+        }
+        self.desc.model.pose_parameters.push(PoseParameter {
+            name: name.to_string(),
+            start: 0.0,
+            end: 0.0,
+            loop_mode: None,
+        });
+        self.desc.model.pose_parameters.len() - 1
+    }
+
     /// `$poseparameter <名> <min> <max> [wrap | loop <值>]`。
     fn cmd_poseparameter(&mut self) -> Result<(), QcError> {
         let name = self.tok(false)?.text;
@@ -1525,6 +1559,87 @@ impl<'a> Parser<'a> {
                         peak: 0.0,
                         tail: 0.0,
                         end: 0.0,
+                    });
+                }
+                "blendlayer" => {
+                    // 官方 `ParseSequence`（`studiomdl.cpp:2890-2943`）：
+                    //
+                    // ```c
+                    // pseq->autolayer[n].flags = 0;              // ← 先清零
+                    // GetToken; name                              // 序列名
+                    // GetToken; start = verify_atoi(token);
+                    // GetToken; peak  = verify_atoi(token);
+                    // GetToken; tail  = verify_atoi(token);
+                    // GetToken; end   = verify_atoi(token);
+                    // while (TokenAvailable()) {                  // ← 子标志循环
+                    //     GetToken;
+                    //     if      "xfade"         flags |= STUDIO_AL_XFADE;   // 0x0080
+                    //     else if "spline"        flags |= STUDIO_AL_SPLINE;  // 0x0040
+                    //     else if "noblend"       flags |= STUDIO_AL_NOBLEND; // 0x0200
+                    //     else if "poseparameter" flags |= STUDIO_AL_POSE;    // 0x4000
+                    //                             GetToken; pose = LookupPoseParameter(token);
+                    //     else if "local"         flags |= STUDIO_AL_LOCAL;   // 0x1000
+                    //                             pseq->flags |= STUDIO_LOCAL; // 0x1000
+                    //     else { UnGetToken(); break; }          // ← **不认识就吐回并停**
+                    // }
+                    // pseq->numautolayers++;
+                    // ```
+                    //
+                    // ⚠️ **`addlayer` 与 `blendlayer` 是同一个数组的两个形态**：
+                    // 前者只给名字（四个时间量全 0、`flags = 0`），后者给名字 +
+                    // 四个时间量 + 可选标志。官方两者都推进
+                    // `pseq->autolayer[pseq->numautolayers++]`，**顺序就是 QC 顺序**。
+                    //
+                    // ⚠️ 子标志循环**遇到不认识的就停**（`UnGetToken` + `break`），
+                    // 所以 `blendlayer "x" 1 2 3 4` 后面紧跟的动画名/其它关键字
+                    // **不会被吃掉**。
+                    let s = self.tok(false)?.text;
+                    let start = self.i()? as f32;
+                    let peak = self.i()? as f32;
+                    let tail = self.i()? as f32;
+                    let end = self.i()? as f32;
+                    let mut flags = 0i32;
+                    let mut pose = 0i16;
+                    let mut local = false;
+                    // 子标志：遇到不认识的就**吐回并停**
+                    // （官方 `UnGetToken(); break;`）。
+                    while self.avail() {
+                        let t = self.tok(false)?;
+                        match t.text.to_ascii_lowercase().as_str() {
+                            "xfade" => flags |= 0x0080,
+                            "spline" => flags |= 0x0040,
+                            "noblend" => flags |= 0x0200,
+                            "local" => {
+                                flags |= 0x1000;
+                                local = true;
+                            }
+                            "poseparameter" => {
+                                flags |= 0x4000;
+                                // `LookupPoseParameter` 找不到会**新建**一个
+                                // （`studiomdl.cpp:2333-2352`），所以这里也
+                                // 按需追加，而不是报错。
+                                let name = self.tok(false)?.text;
+                                pose = self.poseparam_index(&name) as i16;
+                            }
+                            _ => {
+                                // 不认识 ⟹ 吐回该 token 并停（官方 `UnGetToken`）。
+                                self.lex.unget(t);
+                                break;
+                            }
+                        }
+                    }
+                    if local {
+                        // `pseq->flags |= STUDIO_LOCAL`（0x1000）。
+                        seq.extra_flags = Some(seq.extra_flags.unwrap_or(0) | 0x1000);
+                    }
+                    seq.auto_layers.push(AutoLayer {
+                        sequence: s,
+                        pose,
+                        flags,
+                        start,
+                        peak,
+                        tail,
+                        end,
                     });
                 }
                 "event" => {

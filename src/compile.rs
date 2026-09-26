@@ -10976,6 +10976,228 @@ $model \"body\" \"a.smd\" {\n\
         );
     }
 
+    /// **`blendlayer` 必须解析**（`studiomdl.cpp:2890-2943`）。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// mdlc 修前**完全没有 `blendlayer` 分支** ⟹ 关键字本身与它后面的
+    /// 4 个数字全被当成**动画名**压进 `blends` ⟹
+    /// `blend 格数 6 不是完全平方数` 之类的**误导性**错误。
+    ///
+    /// 真实影响（用户的 `v_pistola_processed.qc`，8 处 `blendlayer`）：
+    ///
+    /// | 编译器 | 结果 |
+    /// |---|---|
+    /// | 真 `studiomdl.exe` | **exit 0** |
+    /// | NekoMDL | **exit 0** |
+    /// | mdlc（修前） | **exit 1，8 处错误** |
+    ///
+    /// # 官方语义（`studiomdl.cpp:2890-2943`）
+    ///
+    /// ```c
+    /// autolayer[n].flags = 0;
+    /// name  = token; start = atoi; peak = atoi; tail = atoi; end = atoi;
+    /// while (TokenAvailable()) {
+    ///     if      "xfade"         flags |= 0x0080;
+    ///     else if "spline"        flags |= 0x0040;
+    ///     else if "noblend"       flags |= 0x0200;
+    ///     else if "poseparameter" flags |= 0x4000; pose = LookupPoseParameter(next);
+    ///     else if "local"         flags |= 0x1000; pseq->flags |= 0x1000;
+    ///     else { UnGetToken(); break; }        // ← 不认识就**吐回并停**
+    /// }
+    /// ```
+    ///
+    /// # 实测官方（真 `studiomdl.exe`）
+    ///
+    /// ```text
+    /// blendlayer "layer" 2 5 9 12
+    ///   ⟹ iSequence=<layer 的下标> iPose=0 flags=0x0
+    ///      start=2 peak=5 tail=9 end=12
+    /// ```
+    #[test]
+    fn blendlayer_parses_times_and_flags() {
+        let d = cb_dir("bl-layer");
+        let qc = "\
+$modelname \"bl.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+blend \"px\" 1 -1\n\
+blendwidth 3\n\
+}\n\
+$sequence \"layer\" \"a\" {\n\
+}\n\
+$sequence \"user\" \"b\" {\n\
+blendlayer \"layer\" 2 5 9 12\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("官方能编的 QC，mdlc 也必须能编");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 先证明夹具非空 —— 否则下面的断言会**空洞通过**。
+        assert_eq!(c.sequences.len(), 3, "夹具应有 3 条序列");
+        let user = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "user")
+            .expect("应能找到 `user`");
+        assert_eq!(
+            user.auto_layers.len(),
+            1,
+            "`blendlayer` 必须产生**一条**自动层（修前这里是 0，且 blends 被污染）"
+        );
+        let al = &user.auto_layers[0];
+        // `sequence` 存的是**序列下标**，必须指向 `layer`。
+        assert_eq!(
+            c.sequences[al.sequence as usize].name, "layer",
+            "自动层必须指向 `layer`"
+        );
+        assert_eq!(al.flags, 0, "无子标志时 flags 应为 0");
+        assert_eq!(al.pose, 0, "无 `poseparameter` 时 iPose 应为 0");
+        // ⚠️ 四个时间量在**不带** `STUDIO_AL_POSE` 时会被
+        // `write.cpp:541-544` 除以 `numframes - 1` 转成 cycle。
+        // 本夹具的动画只有 2 帧 ⟹ 除数是 1 ⟹ 落盘值 = QC 原值。
+        assert_eq!(
+            (al.start, al.peak, al.tail, al.end),
+            (2.0, 5.0, 9.0, 12.0),
+            "四个时间量应原样保留（2 帧 ⟹ 除数为 1）"
+        );
+    }
+
+    /// **`blendlayer` 的子标志与 `poseparameter`**（`studiomdl.cpp:2909-2940`）。
+    ///
+    /// `xfade` / `spline` / `noblend` / `poseparameter` / `local` 五个子标志，
+    /// 以及 `poseparameter` 会**顺带**把姿势参数下标写进 `iPose`。
+    ///
+    /// # 实测官方（真 `studiomdl.exe`）
+    ///
+    /// ```text
+    /// blendlayer "layer" 3 6 9 12 xfade spline poseparameter "py"
+    ///   ⟹ iPose=1 flags=0x40c0 start=3 peak=6 tail=9 end=12
+    /// ```
+    ///
+    /// `0x40c0 = STUDIO_AL_POSE(0x4000) | STUDIO_AL_XFADE(0x0080) | STUDIO_AL_SPLINE(0x0040)`。
+    ///
+    /// ⚠️ 带 `STUDIO_AL_POSE` 时**不**做 cycle 换算
+    /// （`write.cpp:546-552`）⟹ 时间量原样落盘。
+    #[test]
+    fn blendlayer_subflags_and_pose_parameter() {
+        let d = cb_dir("bl-flags");
+        let qc = "\
+$modelname \"bl3.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$poseparameter \"py\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+blend \"px\" 1 -1\n\
+blendwidth 3\n\
+}\n\
+$sequence \"layer\" \"a\" {\n\
+}\n\
+$sequence \"user\" \"b\" {\n\
+blendlayer \"layer\" 3 6 9 12 xfade spline poseparameter \"py\"\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let user = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "user")
+            .expect("应能找到 `user`");
+        assert_eq!(user.auto_layers.len(), 1, "应有 1 条自动层");
+        let al = &user.auto_layers[0];
+        // `0x40c0 = POSE | XFADE | SPLINE`（实测官方就是这个值）。
+        assert_eq!(
+            al.flags, 0x40c0,
+            "flags 应为 0x40c0（POSE|XFADE|SPLINE），实际 0x{:x}",
+            al.flags
+        );
+        // `py` 是第 1 个 `$poseparameter` ⟹ `iPose = 1`（实测官方）。
+        assert_eq!(al.pose, 1, "`poseparameter \"py\"` 应给出 iPose=1");
+        // 带 `STUDIO_AL_POSE` ⟹ **不**做 cycle 换算，原样保留。
+        assert_eq!(
+            (al.start, al.peak, al.tail, al.end),
+            (3.0, 6.0, 9.0, 12.0),
+            "带 STUDIO_AL_POSE 时时间量不做 cycle 换算"
+        );
+    }
+
+    /// **`blendlayer` 后面不认识的 token 必须被吐回**（官方 `UnGetToken`）。
+    ///
+    /// 官方子标志循环遇到不认识的就 `UnGetToken(); break;` —— 所以
+    /// `blendlayer` 之后紧跟的**其它关键字**（如 `fadein`）不会被吃掉。
+    ///
+    /// # ⚠️ 判据必须写在**同一行**
+    ///
+    /// `Lexer::token_available`（`lexer.rs`）是**行内**判据 —— 遇到 `\n`
+    /// 就返回 false（与官方 `TokenAvailable` 同语义）。所以把 `fadein`
+    /// 写在下一行时，子标志循环**根本不会进入**，`unget` 那条路径
+    /// 一次都不跑 ⟹ 测不出「吞掉一切」的变异。
+    ///
+    /// 实测：把 `unget` 改成 `continue`（即吞掉未知 token）后，
+    /// 「`fadein` 换行」版本**全绿逃逸**；本版本（同一行）能抓住。
+    ///
+    /// # 实测官方（真 `studiomdl.exe`）
+    ///
+    /// ```text
+    /// blendlayer "layer" 1 2 3 4 fadein 0.75
+    ///   ⟹ seqdesc.fadeintime = 0.75   （`fadein` 被正常解析，没被子标志吃掉）
+    ///      numautolayers = 1
+    /// ```
+    #[test]
+    fn blendlayer_ungets_unknown_token() {
+        let d = cb_dir("bl-unget");
+        let qc = "\
+$modelname \"bl4.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+blend \"px\" 1 -1\n\
+blendwidth 3\n\
+}\n\
+$sequence \"layer\" \"a\" {\n\
+}\n\
+$sequence \"user\" \"b\" {\n\
+blendlayer \"layer\" 1 2 3 4 fadein 0.75\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let user = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "user")
+            .expect("应能找到 `user`");
+        assert_eq!(user.auto_layers.len(), 1, "应有 1 条自动层");
+        assert_eq!(
+            user.auto_layers[0].flags, 0,
+            "`fadein` 不是子标志，不该被算进 flags"
+        );
+        assert_eq!(
+            user.fade_in, 0.75,
+            "同一行的 `fadein 0.75` 必须被正常解析（官方 `UnGetToken`）—— \
+             若实现成「吞掉未知 token」，这里会保持缺省 0.2"
+        );
+    }
+
     /// **`$sequence` 的 `weightlist` 必须覆盖被复用动画的权重。**
     ///
     /// 官方把它落成 `animations[0]->cmds[]` 的 `CMD_WEIGHTS`，
