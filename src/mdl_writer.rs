@@ -192,6 +192,15 @@ pub const ATTACHMENT_SIZE: usize = 92;
 pub const MODEL_NAME_LEN: usize = 64;
 /// VVD 顶点 stride —— `vertexindex` 要乘它。
 pub const VERTEX_STRIDE: usize = 48;
+/// VVD 切线 stride（`Vector4D`）—— `tangentsindex` 要乘它。
+///
+/// `studio.h:1327-1332` `GetGlobalTangentIndex`：
+/// ```cpp
+/// return ( i + ( modelptr->tangentsindex / sizeof( Vector4D ) ) );
+/// ```
+/// ⟹ `tangentsindex` 与 `vertexindex` 同构，是**相对 VVD 切线块的字节偏移**，
+/// 不是下标。
+pub const TANGENT_STRIDE: usize = 16;
 /// `mstudioposeparamdesc_t` 的字节大小。
 ///
 /// ```text
@@ -663,10 +672,30 @@ pub mod off {
     pub const ANIMBLOCK_COUNT: usize = 0x160;
     pub const ANIMBLOCK_OFFSET: usize = 0x164;
     pub const ANIMBLOCK_INDEX: usize = 0x168;
+    /// `bonetablebynameindex`：指向 `byte[numbones]` 的**骨骼名索引表**。
+    ///
+    /// 表内容 = 骨骼下标按**骨骼名（大小写不敏感）升序**排列的结果，
+    /// 由 [`bone_table_by_name`] 生成。**不是恒等置换** —— 骨骼表本身是
+    /// 拓扑序（父在子前），与名字序无关。
     pub const BONE_TABLE_NAME_OFFSET: usize = 0x16C;
-    pub const VERIFICATION_HASH: usize = 0x170;
-    pub const NUM_BONE_TABLE_NAME: usize = 0x174;
-    pub const NUM_VERIFICATION_HASH: usize = 0x178;
+    /// `pVertexBase`（`void*`）：**只在工具进程内使用的运行时指针**
+    /// （`perfstats.cpp:231` / `vradstaticprops.cpp:1913` 之类），
+    /// **从不落盘** —— 官方产物恒为 0。
+    ///
+    /// > 早先这里叫 `VERIFICATION_HASH`，是个**误读**：`studio.h:2179-2180`
+    /// > 明确写着 `void *pVertexBase; void *pIndexBase;`。
+    pub const VERTEX_BASE: usize = 0x170;
+    /// `pIndexBase`（`void*`）：同 [`Self::VERTEX_BASE`]，官方产物恒为 0。
+    ///
+    /// > 早先这里叫 `NUM_BONE_TABLE_NAME` 并**被写入 `bone_count`**，
+    /// > 是个**误读**（`studio.h:2180`）。
+    pub const INDEX_BASE: usize = 0x174;
+    /// `constdirectionallightdot`（`byte`）。其后 3 字节依次是 `rootLOD` /
+    /// `numAllowedRootLODs` / `unused[1]` —— **都是独立 byte，不是 int**
+    /// （`studio.h:2185-2198`）。
+    ///
+    /// > 早先这里叫 `NUM_VERIFICATION_HASH`。
+    pub const CONST_DIRECTIONAL_LIGHT_DOT: usize = 0x178;
     /// `numflexcontrollerui`：`mstudioflexcontrollerui_t`（20 字节/条）的条数。
     ///
     /// `write.cpp`(ep1) 里**根本没有**这一段 —— 它由 DMX 的
@@ -1033,6 +1062,74 @@ fn strip_vtf_ext(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// 生成 `bonetablebyname`：骨骼下标按**骨骼名升序**排列的 `byte[numbones]`。
+///
+/// # 官方语义
+///
+/// `write.cpp:389-399`（`WriteBoneInfo` 尾部）：
+/// ```cpp
+///     byte *pBoneTable = pData;
+///     phdr->bonetablebynameindex = (pData - pStart);
+///     // make a table in bone order and sort it with qsort
+///     for ( i = 0; i < phdr->numbones; i++ ) pBoneTable[i] = i;
+///     qsort( pBoneTable, phdr->numbones, sizeof(byte), BoneNameCompare );
+/// ```
+/// 比较器 `write.cpp:162-169`：
+/// ```cpp
+/// static int BoneNameCompare( const void *elem1, const void *elem2 )
+/// {
+///     int index1 = *(byte *)elem1;
+///     int index2 = *(byte *)elem2;
+///     return strcmpi( g_bonetable[index1].name, g_bonetable[index2].name );
+/// }
+/// ```
+/// 即「**大小写不敏感**的名字字典序」。
+///
+/// # 为什么不能写恒等置换
+///
+/// 引擎唯一的消费者是 `Studio_BoneIndexByName`（`bone_setup.cpp:5725-5750`），
+/// 它对这张表做**二分查找**（`Q_stricmp( pbones[pBoneTable[mid]].pszName(), pName )`）。
+/// 表没排序 ⟹ 二分失效 ⟹ 绝大多数查找返回 −1。
+/// 实测用引擎算法逐名复现：mdlc 修前 **114/119 个骨骼名查不到**，
+/// 官方与 NekoMDL 都是 119/119。
+///
+/// 直接后果是 `bone_merge_cache.cpp:69-71` 的
+/// `if ( parentBoneIndex < 0 ) continue;` 让骨骼进不了 `m_MergedBones`，
+/// 进而 `:90-93` 把 `m_nFollowBoneSetupMask` 清零 —— **所有 `$bonemerge` 失效**。
+///
+/// # 稳定性
+///
+/// `qsort` 本身不稳定，但官方语料里**忽略大小写的重名不存在**
+/// （`btb_verify.js` 实测本模型 119 根：`忽略大小写后重名: []`），
+/// 排序结果因此唯一确定，稳定排序与 `qsort` 等价。
+/// 这里用 `sort_by`（稳定）以保证确定性。
+///
+/// # Panics
+///
+/// 骨骼数 > 256 时 panic。这不是新增约束 ——
+/// `anim_writer` 已把「`mstudioanim_t.bone` 是 `byte`」这条真格式约束
+/// 钉在 256（见 `anim_bone_addressing_limit_is_byte`），
+/// 走到这里时骨骼数必然 ≤ 256。
+fn bone_table_by_name(bones: &[crate::model::Bone]) -> Vec<u8> {
+    assert!(
+        bones.len() <= 256,
+        "骨骼数 {} 超出 `bonetablebyname` 的 byte 寻址范围",
+        bones.len()
+    );
+    let mut order: Vec<u8> = (0..bones.len() as u16)
+        .map(|i| u8::try_from(i).expect("上面已断言 ≤ 256"))
+        .collect();
+    // `strcmpi` = 逐字符 `tolower` 后比较。SMD 骨骼名都是 ASCII，
+    // 用 `to_ascii_lowercase()` 得到与 `strcmpi` 相同的字节序列。
+    order.sort_by(|&a, &b| {
+        bones[a as usize]
+            .name
+            .to_ascii_lowercase()
+            .cmp(&bones[b as usize].name.to_ascii_lowercase())
+    });
+    order
 }
 
 /// 计算每根骨骼的 `flags`。
@@ -2109,15 +2206,41 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 这是 studiomdl 对空段的统一约定 —— 见下面的空段偏移表。
     put_i32(&mut buf, off::BONE_CONTROLLER_COUNT, bc_count as i32);
     put_i32(&mut buf, off::BONE_CONTROLLER_OFFSET, bone_controller_off as i32);
-    // `bonetablename`：`byte[numbones]` 的**拓扑序**索引表。
-    // 实测 3333/3333 个真实模型都有，且 `numbonetablename == numbones`。
-    // 元素含义是「按名字排序后，第 i 个位置对应哪根骨骼」——
-    // 本实现按 `desc.bones` 顺序写恒等映射（与「名字已按序排列」等价）。
+    // `bonetablename`：`byte[numbones]` 的**骨骼名索引表**。
+    //
+    // # 为什么必须排序，而不能写恒等置换
+    //
+    // 官方 `write.cpp:389-399`（`WriteBoneInfo` 尾部）：
+    // ```cpp
+    //     for ( i = 0; i < phdr->numbones; i++ ) pBoneTable[i] = i;
+    //     qsort( pBoneTable, phdr->numbones, sizeof(byte), BoneNameCompare );
+    // ```
+    // 比较器是 `write.cpp:162-169` 的 `strcmpi`（**大小写不敏感**）。
+    //
+    // 引擎侧唯一的消费者 `Studio_BoneIndexByName`（`bone_setup.cpp:5725-5750`）
+    // 对这张表做**二分查找**：
+    // ```cpp
+    //     int mid = (start + end) >> 1;
+    //     int cmp = Q_stricmp( pbones[pBoneTable[mid]].pszName(), pName );
+    // ```
+    // 表未排序 ⟹ 二分退化，绝大多数查找返回 −1。
+    //
+    // 实测（`docs/_probe/` 的 `bsearch_sim.js`，用引擎算法逐名复现）：
+    //   官方 119/119 命中；mdlc 修前 **5/119**（114 个返回 −1）；NekoMDL 119/119。
+    //
+    // 后果链：`bone_merge_cache.cpp:69-71`
+    // `int parentBoneIndex = Studio_BoneIndexByName( m_pFollowHdr, pOwnerBones[i].pszName() );`
+    // `if ( parentBoneIndex < 0 ) continue;` ⟹ 骨骼不入 `m_MergedBones`
+    // ⟹ `:90-93` `if ( !m_MergedBones.Count() ) m_nFollowBoneSetupMask = 0;`
+    // ⟹ **55 条 `$bonemerge` 全部失效**，`C_BaseAnimating::LookupBone`
+    // （`c_baseanimating.cpp:1043`）对所有调用方也一律失败。
     put_i32(&mut buf, off::BONE_TABLE_NAME_OFFSET, bonetablename_off as i32);
-    put_i32(&mut buf, off::NUM_BONE_TABLE_NAME, bone_count as i32);
-    for i in 0..bone_count {
-        buf[bonetablename_off + i] = i as u8;
-    }
+    buf[bonetablename_off..bonetablename_off + bone_count]
+        .copy_from_slice(&bone_table_by_name(&desc.bones));
+    // `pVertexBase`(0x170) / `pIndexBase`(0x174)：**只在工具进程内使用的
+    // 运行时指针，从不落盘**（`studio.h:2179-2180`），官方产物恒为 0。
+    // 实测 13/13 个官方 `.mdl` 两个字段都是 0（`corpus_170.js`）。
+    // 清零循环已经覆盖了它们，这里不再重复写。
     // `studiohdr2`：实测 3333/3333 个真实模型都有，且固定放在 408。
     put_i32(&mut buf, off::STUDIO_HDR2_OFFSET, studiohdr2_off as i32);
     // 下面这些段的**计数为 0**（本实现不产出），但**偏移要写「该段应处
@@ -2183,8 +2306,13 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         off::ANIMBLOCK_COUNT,
         off::ANIMBLOCK_NAME_OFFSET,
         off::ANIMBLOCK_INDEX,
-        off::VERIFICATION_HASH,
-        off::NUM_VERIFICATION_HASH,
+        // `pVertexBase` / `pIndexBase`：工具期指针，**从不落盘**，官方恒 0。
+        off::VERTEX_BASE,
+        // ⚠️ 这里写的是 **4 字节**的 0，覆盖 `constdirectionallightdot` +
+        // `rootLOD` + `numAllowedRootLODs` + `unused[1]` 这**4 个独立 byte**
+        // （`studio.h:2185-2198`）。官方产物这 4 个字节也都是 0，所以
+        // 「按 int 清零」在这里恰好等价，但**不要**据此认为它是 int 字段。
+        off::CONST_DIRECTIONAL_LIGHT_DOT,
         // `KEY_VALUE_OFFSET` / `KEY_VALUE_SIZE` **不在这里** —— 它们有真实值，
         // 由第 11 步无条件写出（**空段也要写自然偏移**，实测 3333/3333）。
         off::SURFACE_PROP_OFFSET,
@@ -2962,6 +3090,16 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                      字节偏移 {vertex_byte_offset} 超出 int32"
                 )));
             }
+            // `tangentsindex` 是同一个算术、更小的 stride（16 < 48），
+            // 所以上面的检查成立时它必然也成立；这里显式再查一次以防将来
+            // `TANGENT_STRIDE` 被改大。
+            let tangent_byte_offset = span.start * TANGENT_STRIDE;
+            if tangent_byte_offset > i32::MAX as usize {
+                return Err(WriteError::Internal(format!(
+                    "bodyparts[{bi}].models[{model_cursor}] 的 tangentsindex \
+                     字节偏移 {tangent_byte_offset} 超出 int32"
+                )));
+            }
             put_i32(&mut buf, mbase + model_off::NUM_VERTICES, span.count as i32);
             // **相对 VVD 顶点块的字节偏移**，不是顶点下标。
             put_i32(
@@ -2969,7 +3107,32 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 mbase + model_off::VERTEX_INDEX,
                 (span.start * VERTEX_STRIDE) as i32,
             );
-            put_i32(&mut buf, mbase + model_off::TANGENT_INDEX, 0);
+            // `tangentsindex` 与 `vertexindex` **同构**：相对 VVD **切线块**的
+            // 字节偏移。官方 `write.cpp:1666-1674` 是并排的两段：
+            //
+            // ```cpp
+            // ALIGN16( externalVertexIndex );
+            // pmodel[i].vertexindex   = (int)externalVertexIndex;
+            // externalVertexIndex   += pmodel[i].numvertices * sizeof(mstudiovertex_t); // 48
+            // ALIGN4( externalTangentsIndex );
+            // pmodel[i].tangentsindex = (int)externalTangentsIndex;
+            // externalTangentsIndex += pmodel[i].numvertices * sizeof(Vector4D);        // 16
+            // ```
+            //
+            // 实测（`v_dual_pistolA`）：官方 = 0 / 374080 / 443248 / 817328 / 886496，
+            // 每个都恰好是前面各 model `numvertices × 16` 的累计；NekoMDL 同样正确。
+            //
+            // ⚠️ 早先这里写死 0，理由是「切线块在 VVD 里，MDL 不需要知道」——
+            // **是错的**：引擎的 `GetGlobalTangentIndex`（`studio.h:1327-1332`）
+            // 用 `tangentsindex / sizeof(Vector4D)` 当**全局切线下标基准**，
+            // 恒为 0 会让 model[1..] 全部去读 model[0] 的切线数据。
+            // 这个字段还被 `cmp_mdl_full.js` 的 `LAYOUT_FIELDS` 吞掉，
+            // 与 `bonetablebynameindex` 是**同一类盲区**。
+            put_i32(
+                &mut buf,
+                mbase + model_off::TANGENT_INDEX,
+                (span.start * TANGENT_STRIDE) as i32,
+            );
             // eyeball：`numeyeballs` + `eyeballindex`（相对该 model 自身，
             // 紧跟该 model 的 mesh 数组之后 = `meshindex + nummeshes*116`）。
             let this_eyeball_off = this_mesh_off + m.meshes.len() * MESH_SIZE;
@@ -3993,17 +4156,29 @@ end
     /// 每次调用用**唯一**的临时目录：测试是并行跑的，共用一个目录会让
     /// 某个用例的清理删掉另一个用例正在读的 SMD。
     fn minimal() -> CompiledModelDesc {
+        compile_desc(TEST_TOML, "mdlc-writer")
+    }
+
+    /// 编译一份**自定义 TOML** 的最小模型（复用 `TEST_SMD` 夹具）。
+    ///
+    /// 与 `minimal` 一样用**唯一**临时目录（测试并行跑）。
+    fn compile_desc(toml: &str, tag: &str) -> CompiledModelDesc {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("mdlc-writer-{}-{n}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("myprop-ref.smd"), TEST_SMD).unwrap();
-        let desc = crate::model::ModelDesc::from_toml(TEST_TOML).unwrap();
+        let desc = crate::model::ModelDesc::from_toml(toml).unwrap();
         let c = compile(&desc, &d).expect("测试模型应能编译");
         std::fs::remove_dir_all(&d).ok();
         c
+    }
+
+    /// 两 model 夹具（第二个 model 复用同一份 SMD）。
+    fn two_model(toml: &str) -> CompiledModelDesc {
+        compile_desc(toml, "mdlc-writer2")
     }
 
     /// 多 LOD 的最小模型（**不写 `smd`** ⟹ 复用 LOD 0 的网格 + 骨骼选项）。
@@ -4208,7 +4383,21 @@ end
             "bonetablename 应紧跟 hitboxset（含其 box 数组）；\
              bone_bytes={bone_bytes} at_bytes={at_bytes} hb_sets={hb_sets} hb_boxes={hb_boxes}"
         );
-        assert_eq!(g(off::NUM_BONE_TABLE_NAME), 2);
+        // `pVertexBase` / `pIndexBase` 是**工具期指针，从不落盘**，
+        // 官方产物恒为 0（`studio.h:2179-2180`；13/13 官方 `.mdl` 实测）。
+        //
+        // ⚠️ 这里曾经断言的是 `g(off::NUM_BONE_TABLE_NAME) == 2` ——
+        // 那个常量名是**误读**，2 就是骨骼数被错写进了 `pIndexBase`。
+        assert_eq!(g(off::VERTEX_BASE), 0, "pVertexBase 必须为 0");
+        assert_eq!(g(off::INDEX_BASE), 0, "pIndexBase 必须为 0");
+        // `bonetablename` 的内容 = 按名字（大小写不敏感）升序的骨骼下标。
+        // `minimal()` 只有 `root` / `tip`，名字序恰好等于下标序。
+        let bt_at = g(off::BONE_TABLE_NAME_OFFSET);
+        assert_eq!(
+            &b[bt_at..bt_at + 2],
+            &[0u8, 1u8],
+            "bonetablename 应为名字序（此处 root < tip ⟹ 恒等）"
+        );
         // 各段必须落在文件内且**按权威顺序递增**。
         // 注意 `bodypart` 在 `texture` **之前** —— 这与「结构体在前、
         // 材质在后」的直觉相反，但 3333 个真实模型一致如此。
@@ -4224,6 +4413,86 @@ end
         for o in order {
             assert!(g(o) < b.len(), "段偏移 {o:#X} 越界");
         }
+    }
+
+    /// **`bonetablebyname` 必须是「按名字升序的骨骼下标」，不是恒等置换。**
+    ///
+    /// 这是「idle 动画骨骼位置错误」的**根因回归钉**。
+    ///
+    /// 官方 `write.cpp:389-399` 先写 `pBoneTable[i] = i`，再
+    /// `qsort(..., BoneNameCompare)`；比较器是 `strcmpi`（大小写不敏感）。
+    /// 引擎 `Studio_BoneIndexByName`（`bone_setup.cpp:5725-5750`）对这张表做
+    /// **二分查找**，表没排序就会让 114/119 个骨骼名查不到
+    /// （`bone_merge_cache.cpp:69-71` 的 `if ( parentBoneIndex < 0 ) continue;`）。
+    ///
+    /// 这里直接调 `bone_table_by_name`，用**乱序**的名字验证排序真的发生。
+    #[test]
+    fn bone_table_by_name_sorts_case_insensitively() {
+        let mk = |names: &[&str]| -> Vec<crate::model::Bone> {
+            names
+                .iter()
+                .map(|n| crate::model::Bone {
+                    name: (*n).to_string(),
+                    ..minimal().desc.bones[0].clone()
+                })
+                .collect()
+        };
+
+        // 乱序 + 大小写混排：小写化后应为 aaa < Bbb < ccc < Ddd。
+        let bones = mk(&["ccc", "AAA", "ddd", "Bbb"]);
+        let t = bone_table_by_name(&bones);
+        assert_eq!(t, vec![1u8, 3, 0, 2], "应按小写名字升序：AAA(1) Bbb(3) ccc(0) ddd(2)");
+
+        // `strcmpi` 的大小写不敏感性：纯 byte 序会把 'B'(0x42) 排在
+        // 'a'(0x61) 之前，`strcmpi` 则按 'b' vs 'a' 比较。
+        let bones = mk(&["b", "A"]);
+        assert_eq!(
+            bone_table_by_name(&bones),
+            vec![1u8, 0],
+            "大小写不敏感：A(a) < b(b)；纯 byte 序会给出 [0, 1]"
+        );
+
+        // 与官方语料一致的形状：`_`(0x5F) 在小写化后落在字母之间。
+        // `bone_x` vs `ValveBiped...` —— 'b' < 'v'，所以 bone_* 在前。
+        let bones = mk(&["ValveBiped.Bip01", "bone_a", "j_gun"]);
+        assert_eq!(
+            bone_table_by_name(&bones),
+            vec![1u8, 2, 0],
+            "bone_a(b) < j_gun(j) < ValveBiped(v)"
+        );
+    }
+
+    /// **回归钉**：产物里写出的 `bonetablename` 不能是恒等置换。
+    ///
+    /// 用名字**逆序**的骨骼表编译，恒等置换会「恰好正确」，
+    /// 所以这里特意让名字序与拓扑序不同，再断言两者不相等。
+    #[test]
+    fn bonetablebyname_is_not_the_identity_permutation() {
+        let bones = ["zeta", "alpha", "mid"];
+        let t = bone_table_by_name(
+            &bones
+                .iter()
+                .map(|n| crate::model::Bone {
+                    name: (*n).to_string(),
+                    ..minimal().desc.bones[0].clone()
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(t, vec![1u8, 2, 0], "alpha(1) < mid(2) < zeta(0)");
+        assert_ne!(t, vec![0u8, 1, 2], "绝不能是恒等置换 —— 那正是修前的 bug");
+    }
+
+    /// `pVertexBase` / `pIndexBase` 落盘必须是 0（工具期指针不持久化）。
+    ///
+    /// 修前 `pIndexBase` 被写成了 `bone_count`（2）。
+    #[test]
+    fn tool_time_pointers_are_zero_on_disk() {
+        let b = write_mdl(&minimal()).unwrap().bytes;
+        let g = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(g(off::VERTEX_BASE), 0);
+        assert_eq!(g(off::INDEX_BASE), 0);
+        // 顺带钉住后面 4 个独立 byte（`constdirectionallightdot` 等）也是 0。
+        assert_eq!(g(off::CONST_DIRECTIONAL_LIGHT_DOT), 0);
     }
 
     #[test]
@@ -4347,6 +4616,69 @@ end
                 .unwrap(),
         );
         assert_eq!(num_vertices, 3);
+    }
+
+    /// **`tangentsindex` 与 `vertexindex` 同构**：都是「相对 VVD 外部数据块的
+    /// 累计字节偏移」，不是下标，也不是相对 model 的偏移。
+    ///
+    /// `studio.h:1327-1332`：
+    /// ```cpp
+    /// inline int mstudio_modelvertexdata_t::GetGlobalTangentIndex( int i ) const
+    /// {
+    ///   mstudiomodel_t *modelptr = (mstudiomodel_t *)((byte *)this - offsetof(mstudiomodel_t, vertexdata));
+    ///   Assert( ( modelptr->tangentsindex % sizeof( Vector4D ) ) == 0 );
+    ///   return ( i + ( modelptr->tangentsindex / sizeof( Vector4D ) ) );
+    /// }
+    /// ```
+    ///
+    /// 官方 `write.cpp:1666-1674` 并排维护这两个累计量：
+    /// ```cpp
+    /// ALIGN16( externalVertexIndex );
+    /// pmodel[i].vertexindex   = (int)externalVertexIndex;
+    /// externalVertexIndex   += pmodel[i].numvertices * sizeof(mstudiovertex_t); // 48
+    /// ALIGN4( externalTangentsIndex );
+    /// pmodel[i].tangentsindex = (int)externalTangentsIndex;
+    /// externalTangentsIndex += pmodel[i].numvertices * sizeof(Vector4D);        // 16
+    /// ```
+    ///
+    /// 实测（`v_dual_pistolA`，5 个 model）官方 `tangentsindex` =
+    /// `0 / 374080 / 443248 / 817328 / 886496`，逐个等于前面各 model
+    /// `numvertices × 16` 的累计。**早先 mdlc 恒写 0**，会让 `model[1..]`
+    /// 全部去读 `model[0]` 的切线数据；NekoMDL 与官方一致。
+    #[test]
+    fn tangent_index_is_byte_offset_not_index() {
+        // 两个 model 复用同一份 SMD ⟹ 第二个 model 的累计偏移必然非零。
+        let toml = format!("{TEST_TOML}\n[[bodyparts.models]]\nsmd = \"myprop-ref.smd\"\n");
+        let out = write_mdl(&two_model(&toml)).unwrap();
+        let b = &out.bytes;
+        let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+
+        let bp_abs = g(off::BODY_PART_OFFSET) as usize;
+        let mrel = g(bp_abs + bp_off::MODEL_INDEX) as usize;
+        assert_eq!(g(bp_abs + bp_off::NUM_MODELS), 2, "夹具应有 2 个 model");
+
+        let mut expect_vertex = 0usize;
+        let mut expect_tangent = 0usize;
+        for m in 0..2 {
+            let moff = bp_abs + mrel + m * MODEL_SIZE;
+            let nv = g(moff + model_off::NUM_VERTICES) as usize;
+            assert_eq!(
+                g(moff + model_off::VERTEX_INDEX) as usize,
+                expect_vertex,
+                "model[{m}] 的 vertexindex 应是累计 48×顶点数"
+            );
+            assert_eq!(
+                g(moff + model_off::TANGENT_INDEX) as usize,
+                expect_tangent,
+                "model[{m}] 的 tangentsindex 应是累计 16×顶点数（不是 0，也不是下标）"
+            );
+            expect_vertex += nv * VERTEX_STRIDE;
+            expect_tangent += nv * TANGENT_STRIDE;
+        }
+        assert!(
+            expect_tangent > 0,
+            "第二个 model 的 tangentsindex 必须非零，否则这个用例什么都没测"
+        );
     }
 
     #[test]
