@@ -1323,6 +1323,9 @@ impl<'a> Parser<'a> {
             blends: Vec::new(),
             blend_width: None,
             blend_params: Vec::new(),
+            blend_ref: None,
+            blend_comp: None,
+            blend_center: None,
             auto_layers: Vec::new(),
             movements: Vec::new(),
             section_frames: None,
@@ -1366,6 +1369,9 @@ impl<'a> Parser<'a> {
             blends: Vec::new(),
             blend_width: None,
             blend_params: Vec::new(),
+            blend_ref: None,
+            blend_comp: None,
+            blend_center: None,
             auto_layers: Vec::new(),
             movements: Vec::new(),
             section_frames: None,
@@ -1454,7 +1460,60 @@ impl<'a> Parser<'a> {
                         parameter,
                         start,
                         end,
+                        // 纯 `blend`：没有附着点，`paramcontrol` 保持官方
+                        // `memset` 的 **0**（`studiomdl.cpp:2731-2752`
+                        // 只写 paramindex/paramstart/paramend）。
+                        attachment: None,
+                        control: None,
                     });
+                }
+                "calcblend" => {
+                    // 官方 `ParseSequence`（`studiomdl.cpp:2753-2774`）：
+                    //
+                    // ```c
+                    // GetToken(false); j = LookupPoseParameter(token); pseq->paramindex[i] = j;
+                    // GetToken(false); pseq->paramattachment[i] = LookupAttachment(token);
+                    // if (pseq->paramattachment[i] == -1) TokenError("Unknown calcblend attachment ...");
+                    // GetToken(false); pseq->paramcontrol[i] = lookupControl(token);
+                    // ```
+                    //
+                    // ⚠️ **槽位 `i` 的算法与 `blend` 逐字相同** ——
+                    // 两个关键字共用一套「按出现顺序占槽」的规则，
+                    // 所以它们必须推进**同一个** `blend_params` 列表。
+                    let parameter = self.tok(false)?.text;
+                    let attachment = self.tok(false)?.text;
+                    let control = if self.avail() {
+                        Some(self.tok(false)?.text)
+                    } else {
+                        None
+                    };
+                    // `calcblend` **不写** `paramstart`/`paramend` ——
+                    // 两个值由 `CalcPoseParameters` 在编译期算出。
+                    seq.blend_params.push(BlendParam {
+                        parameter,
+                        start: 0.0,
+                        end: 0.0,
+                        attachment: Some(attachment),
+                        control,
+                    });
+                }
+                "blendref" => {
+                    // `studiomdl.cpp:2775-2783`：`pseq->paramanim = LookupAnimation(token)`。
+                    //
+                    // ⚠️ `LookupAnimation` **先查动画池、再查序列池**
+                    // （`studiomdl.cpp:2381-2397`），所以这里**不能**在解析期
+                    // 就按动画名校验 —— 一个序列名同样合法。解析期也看不到
+                    // 后面才声明的动画，所以名字**留到 `compile.rs` 解析**
+                    // （与 `subtract` / `weight_list` 同一套做法）。
+                    seq.blend_ref = Some(self.tok(false)?.text);
+                }
+                "blendcomp" => {
+                    // `studiomdl.cpp:2784-2792`：`pseq->paramcompanim = LookupAnimation(token)`。
+                    seq.blend_comp = Some(self.tok(false)?.text);
+                }
+                "blendcenter" => {
+                    // `studiomdl.cpp:2793-2801`：`pseq->paramcenter = LookupAnimation(token)`。
+                    seq.blend_center = Some(self.tok(false)?.text);
                 }
                 "addlayer" => {
                     let s = self.tok(false)?.text;

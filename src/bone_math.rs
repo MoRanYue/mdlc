@@ -528,6 +528,15 @@ pub fn invert(m: &Matrix3x4) -> Matrix3x4 {
     ]
 }
 
+/// 单位变换（`SetIdentityMatrix`）。
+pub fn identity() -> Matrix3x4 {
+    [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0,
+    ]
+}
+
 /// 由位置 + 欧拉角构造骨骼的局部变换。
 pub fn local_transform(position: [f32; 3], angles: [f32; 3]) -> Matrix3x4 {
     let mut m = angle_matrix(angles);

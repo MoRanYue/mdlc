@@ -1218,6 +1218,451 @@ fn layer_time(v: f32, flags: i32, num_frames: f32) -> f32 {
     }
 }
 
+/// `CalcPoseParameterValue`（`simplify.cpp:5428-5446`）。
+///
+/// ⚠️ **兜底的 `return 0.0` 是这条路径的核心，不是「错误处理」。**
+///
+/// `paramcontrol` 在官方是 `memset` 后的 **0** —— 只有 `calcblend` 分支会
+/// 写它（`studiomdl.cpp:2773`）。而 `switch(0)` 不匹配任何 case
+/// ⟹ 每一格都算出 `0.0` ⟹ `paramstart == paramend` ⟹
+/// `MdlError("calcblend failed in %s")`（`simplify.cpp:5566-5569`）。
+///
+/// 这就是「只写 `blendwidth` 不写 `blend`」的序列被官方拒绝的**全部原因**
+/// —— 不是「缺了参数」，而是「误入 calc 分支 + 控制轴是 0」。
+fn calc_pose_parameter_value(control: i32, angles: [f32; 3], pos: [f32; 3]) -> f32 {
+    use crate::model::control as c;
+    /// `RAD2DEG(x)` —— 官方是 `(float)(x * (180.0/M_PI))`。
+    fn rad2deg(v: f32) -> f32 {
+        v * (180.0f32 / std::f32::consts::PI)
+    }
+    match control {
+        c::X => pos[0],
+        c::Y => pos[1],
+        c::Z => pos[2],
+        c::XR => rad2deg(angles[0]),
+        c::YR => rad2deg(angles[1]),
+        c::ZR => rad2deg(angles[2]),
+        // 含 `0`（memset 残留）与 `-1`（`lookupControl` 不认识）——
+        // 官方两者都落到这个兜底。
+        _ => 0.0,
+    }
+}
+
+/// 一个动画在 `CalcBoneTransforms` 下需要的全部输入。
+#[derive(Clone, Copy)]
+struct AnimPose<'a> {
+    /// 第 0 帧的骨骼姿态。
+    frame0: &'a [crate::smd::SmdPose],
+    /// `STUDIO_DELTA` —— 本动画存的是增量。
+    delta: bool,
+    /// `panimation->weight[k]`（来自 `$weightlist`）。
+    weights: &'a [f32],
+}
+
+/// 取动画池第 `ix` 条的 [`AnimPose`]（越界得到空姿态）。
+fn anim_pose<'a>(
+    anims: &'a [crate::model::CompiledAnimation],
+    anim_weights: &'a [Vec<f32>],
+    ix: usize,
+) -> AnimPose<'a> {
+    let a = anims.get(ix);
+    AnimPose {
+        frame0: a
+            .and_then(|a| a.frames.first())
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]),
+        delta: a.map(|a| a.delta).unwrap_or(false),
+        weights: anim_weights.get(ix).map(|w| w.as_slice()).unwrap_or(&[]),
+    }
+}
+
+/// `CalcBoneTransforms(panimation, pbaseanimation, 0, boneToWorld)`
+/// （`simplify.cpp:4539-4589`）—— 求第 0 帧的**世界**矩阵。
+///
+/// 与 [`delta_frame_worlds`] 的区别：`panimation->weight[k]` 是**逐骨骼**的
+/// （`$weightlist`），而那个函数把 `WEIGHT` 写死成 `1.0`，所以这里要整条
+/// 权重表。
+///
+/// ⚠️ 官方**不**在根骨骼上左乘 `rootxform`（对比 `simplify.cpp:4580-4583`
+/// 与 `bone_setup.cpp:2698`）。但本函数走的
+/// [`frame_worlds_from_locals`] **会**加 —— 这不影响结果：
+/// 两个世界矩阵用的是同一个根变换，`worldToBoneMid ∘ boneToWorldRel`
+/// 里它会被**约掉**。
+fn calcblend_worlds(
+    desc: &ModelDesc,
+    parents: &[i32],
+    p: &AnimPose<'_>,
+    base: &AnimPose<'_>,
+) -> Vec<crate::bone_math::Matrix3x4> {
+    let empty = |k: usize| crate::smd::SmdPose {
+        bone: k as i32,
+        position: [0.0; 3],
+        rotation: [0.0; 3],
+    };
+    let locals: Vec<crate::bone_math::Matrix3x4> = (0..parents.len())
+        .map(|k| {
+            let f = p.frame0.get(k).copied().unwrap_or_else(|| empty(k));
+            if !p.delta {
+                // `AngleMatrix( sanim[frame][k].rot, sanim[frame][k].pos, bonematrix )`
+                return crate::bone_math::local_transform(f.position, f.rotation);
+            }
+            // delta：`QuaternionMA(q_base, s, q_delta)` 重建（`:4562-4577`）。
+            let b = base.frame0.get(k).copied().unwrap_or_else(|| empty(k));
+            let s = p.weights.get(k).copied().unwrap_or(1.0);
+            let q1 = crate::bone_math::angle_quaternion(b.rotation);
+            let q2 = crate::bone_math::angle_quaternion(f.rotation);
+            let q3 = crate::bone_math::quaternion_ma(q1, s, q2);
+            let mut p3 = b.position;
+            for (d, src) in p3.iter_mut().zip(f.position.iter()) {
+                *d += s * src;
+            }
+            crate::bone_math::quaternion_local_transform(q3, p3)
+        })
+        .collect();
+    frame_worlds_from_locals(desc, parents, &locals)
+}
+
+/// 一条 `calcblend` 轴的逐格取值（官方 `CalcPoseParameters`，
+/// `simplify.cpp:5448-5596`）。
+///
+/// 返回 `(param_i[], paramstart, paramend)`。
+///
+/// # 算法
+///
+/// ```text
+/// refWorld = CalcBoneTransforms(paramanim, 0)            // 1 参数版 ⟹ 基准 = g_panimation[0]
+/// mid      = refWorld[att.bone] ∘ att.local              // 附着点的「零点」
+/// invMid   = inverse(mid)
+/// for m in 0..groupsize[axis]:
+///     cell     = panim[m[0]][m[1]]                       // 另一根轴取 other
+///     rel      = CalcBoneTransforms(cell, paramcompanim, 0)[att.bone] ∘ att.local
+///     boneRel  = invMid ∘ rel
+///     v        = CalcPoseParameterValue(paramcontrol, angles(boneRel), pos(boneRel))
+///     param_i[m] = v；m == 0 ⟹ paramstart；m == last ⟹ paramend
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn calc_blend_axis(
+    desc: &ModelDesc,
+    parents: &[i32],
+    anims: &[crate::model::CompiledAnimation],
+    anim_weights: &[Vec<f32>],
+    // 网格每一格 → 动画池下标（**行主序**：`cell = j + k * groupsize[0]`）。
+    cell_anim: &[usize],
+    grid: [usize; 2],
+    axis: usize,
+    // `blendcenter` 在网格里的位置（`None` = 没写或没找到）。
+    center: Option<[usize; 2]>,
+    att_bone: usize,
+    att_local: &crate::bone_math::Matrix3x4,
+    control: i32,
+    // `blendref` 解析出的动画下标（缺省 `0` = `g_panimation[0]`）。
+    ref_anim: usize,
+    // `blendcomp` 解析出的动画下标（缺省同 `ref_anim`）。
+    comp_anim: usize,
+) -> (Vec<f32>, f32, f32) {
+    // 基准 `g_panimation[0]` —— 官方 1 参数版 `CalcBoneTransforms` 固定传它
+    // （`simplify.cpp:4533-4536`）。
+    let base0 = anim_pose(anims, anim_weights, 0);
+    let ref_pose = anim_pose(anims, anim_weights, ref_anim);
+    let comp_pose = anim_pose(anims, anim_weights, comp_anim);
+
+    // 附着点的「零点」世界位姿（`:5487-5492`）。
+    let ref_world = calcblend_worlds(desc, parents, &ref_pose, &base0);
+    let mid = ref_world
+        .get(att_bone)
+        .map_or(*att_local, |m| crate::bone_math::concat(m, att_local));
+    let inv_mid = crate::bone_math::invert(&mid);
+
+    // 「另一根轴」取网格的哪一格（`:5503-5521`）。
+    //
+    // 命中 `blendcenter` 时官方把 `m[0]`/`m[1]` **都**写死，于是另一根轴
+    // 也跟着它走；没写（或没找到）时取中点 `groupsize[1-axis] / 2`。
+    let other = match center {
+        Some(c) => c[1 - axis],
+        None => grid[1 - axis] / 2,
+    }
+    .min(grid[1 - axis].saturating_sub(1));
+
+    let n = grid[axis];
+    let mut keys = Vec::with_capacity(n);
+    let (mut start, mut end) = (0.0f32, 0.0f32);
+    for m in 0..n {
+        let (ci, cj) = if axis == 0 { (m, other) } else { (other, m) };
+        let pose = cell_anim
+            .get(cj * grid[0] + ci)
+            .map(|&ix| anim_pose(anims, anim_weights, ix))
+            .unwrap_or(AnimPose {
+                frame0: &[],
+                delta: false,
+                weights: &[],
+            });
+        let world = calcblend_worlds(desc, parents, &pose, &comp_pose);
+        let rel = world
+            .get(att_bone)
+            .map_or(*att_local, |m| crate::bone_math::concat(m, att_local));
+        let bone_rel = crate::bone_math::concat(&inv_mid, &rel);
+        let v = calc_pose_parameter_value(
+            control,
+            crate::bone_math::matrix_angles(&bone_rel),
+            [bone_rel[3], bone_rel[7], bone_rel[11]],
+        );
+        if m == 0 {
+            start = v;
+        }
+        if m + 1 == n {
+            end = v;
+        }
+        keys.push(v);
+    }
+    (keys, start, end)
+}
+
+/// 按名字查附着点，返回 `(骨骼下标, local 矩阵)`。
+///
+/// 官方 `LookupAttachment`（`studiomdl.cpp:5316-5327`）是**线性查表、
+/// 大小写不敏感**（`stricmp`），查不到返回 `-1` ⟹
+/// `Unknown calcblend attachment "<名>"`（`:2766-2770`）。
+///
+/// ⚠️ 官方在**解析期**查表，所以「写在 `$sequence` 之后」的 `$attachment`
+/// 官方看不到。本实现查**全部**附着点（更宽松）—— 真实 QC 里
+/// `$attachment` 都在序列之前，这个差异不可达。
+fn lookup_attachment(
+    desc: &ModelDesc,
+    bone_index: &std::collections::HashMap<&str, usize>,
+    name: &str,
+) -> Option<(usize, crate::bone_math::Matrix3x4)> {
+    let at = desc
+        .attachments
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))?;
+    let bone = *bone_index.get(at.bone.as_str())?;
+    Some((bone, attachment_local_matrix(desc, at)))
+}
+
+/// `blendref` / `blendcomp` / `blendcenter` 的名字 → 动画池下标。
+///
+/// 官方 `LookupAnimation`（`studiomdl.cpp:2381-2397`）**先查动画池、
+/// 再查序列池**（序列 ⟹ 它的 `panim[0][0]`），两者都是 `stricmp`
+/// （大小写不敏感）。
+fn resolve_lookup_animation(
+    name: &str,
+    anims: &[crate::model::CompiledAnimation],
+    anim_index: &std::collections::HashMap<&str, usize>,
+    sequences: &[crate::model::CompiledSequence],
+) -> Option<usize> {
+    // 动画池（先按精确名查快表，再退回大小写不敏感扫描）。
+    if let Some(&i) = anim_index.get(name) {
+        return Some(i);
+    }
+    if let Some(i) = anims
+        .iter()
+        .position(|a| a.name.eq_ignore_ascii_case(name))
+    {
+        return Some(i);
+    }
+    // 序列池 ⟹ 该序列的第一格动画。
+    sequences
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+        .and_then(|s| s.cells.first().copied())
+}
+
+/// `CalcPoseParameters`（`simplify.cpp:5448-5596`）—— 把每条序列的
+/// **calc 轴**算出来，写回 `blend_params`。
+///
+/// # 时序
+///
+/// 官方在 `ProcessData` 末尾调用（`simplify.cpp:7315`），**晚于**
+/// `LinkAttachments`（7298）与 `ProcessIKRules`（7311）。所以：
+///
+/// * 附着点已链接（`att.bone` 是全局骨骼下标）；
+/// * 动画池、序列池都已建完（`blendref` 才能回落到序列池）。
+///
+/// # 失败判据
+///
+/// ```c
+/// if (fabs( pseq->paramstart[iPose] - pseq->paramend[iPose]) < 0.01)
+///     MdlError( "calcblend failed in %s\n", pseq->name );
+/// ```
+///
+/// ⚠️ 这是**硬错误**（`MdlError` 直接终止编译，不产生产物）—— 不是警告。
+/// 复刻它是本函数的**主要目的**：官方拒绝的 QC，mdlc 也必须拒绝，
+/// 否则会静默产出 `paramindex`/`posekey` 全错、且引擎里姿势参数
+/// **完全失效**的模型。
+fn apply_calc_blend_axes(
+    compiled: &mut CompiledModelDesc,
+    anim_weights: &[Vec<f32>],
+    base_dir: &Path,
+) -> Result<(), Vec<CompileError>> {
+    // 没有任何 calc 轴 ⟹ 完全不动（对既有产物零影响）。
+    if !compiled
+        .sequences
+        .iter()
+        .any(|s| !s.calc_axes.is_empty())
+    {
+        return Ok(());
+    }
+
+    let desc = compiled.desc.clone();
+    let bone_index = desc.bone_index();
+    let parents = bone_parents(&desc);
+    let mut errors: Vec<CompileError> = Vec::new();
+
+    // 先把每条序列的 `calc_axes` 取出来（避免同时借用 `compiled` 的两部分）。
+    let plans: Vec<(usize, Vec<crate::model::CompiledCalcAxis>)> = compiled
+        .sequences
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.calc_axes.is_empty())
+        .map(|(i, s)| (i, s.calc_axes.clone()))
+        .collect();
+
+    // `blendref` / `blendcomp` 的解析结果（逐序列）。
+    //
+    // 官方 `LookupAnimation` 查不到时返回 `NULL`，而
+    // `simplify.cpp:5476-5484` 对 `NULL` 有回落 —— 但解析期的
+    // `TokenError("Unknown blendref animation")`（`studiomdl.cpp:2781`）
+    // 已经挡掉了不存在的名字，所以这里解析不出来只可能是内部不一致。
+    let mut per_seq: Vec<Vec<(usize, crate::model::CompiledBlendParam)>> = Vec::new();
+    for (si, axes) in &plans {
+        let seq = &compiled.sequences[*si];
+        let anims = &compiled.animations;
+        // `blendref` → `paramanim`；缺省 `g_panimation[0]`（下标 0）。
+        let ref_anim = seq
+            .blend_ref
+            .as_ref()
+            .and_then(|n| resolve_lookup_animation(n, anims, &compiled_anim_index(anims), &compiled.sequences))
+            .unwrap_or(0);
+        // `blendcomp` → `paramcompanim`；缺省回落到 `paramanim`。
+        let comp_anim = seq
+            .blend_comp
+            .as_ref()
+            .and_then(|n| resolve_lookup_animation(n, anims, &compiled_anim_index(anims), &compiled.sequences))
+            .unwrap_or(ref_anim);
+
+        let grid = seq_grid_of(seq);
+        let mut out = Vec::new();
+        for ax in axes {
+            // 附着点：`None` 是官方 `memset` 残留路径。
+            //
+            // ⚠️ 此时 `paramcontrol` 也必然是 0 ⟹ `CalcPoseParameterValue`
+            // 恒返回 `0.0`，所以**附着点取什么都一样**。用第 0 根骨骼 +
+            // 单位矩阵即可（保证不越界）。
+            let (att_bone, att_local) = match &ax.attachment {
+                Some(name) => match lookup_attachment(&desc, &bone_index, name) {
+                    Some(v) => v,
+                    None => {
+                        errors.push(CompileError {
+                            at: format!("sequences[{si}].blend_params[{}]", ax.axis),
+                            message: format!("未知的 calcblend 附着点 {name:?}"),
+                        });
+                        continue;
+                    }
+                },
+                None => (0usize, crate::bone_math::identity()),
+            };
+            let control = ax
+                .control
+                .as_deref()
+                .map(crate::model::control::lookup)
+                .unwrap_or(0);
+            let (keys, start, end) = calc_blend_axis(
+                &desc,
+                &parents,
+                &compiled.animations,
+                anim_weights,
+                &seq.cells,
+                grid,
+                ax.axis,
+                seq.blend_center,
+                att_bone,
+                &att_local,
+                control,
+                ref_anim,
+                comp_anim,
+            );
+            // ---- 失败判据（`simplify.cpp:5566-5569`）----
+            if (start - end).abs() < 0.01 {
+                errors.push(CompileError {
+                    at: format!("sequences[{si}]"),
+                    message: format!(
+                        "calcblend failed in {}（paramstart={start} paramend={end}，\
+                         差值 < 0.01；官方在这里直接中止编译）",
+                        seq.name
+                    ),
+                });
+                continue;
+            }
+            out.push((
+                ax.axis,
+                crate::model::CompiledBlendParam {
+                    parameter_index: seq.blend_params[ax.axis]
+                        .as_ref()
+                        .map(|p| p.parameter_index)
+                        .unwrap_or(-1),
+                    start,
+                    end,
+                    keys,
+                },
+            ));
+        }
+        per_seq.push(out);
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    for ((si, _), vals) in plans.iter().zip(per_seq) {
+        for (axis, p) in vals {
+            compiled.sequences[*si].blend_params[axis] = Some(p);
+        }
+    }
+    let _ = base_dir;
+    Ok(())
+}
+
+/// `(groupsize[0], groupsize[1])` —— 与 `anim_writer::seq_grid` 同口径。
+fn seq_grid_of(seq: &crate::model::CompiledSequence) -> [usize; 2] {
+    if seq.forward_declared || seq.cells.len() <= 1 {
+        return [1, 1];
+    }
+    let w = seq.blend_width.max(1) as usize;
+    [w, seq.cells.len() / w]
+}
+
+/// 动画池的「名字 → 下标」快表（大小写敏感，与 `anim_index` 同口径）。
+fn compiled_anim_index(
+    anims: &[crate::model::CompiledAnimation],
+) -> std::collections::HashMap<&str, usize> {
+    anims
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.name.as_str(), i))
+        .collect()
+}
+
+/// 附着点的 `local` 矩阵 —— 与写出器**逐字同口径**。
+///
+/// 两处必须一致：`calcblend` 用它算附着点相对位姿，而同一个矩阵
+/// 也会落进 `mstudioattachment_t.local`。不一致就会让「算出来的姿势参数」
+/// 与实际渲染用的附着点不是同一个东西。
+fn attachment_local_matrix(
+    desc: &ModelDesc,
+    at: &crate::model::Attachment,
+) -> crate::bone_math::Matrix3x4 {
+    let pos = at.position.unwrap_or([0.0; 3]);
+    let rot = at.rotation.unwrap_or([0.0; 3]);
+    let angles = [rot[0].to_radians(), rot[1].to_radians(), rot[2].to_radians()];
+    let local = crate::bone_math::local_transform(pos, angles);
+    if desc.model.static_prop {
+        // `$staticprop`：`MakeStaticProp()` 对每个附着点做
+        // `ConcatTransforms( rotated, local, local )`（`simplify.cpp:3392`）。
+        crate::bone_math::concat(&static_prop_matrix(), &local)
+    } else {
+        local
+    }
+}
+
 /// 取 SMD 参考姿态里某根骨骼的姿态。
 fn pose_for(smd: &Smd, node_index: usize) -> Option<&SmdPose> {
     let f = smd.reference_frame()?;
@@ -1556,6 +2001,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 cells: Vec::new(),
                 blend_width: 0,
                 blend_params: [None, None],
+                // `groupsize = [0,0]` ⟹ `CalcPoseParameters` 的
+                // `groupsize[iPose] > 1` 不成立 ⟹ 没有 calc 轴。
+                calc_axes: Vec::new(),
+                blend_ref: None,
+                blend_comp: None,
+                blend_center: None,
                 auto_layers: Vec::new(),
                 events: Vec::new(),
                 fade_in: 0.0,
@@ -1647,15 +2098,91 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
-                params[pi] = Some(crate::model::CompiledBlendParam {
-                    parameter_index: idx,
-                    start: bp.start,
-                    end: bp.end,
-                    keys: blend_param_keys(bp.start, bp.end, grid[pi]),
-                });
+                if let Some(att) = &bp.attachment {
+                    // `calcblend` 轴：`paramstart`/`paramend`/`posekey` **全是
+                    // 算出来的**，这里只占位（真值由
+                    // [`apply_calc_blend_axes`] 在序列全部建完后填）。
+                    //
+                    // ⚠️ 附着点名字**必须在编译期解析**（官方在解析期
+                    // `LookupAttachment`，查不到就 `TokenError`），
+                    // 所以这里就查一次，查不到直接报错。
+                    if lookup_attachment(desc, &bone_index, att).is_none() {
+                        seq_errors.push(e(
+                            format!("{at}.blend_params[{pi}].attachment"),
+                            format!(
+                                "未知的 calcblend 附着点 {att:?}（官方是 Unknown calcblend attachment）"
+                            ),
+                        ));
+                        bad = true;
+                        continue;
+                    }
+                    params[pi] = Some(crate::model::CompiledBlendParam {
+                        parameter_index: idx,
+                        start: 0.0,
+                        end: 0.0,
+                        keys: Vec::new(),
+                    });
+                } else {
+                    params[pi] = Some(crate::model::CompiledBlendParam {
+                        parameter_index: idx,
+                        start: bp.start,
+                        end: bp.end,
+                        keys: blend_param_keys(bp.start, bp.end, grid[pi]),
+                    });
+                }
             }
             if bad {
                 continue;
+            }
+
+            // ---- 官方 `CalcPoseParameters` 会遍历**每一根轴** ----
+            //
+            // 判据（`simplify.cpp:5461-5463`）是**两个条件**：
+            //
+            // ```c
+            // if (pseq->groupsize[iPose] > 1) {
+            //     if (pseq->paramattachment[iPose] != -1) { /* calc 分支 */ }
+            //     else { /* 线性插值：param_i[m] = start*(1-f) + end*f */ }
+            // }
+            // ```
+            //
+            // ⚠️ 循环边界是 `groupsize`，**不是**「QC 写了几个
+            // `blend`/`calcblend`」。所以 `blendwidth 3` 配 0 个 `blend` 时
+            // 轴 0 照样被遍历 —— 而它的 `paramattachment[0]` 是 `memset`
+            // 残留的 **0**（`≠ -1`）⟹ 进入 **calc 分支**
+            // ⟹ `paramcontrol[0]` 同样是 0 ⟹ 每格算出 `0.0`
+            // ⟹ `calcblend failed`（`simplify.cpp:5566-5569`）。
+            //
+            // 这条路径**必须复刻**，否则 mdlc 会对官方拒绝的 QC
+            // 静默产出与官方不同的产物（实测：`idle` 的 `paramindex`
+            // 官方 `[0,-1]` / mdlc `[-1,-1]`，且引擎侧 `move_x` 完全失效）。
+            //
+            // 三种轴的归属：
+            //
+            // | 轴的状态 | `paramattachment` | 走哪条分支 |
+            // |---|---|---|
+            // | 写了 `calcblend` | 附着点下标 | **calc** |
+            // | 写了 `blend` | **-1**（`:2742`） | 线性插值 |
+            // | **两个都没写** | **0**（`memset`） | **calc**（恒 0 ⟹ 报错） |
+            let mut calc_axes: Vec<crate::model::CompiledCalcAxis> = Vec::new();
+            for (axis, &gs) in grid.iter().enumerate() {
+                if gs <= 1 {
+                    continue;
+                }
+                let declared = s.blend_params.get(axis);
+                // 纯 `blend` 轴（声明了但没附着点）走线性插值，**不进** calc。
+                let is_pure_blend =
+                    matches!(declared, Some(bp) if bp.attachment.is_none());
+                if is_pure_blend {
+                    continue;
+                }
+                calc_axes.push(crate::model::CompiledCalcAxis {
+                    axis,
+                    // `None` = 官方 `memset` 残留那条路径（轴根本没声明）——
+                    // 此时控制轴也是 0，所以结果与「哪个附着点」无关。
+                    attachment: declared.and_then(|bp| bp.attachment.clone()),
+                    control: declared.and_then(|bp| bp.control.clone()),
+                });
             }
 
             // 自动层：序列名 → 下标。时间量在这里就转成落盘值。
@@ -1703,6 +2230,19 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             let nf_i = first.len() as i32;
             let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
             let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
+            // `blendcenter` 在网格里的位置（`simplify.cpp:5503-5517`）：
+            // 逐格比 animdesc 指针，命中就记下 `(i0, i1)`。
+            //
+            // ⚠️ 官方比的是**动画对象指针**，所以「同一格被引用两次」时
+            // 取**先命中的那个**（双层循环 `i0` 外层、`i1` 内层）。
+            let blend_center = s.blend_center.as_ref().and_then(|name| {
+                let want = resolve_lookup_animation(name, &anims, &anim_index, &sequences)?;
+                (0..grid[1]).find_map(|k| {
+                    (0..grid[0])
+                        .find(|&j| cell_idx.get(k * grid[0] + j) == Some(&want))
+                        .map(|j| [j, k])
+                })
+            });
             sequences.push(crate::model::CompiledSequence {
                 name: s.name.clone(),
                 smd_path: anims[cell_idx[0]].smd_path.clone(),
@@ -1716,6 +2256,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 cells: cell_idx.clone(),
                 blend_width: width,
                 blend_params: params,
+                calc_axes,
+                blend_ref: s.blend_ref.clone(),
+                blend_comp: s.blend_comp.clone(),
+                blend_center,
                 auto_layers,
                 events: s.events.clone(),
                 fade_in: s.fade_in,
@@ -2059,6 +2603,13 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             cells: vec![anim_ix],
             blend_width: 1,
             blend_params: [None, None],
+            // 单动画序列的 `groupsize` 是 1×1 ⟹ 官方
+            // `CalcPoseParameters` 的 `groupsize[iPose] > 1` **不成立**
+            // ⟹ 一根轴都不遍历 ⟹ 没有 calc 轴。
+            calc_axes: Vec::new(),
+            blend_ref: None,
+            blend_comp: None,
+            blend_center: None,
             auto_layers,
             events: s.events.clone(),
             fade_in: s.fade_in,
@@ -2189,8 +2740,17 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     // 语料里 272 条链有 **263 条非零**，所以这条不是可选项。
     derive_ikchain_knee_dirs(&mut compiled);
 
-    // ---- flex / eyeball / mouth 解析（在重排定稿后）----
+    // ---- `CalcPoseParameters`（`simplify.cpp:5448-5596`）----
     //
+    // 官方在 `ProcessData` 的**末尾**调用（`simplify.cpp:7315`），晚于
+    // `LinkAttachments`（7298）与 `ProcessIKRules`（7311）。这里放在
+    // kneeDir 之后 —— 两者互不影响（kneeDir 只看 `$ikchain` 的骨骼，
+    // calcblend 只看附着点），但保持「序列/动画/附着点全就绪」的前提。
+    //
+    // ⚠️ 这是**硬错误**路径：官方在这里 `MdlError` 直接中止编译。
+    apply_calc_blend_axes(&mut compiled, &anim_weights, base_dir)?;
+
+    // ---- flex / eyeball / mouth 解析（在重排定稿后）----
     // eyeball 的 `up`/`forward`/`org` 用 [`internal_bone_world`] 的世界矩阵
     // 逆变换 —— 与自动 hitbox / 姿态包围盒**同一份口径**（官方
     // `g_bonetable[k].boneToPose`，不是骨骼表最终矩阵）。
@@ -7862,6 +8422,9 @@ weight = 0.5
             blends: Vec::new(),
             blend_width: None,
             blend_params: Vec::new(),
+            blend_ref: None,
+            blend_comp: None,
+            blend_center: None,
             auto_layers: Vec::new(),
             movements: Vec::new(),
             section_frames: None,
@@ -9638,13 +10201,33 @@ end
     fn sequence_ik_rules_attach_to_first_cell() {
         let d = ikr23_dir("r23-first-cell");
         // 3 格 blend，第一格是 `a`（不是名字最靠前的那个）。
+        //
+        // ⚠️ **必须写 `blend` 与 `blendwidth` 两个关键字。**
+        //
+        // 只写 `blendwidth 3`（`groupsize[0] = 3 > 1`）而不写 `blend` 时，
+        // 官方 `CalcPoseParameters`（`simplify.cpp:5461-5569`）会因为
+        // `paramattachment[0]` 是 `memset` 残留的 **0**（`≠ -1`）而误入
+        // calc 分支，`paramcontrol[0]` 同样是 0 ⟹ 每格算出 `0.0`
+        // ⟹ `|paramstart − paramend| = 0 < 0.01` ⟹
+        // **`ERROR: calcblend failed in multi`**。
+        //
+        // 实测（真 `studiomdl.exe`，3 格 + `blendwidth 3` 无 `blend`）：
+        // ```text
+        // ERROR: calcblend failed in multi
+        // ERROR: Aborted Processing on 'r23.mdl'
+        // ```
+        // 所以本夹具补上 `blend "px" 1 -1` + `$poseparameter`，
+        // 才是官方能编译的形态。
         let qc = "\
 $modelname \"r23.mdl\"\n\
 $ikchain \"leg\" \"ankle\"\n\
+$poseparameter \"px\" -1 1\n\
 $animation \"a\" \"a.smd\" fps 30\n\
 $animation \"b\" \"b.smd\" fps 30\n\
 $animation \"c\" \"c.smd\" fps 30\n\
 $sequence \"multi\" \"a\" \"b\" \"c\" {\n\
+blend \"px\" 1 -1\n\
+blendwidth 3\n\
 ikrule \"leg\" touch \"hip\"\n\
 }\n\
 $model \"body\" \"a.smd\" {\n\
@@ -9720,8 +10303,540 @@ $model \"body\" \"a.smd\" {\n\
         );
     }
 
-    /// **`$animation` 块里的 ikrule 不受影响**（回归护栏）。
+    // =====================================================================
+    // calcblend（官方 `CalcPoseParameters`，`simplify.cpp:5448-5596`）
+    //
+    // 全部判据都用真 `studiomdl.exe` 实测过（见每条的文档）。
+    // =====================================================================
+
+    /// 一份「附着点在 `tip` 上、三个格子朝向各不相同」的最小 SMD。
     ///
+    /// `rot` 是 `tip` 的 Z 旋转（弧度）—— 三格分别给 0 / 0.3 / 0.6，
+    /// 于是 `calcblend ... ZR` 的逐格取值必然是 `0 / 17.19 / 34.38` 度。
+    fn cb_smd(rot: &str) -> String {
+        format!(
+            "version 1\n\
+             nodes\n\
+             0 \"root\" -1\n\
+             1 \"tip\" 0\n\
+             end\n\
+             skeleton\n\
+             time 0\n\
+             0 0 0 0 0 0 0\n\
+             1 0 0 8 0 0 {rot}\n\
+             time 1\n\
+             0 0 0 0 0 0 0\n\
+             1 0 0 8 0 0 {rot}\n\
+             end\n\
+             triangles\n\
+             mat\n\
+             0 -8 -8 0 0 0 1 0 0 1 0 1.000000\n\
+             0 8 -8 0 0 0 1 1 0 1 0 1.000000\n\
+             0 0 8 0 0 0 1 0.5 1 1 0 1.000000\n\
+             end\n"
+        )
+    }
+
+    /// 三格 `calcblend` 夹具（`a`/`b`/`c` 的 `tip` Z 旋转 = 0 / 0.3 / 0.6 rad）。
+    fn cb_dir(tag: &str) -> PathBuf {
+        let d = tmpdir(tag);
+        write(&d, "a.smd", &cb_smd("0.000000"));
+        write(&d, "b.smd", &cb_smd("0.300000"));
+        write(&d, "c.smd", &cb_smd("0.600000"));
+        d
+    }
+
+    /// **`calcblend` 的逐格取值必须是「附着点相对位姿」的实测值。**
+    ///
+    /// # 官方（`simplify.cpp:5487-5569`）
+    ///
+    /// ```text
+    /// mid    = CalcBoneTransforms(paramanim, 0)[att.bone] ∘ att.local
+    /// invMid = inverse(mid)
+    /// for m:  rel = CalcBoneTransforms(cell(m), paramcompanim, 0)[att.bone] ∘ att.local
+    ///         v   = CalcPoseParameterValue(paramcontrol, angles(invMid ∘ rel), pos(...))
+    /// ```
+    ///
+    /// # 实测判据（真 `studiomdl.exe`，3 格 + `calcblend "px" "att" ZR`）
+    ///
+    /// ```text
+    /// paramstart = 0.0000    paramend = 114.5916
+    /// posekey    = [0.0000, 57.2958, 114.5916, 0.0000]
+    /// ```
+    ///
+    /// `57.2958 = 1 rad`、`114.5916 = 2 rad` 的度数 —— 正是三格的 Z 旋转
+    /// `0 / 1 / 2 rad` 换算成度。**mdlc 必须逐值复现**（这里用 1e-4 容差
+    /// 吸收 `RAD2DEG` 的浮点差；实测两侧打印到 4 位小数完全相同）。
+    #[test]
+    fn calcblend_measures_attachment_pose_per_cell() {
+        let d = cb_dir("cb-zr");
+        let qc = "\
+$modelname \"cb.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+calcblend \"px\" \"att\" ZR\n\
+blendwidth 3\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let seq = &c.sequences[0];
+        // 先证明夹具非空 —— 否则下面的断言会**空洞通过**。
+        assert_eq!(seq.cells.len(), 3, "夹具应是 3 格");
+        assert_eq!(seq.calc_axes.len(), 1, "应有 1 根 calc 轴");
+        let p = seq.blend_params[0].as_ref().expect("轴 0 应被填上");
+        assert_eq!(p.parameter_index, 0, "paramindex[0] 应指向姿势参数 0");
+        assert_eq!(p.keys.len(), 3, "应有 3 个逐格取值");
+        // ⚠️ 三格旋转 0 / 0.3 / 0.6 rad ⟹ 0 / 17.1887 / 34.3775 度。
+        for (i, want) in [0.0f32, 17.188_73, 34.377_47].iter().enumerate() {
+            assert!(
+                (p.keys[i] - want).abs() < 1e-3,
+                "posekey[{i}] = {} 应约为 {want}",
+                p.keys[i]
+            );
+        }
+        assert!((p.start - 0.0).abs() < 1e-4, "paramstart = {}", p.start);
+        assert!(
+            (p.end - 34.377_47).abs() < 1e-3,
+            "paramend = {} 应约为 34.3775",
+            p.end
+        );
+    }
+
+    /// **`X` / `ZR` 两个控制轴都要认**（`CalcPoseParameterValue` 的 6 个 case）。
+    ///
+    /// 官方只认 `X/Y/Z`（位置分量）与 `XR/YR/ZR`（角度分量，**度**），
+    /// 其余一律返回 `0.0`。这里让三格在 **X 位置**上变化，验证 `X` 走的是
+    /// 位置而不是角度 —— 若把 `X` 与 `XR` 弄混，得到的是 0（因为无旋转）。
+    #[test]
+    fn calcblend_supports_position_and_rotation_controls() {
+        let d = tmpdir("cb-x");
+        // 三格的 tip **X 位置** = 0 / 5 / 10（无旋转）。
+        for (name, x) in [("a.smd", "0.000000"), ("b.smd", "5.000000"), ("c.smd", "10.000000")] {
+            write(
+                &d,
+                name,
+                &format!(
+                    "version 1\n\
+                     nodes\n\
+                     0 \"root\" -1\n\
+                     1 \"tip\" 0\n\
+                     end\n\
+                     skeleton\n\
+                     time 0\n\
+                     0 0 0 0 0 0 0\n\
+                     1 {x} 0 8 0 0 0\n\
+                     time 1\n\
+                     0 0 0 0 0 0 0\n\
+                     1 {x} 0 8 0 0 0\n\
+                     end\n\
+                     triangles\n\
+                     mat\n\
+                     0 -8 -8 0 0 0 1 0 0 1 0 1.000000\n\
+                     0 8 -8 0 0 0 1 1 0 1 0 1.000000\n\
+                     0 0 8 0 0 0 1 0.5 1 1 0 1.000000\n\
+                     end\n"
+                ),
+            );
+        }
+        let qc = "\
+$modelname \"cbx.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+calcblend \"px\" \"att\" X\n\
+blendwidth 3\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let p = c.sequences[0].blend_params[0]
+            .as_ref()
+            .expect("轴 0 应被填上");
+        // 实测官方：`posekey = [0.0000, 5.0000, 10.0000, 0.0000]`。
+        assert_eq!(p.keys.len(), 3, "应有 3 个逐格取值");
+        for (i, want) in [0.0f32, 5.0, 10.0].iter().enumerate() {
+            assert!(
+                (p.keys[i] - want).abs() < 1e-4,
+                "posekey[{i}] = {} 应约为 {want}（控制轴 X 取的是**位置**）",
+                p.keys[i]
+            );
+        }
+    }
+
+    /// **只写 `blendwidth` 不写 `blend` ⟹ 必须报 `calcblend failed`。**
+    ///
+    /// # 这是本轮最重要的判据
+    ///
+    /// 官方 `Cmd_Sequence`（`studiomdl.cpp:2624`）先 `memset(pseq, 0, …)`，
+    /// 然后**只**初始化 `paramindex` / `groupsize` / `fadein` / `fadeout`
+    /// （`:2629-2640`）—— `paramattachment` 与 `paramcontrol`
+    /// **都不在初始化列表里**。
+    ///
+    /// 只有 `blend` 分支写 `paramattachment[i] = -1`（`:2742`）。
+    /// 于是「有 `blendwidth`、没有 `blend`」时：
+    ///
+    /// ```text
+    /// groupsize[0] = 3 > 1                      ⟹ 进入外层 if
+    /// paramattachment[0] == 0  (memset) != -1   ⟹ 进入 **calc 分支**
+    /// paramcontrol[0]    == 0  (memset)
+    ///   ⟹ CalcPoseParameterValue(0, …) 不匹配任何 case ⟹ 返回 0.0
+    ///   ⟹ paramstart == paramend == 0.0
+    ///   ⟹ fabs(差) < 0.01 ⟹ MdlError("calcblend failed in <序列>")
+    /// ```
+    ///
+    /// **真 `studiomdl.exe` 实测**（3 格 + `blendwidth 3`，无 `blend`）：
+    ///
+    /// ```text
+    /// ERROR: calcblend failed in multi
+    /// ERROR: Aborted Processing on 'r23.mdl'
+    /// ```
+    ///
+    /// 用户的真实工程正是踩了这条：Crowbar 反编译出来的 QC 把
+    /// `blend "move_x" 1 -1` **注释掉了**，只留下 `blendwidth 3`。
+    /// mdlc 修前**静默编过**，产出 `paramindex = [-1,-1]`、`posekey` 全 0
+    /// 的模型 —— 引擎侧 `Studio_LocalPoseParameter` 见 `-1` 直接
+    /// `flSetting = 0; index = 0`，姿势参数**完全失效**。
+    #[test]
+    fn blendwidth_without_blend_reports_calcblend_failed() {
+        let d = cb_dir("cb-noblend");
+        let qc = "\
+$modelname \"cb2.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"multi\" \"a\" \"b\" \"c\" {\n\
+blendwidth 3\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let err = compile(&desc, &d).expect_err("官方拒绝的 QC，mdlc 也必须拒绝");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(
+            err.iter().any(|e| e.message.contains("calcblend failed")),
+            "错误信息应含 `calcblend failed`（与官方同一句），实际：{err:?}"
+        );
+        // 官方把**序列名**写进消息（`MdlError("calcblend failed in %s")`）。
+        assert!(
+            err.iter().any(|e| e.message.contains("multi")),
+            "错误信息应含序列名 `multi`，实际：{err:?}"
+        );
+    }
+
+    /// **单动画序列不受影响**（回归护栏）。
+    ///
+    /// `groupsize` 是 1×1 ⟹ 官方 `CalcPoseParameters` 的
+    /// `groupsize[iPose] > 1` **不成立** ⟹ 一根轴都不遍历 ⟹ 不报错。
+    ///
+    /// 实测官方：单动画（`u1_single_anim`）**PASS**。
+    #[test]
+    fn single_animation_sequence_skips_calcblend_check() {
+        let d = cb_dir("cb-single");
+        let qc = "\
+$modelname \"cb3.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$sequence \"idle\" \"a\" {\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("单动画序列必须能编译（groupsize = 1×1）");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert_eq!(
+            c.sequences[0].cells.len(),
+            1,
+            "单动画序列的 `cells` 恰好 1 项（隐含动画 `@idle`）"
+        );
+        assert!(
+            c.sequences[0].calc_axes.is_empty(),
+            "groupsize = 1×1 ⟹ 不应有 calc 轴"
+        );
+        assert_eq!(
+            c.sequences[0].blend_params[0], None,
+            "单动画序列不该有参数轴"
+        );
+    }
+
+    /// **纯 `blend` 轴不能误入 calc 分支**（回归护栏）。
+    ///
+    /// 官方 `blend` 会把 `paramattachment[i] = -1`（`studiomdl.cpp:2742`），
+    /// 于是走**线性插值**那条 `else`（`simplify.cpp:5576-5591`），
+    /// 逐格取值 = `start*(1-f) + end*f`。
+    ///
+    /// 若把「声明了 `blend`」也当成 calc 轴，就会去算附着点相对位姿 ——
+    /// 而纯 `blend` 的 `paramcontrol` 是 0 ⟹ 每格 0 ⟹ 误报
+    /// `calcblend failed`。**这是最容易犯的过度泛化。**
+    #[test]
+    fn pure_blend_axis_uses_linear_interpolation_not_calc() {
+        let d = cb_dir("cb-pure");
+        let qc = "\
+$modelname \"cb4.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+blend \"px\" 1 -1\n\
+blendwidth 3\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("纯 blend 必须能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(
+            c.sequences[0].calc_axes.is_empty(),
+            "纯 `blend` 轴不该进 calc 分支"
+        );
+        let p = c.sequences[0].blend_params[0]
+            .as_ref()
+            .expect("轴 0 应被填上");
+        // `start=1, end=-1, groupsize=3` ⟹ `[1, 0, -1]`。
+        assert_eq!(p.keys, vec![1.0, 0.0, -1.0], "线性插值应为 [1, 0, -1]");
+        assert_eq!(p.start, 1.0);
+        assert_eq!(p.end, -1.0);
+    }
+
+    /// **`blend` 与 `calcblend` 共用同一套「按出现顺序占槽」规则。**
+    ///
+    /// 官方两个关键字的槽位算法**逐字相同**（`studiomdl.cpp:2734-2737`
+    /// 与 `:2756-2759`）：
+    ///
+    /// ```c
+    /// i = 0;
+    /// if (pseq->paramindex[0] != -1) { i = 1; }
+    /// ```
+    ///
+    /// # 判据必须让**两根轴的 `groupsize` 都 > 1**
+    ///
+    /// 3 格 + `blendwidth 3` 时 `groupsize = [3, 1]`，轴 1 的 `groupsize[1]`
+    /// 是 1 ⟹ 官方 `CalcPoseParameters` 的外层 `if` 不成立 ⟹ 轴 1
+    /// **根本不参与**（`paramstart[1]`/`paramend[1]` 保持 `blend` 写的
+    /// QC 值）。那种夹具**测不出槽位顺序**。
+    ///
+    /// 所以这里用 **2×2 网格**（`groupsize = [2, 2]`），两根轴都真的被遍历。
+    ///
+    /// # ⚠️ 2×2 时**两根轴都必须声明**
+    ///
+    /// 只写 `calcblend`（轴 1 空着）时，轴 1 的 `paramattachment` 是
+    /// `memset` 残留的 **0**、`paramcontrol` 也是 0 ⟹ 每格 0 ⟹
+    /// **官方照样报 `calcblend failed`**。
+    /// 实测（真 `studiomdl.exe`，2×2 只写 `calcblend`）：
+    /// `ERROR: calcblend failed in idle`。
+    ///
+    /// # 实测官方（2×2，`calcblend` 占槽 0 + `blend` 占槽 1）
+    ///
+    /// 本夹具的 `tip` Z 旋转是 **0 / 0.3 / 0.6 / 0** 弧度
+    /// （见 [`cb_smd`]），所以：
+    ///
+    /// ```text
+    /// 轴 0（calc）遍历**第 1 列**（中点 `2/2 = 1`）⟹ 格子 `c`(0.6 rad) / `d`(0)
+    ///   ⟹ paramstart[0] = 34.3775°、paramend[0] = 0°
+    /// 轴 1（纯 blend，线性 1 → -1）⟹ paramstart[1] = 1、paramend[1] = -1
+    /// ```
+    ///
+    /// **若槽位顺序弄反**，轴 0 会拿到线性的 `1/-1`、轴 1 拿到 calc 值 ——
+    /// 两个断言都会红。
+    #[test]
+    fn blend_and_calcblend_share_the_axis_slot_order() {
+        let d = cb_dir("cb-order1");
+        write(&d, "d.smd", &cb_smd("0.000000")); // 第 4 格 = 与 `a` 相同
+        let qc = "\
+$modelname \"cb5.mdl\"\n\
+$poseparameter \"pa\" -1 1\n\
+$poseparameter \"pb\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$animation \"d\" \"d.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" \"d\" {\n\
+calcblend \"pa\" \"att\" ZR\n\
+blend \"pb\" 1 -1\n\
+blendwidth 2\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let seq = &c.sequences[0];
+        assert_eq!(seq.cells.len(), 4, "夹具应是 2×2 = 4 格");
+        assert_eq!(seq.calc_axes.len(), 1, "应恰好 1 根 calc 轴");
+        assert_eq!(seq.calc_axes[0].axis, 0, "calcblend 先写 ⟹ 占槽 0");
+        let p0 = seq.blend_params[0].as_ref().expect("轴 0");
+        let p1 = seq.blend_params[1].as_ref().expect("轴 1");
+        // 轴 0 = calc：第 1 列的 `c`(0.6 rad = 34.3775°) → `d`(0)。
+        assert_eq!(p0.keys.len(), 2, "轴 0 应有 2 个逐格取值");
+        assert!(
+            (p0.start - 34.377_47).abs() < 1e-3,
+            "paramstart[0] = {} 应约为 34.3775（第 1 列的 `c`，0.6 rad）",
+            p0.start
+        );
+        assert!((p0.end - 0.0).abs() < 1e-4, "paramend[0] = {}", p0.end);
+        // 轴 1 = 纯 blend：线性插值 `1 → -1`。
+        assert_eq!((p1.start, p1.end), (1.0, -1.0), "槽 1 应是 QC 的线性值");
+        assert_eq!(p1.keys, vec![1.0, -1.0], "轴 1 的逐格取值应是 [1, -1]");
+    }
+
+    /// **2×2 网格上「另一根轴取中点」**（`simplify.cpp:5518-5521`）。
+    ///
+    /// `blendcenter` 没写时官方取 `m[1-iPose] = groupsize[1-iPose] / 2`
+    /// —— **整数除法**，所以 2 格时取 `1`（不是 0、也不是 0.5）。
+    ///
+    /// # 判据
+    ///
+    /// 轴 0 必须遍历**第 1 列**（`c`/`d`）而不是第 0 列（`a`/`b`）：
+    ///
+    /// | 假设 | `paramstart[0]` |
+    /// |---|---|
+    /// | 取中点（**官方**） | `34.3775`（`c` = 0.6 rad） |
+    /// | 误取第 0 列 | `0`（`a`） |
+    ///
+    /// # ⚠️ 两根轴都要声明
+    ///
+    /// 2×2 只写 `calcblend` 时轴 1 是 `memset` 路径（控制轴 0）⟹
+    /// **官方直接报 `calcblend failed`**（实测）。所以夹具必须同时给
+    /// 轴 1 一个 `blend`，才走得到「取中点」这段逻辑。
+    #[test]
+    fn calcblend_other_axis_uses_integer_midpoint() {
+        let d = cb_dir("cb-mid");
+        write(&d, "d.smd", &cb_smd("0.000000"));
+        let qc = "\
+$modelname \"cb9.mdl\"\n\
+$poseparameter \"pa\" -1 1\n\
+$poseparameter \"pb\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$animation \"d\" \"d.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" \"d\" {\n\
+calcblend \"pa\" \"att\" ZR\n\
+blend \"pb\" 1 -1\n\
+blendwidth 2\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let p = c.sequences[0].blend_params[0].as_ref().expect("轴 0");
+        assert_eq!(p.keys.len(), 2, "轴 0 应有 2 个逐格取值");
+        assert!(
+            (p.start - 34.377_47).abs() < 1e-3,
+            "paramstart = {} 应约为 34.3775 —— 证明取的是**第 1 列**（中点 `2/2 = 1`）",
+            p.start
+        );
+        assert!(
+            (p.end - 0.0).abs() < 1e-4,
+            "paramend = {} 应是第 1 列末格 `d` 的 0",
+            p.end
+        );
+    }
+
+    /// **未知的 `calcblend` 附着点必须报错**（官方 `TokenError`）。
+    ///
+    /// 官方 `studiomdl.cpp:2766-2770`：
+    /// ```c
+    /// pseq->paramattachment[i] = LookupAttachment( token );
+    /// if (pseq->paramattachment[i] == -1) TokenError( "Unknown calcblend attachment \"%s\"\n", token );
+    /// ```
+    #[test]
+    fn unknown_calcblend_attachment_is_rejected() {
+        let d = cb_dir("cb-badatt");
+        let qc = "\
+$modelname \"cb7.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+calcblend \"px\" \"nosuchatt\" ZR\n\
+blendwidth 3\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let err = compile(&desc, &d).expect_err("未知附着点必须被拒绝");
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(
+            err.iter().any(|e| e.message.contains("nosuchatt")),
+            "错误信息应含附着点名，实际：{err:?}"
+        );
+    }
+
+    /// **`blendref` / `blendcomp` / `blendcenter` 必须能解析且被消费。**
+    ///
+    /// 官方三者都是 `LookupAnimation`（`studiomdl.cpp:2775-2801`）——
+    /// **先查动画池、再回落到序列池**（`:2381-2397`）。
+    ///
+    /// 这里用 `blendcomp` 指向**另一条动画**：`CalcBoneTransforms` 的
+    /// 3 参数版只在动画带 `STUDIO_DELTA` 时读 `pbaseanimation`
+    /// （`simplify.cpp:4568`），所以对非 delta 夹具它**不影响数值** ——
+    /// 本测试钉的是「三个关键字都被接受、且不改变正确的 calc 结果」。
+    #[test]
+    fn blendref_blendcomp_blendcenter_are_accepted() {
+        let d = cb_dir("cb-refs");
+        let qc = "\
+$modelname \"cb8.mdl\"\n\
+$poseparameter \"px\" -1 1\n\
+$attachment \"att\" \"tip\" 0 0 0 rotate 0 0 0\n\
+$animation \"a\" \"a.smd\" fps 30\n\
+$animation \"b\" \"b.smd\" fps 30\n\
+$animation \"c\" \"c.smd\" fps 30\n\
+$sequence \"idle\" \"a\" \"b\" \"c\" {\n\
+calcblend \"px\" \"att\" ZR\n\
+blendwidth 3\n\
+blendref \"a\"\n\
+blendcomp \"b\"\n\
+blendcenter \"b\"\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let seq = &c.sequences[0];
+        assert_eq!(seq.blend_ref.as_deref(), Some("a"), "blendref 应被记录");
+        assert_eq!(seq.blend_comp.as_deref(), Some("b"), "blendcomp 应被记录");
+        // `blendcenter "b"` ⟹ `b` 是第 1 格 ⟹ `[i0, i1] = [1, 0]`。
+        assert_eq!(seq.blend_center, Some([1, 0]), "blendcenter 应解析成网格位置");
+        // 数值仍必须正确（`blendref` 换成 `a` 后「零点」就是 `a` 的第 0 帧，
+        // 与缺省 `g_panimation[0]` 恰好是同一条 ⟹ 结果不变）。
+        let p = seq.blend_params[0].as_ref().expect("轴 0");
+        assert!(
+            (p.end - 34.377_47).abs() < 1e-3,
+            "paramend = {} 应约为 34.3775",
+            p.end
+        );
+    }
+
+    /// **`$animation` 块里的 ikrule 不受影响**（回归护栏）。
     /// 官方两条路径都写 `panim->cmds[]`，所以「写在 `$animation` 里」
     /// 与「写在 `$sequence` 里」最终都进同一条动画。这条钉住
     /// **不要**为了修 R23 而把 `$animation` 级的规则搬走或复制一份。

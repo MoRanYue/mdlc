@@ -1297,8 +1297,73 @@ pub struct Sequence {
     /// 最多 2 个：第 0 个对应 X 轴（`groupsize[0]`），
     /// 第 1 个对应 Y 轴（`groupsize[1]`）。
     /// **轴的顺序就是数组顺序**，与 QC 里 `blend` 命令的先后一致。
+    ///
+    /// # ⚠️ `blend` 与 `calcblend` 共用这一个列表
+    ///
+    /// 官方两个关键字用的是**同一个槽位分配规则**
+    /// （`studiomdl.cpp:2734-2737` 与 `:2756-2759`，逐字相同）：
+    ///
+    /// ```c
+    /// i = 0;
+    /// if (pseq->paramindex[0] != -1) { i = 1; }   // 槽 0 被占 ⟹ 用槽 1
+    /// ```
+    ///
+    /// 即**按 QC 出现顺序**占槽，与是哪个关键字**无关**。
+    /// 所以 `blend "pa" …` 后面跟 `calcblend "pb" …` 会占槽 0 / 槽 1，
+    /// 反过来写也一样 —— 用一个有序列表就能精确表达。
+    /// 每项是不是 calc 由 [`BlendParam::attachment`] 区分。
     #[serde(default)]
     pub blend_params: Vec<BlendParam>,
+    /// `blendref`（QC 的 `blendref <动画名>`）—— `pseq->paramanim`。
+    ///
+    /// # 角色：`calcblend` 的**「零点」参考动画**
+    ///
+    /// 官方用它算附着点的「零位姿」（`simplify.cpp:5488`）：
+    ///
+    /// ```c
+    /// CalcBoneTransforms( pseq->paramanim, 0, boneToWorld );
+    /// ConcatTransforms( boneToWorld[k0], g_attachment[n0].local, boneToWorldMid );
+    /// MatrixInvert( boneToWorldMid, worldToBoneMid );
+    /// ```
+    ///
+    /// 为空时**回落到 `g_panimation[0]`**（`simplify.cpp:5476-5479`），
+    /// 即 QC 里**第一条** `$animation`。
+    #[serde(default)]
+    pub blend_ref: Option<String>,
+    /// `blendcomp`（QC 的 `blendcomp <动画名>`）—— `pseq->paramcompanim`。
+    ///
+    /// # 角色：逐格算值时给 `CalcBoneTransforms` 的**基准动画**
+    ///
+    /// 官方（`simplify.cpp:5526`）：
+    ///
+    /// ```c
+    /// CalcBoneTransforms( pseq->panim[m[0]][m[1]], pseq->paramcompanim, 0, boneToWorld );
+    /// ```
+    ///
+    /// 这是 3 参数版，`pbaseanimation` 只在动画带 `STUDIO_DELTA` 时才被读
+    /// （`simplify.cpp:4568` 的 `pbaseanimation->sanim[0][k]`）——
+    /// 非 delta 动画下它与结果无关。
+    ///
+    /// 为空时回落到 `paramanim`（`simplify.cpp:5481-5484`）。
+    #[serde(default)]
+    pub blend_comp: Option<String>,
+    /// `blendcenter`（QC 的 `blendcenter <动画名>`）—— `pseq->paramcenter`。
+    ///
+    /// # 角色：决定「另一根轴」取网格的哪一格
+    ///
+    /// 官方先在网格里找它的位置 `(i0, i1)`，找不到就取中点
+    /// （`simplify.cpp:5503-5521`）：
+    ///
+    /// ```c
+    /// if (pseq->paramcenter != NULL) { 找到 (i0,i1) 使 panim[i0][i1] == paramcenter ⟹ m[0]=i0, m[1]=i1; }
+    /// if (!found) { m[1-iPose] = pseq->groupsize[1-iPose] / 2; }
+    /// ```
+    ///
+    /// ⚠️ **命中时 `m[0]` 与 `m[1]` 被同时写死**，于是两层循环里
+    /// 「另一根轴」也跟着 `blendcenter` 走 —— 这是官方的原样行为
+    /// （`m[iPose]` 在循环里被覆盖，`m[1-iPose]` 保持 `blendcenter` 给的值）。
+    #[serde(default)]
+    pub blend_center: Option<String>,
     /// **自动层**（QC 的 `addlayer <序列名>`）。
     ///
     /// 自动层让引擎在播本序列时**叠加**另一条序列。
@@ -1446,6 +1511,15 @@ pub type BlendCellName = String;
 /// ```
 ///
 /// 实测 `look_poses`（`start=-1, end=1, groupsize[0]=3`）⟹ `[-1, 0, 1]` ✓
+///
+/// # 两种来源（QC 的 `blend` 与 `calcblend`）
+///
+/// [`Self::attachment`] 为 `None` 时是纯 `blend`：`start`/`end` 来自 QC，
+/// `param0[]` 走上面的线性插值。
+///
+/// 为 `Some` 时是 `calcblend`：`start`/`end` 与 `param0[]` **全部是算出来的**
+/// （官方 `CalcPoseParameters`，`simplify.cpp:5448-5596`），此时 QC 里
+/// 那两个数字**根本不存在**，字段值在编译期被覆盖。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BlendParam {
@@ -1455,11 +1529,38 @@ pub struct BlendParam {
     /// 的「名字或下标」惯例一致。
     pub parameter: String,
     /// 该轴的起始值（QC `blend` 的第二个数字）。
+    ///
+    /// `calcblend` 轴忽略它（值由编译期算出）。
     #[serde(default)]
     pub start: f32,
     /// 该轴的结束值（QC `blend` 的第三个数字）。
+    ///
+    /// `calcblend` 轴忽略它（值由编译期算出）。
     #[serde(default)]
     pub end: f32,
+    /// `calcblend` 的附着点名（`Some` ⟹ 本轴是 `calcblend`）。
+    ///
+    /// 官方 `LookupAttachment` 查不到时报
+    /// `Unknown calcblend attachment "<名>"`（`studiomdl.cpp:2766-2770`）。
+    #[serde(default)]
+    pub attachment: Option<String>,
+    /// `calcblend` 的控制轴名（`X` / `Y` / `Z` / `XR` / `YR` / `ZR`）。
+    ///
+    /// 大小写不敏感（官方 `lookupControl` 用 `stricmp`）。
+    ///
+    /// ⚠️ **缺省是「无控制轴」，不是 `X`。** 官方
+    /// `Cmd_Sequence`（`studiomdl.cpp:2624`）先 `memset(pseq, 0, …)`，
+    /// 而 `paramcontrol[i]` **只在 `calcblend` 分支被赋值**
+    /// （`:2773`）。所以纯 `blend` 的轴 `paramcontrol == 0`，
+    /// 而 `CalcPoseParameterValue` 对 0 **不匹配任何 case** ⟹ 返回 `0.0`
+    /// （`simplify.cpp:5445`）。这正是「只写 `blendwidth` 不写 `blend`」
+    /// 的序列会报 `calcblend failed` 的根因 —— 见
+    /// [`CompiledSequence::param_axis_count`] 的说明。
+    ///
+    /// 用 `None` 表达「0」；无法识别的名字也回落到 `None`
+    /// （官方 `lookupControl` 返回 `-1`，而 `-1` 同样不匹配任何 case ⟹ 也是 0）。
+    #[serde(default)]
+    pub control: Option<String>,
 }
 
 /// 一条自动层（QC 的 `addlayer <序列名>`）。
@@ -3294,12 +3395,103 @@ pub struct CompiledBlendCell {
     pub smd_path: std::path::PathBuf,
 }
 
+/// `calcblend` 的控制轴位（`studio.h:3072-3084`，`STUDIO_X` 起）。
+///
+/// # 为什么用位而不是枚举
+///
+/// 官方 `lookupControl`（`studiomdl.cpp:395-415`）返回的是**位**，
+/// 直接存进 `pseq->paramcontrol[i]`，再由 `CalcPoseParameterValue`
+/// 的 `switch` 消费（`simplify.cpp:5428-5446`）。用位值能逐字对上，
+/// 也自然表达「无法识别的名字 ⟹ `-1` ⟹ 不匹配任何 case」。
+///
+/// # ⚠️ `0` 是合法且**最常见**的取值
+///
+/// `memset` 之后 `paramcontrol[i] == 0`，而 `switch(0)` 不匹配任何 case
+/// ⟹ `CalcPoseParameterValue` 返回 **`0.0`**（`:5445` 的兜底 `return 0.0`）。
+/// 这不是「未设置」的错误状态，而是官方**确实会走到**的一条路径 ——
+/// 「只写 `blendwidth` 不写 `blend`」时就是它。
+pub mod control {
+    /// `X` —— 附着点相对位置的 X 分量。
+    pub const X: i32 = 0x0000_0001;
+    /// `Y`。
+    pub const Y: i32 = 0x0000_0002;
+    /// `Z`。
+    pub const Z: i32 = 0x0000_0004;
+    /// `XR` —— 附着点相对朝向的 X 分量（**度**）。
+    pub const XR: i32 = 0x0000_0008;
+    /// `YR`。
+    pub const YR: i32 = 0x0000_0010;
+    /// `ZR`。
+    pub const ZR: i32 = 0x0000_0020;
+
+    /// `lookupControl`（`studiomdl.cpp:395-415`）的等价实现。
+    ///
+    /// **大小写不敏感**（官方用 `stricmp`）。无法识别时返回 `-1`
+    /// —— 与官方一致；`-1` 在 `switch` 里同样落到 `return 0.0`。
+    ///
+    /// ⚠️ 官方还认 `LX/LY/LZ/LXR/LYR/LZR/LM/LQ`（局部轴与线性），
+    /// 但 `CalcPoseParameterValue` 的 `switch` **只处理前 6 个** ——
+    /// 其余一样返回 `0.0`。所以这里只需识别前 6 个，
+    /// 其余（含拼错的）一律回落到「不匹配」。
+    pub fn lookup(name: &str) -> i32 {
+        if name.eq_ignore_ascii_case("X") {
+            X
+        } else if name.eq_ignore_ascii_case("Y") {
+            Y
+        } else if name.eq_ignore_ascii_case("Z") {
+            Z
+        } else if name.eq_ignore_ascii_case("XR") {
+            XR
+        } else if name.eq_ignore_ascii_case("YR") {
+            YR
+        } else if name.eq_ignore_ascii_case("ZR") {
+            ZR
+        } else {
+            -1
+        }
+    }
+}
+
+/// 一条**待算**的 `calcblend` 轴。
+///
+/// # 为什么不能在序列循环里就地算
+///
+/// 官方 `CalcPoseParameters`（`simplify.cpp:7315`）跑在 `ProcessData` 的
+/// **末尾** —— 那时所有序列、动画、附着点都已就绪。而 `blendref` /
+/// `blendcomp` / `blendcenter` 走的是 `LookupAnimation`，
+/// **会回落到序列池**（`studiomdl.cpp:2381-2397`）⟹ 必须等序列建完。
+///
+/// 所以本结构是「先记下要算什么」，由 [`CompiledModelDesc`] 建好之后的
+/// 一趟后处理消费。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledCalcAxis {
+    /// 网格的哪一根轴（0 或 1）。
+    pub axis: usize,
+    /// `calcblend` 的附着点名。
+    ///
+    /// `None` = **官方 `memset` 残留**那条路径：本轴没有对应的
+    /// `blend`/`calcblend`，于是 `paramattachment[iPose]` 保持 **0**
+    /// （`≠ -1` ⟹ 误入 calc 分支），而 `paramcontrol[iPose]` 同样是 **0**。
+    /// `CalcPoseParameterValue(0, …)` 恒返回 `0.0`
+    /// ⟹ 每一格都是 0 ⟹ 必然触发 `calcblend failed`。
+    pub attachment: Option<String>,
+    /// 控制轴名（`X` / `Y` / `Z` / `XR` / `YR` / `ZR`）。
+    ///
+    /// `None` = 官方 `memset` 的 **0**（或 `lookupControl` 不认识 ⟹ `-1`），
+    /// 两者在 `switch` 里都落到 `return 0.0`。
+    pub control: Option<String>,
+}
+
 /// blend 的一个参数轴（已解析）。
 ///
 /// 落盘时 `paramindex[i]` = [`Self::parameter_index`]，
 /// `paramstart[i]`/`paramend[i]` = `start`/`end`，
 /// 而 `param0[]`/`param1[]` 是**线性插值**出来的逐格取值
 /// （`simplify.cpp:5579-5590`）。
+///
+/// ⚠️ `calcblend` 的轴（[`BlendParam::attachment`] 非空）在编译期被
+/// **整个改写** —— `start`/`end`/`keys` 三个都换成 `CalcPoseParameters`
+/// 算出的实测值，线性插值**不参与**。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledBlendParam {
     /// `mstudioseqdesc_t.paramindex[i]`：参数在
@@ -3513,6 +3705,46 @@ pub struct CompiledSequence {
     ///
     /// 元素是 `(参数下标, param0[], param1[])` 里的**该轴那一个**数组。
     pub blend_params: [Option<CompiledBlendParam>; 2],
+    /// **待算**的 `calcblend` 轴（见 [`CompiledCalcAxis`]）。
+    ///
+    /// # ⚠️ 这里记录的是「官方会走到 calc 分支」的全部情形
+    ///
+    /// 不只是「QC 写了 `calcblend`」，还包括官方那个著名的
+    /// **未初始化字段**路径：
+    ///
+    /// ```text
+    /// groupsize[iPose] > 1  &&  paramattachment[iPose] != -1
+    /// ```
+    ///
+    /// `Cmd_Sequence`（`studiomdl.cpp:2624`）只 `memset` + 初始化
+    /// `paramindex`/`groupsize`/`fadein`/`fadeout`，**`paramattachment`
+    /// 与 `paramcontrol` 都不在初始化列表里** ⟹ 都是 **0**。
+    /// 只有 `blend` 会写 `paramattachment[i] = -1`（`:2742`）。
+    ///
+    /// 所以**只写 `blendwidth` 而没写 `blend`** 时：
+    /// `groupsize[0] = 3 > 1` 成立，`paramattachment[0] == 0 != -1` 也成立
+    /// ⟹ 进入 calc 分支 ⟹ `paramcontrol[0] == 0` ⟹ 每格 `v = 0.0`
+    /// ⟹ `|paramstart − paramend| = 0 < 0.01` ⟹
+    /// **`ERROR: calcblend failed in <序列>`**（`simplify.cpp:5566-5569`）。
+    ///
+    /// 这正是本字段要复刻的行为：空列表 = 官方不会进 calc 分支。
+    pub calc_axes: Vec<CompiledCalcAxis>,
+    /// `blendref`（QC 的 `blendref <名>`）—— 原始名字。
+    ///
+    /// ⚠️ **留到后处理再解析**：官方 `LookupAnimation` 先查动画池、
+    /// **再回落到序列池**（`studiomdl.cpp:2381-2397`），而序列池要等
+    /// 全部序列建完才存在。
+    pub blend_ref: Option<String>,
+    /// `blendcomp`（QC 的 `blendcomp <名>`）—— 原始名字。
+    ///
+    /// `None` ⟹ 官方回落到 `paramanim`（即 `blend_ref` 解析出的值）。
+    pub blend_comp: Option<String>,
+    /// `blendcenter`（QC 的 `blendcenter <名>`）在网格里的位置 `[i0, i1]`。
+    ///
+    /// **已解析**（建序列时就能做：只需比对格子的动画下标）。
+    /// `None` = 没写，或写了但**不在网格里** —— 官方两种都取中点
+    /// （`simplify.cpp:5518-5521` 的 `if (!found)`）。
+    pub blend_center: Option<[usize; 2]>,
     /// 自动层（`mstudioautolayer_t`）。
     pub auto_layers: Vec<CompiledAutoLayer>,
     /// 动画事件（已从描述层搬过来，便于写出器直接消费）。
