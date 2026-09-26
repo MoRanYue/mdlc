@@ -2434,6 +2434,34 @@ fn build_ik_rules(
     //
     // mdlc 里 animdesc 与 seqdesc 一一对应（`$staticprop` 除外，而它没有
     // ikchain），blend 表元素就是 seq 下标，所以**每条动画都被引用**。
+    // ⚠️ **`index` 只对「被某条序列引用过」的动画才有意义。**
+    //
+    // 官方 `SetSequence`（`simplify.cpp:6325-6334`）的双层循环是
+    // `for (i = 0; i < g_sequence.Count(); i++)` → `panim[j][k]->ikrule[n].index = n`
+    // —— **只遍历序列**。所以：
+    //
+    // * 被序列引用的动画：`index = 0,1,2…`（规则在动画内的序号）；
+    // * **没被任何序列引用的动画**：`index` 保持 `memset` 的 **0**
+    //   （全部规则都是 0，不是 0,1,2…）。
+    //
+    // mdlc 修前对所有动画都写 `i`（序号）⟹ 孤儿动画的第 2 条规则拿到
+    // `index = 1`。实测（`v_dual_pistola_processed.qc`）：`a_run` 与
+    // `look_neutral` 的 `rule1.index` 官方 **0**、mdlc **1**
+    // （`docs/_probe/cmp_mdl_full.js` 报 `animdescs[].ikrules[].index: 0 vs 1`）。
+    //
+    // 这个字段是**该规则在动画内的下标**，引擎用它把 `ikrule[]` 与
+    // 动画槽位对应；写错会让 IK 解算指向错误的槽 ⟹ **骨骼被拽到错误的
+    // 目标位置**（HLMV 里表现为骨骼乱跳）。
+    //
+    // 全语料佐证（`rsrch_ik_index2.js`）：`index == j` 27749 条、
+    // `index != j` **3192 条全部是 0**，且全部属于未被引用的动画。
+    let index_of = |i: usize| -> i32 {
+        if spec.orphan {
+            0
+        } else {
+            i as i32
+        }
+    };
     Ok(rules
         .into_iter()
         .enumerate()
@@ -2451,7 +2479,7 @@ fn build_ik_rules(
                 (0.0, 0.0, 1.0, 1.0, 0.0)
             };
             crate::model::ResolvedIkRule {
-                index: i as i32,
+                index: index_of(i),
                 type_code: p.type_code,
                 chain: p.chain,
                 bone: p.bone,
