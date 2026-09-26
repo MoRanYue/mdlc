@@ -1187,6 +1187,186 @@ pub fn anim_specs_len(compiled: &CompiledModelDesc) -> usize {
 /// **关键**：`pPosV()` 只按 `ANIMROT` 是否置位来偏移 6 字节，所以两个
 /// valueptr **必须紧挨着**，中间不能插任何东西。正确顺序是
 /// 「常量载荷 → rotV → posV → 各轴的流」。
+///
+/// **段表条目数** —— `floor(nframes / sectionframes) + 2`。
+///
+/// # ⚠️ 必须用**动画自己**的帧数，不能用引用它的序列的
+/// `Sequence::num_sections`
+///
+/// 段表是**逐 animdesc** 的，而 `sectionframes` / `numframes` 也都是
+/// animdesc 的字段。但同一条动画可能被**帧数不同**的序列引用
+/// （`$animation` 定义一次、多条 `$sequence` 复用），而
+/// `Sequence::num_sections` 是按**该序列**的 `frames.len()` 算的
+/// （`compile.rs:2639`）。
+///
+/// 两者一旦不等，段表就会**短写**，后面的条目落到链数据里 —— 读出来是垃圾。
+///
+/// # 实测（`v_dual_pistola` 的 R 变体）
+///
+/// ```text
+/// $sequence "idle" { "a_run" }        ← 72 帧  ⟹ num_sections = 72/30+2 = 4
+/// $animation "a_idle_1" …             ← 230 帧 ⟹ 引擎需要 230/30+2 = 9 条
+/// ```
+///
+/// mdlc 修前给 `a_idle_1` 只写 **4** 条，官方 **9** 条：
+///
+/// ```text
+/// 官方 a_idle_1: {0,4084} {0,10732} {0,17512} {0,23780} {0,30604} {0,37708} {0,44508} {0,50940} {0,56192}
+/// mdlc 修前    : {0,4036} {0,9700}  {0,15332} {0,20668} {1188096,-6815748} {1610611455,1064618} …
+///                                                       ^^^^^^^^^^^^^^^^^^ 垃圾（链数据被当成段表）
+/// ```
+///
+/// 引擎读 `pSection(4)` 会拿到乱码 `animindex` ⟹ 整段动画解不出来。
+///
+/// ⚠️ **这个 bug 在 S 变体上恰好隐身**：那里 `idle` 直接引用 `a_idle_1`，
+/// 序列与动画帧数相同 ⟹ `num_sections` 恰好正确。
+/// **「同一个值有两个来源」时，只有在两者不等时才暴露。**
+fn section_count(nframes: usize, sf: i32) -> usize {
+    if sf <= 0 || nframes == 0 {
+        0
+    } else {
+        nframes / sf as usize + 2
+    }
+}
+
+/// **段 k 的帧区间**（`mstudioanimsections_t` 的载荷划分）。
+///
+/// # 引擎口径（`studio.cpp:76-100`，**半开**）
+///
+/// ```c
+/// if (sectionframes != 0) {
+///     if (numframes > sectionframes && *piFrame == numframes - 1) {
+///         *piFrame = 0;
+///         section = (numframes / sectionframes) + 1;   // ← 末帧单独一段
+///     } else {
+///         section = *piFrame / sectionframes;
+///         *piFrame -= section * sectionframes;
+///     }
+///     block = pSection(section)->animblock;
+///     index = pSection(section)->animindex;
+/// }
+/// ```
+///
+/// 即引擎实际会读：
+///
+/// | 段 | 被读的帧 |
+/// |---|---|
+/// | `k ∈ [0, nf/sf)` | `[k*sf, (k+1)*sf)`，段内 `local = f − k*sf` |
+/// | `nf/sf` | `[nf/sf*sf, nf−2]`（**末帧被重定向走了**） |
+/// | `nf/sf + 1` | **只有末帧** `nf−1`，`local = 0` |
+///
+/// # 官方写入的数据范围（实测，闭区间）
+///
+/// | 段 k | 帧范围 | 帧数 |
+/// |---|---|---|
+/// | `k < nf/sf` | `[k*sf, (k+1)*sf]` | `sf+1`（多一帧前瞻） |
+/// | `k == nf/sf` | `[k*sf, nf−1]` | 含末帧 |
+/// | `k == nf/sf + 1`，且 `nf % sf != 0` | **`[nf−1, nf−1]`** | **1** |
+/// | `k == nf/sf + 1`，且 `nf % sf == 0` | **空** | 0 |
+///
+/// # ⚠️ 最后一段曾经被算成空 —— 这就是「骨骼乱跳」的根因
+///
+/// 早先这里对 `k == nf/sf + 1` 也算 `[k*sf, min((k+1)*sf, nf−1)]`，
+/// 于是 `lo > hi` ⟹ `None` ⟹ 该段写成「空段」（只有常量骨骼）。
+/// 而引擎恰恰**从这一段读末帧**，拿到的是「除常量外全是参考姿态」
+/// ⟹ **末帧整根骨骼跳变**。
+///
+/// 实测 `v_dual_pistola`（`nf=230 sf=30`）：官方 `sec8` 有 **81** 条记录、
+/// mdlc 只有 **66** 条；`a_run`（`nf=72 sf=30`）官方 `sec3` 有 1 帧数据、
+/// mdlc 段空。逐帧对比证实**只有末帧错**（`a_idle_1` 末帧 48/119 根骨骼
+/// 差，最大 **101.79°**；其余 229 帧**一处都不差**）。
+///
+/// # ⚠️ 但 `nf % sf == 0` 时官方那一段**确实是空的**
+///
+/// 此时末帧已被前一段的闭区间覆盖（`[nf−sf, nf]` 裁到 `nf−1`），
+/// 官方不再单独写。实测（真 `studiomdl.exe` 产物）：
+///
+/// | 夹具 | nf | nf % sf | 末段内容 |
+/// |---|---|---|---|
+/// | `v_dual_pistola` `a_idle_1` | 230 | 20 | **81 条真实记录** |
+/// | `v_dual_pistola` `a_run` | 72 | 12 | 真实记录 |
+/// | `v_dual_pistola` `@deploy` | 40 | 10 | 真实记录 |
+/// | `sfw120` `@idle` | 120 | **0** | **只有 bone0 的常量链**（16 B） |
+///
+/// 若漏掉这个门，`sfw120` 的 `b1`/`b2` 位移差 **10.05 / 20.05**。
+fn section_frame_range(k: usize, _n_sec: usize, n: usize, sf: i32) -> Option<(usize, usize)> {
+    if n == 0 || sf <= 0 {
+        return None;
+    }
+    let sf = sf as usize;
+    // ⚠️ 用**引擎自己的公式**算末段下标（`section = nf/sf + 1`），
+    // 而不是用 `n_sec - 1` —— 后者依赖调用方把 `num_sections` 算成
+    // `nf/sf + 2`，一旦两边口径漂移就会静默错位。
+    let last_sec = n / sf + 1;
+    if !n.is_multiple_of(sf) && n > sf && k == last_sec {
+        return Some((n - 1, n - 1));
+    }
+    let lo = k * sf;
+    let hi = ((k + 1) * sf).min(n - 1);
+    if lo <= hi { Some((lo, hi)) } else { None }
+}
+
+/// **本段**的旋转常量载荷（`RAWROT2` 要写的绝对值）。
+///
+/// # 为什么必须逐段算，不能用整条动画的结论
+///
+/// 官方 `WriteAnimationData`（`write.cpp:715`）是**逐段**调用的，而它的判据
+///
+/// ```c
+/// if (srcanim->numanim[j][3] >= srcanim->numframes && …)   // :774
+/// AngleQuaternion( srcanim->sanim[0][j].rot, q );          // :756
+/// ```
+///
+/// 里的 `numframes` 与 `sanim[0]` **都是本段的**。于是：
+///
+/// | 段 | 帧数 | 旋转恒定？ | 官方编码 |
+/// |---|---|---|---|
+/// | `k < nf/sf` | `sf+1` | 取决于数据 | `ANIMROT` / `RAWROT2` |
+/// | **末段**（末帧单独一段） | **1** | **恒真** | **`RAWROT2`** |
+///
+/// # 实测（`v_dual_pistola` 的 `a_idle_1`，末段）
+///
+/// ```text
+/// 官方 sec8：81 条记录  flags 分布 {0x21: 49, 0x20: 31, 0x1: 1}
+/// mdlc 修前：81 条记录  flags 分布 {0x21: 5, 0x20: 20, 0x1: 3, 0x4: 38, 0x0: 11, 0x24: 4}
+/// ```
+///
+/// 官方**每一根有旋转的骨骼都是 `RAWROT2`**（`0x20`/`0x21`），而 mdlc 因为
+/// 沿用了整条动画「旋转不恒定」的结论、又够不到 `ANIMROT`（要求 `n > 1`），
+/// 于是**旋转整个丢失** ⟹ 末帧 48/119 根骨骼跳变（最大 **101.79°**）。
+fn section_rot_const(
+    raw_rot: Option<&Vec<[f32; 3]>>,
+    lo: usize,
+    hi: usize,
+    delta: bool,
+    ref_rot: Option<&[f32; 3]>,
+) -> Option<[f32; 3]> {
+    let sub = raw_rot?.get(lo..=hi)?;
+    let first = sub.first()?;
+    // ⚠️ 判据是**原始差值逐帧精确相等**（不是量化后）—— 与 R20 同一口径。
+    if !sub.iter().all(|r| r == first) {
+        return None;
+    }
+    Some(if delta {
+        // `DELTA` 动画的 `sanim` 本身就是增量，引擎也不加参考 ⟹ 绝对值 == 差值。
+        *first
+    } else {
+        let r = ref_rot?;
+        [0, 1, 2].map(|k| wrap_to_pi(first[k] + r[k]))
+    })
+}
+
+/// 写一条**段链**所需的「整条动画级」上下文。
+///
+/// 打包成结构体是为了让参数个数可控，也让「哪些量是整条动画的、
+/// 哪些是本段的」在类型上一眼可见。
+struct ChainCtx<'a> {
+    /// 逐骨骼的**原始旋转差值帧**（未量化）—— 逐段重算旋转常量用。
+    raw_rot_per_bone: Option<&'a BoneFrameTable>,
+    /// 逐骨骼的参考姿态 `(pos, rot)` —— 常量载荷要烘进参考姿态。
+    ref_rots: Option<&'a [([f32; 3], [f32; 3])]>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_one_chain(
     anim_data: &mut Vec<u8>,
@@ -1198,7 +1378,10 @@ fn write_one_chain(
     _pos_scale: &[[f32; 3]],
     delta: bool,
     anim_data_abs: usize,
+    ctx: &ChainCtx<'_>,
 ) -> Result<(), AnimWriteError> {
+    let raw_rot_per_bone = ctx.raw_rot_per_bone;
+    let ref_rots = ctx.ref_rots;
     // 空段：**不是**写 `ff` 占位，而是照常写「与帧无关的那些骨骼」。
     //
     // 实测官方 `sfw120` 的段 4/5（`nEnt-2`、`nEnt-1`）：
@@ -1260,15 +1443,34 @@ fn write_one_chain(
     };
     let seg_channels: Vec<BoneChannels> = channels
         .iter()
-        .map(|ch| BoneChannels {
+        .enumerate()
+        .map(|(b, ch)| BoneChannels {
             rot: [slice(&ch.rot[0]), slice(&ch.rot[1]), slice(&ch.rot[2])],
             pos: [slice(&ch.pos[0]), slice(&ch.pos[1]), slice(&ch.pos[2])],
             // 分段只切「逐帧采样」的轴；`Constant`/`Absent` 原样保留
             // （`slice` 对它们走 `other.clone()`）。所以整条位移若原本恒定，
             // 切出来的每一段也恒定，常量位移可以照用。
+            //
+            // ⚠️ **位移不做逐段重算** —— 实测把它也改成「本段差值恒定
+            // ⟹ `RAWPOS`」会**引入回归**：多帧段里官方仍写 `ANIMPOS`
+            // （`@deploy_layer` sec0 官方 `0x1c`、误改后 `0x14`），
+            // 姿态差从 0 涨到 **345**。位移的判据是整条动画的
+            // `pos_delta_is_const`，只有**单帧末段**例外 —— 而那个例外
+            // 已由 [`section_frame_range`] 把末帧单独切出来天然满足。
             pos_const_raw: ch.pos_const_raw,
             pos_delta_is_const: ch.pos_delta_is_const,
-            rot_const_raw: ch.rot_const_raw,
+            // ⚠️ **旋转常量载荷必须逐段重算**（见 [`section_rot_const`]）。
+            // 沿用整条动画的结论会让「单帧末段」丢掉旋转 ——
+            // 那段够不到 `ANIMROT`（要求 `n > 1`），而整条动画的
+            // `rot_const_raw` 又常因其它段不恒定而为 `None`。
+            rot_const_raw: section_rot_const(
+                raw_rot_per_bone.and_then(|t| t.get(b)).map(|pair| &pair.0),
+                lo,
+                hi,
+                delta,
+                ref_rots.and_then(|t| t.get(b)).map(|(_, r)| r),
+            )
+            .or(ch.rot_const_raw),
         })
         .collect();
 
@@ -3217,7 +3419,9 @@ pub fn write_animations(
         // 注意是**两端含**的 `sf+1` 帧（`sf120` 实测 31/31/31/30），
         // 不是半开的 `sf` 帧。
         let sf = seq.section_frames;
-        let n_sec = if sf > 0 { seq.num_sections } else { 0 };
+        // ⚠️ 段数取自**本动画自己的帧数**（`n`），不是 `seq.num_sections` ——
+        // 后者按引用它的序列算，复用动画时会短写。见 [`section_count`]。
+        let n_sec = section_count(n, sf);
         let sec_table_off = if n_sec > 0 {
             let at = anim_data.len();
             // 先占位（`animindex` 要等各段链写好才知道）。
@@ -3237,17 +3441,12 @@ pub fn write_animations(
         };
 
         // 每段的帧区间（空段 = `None`）。
+        //
+        // ⚠️ **`k == nf/sf + 1` 那一段不一定是空的** —— 引擎会把**末帧**
+        // 重定向到它（`studio.cpp:86-90`）。详见 [`section_frame_range`]。
         let sec_ranges: Vec<Option<(usize, usize)>> = if n_sec > 0 {
             (0..n_sec)
-                .map(|k| {
-                    let lo = k as i32 * sf;
-                    let hi = ((k + 1) as i32 * sf).min(n.saturating_sub(1) as i32);
-                    if lo <= hi && lo < n as i32 {
-                        Some((lo as usize, hi as usize))
-                    } else {
-                        None
-                    }
-                })
+                .map(|k| section_frame_range(k, n_sec, n, sf))
                 .collect()
         } else {
             Vec::new()
@@ -3296,6 +3495,10 @@ pub fn write_animations(
                     &pos_scale,
                     is_delta,
                     anim_data_abs,
+                    &ChainCtx {
+                        raw_rot_per_bone: per_seq_frames.get(si),
+                        ref_rots: Some(ref_poses),
+                    },
                 )?;
             }
         }
@@ -4089,22 +4292,24 @@ pub fn write_animations(
                 //
                 // 所以块形态下的载荷不是「一整条动画」，而是**逐段载荷的紧密拼接**。
                 let sf = seq.section_frames;
-                let n_sec = if sf > 0 { seq.num_sections } else { 0 };
+                // ⚠️ 与内联形态**同一个函数** —— 段数必须按**本动画**的帧数算。
+                let n_sec = section_count(n, sf);
                 let mut block_section_offsets: Option<Vec<usize>> = None;
                 if n_sec > 0 {
                     let mut joined: Vec<u8> = Vec::new();
                     let mut offs: Vec<usize> = Vec::with_capacity(n_sec);
                     for k in 0..n_sec {
                         offs.push(joined.len());
-                        let lo = k as i32 * sf;
-                        let hi = ((k + 1) as i32 * sf).min(n.saturating_sub(1) as i32);
-                        let seg_tracks = if lo <= hi && lo < n as i32 {
-                            slice_tracks(&tracks, lo as usize, hi as usize)
-                        } else {
-                            // 空段：**没有**逐帧数据，但头部仍是 36
-                            // （带一条旋转常量），`stride = 0`。
-                            // 实测 `absec1` 的 sec[4]/sec[5]：`hdr 28/36/0`。
-                            empty_segment_tracks(bone_count)
+                        // ⚠️ 与内联形态**同一个函数** —— 末帧那一段不一定是空的
+                        // （见 [`section_frame_range`]）。两条路径必须一致。
+                        let seg_tracks = match section_frame_range(k, n_sec, n, sf) {
+                            Some((lo, hi)) => slice_tracks(&tracks, lo, hi),
+                            None => {
+                                // 空段：**没有**逐帧数据，但头部仍是 36
+                                // （带一条旋转常量），`stride = 0`。
+                                // 实测 `absec1` 的 sec[4]/sec[5]：`hdr 28/36/0`。
+                                empty_segment_tracks(bone_count)
+                            }
                         };
                         joined.extend_from_slice(&crate::ani_writer::write_raw_payload_tracks(
                             &seg_tracks,
@@ -5647,6 +5852,178 @@ mod tests {
         assert!(offs[2] > 0, "Z 变化 → 有流");
         let zs = decode_stream(d, pos_vp + offs[2] as usize, 3);
         assert!(zs[2] > zs[1] && zs[1] > zs[0], "位移应单调递增：{zs:?}");
+    }
+
+    // ---- 段（`mstudioanimsections_t`）----
+
+    /// **段数只由「本动画的帧数 + sectionframes」决定。**
+    ///
+    /// 判据来自 `v_dual_pistola` 的 R 变体：那里 `$sequence "idle"` 引用
+    /// **72 帧**的 `a_run`，而同一条 QC 里的 `a_idle_1` 是 **230 帧**。
+    /// 若段数取自序列（`Sequence::num_sections = 72/30+2 = 4`），
+    /// `a_idle_1` 的段表就会**短写 5 条**，后面的条目落到链数据里，
+    /// 读出来是垃圾（实测 `{blk=1188096,idx=-6815748}`）。
+    #[test]
+    fn section_count_uses_animation_frames_not_sequence() {
+        // 同一个 `sf`，两个帧数 ⟹ 两个段数。
+        assert_eq!(section_count(230, 30), 9, "230/30+2 = 9");
+        assert_eq!(section_count(72, 30), 4, "72/30+2 = 4");
+        assert_eq!(section_count(40, 30), 3, "40/30+2 = 3");
+        assert_eq!(section_count(120, 30), 6, "120/30+2 = 6");
+        // 不分段 / 空动画 ⟹ 0。
+        assert_eq!(section_count(230, 0), 0, "sf=0 ⟹ 不分段");
+        assert_eq!(section_count(0, 30), 0, "无帧 ⟹ 0");
+    }
+
+    /// **末帧单独那一段：`nf % sf != 0` 才有数据。**
+    ///
+    /// 引擎（`studio.cpp:84-96`）把**末帧**重定向到 `nf/sf + 1` 段。
+    /// 官方实测：
+    ///
+    /// | nf | sf | nf%sf | 末段 |
+    /// |---|---|---|---|
+    /// | 230 | 30 | 20 | `[229,229]`（81 条真实记录） |
+    /// | 72 | 30 | 12 | `[71,71]` |
+    /// | 120 | 30 | **0** | **空**（只有 bone0 常量链） |
+    #[test]
+    fn last_section_holds_final_frame_only_when_remainder_nonzero() {
+        // nf=230 sf=30 ⟹ nEnt=9，末段下标 = 230/30+1 = 8。
+        let r = section_frame_range(8, 9, 230, 30);
+        assert_eq!(r, Some((229, 229)), "230%30=20 != 0 ⟹ 末段 = 末帧");
+
+        // nf=72 sf=30 ⟹ nEnt=4，末段下标 = 3。
+        let r = section_frame_range(3, 4, 72, 30);
+        assert_eq!(r, Some((71, 71)), "72%30=12 != 0 ⟹ 末段 = 末帧");
+
+        // nf=120 sf=30 ⟹ 120%30==0 ⟹ 末段必须是**空**（否则位移差 20.05）。
+        let r = section_frame_range(5, 6, 120, 30);
+        assert_eq!(r, None, "120%30==0 ⟹ 末段为空（官方那里给的是参考姿态）");
+    }
+
+    /// **非末段的帧区间是闭区间 `[k*sf, (k+1)*sf]`**（两端含，`sf+1` 帧）。
+    #[test]
+    fn non_final_sections_use_closed_interval() {
+        // nf=230 sf=30：段 0 = [0,30]（31 帧），段 1 = [30,60]（31 帧）。
+        assert_eq!(section_frame_range(0, 9, 230, 30), Some((0, 30)));
+        assert_eq!(section_frame_range(1, 9, 230, 30), Some((30, 60)));
+        // 段 7 的 `hi` 被裁到 `nf-1 = 229`。
+        assert_eq!(section_frame_range(7, 9, 230, 30), Some((210, 229)));
+        // 空段（`lo > hi`）→ None。nf=60 sf=30 的段 2 = [60, 59] ⟹ None。
+        assert_eq!(section_frame_range(2, 4, 60, 30), None, "lo=60 > hi=59");
+    }
+
+    /// **段表条目数与帧区间的「全覆盖」自检**。
+    ///
+    /// 引擎会读的每一帧都必须落在**恰好一个**段里。
+    ///
+    /// ⚠️ 注意末帧的归属**不是**无条件的「`nf/sf + 1` 段」：
+    ///
+    /// * `nf % sf != 0` ⟹ 末帧在 `nf/sf + 1` 段（那一段是**闭区间退化**的
+    ///   单帧区间）；
+    /// * `nf % sf == 0` ⟹ 末帧已被**前一段的闭区间**覆盖
+    ///   （段 `nf/sf − 1` 的 `[k*sf, (k+1)*sf]` 裁到 `nf−1`），
+    ///   `nf/sf + 1` 段为空。
+    ///
+    /// 本测试按「哪一段真的含这一帧」来判，而不是假设段号 ——
+    /// 第一版就是假设了段号，在 `nf=120 sf=30` 的 frame 119 上假红。
+    #[test]
+    fn sections_cover_every_engine_readable_frame() {
+        for (nf, sf) in [
+            (230usize, 30i32),
+            (72, 30),
+            (40, 30),
+            (120, 30),
+            (121, 30),
+            (60, 30),
+            (31, 30),
+        ] {
+            let n_sec = section_count(nf, sf);
+            assert_eq!(n_sec, nf / sf as usize + 2, "nf={nf} sf={sf}");
+            let ranges: Vec<Option<(usize, usize)>> = (0..n_sec)
+                .map(|k| section_frame_range(k, n_sec, nf, sf))
+                .collect();
+            // 每个「引擎会读的帧」必须落在**至少一个**段里。
+            for f in 0..nf {
+                let hits = ranges
+                    .iter()
+                    .filter(|r| r.is_some_and(|(lo, hi)| (lo..=hi).contains(&f)))
+                    .count();
+                assert!(
+                    hits >= 1,
+                    "nf={nf} sf={sf} frame={f} 没被任何段覆盖（ranges={ranges:?}）"
+                );
+            }
+            // 末帧的归属：`nf % sf != 0` 时必须在 `nf/sf + 1` 段里。
+            let last = nf - 1;
+            let last_sec = nf / sf as usize + 1;
+            if !nf.is_multiple_of(sf as usize) {
+                assert!(
+                    ranges[last_sec].is_some_and(|(lo, hi)| (lo..=hi).contains(&last)),
+                    "nf={nf} sf={sf} 末帧应在 sec{last_sec}（ranges={ranges:?}）"
+                );
+            } else {
+                assert!(
+                    ranges[last_sec].is_none(),
+                    "nf={nf} sf={sf} 整除时 sec{last_sec} 应为空（ranges={ranges:?}）"
+                );
+            }
+        }
+    }
+
+    /// **`section_rot_const`：旋转常量载荷必须逐段算。**
+    ///
+    /// # 为什么这条必须单独测
+    ///
+    /// 这个函数只影响「单帧末段」的编码：那段够不到 `ANIMROT`（要求
+    /// `n > 1`），所以一旦这里返回 `None`，该骨骼的**旋转就整个丢失**
+    /// （官方写 `0x21`，mdlc 会写 `0x01`）。
+    ///
+    /// 实测：把本函数改成恒返回 `None`（= 沿用整条动画的结论）后，
+    /// **全部单元测试仍然全绿** —— 只有对真实产物的逐帧姿态探针
+    /// （`probe_anim_pose_sections.js`）才抓得到（末帧 48/119 根骨骼差，
+    /// 最大 **101.79°**）。所以这里补上直接判据。
+    #[test]
+    fn section_rot_const_is_computed_per_section() {
+        // 一条「整条动画旋转**不恒定**、但**末段（单帧）恒定**」的数据 ——
+        // 这正是 `a_idle_1` 的形态。
+        let raw: Vec<[f32; 3]> = vec![
+            [0.0, 0.0, 0.1],
+            [0.0, 0.0, 0.2],
+            [0.0, 0.0, 0.3],
+            [0.5, 0.0, 0.3], // ← 末帧，与前一帧不同 ⟹ 整条不恒定
+        ];
+        let ref_rot = [0.0, 0.0, 1.0];
+
+        // 整条（lo=0, hi=3）不恒定 ⟹ None。
+        assert_eq!(
+            section_rot_const(Some(&raw), 0, 3, false, Some(&ref_rot)),
+            None,
+            "整条动画旋转不恒定 ⟹ 不能写 RAWROT2"
+        );
+        // **末段**（lo=hi=3，单帧）恒定 ⟹ `Some(差值 + 参考)`。
+        assert_eq!(
+            section_rot_const(Some(&raw), 3, 3, false, Some(&ref_rot)),
+            Some([0.5, 0.0, 1.3]),
+            "单帧段必然恒定 ⟹ 必须给出常量载荷（否则旋转整个丢失）"
+        );
+        // [1,2] 是 0.2 与 0.3 ⟹ 不恒定。
+        assert_eq!(
+            section_rot_const(Some(&raw), 1, 2, false, Some(&ref_rot)),
+            None,
+            "[0.2, 0.3] 不恒定 ⟹ None"
+        );
+        // `DELTA` 动画：载荷就是差值本身，不加参考。
+        assert_eq!(
+            section_rot_const(Some(&raw), 3, 3, true, Some(&ref_rot)),
+            Some([0.5, 0.0, 0.3]),
+            "DELTA 动画的 sanim 本身就是增量，引擎不加参考"
+        );
+        // 没有原始帧 / 越界 ⟹ None（不 panic）。
+        assert_eq!(section_rot_const(None, 0, 0, false, Some(&ref_rot)), None);
+        assert_eq!(
+            section_rot_const(Some(&raw), 0, 99, false, Some(&ref_rot)),
+            None
+        );
     }
 
     // ---- 无序列 ----
