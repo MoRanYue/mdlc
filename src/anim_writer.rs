@@ -853,11 +853,36 @@ fn write_axis(
             let off_i16 = i16::try_from(off)
                 .map_err(|_| AnimWriteError::Internal("通道偏移超出 i16（动画过大）".into()))?;
             anim_data[at..at + 2].copy_from_slice(&off_i16.to_le_bytes());
-            // valid = 1, total = N：解码器读 1 个采样后复制 N-1 次。
-            let total = u8::try_from(n).unwrap_or(u8::MAX);
-            anim_data.push(1);
-            anim_data.push(total);
-            anim_data.extend_from_slice(&v.to_le_bytes());
+            // ⚠️ **`total` 是 `u8`，所以超过 255 帧必须拆成多条 run。**
+            //
+            // 早先这里写 `u8::try_from(n).unwrap_or(u8::MAX)` —— 把长度
+            // **截断**到 255。解码器（`bone_setup.cpp` 的
+            // `CalcBonePosition`/`CalcBoneQuaternion`）按 `total` 复制采样，
+            // 于是**第 255 帧之后完全没有数据**，那些帧退化到
+            // 「上一个采样 + 参考姿态」⟹ 骨骼错乱。
+            //
+            // 实测（`v_dual_pistola`，`$sectionframes 30 999` 让全部动画不分段）
+            // `@item_loop`（**325 帧**）的 `b2 Camera`：
+            //
+            // ```text
+            // 官方 pos[0] spans: v1/t255 v1/t70 ...     ← 255 + 70 = 325
+            // mdlc 修前        : 单条 v1/t255            ← 只覆盖 255 帧
+            // ```
+            //
+            // 症状：前 255 帧完全正常，**第 255 帧起位移差最大 71.1**、
+            // 旋转差最大 17.76°（`@item_loop` / `@helping_hand_loop` 及其
+            // `_layer` 共 4 条 325 帧动画、198 个坏帧）。
+            //
+            // 拆分方式与 [`rle_runs`] 一致：每条 run 最多 255 帧，
+            // 每条都是 `valid = 1`（一个采样）复制 `total` 次。
+            let mut left = n;
+            while left > 0 {
+                let chunk = left.min(255);
+                anim_data.push(1);
+                anim_data.push(chunk as u8);
+                anim_data.extend_from_slice(&v.to_le_bytes());
+                left -= chunk;
+            }
         }
         AxisData::Sampled(s) => {
             let runs = rle_runs(s);
@@ -1847,6 +1872,17 @@ fn write_chain_body(
 struct AnimSpec {
     /// 引用该动画的**第一条序列**的下标（只用于诊断/错误消息）。
     seq_index: usize,
+    /// **没有任何序列引用这条动画**（孤儿 `$animation`）。
+    ///
+    /// # 为什么必须显式记下来
+    ///
+    /// [`Self::seq_index`] 在找不到引用序列时会 `unwrap_or(0)` 落到
+    /// `seq[0]` —— 那个值只该用于诊断，**不能**用来取 `section_frames`
+    /// 之类的语义字段。实测 `v_dual_pistola_processed.qc`：
+    /// `look_neutral` 只被 `$animation` 声明、没有任何序列引用它，
+    /// 于是继承了 `seq[0]`（`idle`）的 `section_frames=30`，
+    /// 而官方按**全局** `$sectionframes` 判 `nf=1 >= 36` 不成立 ⟹ `sf=0`。
+    orphan: bool,
     /// **动画池**下标（= animdesc 下标）。见
     /// [`crate::model::CompiledModelDesc::animations`]。
     anim_index: usize,
@@ -2015,6 +2051,7 @@ fn anim_specs(compiled: &CompiledModelDesc) -> Vec<AnimSpec> {
         return match compiled.sequences.first() {
             Some(s) => vec![AnimSpec {
                 seq_index: 0,
+                orphan: false,
                 anim_index: 0,
                 frames: 1,
                 fps: s.fps,
@@ -2031,11 +2068,15 @@ fn anim_specs(compiled: &CompiledModelDesc) -> Vec<AnimSpec> {
         .map(|(i, a)| AnimSpec {
             // 反查「哪条序列引用了它」只为取诊断用的名字；动画池的顺序
             // 与序列无关，所以这里取**第一条引用它的序列**。
+            //
+            // ⚠️ 找不到时 `unwrap_or(0)` 只是为了有个合法下标 ——
+            // **语义字段必须看 `orphan`**，不能拿 `seq[0]` 的值顶替。
             seq_index: compiled
                 .sequences
                 .iter()
                 .position(|s| s.cells.contains(&i))
                 .unwrap_or(0),
+            orphan: !compiled.sequences.iter().any(|s| s.cells.contains(&i)),
             anim_index: i,
             frames: a.frames.len(),
             fps: a.fps,
@@ -3418,7 +3459,19 @@ pub fn write_animations(
         //
         // 注意是**两端含**的 `sf+1` 帧（`sf120` 实测 31/31/31/30），
         // 不是半开的 `sf` 帧。
-        let sf = seq.section_frames;
+        // ⚠️ **孤儿动画（没有任何序列引用）不能沿用 `seq[0]` 的
+        // `section_frames`** —— 那只是 `unwrap_or(0)` 的诊断回退值。
+        // 官方按**全局** `$sectionframes` 的阈值判，所以孤儿动画要自己算。
+        // 实测 `look_neutral`：官方 `sf=0`，而沿用 `seq[0]`（`idle`）
+        // 会得到 `sf=30` + 一张 `nEnt=2` 的段表。见 [`AnimSpec::orphan`]。
+        let sf = if spec.orphan {
+            match compiled.desc.model.section_frames {
+                Some((len, thr)) if len > 0 && n as i32 >= thr => len,
+                _ => 0,
+            }
+        } else {
+            seq.section_frames
+        };
         // ⚠️ 段数取自**本动画自己的帧数**（`n`），不是 `seq.num_sections` ——
         // 后者按引用它的序列算，复用动画时会短写。见 [`section_count`]。
         let n_sec = section_count(n, sf);
@@ -4507,6 +4560,7 @@ mod tests {
 
         let spec = AnimSpec {
             seq_index: 0,
+            orphan: false,
             anim_index: 0,
             frames: 3,
             fps: 30.0,
@@ -4543,6 +4597,7 @@ mod tests {
 
         let spec = AnimSpec {
             seq_index: 0,
+            orphan: false,
             anim_index: 0,
             frames: 3,
             fps: 30.0,
@@ -4604,6 +4659,7 @@ mod tests {
                     pose_parameters: Vec::new(),
                     realign_bones: false,
                     anim_block_size: None,
+                    section_frames: None,
                 },
                 physics: Default::default(),
                 materials: Default::default(),
@@ -6846,6 +6902,7 @@ mod tests {
                     pose_parameters: Vec::new(),
                     realign_bones: false,
                     anim_block_size: None,
+                    section_frames: None,
                 },
                 physics: Default::default(),
                 materials: Default::default(),
@@ -7715,6 +7772,115 @@ mod tests {
         // 第一段占 2（头）+ 2（1 个采样）= 4 字节，第二段的头紧随其后。
         assert_eq!(e[4], 1, "第二段 valid");
         assert_eq!(e[5], 45, "第二段 total = 300 − 255 = 45");
+    }
+
+    /// **`AxisData::Constant` 超过 255 帧也必须拆 run。**
+    ///
+    /// # 这是「@item_loop 第 255 帧后骨骼错乱」的根因
+    ///
+    /// `total` 是 `u8`，而 `Constant` 分支早先写的是
+    /// `u8::try_from(n).unwrap_or(u8::MAX)` —— 把长度**截断**到 255。
+    /// 引擎按 `total` 复制采样 ⟹ **第 255 帧之后完全没有数据**。
+    ///
+    /// 实测（`v_dual_pistola`，`$sectionframes 30 999` 让全部动画不分段）
+    /// `@item_loop`（**325 帧**）的 `b2 Camera`：
+    ///
+    /// ```text
+    /// 官方 pos[0] spans: v1/t255 v1/t70 …    ← 255 + 70 = 325
+    /// mdlc 修前        : 单条 v1/t255         ← 只覆盖 255 帧
+    /// ```
+    ///
+    /// 症状：前 255 帧完全正常，之后位移差最大 **71.12**、旋转差 **17.76°**
+    /// （4 条 325 帧动画、共 **198** 个坏帧）。
+    #[test]
+    fn constant_axis_splits_at_255_frames() {
+        // `write_axis` 是纯函数（只吃 `n` 与 `AxisData`），不需要编译产物。
+        let mut buf: Vec<u8> = vec![0, 0]; // 给 valueptr 留 2 字节
+        write_axis(&mut buf, 0, 0, &AxisData::Constant(1234), 325).expect("写常量轴");
+        // buf = [ptr_lo, ptr_hi, run1...]
+        let off = i16::from_le_bytes([buf[0], buf[1]]) as usize;
+        assert_eq!(off, 2, "通道数据紧跟在 valueptr 之后");
+        // 第一条 run：{1, 255}，采样 1234
+        assert_eq!(buf[off], 1, "run1 valid");
+        assert_eq!(buf[off + 1], 255, "run1 total = 255");
+        assert_eq!(i16::from_le_bytes([buf[off + 2], buf[off + 3]]), 1234);
+        // 第二条 run：{1, 70}，同一个采样 —— 255 + 70 = 325
+        assert_eq!(buf[off + 4], 1, "run2 valid");
+        assert_eq!(buf[off + 5], 70, "run2 total = 325 − 255 = 70");
+        assert_eq!(i16::from_le_bytes([buf[off + 6], buf[off + 7]]), 1234);
+        assert_eq!(buf.len(), off + 8, "恰好两条 run，没有多余字节");
+    }
+
+    /// **恒定轴在 255 帧以内仍然只写一条 run**（回归护栏）。
+    ///
+    /// 拆分只在**超过 255** 时发生 —— 否则会把绝大多数正常动画写胖
+    /// （每条常量轴多 4 字节），破坏 parity 的逐字节一致。
+    #[test]
+    fn constant_axis_does_not_split_at_or_below_255() {
+        for n in [1usize, 2, 30, 255] {
+            let mut buf: Vec<u8> = vec![0, 0];
+            write_axis(&mut buf, 0, 0, &AxisData::Constant(-77), n).expect("写常量轴");
+            assert_eq!(
+                buf.len(),
+                2 + 4,
+                "n={n} 应恰好一条 run（头 2 + 采样 2）"
+            );
+            assert_eq!(buf[2], 1, "n={n} valid");
+            assert_eq!(buf[3], n as u8, "n={n} total");
+        }
+    }
+
+    /// **孤儿动画（无序列引用）不能继承 `seq[0]` 的 `section_frames`。**
+    ///
+    /// 官方按**全局** `$sectionframes <段长> <阈值>` 的阈值判
+    /// （`nf >= 阈值`）。mdlc 的 `anim_specs` 用
+    /// `.position(|s| s.cells.contains(&i)).unwrap_or(0)` 反查引用序列，
+    /// 孤儿动画会落到 `seq[0]` ⟹ 继承它的 `section_frames`。
+    ///
+    /// 实测 `v_dual_pistola_processed.qc`（`$sectionframes 30 36`）：
+    /// `look_neutral` 只被 `$animation` 声明，官方 `sf=0`，
+    /// mdlc 修前 `sf=30` + 一张 `nEnt=2` 的段表。
+    #[test]
+    fn orphan_animation_uses_global_sectionframes_not_seq0() {
+        let mut c = compiled(vec![seq("idle", false, vec![
+            vec![pose([0.0; 3], [0.0; 3])];
+            40
+        ])], 1);
+        // `seq[0]`（idle）分段：40 帧 >= 阈值 36 ⟹ sf = 30。
+        c.sequences[0].section_frames = 30;
+        // 全局值（官方 `g_sectionframes`）。
+        c.desc.model.section_frames = Some((30, 36));
+        // 再加一条**没有任何序列引用**的 1 帧动画。
+        c.animations.push(crate::model::CompiledAnimation {
+            name: "orphan".into(),
+            smd_path: "x.smd".into(),
+            fps: 30.0,
+            looping: false,
+            frames: vec![vec![pose([0.0; 3], [0.0; 3])]],
+            delta: false,
+            ik_rules: Vec::new(),
+            no_auto_ik: false,
+            pre_subtract_frames: None,
+        });
+
+        let specs = anim_specs(&c);
+        let orphan = specs
+            .iter()
+            .find(|s| s.anim_index == 1)
+            .expect("应能拿到孤儿动画的 spec");
+        assert!(orphan.orphan, "第 2 条动画没有任何序列引用 ⟹ orphan");
+        assert!(!specs[0].orphan, "idle 被序列引用 ⟹ 不是 orphan");
+
+        let out = write_with_f0_refs(&c, &[-1]).expect("写出动画");
+        assert_eq!(
+            out.section_frames[1], 0,
+            "孤儿动画 1 帧 < 阈值 36 ⟹ sectionframes 必须是 0（官方口径）；\
+             修前会继承 seq[0] 的 30"
+        );
+        assert_eq!(
+            out.section_frames[0], 30,
+            "被引用的 40 帧动画仍应是 30"
+        );
     }
 }
 

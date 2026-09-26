@@ -187,6 +187,7 @@ impl<'a> Parser<'a> {
                     pose_parameters: Vec::new(),
                     realign_bones: false,
                     anim_block_size: None,
+                    section_frames: None,
                 },
                 physics: Physics::default(),
                 materials: Materials::default(),
@@ -3343,6 +3344,11 @@ impl<'a> Parser<'a> {
                     seq.section_threshold = Some(thr);
                 }
             }
+            // ⚠️ **同时记到 model 上** —— 没有被任何序列引用的 `$animation`
+            // 拿不到上面那个逐序列回填，只能按全局值判（见
+            // `ModelMeta::section_frames`）。实测 `look_neutral`：
+            // 官方 `sf=0`，而 mdlc 因为落到 `seq[0]` 而继承了 `idle` 的 30。
+            self.desc.model.section_frames = Some((len, thr));
         }
         self.desc.model.contents = Some(self.contents);
         self.desc.model.static_prop = self.static_prop;

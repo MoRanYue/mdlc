@@ -1934,6 +1934,37 @@ pub struct ModelMeta {
     /// 即便所有动画加起来远小于 4096 字节 —— 见 [`crate::anim_writer`] 的说明。
     #[serde(default)]
     pub anim_block_size: Option<i32>,
+    /// **顶层 `$sectionframes <每段帧数> <阈值>` 的全局值**。
+    ///
+    /// # 为什么必须是全局
+    ///
+    /// 官方把它存成**两个全局变量**（`g_sectionframes` / `g_sectionthreshold`），
+    /// 每条动画写出时**现取**。而 mdlc 的 IR 是逐序列字段，早先只在
+    /// `Parser::finish` 里把它回填给**序列**（`qc/parse.rs`）—— 于是
+    /// **没有被任何 `$sequence` 引用的 `$animation`** 拿不到它。
+    ///
+    /// # 实测（`v_dual_pistola_processed.qc`，`$sectionframes 30 36`）
+    ///
+    /// `look_neutral` 只被 `$animation` 声明、**没有任何序列引用它**：
+    ///
+    /// ```text
+    /// 官方 animdesc[2] look_neutral: nf=1  sectionframes=0   sectionindex=0
+    /// mdlc 修前                    : nf=1  sectionframes=30  sectionindex=71804
+    /// ```
+    ///
+    /// 原因是 `anim_specs` 反查引用序列时用了
+    /// `.position(|s| s.cells.contains(&i)).unwrap_or(0)` —— 找不到就落到
+    /// **`seq[0]`（`idle`）**，于是继承了 `idle` 的 `section_frames=30`。
+    ///
+    /// `sectionframes=30` 而 `nf=1` 会让段表长成
+    /// `nEnt = 1/30 + 2 = 2` 条 —— 官方那 4 条 `look_*`（都是 1 帧）
+    /// 全是 `sf=0 / sectionindex=0`，只有 `look_neutral` 因为孤儿身份
+    /// 走错分支。（数值上 1 帧动画的段表不影响姿态，但字段与官方不一致，
+    /// 且多出 `nEnt*8` 字节。）
+    ///
+    /// 有它之后，孤儿动画按**全局值**判 `nf >= 阈值`，与官方同一条规则。
+    #[serde(default)]
+    pub section_frames: Option<(i32, i32)>,
 }
 
 /// **物理 / 碰撞模型**参数 —— `[physics]` 表。
