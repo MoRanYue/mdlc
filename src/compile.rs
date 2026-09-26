@@ -1758,7 +1758,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let smd_path = resolve_smd_path(base_dir, &s.smd);
         let by_name = anim_index.get(s.smd.as_str()).copied();
         let reused = by_name.is_some();
-        let (anim_ix, frames) = match by_name {
+        let (anim_ix, mut frames) = match by_name {
             Some(i) => (i, anims[i].frames.clone()),
             None => {
                 let Some((frames, _smd)) = load_smd_frames(
@@ -1802,6 +1802,109 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             anims[anim_ix].ik_rules.extend(s.ik_rules.iter().cloned());
         }
 
+        // ---- `$sequence` 块里的 `weightlist`（`CMD_WEIGHTS`）----
+        //
+        // 与 `ikrule`（R23）**同一个机制**：官方 `ParseSequence` 把序列块里的
+        // 「动画选项」交给 `ParseAnimationToken(animations[0])`
+        // （`studiomdl.cpp:2944`），而 `weightlist` 只由 `ParseCmdlistToken`
+        // 处理（`studiomdl.cpp:1714-1732`）⟹ 它落成
+        // **`animations[0]->cmds[]` 里的一条 `CMD_WEIGHTS`**，
+        // 由 `processAnimations`（`simplify.cpp:154-166`）执行
+        // `setAnimationWeight(panim, index)` —— **作用在动画对象上**。
+        //
+        // 隐含动画那条路径（`!reused`）已经在上面把 `s.weight_list` 用掉了；
+        // **复用**已声明动画时（`$sequence "fidget" "a_look_mid" weightlist "empty"`）
+        // 必须**覆盖**那个共享动画的权重 —— 官方就是改共享对象。
+        //
+        // ⚠️ 这不是「序列自己的权重」：序列的 `weight[]` 是
+        // `merge_weights`（`simplify.cpp:302-318`）**对各格取 MAX** 得来的。
+        // 所以 `fidget`（单格 = `a_look_mid`）得到**全 0**，而共用
+        // `a_look_mid` 的 `look_poses`（三格）取 MAX 后仍是**全 1** ——
+        // 实测 NekoMDL 与发布版**都是这个形态**（`fidget` 全 0、
+        // `look_poses` 全非零），而 mdlc 修前两边都给全 1。
+        //
+        // 早先只在 `!reused` 分支处理 ⟹ `fidget` / `fidget_layer` 的
+        // `weightlist "empty"` **被静默丢弃**。
+        if s.weight_list.is_some() {
+            anim_weights[anim_ix] = weights_of(s.weight_list.as_deref());
+        }
+
+        // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
+        //
+        // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
+        // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
+        // 执行 `forceNumframes(panim, frames)`。
+        //
+        // 官方实现（`simplify.cpp:1279-1293`）：
+        // ```c
+        // for (j = panim->numframes; j < numframes; j++) {
+        //     panim->sanim[j] = kalloc(1, size);
+        //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
+        // }
+        // panim->numframes = numframes;
+        // ```
+        // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
+        // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
+        // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
+        // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
+        // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
+        //  `a_look_mid` 的 nf = 90）。
+        //
+        // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
+        // `Sequence::num_frames` 后只用于事件 cycle 的换算
+        // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
+        // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
+        // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
+        //
+        // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
+        // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
+        // 则本序列拿到的还是旧副本。
+        // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
+        //
+        // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
+        // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
+        // 执行 `forceNumframes(panim, frames)`。
+        //
+        // 官方实现（`simplify.cpp:1279-1293`）：
+        // ```c
+        // for (j = panim->numframes; j < numframes; j++) {
+        //     panim->sanim[j] = kalloc(1, size);
+        //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
+        // }
+        // panim->numframes = numframes;
+        // ```
+        // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
+        // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
+        // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
+        // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
+        // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
+        //  `a_look_mid` 的 nf = 90）。
+        //
+        // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
+        // `Sequence::num_frames` 后只用于事件 cycle 的换算
+        // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
+        // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
+        // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
+        //
+        // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
+        // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
+        // 则本序列拿到的还是旧副本。
+        if let Some(n) = s.num_frames {
+            let n = n.max(0) as usize;
+            if n > 0 && n > anims[anim_ix].frames.len() {
+                let last = anims[anim_ix].frames.last().cloned();
+                if let Some(last) = last {
+                    while anims[anim_ix].frames.len() < n {
+                        anims[anim_ix].frames.push(last.clone());
+                    }
+                }
+            }
+        }
+        // 本序列的帧副本与共享动画保持一致（`forceNumframes` 只延长）。
+        if s.num_frames.is_some() {
+            frames = anims[anim_ix].frames.clone();
+        }
+
         // ---- `$sequence` 块里的 `subtract`（`CMD_SUBTRACT`）----
         //
         // 官方 `ParseSequence` 在 `numblends || isAppend` 时把 token 交给
@@ -1813,7 +1916,6 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // `anims[j].frames` —— 官方那样会让「同一个动画被两条序列引用」时
         // 互相污染（减除被叠加两次）。后者在本工程里观测不到（每条
         // `*_layer` 序列各有独立动画），但改共享状态是更差的选择。
-        let mut frames = frames;
         let mut seq_pre_subtract: Option<Vec<Vec<crate::smd::SmdPose>>> = None;
         // ⚠️ **`$sequence` 的 `delta` / `subtract` 必须把
         // `anims[anim_ix].delta` 也置上** —— 官方是**同一个**标志。
@@ -1901,6 +2003,49 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let nf = frames.len() as i32;
         let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
         let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
+        // ---- 自动层（`addlayer <序列名>`）----
+        //
+        // ⚠️ **单动画序列与 blend 序列走的是两条不同的代码路径**，而
+        // `addlayer` 在**两条路径上都必须处理**。
+        //
+        // 官方 `ParseSequence` 的 `addlayer` 分支（`studiomdl.cpp:2867-2872`）
+        // 只把序列名记进 `pseq->autolayer[]`，**与 `numblends` 无关** ——
+        // 所以 `$sequence "reload_layer" "al_reload" … addlayer "look_poses"`
+        // （单动画 + addlayer）与 `$sequence "idle" "a_run" "a_idle" … addlayer …`
+        // （blend + addlayer）**是同一件事**。
+        //
+        // 早先这里对单动画路径写死了 `auto_layers: Vec::new()` ⟹
+        // `reload_layer` / `reload_loop_layer` / `reload_end_layer` 三条序列的
+        // `addlayer "look_poses"` **被静默丢弃**（NekoMDL 有、mdlc 没有）。
+        // 自动层丢失 ⟹ 引擎不会把这些序列与 `look_poses` 混合 ⟹
+        // **手部/上身姿态少了一层**。
+        //
+        // 帧数取**本序列第一格**的（官方用 `panim[0][0]->numframes`，
+        // `write.cpp:541-544`），与 blend 路径同一口径。
+        let mut auto_layers = Vec::with_capacity(s.auto_layers.len());
+        {
+            let nf = frames.len().max(1) as f32;
+            for (li, al) in s.auto_layers.iter().enumerate() {
+                let Some(seq_idx) = desc.sequences.iter().position(|x| x.name == al.sequence) else {
+                    seq_errors.push(e(
+                        format!("{at}.auto_layers[{li}].sequence"),
+                        format!("找不到序列 {:?}", al.sequence),
+                    ));
+                    continue;
+                };
+                auto_layers.push(crate::model::CompiledAutoLayer {
+                    sequence: seq_idx as i16,
+                    pose: al.pose,
+                    flags: al.flags,
+                    // `write.cpp:539-551`：不带 `STUDIO_AL_POSE` 时
+                    // 四个量**除以 `numframes − 1`**（转 cycle）。
+                    start: layer_time(al.start, al.flags, nf),
+                    peak: layer_time(al.peak, al.flags, nf),
+                    tail: layer_time(al.tail, al.flags, nf),
+                    end: layer_time(al.end, al.flags, nf),
+                });
+            }
+        }
         sequences.push(crate::model::CompiledSequence {
             name: s.name.clone(),
             smd_path,
@@ -1914,7 +2059,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             cells: vec![anim_ix],
             blend_width: 1,
             blend_params: [None, None],
-            auto_layers: Vec::new(),
+            auto_layers,
             events: s.events.clone(),
             fade_in: s.fade_in,
             fade_out: s.fade_out,
@@ -9638,6 +9783,243 @@ $model \"body\" \"a.smd\" {\n\
                 crate::model::IkRuleType::Release
             ],
             "顺序必须是「动画块在前、序列块在后」（官方往 `panim->numcmds` 尾部追加）"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R26：`$sequence` 块里的**另外两个**动画选项 —— `addlayer` 与
+    // `weightlist` / `numframes` —— 与 R23 是**同一条机制**
+    // ------------------------------------------------------------------
+
+    /// **单动画序列的 `addlayer` 不得被丢弃。**
+    ///
+    /// # 官方依据（`studiomdl.cpp:2867-2872`）
+    ///
+    /// `addlayer` 的分支**与 `numblends` 无关**，只把序列名记进
+    /// `pseq->autolayer[]`：
+    /// ```c
+    /// else if (stricmp( "addlayer", token ) == 0) {
+    ///     GetToken( false );
+    ///     strcpyn( pseq->autolayer[pseq->numautolayers].name, token );
+    ///     pseq->numautolayers++;
+    /// }
+    /// ```
+    /// 所以「单动画 + addlayer」与「blend + addlayer」是**同一件事**。
+    ///
+    /// # 实测症状
+    ///
+    /// mdlc 的单动画路径写死了 `auto_layers: Vec::new()` ⟹ 用户的
+    /// `reload_layer` / `reload_loop_layer` / `reload_end_layer` 三条序列
+    /// （QC 里都有 `addlayer "look_poses"`）的自动层**被静默丢弃** ——
+    /// NekoMDL 有 1 条、mdlc 0 条 ⟹ 引擎不会把这三条序列与 `look_poses`
+    /// 混合 ⟹ **上身/手部少一层姿态**。
+    #[test]
+    fn single_animation_sequence_keeps_addlayer() {
+        let d = ikr23_dir("r26-addlayer");
+        let qc = "\
+$modelname \"r26a.mdl\"\n\
+$animation \"base\" \"a.smd\" fps 30\n\
+$animation \"layer\" \"b.smd\" fps 30\n\
+$sequence \"lps\" \"layer\"\n\
+$sequence \"sl\" \"base\" {\n\
+addlayer \"lps\"\n\
+}\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let sl = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "sl")
+            .expect("序列 `sl` 应存在");
+        // 先证明夹具非空 —— 否则下面的断言会**空洞通过**。
+        assert!(
+            c.sequences.len() >= 2,
+            "夹具应至少 2 条序列（`lps` / `sl`），实际 {}",
+            c.sequences.len()
+        );
+        assert_eq!(
+            sl.auto_layers.len(),
+            1,
+            "**单动画**序列的 `addlayer` 必须保留（修前这里是 0 —— \
+             `reload_layer` 形态）"
+        );
+        // `sequence` 字段存的是**序列下标**，必须指向 `lps`。
+        let target = sl.auto_layers[0].sequence as usize;
+        assert_eq!(
+            c.sequences[target].name, "lps",
+            "自动层必须指向 `lps`，实际指向 {}",
+            c.sequences[target].name
+        );
+        // 相邻对照：blend 路径的 addlayer 早就是好的 —— 两条路径必须一致。
+        assert_eq!(
+            sl.auto_layers[0].flags, 0,
+            "`addlayer`（不带 `blendlayer` 的时间量）flags 应为 0"
+        );
+    }
+
+    /// **`$sequence` 的 `weightlist` 必须覆盖被复用动画的权重。**
+    ///
+    /// 官方把它落成 `animations[0]->cmds[]` 的 `CMD_WEIGHTS`，
+    /// 由 `setAnimationWeight`（`simplify.cpp:1721-1729`）**改共享动画对象**。
+    /// 序列自己的 `weight[]` 是之后由 `merge_weights`
+    /// （`simplify.cpp:302-318`）**对各格取 MAX** 得来的。
+    ///
+    /// # 实测症状（用户工程）
+    ///
+    /// ```text
+    /// $sequence "fidget" "a_look_mid" weightlist "empty" … numframes 90 fps 1
+    /// ```
+    /// `empty` 表（只写了 `"ValveBiped.ValveBiped" 0`）经父链补齐后**全 0**。
+    /// NekoMDL 与发布版**都**给 `fidget` 全 0，而 mdlc 修前给全 1
+    /// （`weightlist` 只在 `!reused` 分支被读）。
+    ///
+    /// ⚠️ 这条同时钉住「**共享**」：`fidget` 走完后，被它复用的动画
+    /// 权重必须是 0 —— 不是「序列自己的副本」。
+    #[test]
+    fn sequence_weightlist_overrides_reused_animation() {
+        let d = ikr23_dir("r26-weightlist");
+        let qc = "\
+$modelname \"r26b.mdl\"\n\
+$weightlist \"zero\" {\n\
+\"root\" 0\n\
+}\n\
+$animation \"shared\" \"a.smd\" fps 30\n\
+$sequence \"w\" \"shared\" weightlist \"zero\"\n\
+$model \"body\" \"a.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let w = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "w")
+            .expect("序列 `w` 应存在")
+            .weights
+            .clone();
+        // 先证明夹具非空：骨骼数与权重向量长度必须对得上。
+        assert_eq!(
+            w.len(),
+            c.desc.bones.len(),
+            "权重向量长度应等于骨骼数（否则下面的「全 0」判据是空洞的）"
+        );
+        assert!(
+            !w.is_empty(),
+            "权重向量不能为空 —— 否则 `all(|x| x == 0.0)` 会空洞通过"
+        );
+        assert!(
+            w.iter().all(|v| *v == 0.0),
+            "`weightlist \"zero\"` 应让**全部**骨骼权重为 0（修前是 1），实际 {w:?}"
+        );
+    }
+
+    /// **`$sequence` 的 `numframes` 必须延长被复用动画**（官方 `forceNumframes`）。
+    ///
+    /// 官方实现（`simplify.cpp:1279-1293`）把**最后一帧**复制到 `numframes`
+    /// 为止，且改的是**共享动画对象** ⟹ 引用同一动画的其它序列**也跟着变长**。
+    ///
+    /// # 实测症状（用户工程）
+    ///
+    /// ```text
+    /// $sequence "fidget" "a_look_mid" weightlist "empty" "ACT_VM_FIDGET" 100 numframes 90 fps 1
+    /// ```
+    /// `a_look_mid` 来自 `look_poses.smd` 的 `frames 1 1`（**1 帧**）。
+    /// NekoMDL 把它延长到 **90 帧**，且 `look_poses` 的 blend 表里
+    /// 引用的 `a_look_mid` **同样是 90 帧**；mdlc 修前**完全没有实现**
+    /// `CMD_NUMFRAMES` ⟹ 两侧都停在 1 帧。
+    ///
+    /// ⚠️ 判据必须**同时**看「变长」与「共享」两件事 —— 只看本序列会漏掉
+    /// 「另一条序列也应看到 90 帧」，而那正是官方的行为。
+    #[test]
+    fn sequence_numframes_extends_shared_animation() {
+        let d = ikr23_dir("r26-numframes");
+        // `b.smd` 只有 2 帧（`IKR23_SMD`）⟹ 延长到 5 帧后末帧应被复制 3 次。
+        let qc = "\
+$modelname \"r26c.mdl\"\n\
+$animation \"shared\" \"b.smd\" fps 30\n\
+$sequence \"grow\" \"shared\" numframes 5\n\
+$sequence \"user\" \"shared\"\n\
+$model \"body\" \"b.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let anim = c
+            .animations
+            .iter()
+            .find(|a| a.name == "shared")
+            .expect("动画 `shared` 应存在");
+        // 先证明夹具非空：源只有 2 帧，否则「延长」判据没有意义。
+        assert!(
+            anim.frames.len() == 5,
+            "`numframes 5` 应把 2 帧的动画延长到 5 帧，实际 {} 帧",
+            anim.frames.len()
+        );
+        // 末帧必须被**复制**（不是补零）—— 官方是 memcpy 最后一帧。
+        assert_eq!(
+            anim.frames[2], anim.frames[1],
+            "第 2 帧应是第 1 帧的复制（官方 memcpy 最后一帧）"
+        );
+        assert_eq!(
+            anim.frames[4], anim.frames[1],
+            "第 4 帧应是第 1 帧的复制（官方 memcpy 最后一帧）"
+        );
+        // **共享**：另一条引用同一动画的序列也应看到 5 帧。
+        let user = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "user")
+            .expect("序列 `user` 应存在");
+        assert_eq!(
+            user.frames.len(),
+            5,
+            "`numframes` 改的是**共享动画** ⟹ 引用它的另一条序列也应看到 5 帧（修前 2 帧）"
+        );
+    }
+
+    /// **`numframes` 只延长、不缩短**（回归护栏）。
+    ///
+    /// 官方 `forceNumframes` 的循环是 `for (j = panim->numframes; j < numframes; j++)`
+    /// —— 传一个**更小**的值时循环一次都不跑，但 `panim->numframes = numframes`
+    /// **照样执行** ⟹ 帧数会被改小，而 `sanim[]` 里的数据仍在。
+    ///
+    /// 本实现只处理「延长」（`n > len` 才 push），并在随后把 `frames`
+    /// 与共享动画同步 —— 这条钉住「写一个更小的 `numframes` 不会把序列撑大」。
+    #[test]
+    fn sequence_numframes_smaller_value_does_not_grow() {
+        let d = ikr23_dir("r26-numframes-small");
+        let qc = "\
+$modelname \"r26d.mdl\"\n\
+$animation \"shared\" \"b.smd\" fps 30\n\
+$sequence \"shrink\" \"shared\" numframes 1\n\
+$model \"body\" \"b.smd\" {\n\
+}\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let c = compile(&desc, &d).expect("应能编译");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let anim = c
+            .animations
+            .iter()
+            .find(|a| a.name == "shared")
+            .expect("动画 `shared` 应存在");
+        // 夹具非空：源确实有 2 帧。
+        assert!(
+            anim.frames.len() >= 2,
+            "夹具的源动画应有 >= 2 帧，实际 {}",
+            anim.frames.len()
+        );
+        assert_eq!(
+            anim.frames.len(),
+            2,
+            "`numframes 1`（比源小）**不得**改变帧数 —— 修前若写成无条件 resize \
+             会把它截断"
         );
     }
 }
