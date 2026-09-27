@@ -37,6 +37,15 @@ toml = "1.1.6"
 # 于是**调用点不需要任何 `#[cfg(...)]` 门禁**，两种构建写法完全一致。
 hotpath = "0.26.1"
 
+# 非加密哈希器。`build_vanim_map` 的就近匹配网格用整数三元组做键，
+# 一次完整编译要查 486 万次，默认的 SipHash 在这里是纯开销 ——
+# 网格**从不被迭代**，格内顺序由显式的倒序回填决定，所以哈希值
+# 不可能泄漏到产物里（实测换哈希器后 101/101 parity 逐字节相同）。
+#
+# 实测（`parity/linnea-export.toml`，函数级同一 span、各 3 轮取中位）：
+#   SipHash 130.60 ms → 75.85 ms（**1.72×**），端到端 1.14×。
+rustc-hash = "2.1.3"
+
 [features]
 # 分段计时探针。**默认关闭** —— 打开后 `measure_block!` 会在每个计时点做
 # 一次原子读，实测给单 LOD 常见路径带来约 2.5% 开销（历史数据见 `src/lod.rs`
@@ -50,3 +59,14 @@ hotpath = "0.26.1"
 # 这一行只是把上面那个依赖的 `hotpath` feature 转发出去；关掉时 hotpath
 # 整体退化成空实现，仍然参与编译（依赖树多 hotpath + hotpath-macros 两项）。
 hotpath = ["hotpath/hotpath"]
+
+[profile.release]
+# thin LTO + 单 codegen unit。实测（交错 A/B，同一台机器，各 10-14 轮）：
+#   相对「无 LTO + 默认 cgu=16」：t100000 +2.9%、lod4 +6.0%。
+#   `codegen-units` 是关键变量：默认的 16 会把 thin LTO 的收益吃掉大半，
+#   显式设成 1 之后 linnea-export +3.54%、lod4 +5.25%（两项都有可测差异）。
+# 选 thin 而不是 fat：thin+cgu=1 与 fat+cgu=1 实测等价
+# （linnea-export 上 thin 反而快 2.40%，lod4 中性），而 fat 构建要 107 s、
+# thin 只要 102 s，且 fat 需要 `codegen-units=1` 才有收益。
+lto = "thin"
+codegen-units = 1
