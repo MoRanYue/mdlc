@@ -19,7 +19,7 @@ use mdlc::compile::compile;
 // 诊断输出的路由版（`eprintln!` / `eprint!` 的替代）—— 官方兼容模式下
 // 自动改走 stdout，理由见 [`mdlc::diag`] 模块文档。
 use mdlc::{diagln, diagprint};
-use mdlc::mdl_writer::{flatten_vertices, write_mdl};
+use mdlc::mdl_writer::write_mdl;
 use mdlc::model::ModelDesc;
 use mdlc::phy::{self, PhyHull, PhyParams, PhySolid};
 use mdlc::vtx_writer::{self, write_vtx_with};
@@ -430,7 +430,7 @@ fn compile_and_write(
             mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
     }
 
-    let _t_mdl = mdlc::prof::Span::new("main: write_mdl + flatten_vertices");
+    let _t_mdl = mdlc::prof::Span::new("main: write_mdl");
     let out = match write_mdl(&compiled) {
         Ok(o) => o,
         Err(e) => {
@@ -438,9 +438,6 @@ fn compile_and_write(
             return ExitCode::from(1);
         }
     };
-
-    // 顶点摊平 —— 必须与 write_mdl 用同一套 spans 编号。
-    let flat = flatten_vertices(&compiled, &out.spans);
     drop(_t_mdl);
     let _t_vvd = mdlc::prof::Span::new("main: build_vvd + to_bytes");
     let vvd = match build_vvd(&compiled, out.checksum) {
@@ -647,7 +644,7 @@ fn compile_and_write(
     println!("骨骼        {}", desc.bones.len());
     println!("材质        {}", desc.materials.textures.len());
     println!("body part   {}", desc.bodyparts.len());
-    println!("顶点        {}", flat.len());
+    println!("顶点        {}", compiled.total_vertices());
     println!("三角形      {}", compiled.total_triangles());
     println!();
     println!("MDL         {:>10} 字节  {}", out.bytes.len(), mdl_path.display());
