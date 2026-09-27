@@ -2970,14 +2970,16 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 这一步之前只写「单位旋转 + 平移取负」，对 `rotation = 0` 的合成模型
     // 看不出问题，但真实模型的第一根骨骼几乎都带 π/2 旋转，那样写会让
     // 顶点被错误旋转 —— 模型在游戏里扭曲，且编译器不会报任何错。
-    {
-        let mut positions = Vec::with_capacity(bone_count);
-        let mut rotations = Vec::with_capacity(bone_count);
+    //
+    // ⚠️ `ptb` **不能**关在块里：第 9 步的 `absolute` 附着点要用它做左乘
+    // （官方 `LinkAttachments()`，`simplify.cpp:5388`）。
+    //
+    // 矩阵本身走 [`crate::compile::bone_pose_to_bone`] —— 与 `calcblend`
+    // 共用唯一实现（`absolute` 附着点的 `local` 和落盘的那一份必须是**同一个**
+    // 矩阵，两份实现漂移过一次）。
+    let ptb = {
         let mut parents: Vec<i32> = Vec::with_capacity(bone_count);
-        for (i, b) in desc.bones.iter().enumerate() {
-            let (p, r) = resolve_bone_pose(desc, compiled, i);
-            positions.push(p);
-            rotations.push(r);
+        for b in desc.bones.iter() {
             parents.push(match b.parent.as_deref() {
                 Some(name) => *bone_index
                     .get(name)
@@ -2986,14 +2988,15 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 None => -1,
             });
         }
-        let ptb = crate::bone_math::compute_pose_to_bone(&positions, &rotations, &parents);
+        let ptb = crate::compile::bone_pose_to_bone(desc, compiled, &parents);
         for (i, m) in ptb.iter().enumerate() {
             let base = bone_off + i * BONE_SIZE;
             for (k, v) in m.iter().enumerate() {
                 put_f32(&mut buf, base + bone_off::POSE_TO_BONE + k * 4, *v);
             }
         }
-    }
+        ptb
+    };
 
     // ---- 6. 材质表 ----
     for (i, t) in desc.materials.textures.iter().enumerate() {
@@ -3383,47 +3386,19 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             .get(at.bone.as_str())
             .ok_or_else(|| {
                 WriteError::Internal(format!("附着点骨骼 {:?} 未通过校验", at.bone))
-            })? as i32;
-        put_i32(&mut buf, base + at_off::LOCAL_BONE, bone);
-        // `local` 是 matrix3x4_t：位置 + 旋转（**角度** → 弧度）。
-        let pos = at.position.unwrap_or([0.0; 3]);
-        let rot = at.rotation.unwrap_or([0.0; 3]);
-        let angles = [
-            rot[0].to_radians(),
-            rot[1].to_radians(),
-            rot[2].to_radians(),
-        ];
-        if desc.model.static_prop {
-            // `$staticprop`：`MakeStaticProp()` 对**每个**附着点做
-            // `ConcatTransforms( rotated, g_attachment[i].local, g_attachment[i].local )`
-            // （`simplify.cpp:3392`）—— 把几何旋转左乘到 `local` 上。
-            //
-            // 关键是**先组装完整的 local（含平移）再左乘**。分两步写
-            // （先写旋转、再用 `pos` 覆盖平移列）会把旋转后的平移又换回
-            // 未旋转的原值 —— 实测官方是 `(-8, 7, 9)`，即
-            // `Rz(90°) × (7,8,9)`，而不是 `(7,8,9)`。
-            //
-            // 实测 `ipf4`（`$staticprop` + `$attachment "muzzle" "root" 7 8 9`）：
-            // ```text
-            //   local = [[-0, -1, 0, -8],
-            //            [ 1, -0, 0,  7],
-            //            [ 0,  0, 1,  9]]
-            // ```
-            let local = crate::bone_math::local_transform(pos, angles);
-            let m = crate::bone_math::concat(&crate::compile::static_prop_matrix(), &local);
-            for (k, v) in m.iter().enumerate() {
-                put_f32(&mut buf, base + at_off::LOCAL + k * 4, *v);
-            }
-        } else {
-            let m = crate::bone_math::angle_matrix(angles);
-            for (k, v) in m.iter().enumerate() {
-                put_f32(&mut buf, base + at_off::LOCAL + k * 4, *v);
-            }
-            // 平移列是 matrix3x4 的第 4 列，即下标 3 / 7 / 11
-            // （**不是字节偏移 3/7/11** —— 早先这里漏乘 4，导致位置全丢）。
-            put_f32(&mut buf, base + at_off::LOCAL + 3 * 4, pos[0]);
-            put_f32(&mut buf, base + at_off::LOCAL + 7 * 4, pos[1]);
-            put_f32(&mut buf, base + at_off::LOCAL + 11 * 4, pos[2]);
+            })?;
+        put_i32(&mut buf, base + at_off::LOCAL_BONE, bone as i32);
+        // `local` 是 matrix3x4_t。
+        //
+        // ⚠️ **不再在这里重算** —— 走 [`crate::compile::attachment_local_matrix`]，
+        // 与 `calcblend` 共用唯一实现。两份实现漂移过一次：这里的旧版本只写
+        // 「`angle_matrix(rot)` + 平移列」，于是 `$attachment ... absolute`
+        // 的 `local` 既没有 `AngleIMatrix( g_defaultrotation )` 的旋转，
+        // 也没有 `LinkAttachments()` 的 `poseToBone` 左乘 —— 实测官方
+        // 用户的 `eyes` 附着点偏差高达 **61.57**（`docs/_probe/att_abs_check.js`）。
+        let m = crate::compile::attachment_local_matrix(desc, at, &ptb, bone);
+        for (k, v) in m.iter().enumerate() {
+            put_f32(&mut buf, base + at_off::LOCAL + k * 4, *v);
         }
         // unused[8] 保持 0。
     }
@@ -5013,6 +4988,9 @@ end
             bone: "tip".into(),
             position: None,
             rotation: None,
+            absolute: false,
+            absolute_rotation: None,
+            rigid: false,
             flags: None,
         });
         d.desc.bones[0].bonemerge = true;
@@ -5051,6 +5029,222 @@ end
             tip,
             BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_ATTACHMENT | BONE_USED_BY_HITBOX,
             "tip 应为 VERTEX_LOD0 | ATTACHMENT | HITBOX（0x700），实际 0x{tip:X}"
+        );
+    }
+
+    /// 从写出的 MDL 里读出第 `i` 个附着点的 `local` 矩阵（12 个 f32）。
+    fn attachment_local_of(b: &[u8], i: usize) -> [f32; 12] {
+        let base = i32::from_le_bytes(
+            b[off::LOCAL_ATTACHMENT_OFFSET..off::LOCAL_ATTACHMENT_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize
+            + i * ATTACHMENT_SIZE;
+        let mut m = [0.0f32; 12];
+        for (k, v) in m.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(
+                b[base + at_off::LOCAL + k * 4..][..4].try_into().unwrap(),
+            );
+        }
+        m
+    }
+
+    /// 从写出的 MDL 里读出第 `i` 个附着点的 `flags`。
+    fn attachment_flags_of(b: &[u8], i: usize) -> i32 {
+        let base = i32::from_le_bytes(
+            b[off::LOCAL_ATTACHMENT_OFFSET..off::LOCAL_ATTACHMENT_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize
+            + i * ATTACHMENT_SIZE;
+        i32::from_le_bytes(b[base + at_off::FLAGS..][..4].try_into().unwrap())
+    }
+
+    /// ⭐ `$attachment ... absolute` 的 `local` =
+    /// `poseToBone[bone] ∘ AngleIMatrix(g_defaultrotation)`（**平移列最后写**）。
+    ///
+    /// 官方两步：① 解析期 `AngleIMatrix( g_defaultrotation, local )`
+    /// （`studiomdl.cpp:5246`）；② `LinkAttachments()` 里
+    /// `ConcatTransforms( poseToBone, world, local )`（`simplify.cpp:5388`）。
+    /// 平移列在**最后**才写进 `local`（`studiomdl.cpp:5305-5307`），所以第 ② 步
+    /// 左乘的是「**已带平移**的 `AngleIMatrix`」。
+    ///
+    /// 官方产物裁决（`docs/_probe/att_abs_check.js`，`_official_user_qc3.mdl`
+    /// 的 `eyes` 附着点）：公式预测与实测最大偏差 **8.368e-7**。
+    ///
+    /// 夹具：`tip` 在 SMD 参考姿态里位于 `(0,0,8)`、旋转为 0，父为 `root`
+    /// （原点、旋转 0）⟹ `poseToBone[tip]` = 平移 `(0,0,-8)`。
+    #[test]
+    fn absolute_attachment_local_is_pose_to_bone_times_angle_imatrix() {
+        let toml = format!(
+            "{TEST_TOML}
+[[attachments]]
+name = \"eyes\"
+bone = \"tip\"
+position = [1.0, -3.62, 61.57]
+absolute = true
+"
+        );
+        let d = compile_desc(&toml, "mdlc-writer-abs");
+        let out = write_mdl(&d).unwrap();
+        let m = attachment_local_of(&out.bytes, 0);
+
+        // `AngleIMatrix( [0,0,π/2] )` 的旋转 = `[0,1,0, -1,0,0, 0,0,1]`
+        // （= `AngleMatrix` 的转置），再左乘平移 `(0,0,-8)` 的 `poseToBone`
+        // ⟹ 平移列 `(1.0, -3.62, 61.57 - 8.0)`。
+        let want = [
+            0.0, 1.0, 0.0, 1.0, //
+            -1.0, 0.0, 0.0, -3.62, //
+            0.0, 0.0, 1.0, 53.57,
+        ];
+        for (k, (got, exp)) in m.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-4,
+                "absolute 附着点的 local[{k}] 应为 {exp}，实际 {got}（完整矩阵 {m:?}）"
+            );
+        }
+    }
+
+    /// 非 `absolute` 的附着点 `local` = 解析期原样（`poseToBone` 与 `boneToPose`
+    /// 在官方 `LinkAttachments()` 里相互抵消，`simplify.cpp:5334/5388`）。
+    ///
+    /// 这条是**反向**判据：若把 `absolute` 的左乘误用到所有附着点上，
+    /// `mouth` 这类普通附着点的平移列会被 `poseToBone` 平移走 —— 立刻失败。
+    #[test]
+    fn plain_attachment_local_ignores_pose_to_bone() {
+        let toml = format!(
+            "{TEST_TOML}
+[[attachments]]
+name = \"mouth\"
+bone = \"tip\"
+position = [0.8, -5.8, -0.15]
+"
+        );
+        let d = compile_desc(&toml, "mdlc-writer-plain");
+        let out = write_mdl(&d).unwrap();
+        let m = attachment_local_of(&out.bytes, 0);
+        // 旋转为 0 ⟹ 单位旋转；平移列原样（**不**减 8）。
+        let want = [
+            1.0, 0.0, 0.0, 0.8, //
+            0.0, 1.0, 0.0, -5.8, //
+            0.0, 0.0, 1.0, -0.15,
+        ];
+        for (k, (got, exp)) in m.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "非 absolute 附着点的 local[{k}] 应为 {exp}，实际 {got}（完整矩阵 {m:?}）"
+            );
+        }
+    }
+
+    /// `absolute` **不落盘**：`mstudioattachment_t.flags` 里只有 `world_align`。
+    ///
+    /// 官方 `write.cpp:350` 写的是 `g_attachment[i].flags`，而 `absolute`/`rigid`
+    /// 落在**另一个**字段 `g_attachment[i].type`（`studiomdl.h:277-278`）
+    /// ⟹ 产物里恒为 0。真 studiomdl 裁决
+    /// （`docs/_probe/oracle_attachment_flags.js`）：官方对 `absolute`/`rigid`
+    /// 都写 `0x0`，只有 `world_align` 写 `0x10000`。
+    #[test]
+    fn attachment_flags_only_carry_world_align() {
+        let toml = format!(
+            "{TEST_TOML}
+[[attachments]]
+name = \"eyes\"
+bone = \"tip\"
+position = [1.0, 2.0, 3.0]
+absolute = true
+
+[[attachments]]
+name = \"muzzle\"
+bone = \"tip\"
+position = [0.0, 0.0, 0.0]
+rigid = true
+
+[[attachments]]
+name = \"flash\"
+bone = \"tip\"
+position = [0.0, 0.0, 0.0]
+flags = 65536
+"
+        );
+        let d = compile_desc(&toml, "mdlc-writer-atflags");
+        let out = write_mdl(&d).unwrap();
+        assert_eq!(attachment_flags_of(&out.bytes, 0), 0, "absolute 不落盘");
+        assert_eq!(attachment_flags_of(&out.bytes, 1), 0, "rigid 不落盘");
+        assert_eq!(
+            attachment_flags_of(&out.bytes, 2),
+            0x10000,
+            "world_align 落 ATTACHMENT_FLAG_WORLD_ALIGN"
+        );
+    }
+
+    /// `local` 的**旋转来源**由 `absolute_rotation` 决定，与 `absolute` 解耦。
+    ///
+    /// 官方用同一个 `local` 矩阵、由选项**顺序**覆盖（`studiomdl.cpp:5246` 的
+    /// `AngleIMatrix` vs `:5268` 的 `AngleMatrix`）—— 两种情形的 `IS_ABSOLUTE`
+    /// 都置位，只有旋转来源不同。mdlc 拆成 `absolute` + `absolute_rotation`。
+    ///
+    /// 这条是**反向**判据：`use_imatrix` 若恒 `true`，普通附着点的旋转会被换成
+    /// `AngleIMatrix( g_defaultrotation )`（`Rz(-90°)`）；若恒 `false`，
+    /// `absolute` 的旋转会变成 `AngleMatrix( rotation )`。两者都被下面钉住。
+    #[test]
+    fn attachment_rotation_source_depends_on_absolute_rotation() {
+        let toml = format!(
+            "{TEST_TOML}
+[[attachments]]
+name = \"plain\"
+bone = \"tip\"
+position = [0.0, 0.0, 0.0]
+rotation = [11.0, 22.0, 33.0]
+
+[[attachments]]
+name = \"abs_uses_imatrix\"
+bone = \"tip\"
+position = [0.0, 0.0, 0.0]
+rotation = [11.0, 22.0, 33.0]
+absolute = true
+
+[[attachments]]
+name = \"abs_uses_rotate\"
+bone = \"tip\"
+position = [0.0, 0.0, 0.0]
+rotation = [11.0, 22.0, 33.0]
+absolute = true
+absolute_rotation = false
+"
+        );
+        let d = compile_desc(&toml, "mdlc-writer-rot");
+        let out = write_mdl(&d).unwrap();
+        let plain = attachment_local_of(&out.bytes, 0);
+        let abs_im = attachment_local_of(&out.bytes, 1);
+        let abs_rot = attachment_local_of(&out.bytes, 2);
+
+        // `abs_uses_imatrix` 的旋转必须**完全忽略** `rotation`
+        // ⟹ 与 `plain`（用 `rotation`）的旋转部分不同。
+        assert_ne!(
+            &plain[0..3],
+            &abs_im[0..3],
+            "`absolute` 未带 `rotate` ⟹ 旋转应来自 `AngleIMatrix( g_defaultrotation )`，\
+             不该等于 `AngleMatrix( rotation )`（plain={plain:?} abs={abs_im:?}）"
+        );
+        // `abs_uses_rotate`（`absolute_rotation = false`）的旋转来自 `rotation`
+        // ⟹ 与 `plain` 的旋转部分一致（只差 `poseToBone` 左乘的平移）。
+        for k in [0usize, 1, 2, 4, 5, 6, 8, 9, 10] {
+            assert!(
+                (plain[k] - abs_rot[k]).abs() < 1e-5,
+                "`absolute_rotation = false` ⟹ 旋转来自 `AngleMatrix( rotation )`，\
+                 应与 plain 一致；local[{k}] plain={} abs_rot={}",
+                plain[k],
+                abs_rot[k]
+            );
+        }
+        // `absolute` 仍要做 `poseToBone` 左乘（`tip` 在 `(0,0,8)` ⟹ 平移 z 减 8）。
+        assert!(
+            (abs_rot[11] - (plain[11] - 8.0)).abs() < 1e-4,
+            "`absolute` 的左乘必须照做（`absolute_rotation` 只管旋转来源）：\
+             plain[11]={} abs_rot[11]={}",
+            plain[11],
+            abs_rot[11]
         );
     }
 

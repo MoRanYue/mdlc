@@ -448,31 +448,19 @@ fn build_model_lods(
                     continue;
                 }
             };
-            // 骨骼必须与 LOD 0 一致（同一个 model 的各 LOD 共用骨架）。
-            let desc_index = desc.bone_index();
-            let missing: Vec<&str> = smd
-                .nodes
-                .iter()
-                .map(|n| n.name.as_str())
-                .filter(|n| !desc_index.contains_key(n))
-                .collect();
-            if !missing.is_empty() {
-                errs.push(e(
-                    &lpath,
-                    format!(
-                        "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
-                        smd_path.display(),
-                        missing.len(),
-                        missing
-                            .iter()
-                            .take(5)
-                            .copied()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ));
-                continue;
-            }
+            // ⚠️ **不要**因为「LOD SMD 里有 `[[bones]]` 没有的骨骼」而报错。
+            //
+            // 官方 `$lod` 的源是 `Load_Source(..., isActiveModel = false)`
+            // （`studiomdl.cpp:5434-5436`，默认值见 `studiomdl.h:1127`），
+            // 所以它的顶点权重**不**给骨骼打 `boneref` —— LOD SMD 里那些
+            // 「零顶点引用、又没被 `$definebone`/`$attachment`/`$ikchain`/
+            // `$mouth`/`$bonemerge`/眼球 提到」的骨骼根本不在表里。
+            // 官方靠 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）
+            // 把这些骨骼**沿父链上溯**、实在找不到就静默重映射到根骨骼 0
+            // （`:4180` 的 `k = 0;`），从不报错。
+            //
+            // mdlc 侧的对应实现在 `smd_vertex_to_ir`（同一条父链上溯），
+            // 所以这里直接放行。
             let meshes = match build_meshes(&smd, desc, &smd_path, &lpath, m.flip_triangles) {
                 Ok(v) => v,
                 Err(err) => {
@@ -584,6 +572,19 @@ fn build_model_lods(
 struct VertexBoneMap<'s, 'd> {
     /// SMD `nodes` 段的骨骼名（按 SMD 自己的下标）。
     node_names: Vec<&'s str>,
+    /// SMD `nodes` 段每根骨骼的**父下标**（`-1` 表示无父）。
+    ///
+    /// 用于官方 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）
+    /// 的**父链上溯**：SMD 里的骨骼若不在描述文件的骨骼表里，就沿父链找到
+    /// 第一根在表里的祖先；实在找不到则官方静默重映射到**根骨骼 0**
+    /// （`:4180` 的 `k = 0;`）。
+    ///
+    /// ⭐ 这条路径是必需的：官方骨骼表只收 `$definebone` 与 `boneref != 0`
+    /// 的骨骼，动画 SMD 里「零顶点引用、又没被保命判据提到」的骨骼不在表里
+    /// （用户工程 `linnea_replaces_zoey` 的 `TeenAngst.smd`/`ragdoll.smd`
+    /// 各有 12 根这样的骨骼）。旧实现直接报错，那是「官方能编过、mdlc 编不过」
+    /// 的假阳性。
+    smd_parents: Vec<i32>,
     /// 描述文件骨骼名 → 下标。与 [`ModelDesc::bone_index`] 一致（**大小写敏感**）。
     desc_index: HashMap<&'d str, usize>,
     /// `nodes` 段的条目数（只用于报错文案）。
@@ -596,10 +597,41 @@ impl<'s, 'd> VertexBoneMap<'s, 'd> {
     fn new(smd: &'s Smd, desc: &'d ModelDesc) -> Self {
         VertexBoneMap {
             node_names: smd.nodes.iter().map(|n| n.name.as_str()).collect(),
+            smd_parents: smd.nodes.iter().map(|n| n.parent).collect(),
             desc_index: desc.bone_index(),
             node_count: smd.nodes.len(),
             bone_count: desc.bones.len(),
         }
+    }
+
+    /// 把 SMD 的骨骼下标映射到描述文件的骨骼下标。
+    ///
+    /// 复刻官方 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）：
+    /// 先按名字直接查；查不到就**沿父链上溯**（`:4167-4171`）；整条链都不在
+    /// 表里则返回**根骨骼 0**（`:4180` 的 `k = 0;`，官方那条「illegal parent
+    /// bone replacement」诊断被 `#if 0` 关掉了，见 `:4186-4210`）。
+    ///
+    /// 返回 `None` 只在描述文件的骨骼表**为空**时发生（没有 0 号骨骼可退）。
+    fn map_bone(&self, node: usize) -> Option<usize> {
+        // 先直接查（大小写敏感，与 `desc.bone_index()` 一致）。
+        let mut k = node as i32;
+        let mut guard = 0usize;
+        while k >= 0 {
+            let ki = k as usize;
+            if let Some(name) = self.node_names.get(ki)
+                && let Some(&di) = self.desc_index.get(*name)
+            {
+                return Some(di);
+            }
+            // 环保护：SMD 的 `nodes` 段理论上无环，但坏文件不该让编译器挂死。
+            guard += 1;
+            if guard > self.node_names.len() {
+                break;
+            }
+            k = self.smd_parents.get(ki).copied().unwrap_or(-1);
+        }
+        // 整条父链都不在表里 ⟹ 官方重映射到根骨骼 0。
+        if self.bone_count > 0 { Some(0) } else { None }
     }
 }
 
@@ -751,10 +783,8 @@ fn smd_vertex_to_ir(
     let bone_count = bone_map.bone_count;
 
     // SMD 的绑定用的是**SMD 自己的**骨骼下标，需要映射到描述文件的骨骼表。
-    // 两边都用名字对齐 —— 这样 SMD 里多出的骨骼（例如仅用于动画的辅助骨）
-    // 会被明确报错而不是静默错位。
-    let node_names = &bone_map.node_names;
-    let desc_index = &bone_map.desc_index;
+    // 映射走 [`VertexBoneMap::map_bone`]（复刻官方
+    // `MapSourcesToGlobalBonetable()`：按名查 → 沿父链上溯 → 退根骨骼 0）。
 
     // 权重按从大到小排序，并只保留前 MAX_BONES_PER_VERT 组（引擎上限）。
     //
@@ -785,8 +815,9 @@ fn smd_vertex_to_ir(
         if l.weight <= 0.0 {
             continue;
         }
-        let node_name = node_names.get(l.bone.max(0) as usize).ok_or_else(|| {
-            e(
+        let node_ix = usize::try_from(l.bone).unwrap_or(usize::MAX);
+        if node_ix >= bone_map.node_count {
+            return Err(e(
                 at,
                 format!(
                     "{} 里顶点引用了骨骼下标 {}，但 nodes 段只有 {} 项",
@@ -794,13 +825,18 @@ fn smd_vertex_to_ir(
                     l.bone,
                     bone_map.node_count
                 ),
-            )
-        })?;
-        let Some(&di) = desc_index.get(node_name) else {
+            ));
+        }
+        // 复刻官方 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）：
+        // 名字查不到就沿父链上溯，整条链都不在表里则重映射到根骨骼 0。
+        // 旧实现直接报「不在描述的 [[bones]] 里」—— 那是假阳性：官方骨骼表
+        // 只收 `$definebone` 与 `boneref != 0` 的骨骼，动画 SMD 里那些
+        // 「零顶点引用、又没被保命判据提到」的骨骼本就不在表里。
+        let Some(di) = bone_map.map_bone(node_ix) else {
             return Err(e(
                 at,
                 format!(
-                    "{} 里的骨骼 {node_name:?} 不在描述的 [[bones]] 里",
+                    "{} 里的骨骼下标 {node_ix} 无法映射到 [[bones]]（骨骼表为空）",
                     smd_path.display()
                 ),
             ));
@@ -1011,30 +1047,23 @@ fn load_smd_frames(
         errs.push(e(format!("{} 的 skeleton 段没有任何帧", smd_path.display())));
         return None;
     }
-    let missing: Vec<&str> = smd
-        .nodes
-        .iter()
-        .map(|n| n.name.as_str())
-        .filter(|n| !desc_index.contains_key(n))
-        .collect();
-    if !missing.is_empty() {
-        errs.push(e(format!(
-            "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
-            smd_path.display(),
-            missing.len(),
-            missing.iter().take(5).copied().collect::<Vec<_>>().join(", ")
-        )));
-        return None;
-    }
-    // 描述里有、SMD 里没有的骨骼 —— 官方会保留它们，姿态优先取 `$definebone`
-    // 的 `rawLocal`（`position`/`rotation` 任一或两者都有）。
+    // ⚠️ **不要**因为「SMD 里有 `[[bones]]` 没有的骨骼」而报错。
     //
-    // 两者都没有时退回**零姿态**，而不是报错：官方 `TranslateAnimations`
-    // 的 `q == -1` 分支（见上方文档注释）拿骨骼表参考姿态当默认值继续，
-    // 对「某 SMD 缺某骨骼」从不报错。若在此报错，就会出现「官方能编过、
-    // mdlc 编不过」的假阳性（`anims/foot_fix.smd` 缺 `ValveBiped.forward`
-    // 即此例）。零姿态也自洽：该骨骼在别的 SMD 里若被覆盖，覆盖值照样
-    // 生效；本 SMD 里它本来就没有数据。
+    // 官方对这种情况**从不报错**：骨骼表（`BuildGlobalBonetable`，
+    // `simplify.cpp:3616-3695`）只收 `$definebone` 与 `boneref != 0` 的骨骼，
+    // 动画 SMD 里那些「零顶点引用、又没被 `$definebone`/`$attachment`/
+    // `$ikchain`/`$mouth`/`$bonemerge`/眼球 提到」的骨骼**根本不在表里**，
+    // 而 `TranslateAnimations` 只是按 `boneLocalToGlobal[]` 映射、映射不到的
+    // 就跳过（`MapSourcesToGlobalBonetable`，`simplify.cpp:4148-4217`）。
+    //
+    // ⭐ 实测：用户工程 `linnea_replaces_zoey` 的 `TeenAngst.smd` / `ragdoll.smd`
+    // 各有 12 根这样的骨骼（7 根 `jiggy_hair_*`/`jiggle_holster` + 5 根
+    // `attachment_bandage_*`/`attachment_arm*_T`），官方编出 122 根骨骼、
+    // 编过；mdlc 旧实现把每个 SMD 的每个 node 都收进表（134 根），于是这里
+    // 反而「不报错」—— 收紧判据后必须同步放宽这条检查，否则会出现
+    // 「官方能编过、mdlc 编不过」的假阳性。
+    //
+    // 逐帧构造时（见下方）对映射不到的骨骼已经 `continue` 跳过，语义一致。
     let smd_names: std::collections::HashSet<&str> =
         smd.nodes.iter().map(|n| n.name.as_str()).collect();
     let mut fallback: Vec<Option<crate::smd::SmdPose>> = vec![None; bone_count];
@@ -1501,13 +1530,27 @@ fn lookup_attachment(
     desc: &ModelDesc,
     bone_index: &std::collections::HashMap<&str, usize>,
     name: &str,
+    pose_to_bone: &[crate::bone_math::Matrix3x4],
 ) -> Option<(usize, crate::bone_math::Matrix3x4)> {
+    let (at, bone) = find_attachment(desc, bone_index, name)?;
+    Some((bone, attachment_local_matrix(desc, at, pose_to_bone, bone)))
+}
+
+/// 按名字查附着点，返回 `(附着点, 绑定的骨骼下标)` —— **不构造** `local` 矩阵。
+///
+/// 只做「名字 + 骨骼都存在吗」这一半的判定（`local` 需要 `poseToBone`，
+/// 而序列建立期还拿不到），供 `$sequence` 的 `calcblend` 参数占位时做存在性检查。
+fn find_attachment<'d>(
+    desc: &'d ModelDesc,
+    bone_index: &std::collections::HashMap<&str, usize>,
+    name: &str,
+) -> Option<(&'d crate::model::Attachment, usize)> {
     let at = desc
         .attachments
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case(name))?;
     let bone = *bone_index.get(at.bone.as_str())?;
-    Some((bone, attachment_local_matrix(desc, at)))
+    Some((at, bone))
 }
 
 /// `blendref` / `blendcomp` / `blendcenter` 的名字 → 动画池下标。
@@ -1577,6 +1620,10 @@ fn apply_calc_blend_axes(
     let desc = compiled.desc.clone();
     let bone_index = desc.bone_index();
     let parents = bone_parents(&desc);
+    // `absolute` 附着点的 `local` 需要附着点骨骼的 `poseToBone`
+    // （官方 `LinkAttachments()`，`simplify.cpp:5388`）—— 必须与落盘的那一份
+    // 完全一致，所以走同一个 [`bone_pose_to_bone`]。
+    let pose_to_bone = bone_pose_to_bone(&desc, compiled, &parents);
     let mut errors: Vec<CompileError> = Vec::new();
 
     // 先把每条序列的 `calc_axes` 取出来（避免同时借用 `compiled` 的两部分）。
@@ -1620,7 +1667,7 @@ fn apply_calc_blend_axes(
             // 恒返回 `0.0`，所以**附着点取什么都一样**。用第 0 根骨骼 +
             // 单位矩阵即可（保证不越界）。
             let (att_bone, att_local) = match &ax.attachment {
-                Some(name) => match lookup_attachment(&desc, &bone_index, name) {
+                Some(name) => match lookup_attachment(&desc, &bone_index, name, &pose_to_bone) {
                     Some(v) => v,
                     None => {
                         errors.push(CompileError {
@@ -1712,23 +1759,88 @@ fn compiled_anim_index(
         .collect()
 }
 
-/// 附着点的 `local` 矩阵 —— 与写出器**逐字同口径**。
+/// 逐骨骼的 `poseToBone` 矩阵。
 ///
-/// 两处必须一致：`calcblend` 用它算附着点相对位姿，而同一个矩阵
-/// 也会落进 `mstudioattachment_t.local`。不一致就会让「算出来的姿势参数」
+/// 官方 `g_bonetable[k].boneToPose` 是骨骼的**世界**矩阵，而文件里的
+/// `mstudiobone_t.poseToBone`（偏移 `0x60`）是它的**逆**；写出器把本函数的
+/// 结果落进那个字段，`LinkAttachments()` 又用它给 `absolute` 附着点做左乘
+/// （`simplify.cpp:5388`）⟹ 两处必须是**同一个**矩阵，所以只算一次、共用。
+///
+/// `parents` 必须是**骨骼表下标**空间的父下标（[`bone_parents`] 的产物）。
+pub(crate) fn bone_pose_to_bone(
+    desc: &ModelDesc,
+    compiled: &CompiledModelDesc,
+    parents: &[i32],
+) -> Vec<crate::bone_math::Matrix3x4> {
+    let n = desc.bones.len();
+    let mut positions = Vec::with_capacity(n);
+    let mut rotations = Vec::with_capacity(n);
+    for i in 0..n {
+        let (p, r) = resolve_bone_pose(desc, compiled, i);
+        positions.push(p);
+        rotations.push(r);
+    }
+    crate::bone_math::compute_pose_to_bone(&positions, &rotations, parents)
+}
+
+/// 附着点的 `local` 矩阵 —— **唯一实现**，写出器直接调用它。
+///
+/// 之所以只有一份：`calcblend` 用它算附着点相对位姿，而同一个矩阵也会落进
+/// `mstudioattachment_t.local`。两份实现一旦漂移，算出来的姿势参数就会
 /// 与实际渲染用的附着点不是同一个东西。
-fn attachment_local_matrix(
+///
+/// # 官方口径
+///
+/// 1. **解析期**（`studiomdl.cpp:5212-5310`）：以 `AngleMatrix( QAngle(0,0,0) )`
+///    起步（`:5237`），选项按**出现顺序**覆盖同一个 `local`：
+///    - `absolute` ⟹ `AngleIMatrix( g_defaultrotation )`（`:5246`）
+///    - `rotate` ⟹ `AngleMatrix( angles )`（`:5268`）
+///    - `x_and_z_axes` ⟹ 直接写列（`:5294-5297`）
+///
+///    平移列在选项循环**之后**才写（`:5305-5307`）⟹ 没有任何选项能覆盖它。
+/// 2. **`$staticprop`**：`MakeStaticProp()` 做
+///    `ConcatTransforms( rotated, local, local )`（`simplify.cpp:3392`）。
+/// 3. **`LinkAttachments()`**（`simplify.cpp:5379-5388`）：
+///    `absolute` ⟹ `local = poseToBone ∘ local`；否则 `poseToBone ∘ boneToPose`
+///    互相抵消，`local` 原样落盘。
+///
+/// `pose_to_bone[bone]` 必须与落进产物 `mstudiobone_t.poseToBone` 的那一份
+/// 完全一致 —— 即 [`bone_pose_to_bone`] 的产物。
+pub(crate) fn attachment_local_matrix(
     desc: &ModelDesc,
     at: &crate::model::Attachment,
+    pose_to_bone: &[crate::bone_math::Matrix3x4],
+    bone: usize,
 ) -> crate::bone_math::Matrix3x4 {
     let pos = at.position.unwrap_or([0.0; 3]);
     let rot = at.rotation.unwrap_or([0.0; 3]);
     let angles = [rot[0].to_radians(), rot[1].to_radians(), rot[2].to_radians()];
-    let local = crate::bone_math::local_transform(pos, angles);
+    // 旋转由**最后一个**改旋转的选项决定（官方就是顺序覆盖同一个矩阵）。
+    // `absolute_rotation == None`（TOML 只写 `absolute = true`）⟹ 跟随 `absolute`。
+    let use_imatrix = at.absolute_rotation.unwrap_or(at.absolute);
+    let mut local = if use_imatrix {
+        // `AngleIMatrix( g_defaultrotation )`（`studiomdl.cpp:5246`）。
+        // `g_defaultrotation` 默认 `RadianEuler( 0, 0, M_PI / 2 )`
+        // （`studiomdl.cpp:6883`），与 `ani_writer::ROOT_REFERENCE_ANGLES`
+        // 是同一个值 —— 用户 QC 没有 `$origin`/`$upaxis`，走的就是默认。
+        crate::bone_math::angle_imatrix(crate::ani_writer::ROOT_REFERENCE_ANGLES)
+    } else {
+        crate::bone_math::angle_matrix(angles)
+    };
+    // 平移列最后写（`studiomdl.cpp:5305-5307`）。
+    local[3] = pos[0];
+    local[7] = pos[1];
+    local[11] = pos[2];
     if desc.model.static_prop {
-        // `$staticprop`：`MakeStaticProp()` 对每个附着点做
-        // `ConcatTransforms( rotated, local, local )`（`simplify.cpp:3392`）。
+        // `$staticprop`：`MakeStaticProp()`（`simplify.cpp:3386-3397`）。
+        //
+        // ⚠️ 它还把 `type` 清零（`:3396`）⟹ 紧随其后的 `LinkAttachments()`
+        // 里 `IS_ABSOLUTE` 已不复存在，静态道具的附着点**不会**被左乘。
         crate::bone_math::concat(&static_prop_matrix(), &local)
+    } else if at.absolute {
+        // `LinkAttachments()`：`ConcatTransforms( poseToBone, world, local )`，
+        // 而 `absolute` 时 `world` 就是 `local`（`simplify.cpp:5379-5388`）。
+        crate::bone_math::concat(&pose_to_bone[bone], &local)
     } else {
         local
     }
@@ -1791,32 +1903,16 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     }
                 };
 
-                // SMD 里的骨骼必须在描述的骨骼表里能找到，且数量一致 ——
-                // 否则顶点绑定会指向不存在的骨骼。
-                let desc_index = desc.bone_index();
-                let mut missing: Vec<&str> = Vec::new();
-                for n in &smd.nodes {
-                    if !desc_index.contains_key(n.name.as_str()) {
-                        missing.push(n.name.as_str());
-                    }
-                }
-                if !missing.is_empty() {
-                    errors.push(e(
-                        format!("{at}.smd"),
-                        format!(
-                            "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
-                            smd_path.display(),
-                            missing.len(),
-                            missing
-                                .iter()
-                                .take(5)
-                                .copied()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    ));
-                    continue;
-                }
+                // ⚠️ **不要**因为「网格源 SMD 里有 `[[bones]]` 没有的骨骼」而报错。
+                //
+                // 官方骨骼表只收 `$definebone` 与 `boneref != 0` 的骨骼
+                // （`BuildGlobalBonetable`，`simplify.cpp:3668`）。网格源里
+                // 「零顶点引用、又没被保命判据提到」的骨骼同样不在表里，
+                // 官方靠 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）
+                // 沿父链上溯、找不到就静默重映射到根骨骼 0（`:4180`）。
+                //
+                // mdlc 侧对应实现在 `smd_vertex_to_ir`（同一条父链上溯），
+                // 所以这里直接放行。
 
                 let meshes = match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
                     Ok(v) => v,
@@ -1863,14 +1959,21 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 //
                 // 用**名字**建映射（与上面 `missing` 检查同一份 `desc_index`），
                 // 这样 SMD 的 node 顺序与描述里的 `[[bones]]` 顺序无关。
+                //
+                // 查不到时走官方的父链上溯（`MapSourcesToGlobalBonetable()`，
+                // `simplify.cpp:4148-4217`），整条链都不在表里则退到根骨骼 0。
+                let bone_map = VertexBoneMap::new(&smd, desc);
                 let poses: Vec<SmdPose> = smd
                     .reference_frame()
                     .map(|f| {
                         f.poses
                             .iter()
                             .filter_map(|p| {
-                                let node = smd.nodes.get(p.bone.max(0) as usize)?;
-                                let &di = desc_index.get(node.name.as_str())?;
+                                let node_ix = usize::try_from(p.bone).ok()?;
+                                if node_ix >= smd.nodes.len() {
+                                    return None;
+                                }
+                                let di = bone_map.map_bone(node_ix)?;
                                 Some(SmdPose {
                                     bone: di as i32,
                                     position: p.position,
@@ -2254,7 +2357,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         // ⚠️ 附着点名字**必须在编译期解析**（官方在解析期
                         // `LookupAttachment`，查不到就 `TokenError`），
                         // 所以这里就查一次，查不到直接报错。
-                        if lookup_attachment(desc, &bone_index, att).is_none() {
+                        //
+                        // 这里只要**存在性**（`local` 要等骨骼姿态定下来才有意义），
+                        // 所以用 [`find_attachment`]。
+                        if find_attachment(desc, &bone_index, att).is_none() {
                             seq_errors.push(e(
                                 format!("{at}.blend_params[{pi}].attachment"),
                                 format!(
@@ -5931,7 +6037,7 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
         // （`Missing control bone "%s" for procedural bone "%s"`），
         // 见 `resolve_quat_interp_bones` 里的 control 段。
         let Some(&bone) = desc.bone_index().get(j.bone.as_str()) else {
-            crate::diagln!("jigglebone {:?} unused", j.bone);
+            crate::diagln!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", j.bone);
             continue;
         };
 
@@ -6099,7 +6205,7 @@ fn resolve_quat_interp_bones(
         // 后 `continue; // optimized out, don't complain`。L4D2 exe 里该串在
         // @0x5764a4。修前 mdlc 在这里报「骨骼 {:?} 找不到」并中止编译。
         let Some(&bone) = bone_index.get(q.bone.as_str()) else {
-            crate::diagln!("quatinterpbone {:?} unused", q.bone);
+            crate::diagln!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", q.bone);
             continue;
         };
         let bone = bone as i32;
@@ -9558,17 +9664,37 @@ end
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// SMD 里有、`[[bones]]` 里没有的骨骼 ⟹ **沿父链上溯**，不是报错。
+    ///
+    /// 官方 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）：
+    /// 按名查不到就沿 `localBone[].parent` 上溯（`:4167-4171`），整条链都
+    /// 不在表里则静默重映射到根骨骼 0（`:4180` 的 `k = 0;`，「illegal parent
+    /// bone replacement」诊断被 `#if 0` 关掉）。
+    ///
+    /// 这条路径是**必需的**：官方骨骼表只收 `$definebone` 与 `boneref != 0`
+    /// 的骨骼，动画 SMD 里「零顶点引用、又没被保命判据提到」的骨骼不在表里。
+    /// 旧实现直接报「不在描述的 [[bones]] 里」—— 那是「官方能编过、mdlc
+    /// 编不过」的假阳性（用户工程 `linnea_replaces_zoey` 的 `TeenAngst.smd`
+    /// / `ragdoll.smd` 各有 12 根这样的骨骼）。
+    ///
+    /// 本用例：SMD 的 `tip` 改名成 `ghost`，`ghost` 的父是 `root`（在表里）
+    /// ⟹ 顶点应绑到 `root`（下标 0），且**编译成功**。
     #[test]
-    fn reports_bone_not_declared_in_desc() {
+    fn smd_bone_absent_from_desc_falls_back_to_nearest_ancestor() {
         let d = tmpdir("badbone");
         let smd = SMD.replace("1 \"tip\" 0", "1 \"ghost\" 0");
         write(&d, "myprop-ref.smd", &smd);
         let desc = ModelDesc::from_toml(&desc_toml("myprop-ref.smd")).unwrap();
-        let errs = compile(&desc, &d).unwrap_err();
-        assert!(
-            errs.iter().any(|x| x.message.contains("不在 [[bones]]")),
-            "{errs:?}"
-        );
+        let c = compile(&desc, &d).expect("官方对这种情况从不报错，mdlc 也不该报");
+        // `ghost` 不在 `[[bones]]` 里，但它的父 `root` 在 ⟹ 绑到 `root`。
+        let m = &c.bodyparts[0].models[0];
+        for v in &m.meshes[0].vertices {
+            assert_eq!(
+                v.bones,
+                vec![[0.0, 1.0]],
+                "顶点应沿父链回退到 root（下标 0）：{v:?}"
+            );
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -114,6 +114,14 @@ pub struct Parser<'a> {
     /// `$weightlist` 是否出现过（暂只记录，见 `PROGRESS.md` §1.1）。
     pub weightlists: Vec<String>,    /// 所有被引用的网格/动画文件（相对 qdir），供骨骼与材质扫描。
     referenced_files: Vec<String>,
+    /// `referenced_files` 里哪些是**网格源**（`$model` / `$bodygroup { studio … }`）。
+    ///
+    /// 官方 `Load_Source` 的 `isActiveModel` 只有 `Option_Studio` 一处传 `true`
+    /// （`studiomdl.cpp:963`），而 `TagUsedBones` 的顶点权重循环正由它把关
+    /// （`simplify.cpp:3441-3442`）—— **只有网格源的顶点权重**能让骨骼入表。
+    /// 动画源 / `$lod` 的 `replacemodel` / `$collisionmodel` 的顶点权重一概不算
+    /// （它们的 `isActiveModel` 都是默认的 `false`，见 `studiomdl.h:1127`）。
+    mesh_sources: HashSet<String>,
     /// 解析出的错误（累积，最后一起报）。
     errors: Vec<QcError>,
     /// `$bonemerge` 的骨骼名（骨骼表建好后回填）。
@@ -139,8 +147,6 @@ pub struct Parser<'a> {
     /// > （`studiomdl.cpp:59`），只有 `$lockdefinebones` 置 false
     /// > （`:5733`）—— 那是**旧版**语义，**不要照抄**。
     unlock_define_bones: bool,
-    /// `$attachment` 里哪些带 `absolute`（写出器需要按 `g_defaultrotation` 反转）。
-    attachment_absolute: Vec<bool>,
     /// `$jointsurfaceprop` 的待办（骨骼表建好后回填）。
     joint_surface_props: Vec<(String, String)>,
     /// `$lod` 出现在任何 bodypart **之前**时的暂存。
@@ -223,10 +229,10 @@ impl<'a> Parser<'a> {
             animation_names: HashSet::new(),
             weightlists: Vec::new(),
             referenced_files: Vec::new(),
+            mesh_sources: HashSet::new(),
             errors: Vec::new(),
             bonemerge_names: Vec::new(),
             unlock_define_bones: false,
-            attachment_absolute: Vec::new(),
             joint_surface_props: Vec::new(),
             pending_lods: Vec::new(),
             pending_vta: None,
@@ -886,6 +892,13 @@ impl<'a> Parser<'a> {
 
         let smd = self.resolve_src(&filename);
         self.referenced_files.push(smd.clone());
+        // ⭐ 这里是**唯一**的「网格源」标记点 —— 对应官方
+        // `Load_Source( pmodel->filename, "", false, true )`
+        // （`studiomdl.cpp:963`，全树唯一 `isActiveModel = true`）。
+        // 官方即使命中缓存也会补置该标志（`studiomdl.cpp:1589-1590`），
+        // 所以「同一个 SMD 既当网格源又当动画源」时按**网格源**算，
+        // 这里的集合语义正好一致。
+        self.mesh_sources.insert(smd.clone());
         Ok(BodyModel {
             smd,
             name: model_name.take(),
@@ -2129,18 +2142,30 @@ impl<'a> Parser<'a> {
         let name = self.tok(false)?.text;
         let bone = self.tok(false)?.text;
         let pos = self.v3()?;
+        // ⚠️ 这个 `flags` 是**直接落进产物**的 `mstudioattachment_t.flags`。
+        // 官方只有 `world_align` 会写进去（`studiomdl.cpp:5255` +
+        // `write.cpp:350`）—— `absolute`/`rigid` 走的是**另一个**字段
+        // `g_attachment[].type`（`studiomdl.h:277-278`），从不落盘。
+        // 真 studiomdl 裁决（`docs/_probe/oracle_attachment_flags.js`）：
+        // `absolute`/`rigid` 官方都写 `0x0`，只有 `world_align` 写 `0x10000`。
         let mut flags = 0i32;
         let mut rotation = [0.0f32; 3];
         let mut absolute = false;
+        let mut rigid = false;
+        // `local` 的**旋转**最终由最后一个改旋转的选项决定（官方就是顺序覆盖
+        // 同一个 `local` 矩阵）。mdlc 把旋转拆成了欧拉角 + 这一个 bit。
+        let mut absolute_rotation: Option<bool> = None;
         while self.avail() {
             let t = self.tok(false)?;
             match t.text.to_ascii_lowercase().as_str() {
                 "absolute" => {
                     absolute = true;
-                    flags |= 0x0001; // IS_ABSOLUTE
+                    // 官方紧接着就 `AngleIMatrix( g_defaultrotation, local )`
+                    // （`studiomdl.cpp:5246`）。
+                    absolute_rotation = Some(true);
                 }
-                "rigid" => flags |= 0x0002, // IS_RIGID
-                "world_align" => flags |= 0x0004,
+                "rigid" => rigid = true,
+                "world_align" => flags |= 0x10000, // ATTACHMENT_FLAG_WORLD_ALIGN
                 "rotate" => {
                     // ⚠️ **官方读进来的是 `QAngle{pitch, yaw, roll}`**，
                     // 而 `Attachment.rotation` 的约定是 `RadianEuler{roll, pitch, yaw}`
@@ -2176,6 +2201,9 @@ impl<'a> Parser<'a> {
                     }
                     // `QAngle{pitch, yaw, roll}` → `RadianEuler{roll, pitch, yaw}`
                     rotation = [q[2], q[0], q[1]];
+                    // `rotate` 在 `absolute` **之后** ⟹ 旋转来自 `rotate`
+                    // （官方同一个 `local` 被后写者覆盖，`studiomdl.cpp:5268`）。
+                    absolute_rotation = Some(false);
                 }
                 "x_and_z_axes" => {
                     let _ = self.v3()?;
@@ -2195,9 +2223,11 @@ impl<'a> Parser<'a> {
             bone,
             position: Some(pos),
             rotation: Some(rotation),
+            absolute,
+            absolute_rotation,
+            rigid,
             flags: Some(flags),
         });
-        self.attachment_absolute.push(absolute);
         Ok(())
     }
 
@@ -3013,6 +3043,18 @@ impl<'a> Parser<'a> {
                         nodes: s.nodes.iter().map(|n| n.name.clone()).collect(),
                         materials: s.materials_in_order(),
                         num_frames: s.frames.len(),
+                        // `links` 已保证非空（见 `SmdInfo::vert_refs` 的注释），
+                        // 下标越界的引用直接丢弃 —— 顶点路径
+                        // （`compile::smd_vertex_to_ir`）另有更精确的报错。
+                        vert_refs: s
+                            .triangles
+                            .iter()
+                            .flat_map(|t| t.vertices.iter())
+                            .flat_map(|v| v.links.iter())
+                            .filter_map(|l| usize::try_from(l.bone).ok())
+                            .filter(|&b| b < s.nodes.len())
+                            .collect(),
+                        parents: s.nodes.iter().map(|n| n.parent).collect(),
                     }),
                 },
             };
@@ -3021,7 +3063,154 @@ impl<'a> Parser<'a> {
 
         // ---- 2. 骨骼表 ----
         //
-        // `$definebone` 先，然后各 SMD 的 nodes（按**引用顺序**）。
+        // 复刻官方 `TagUsedBones`（`simplify.cpp:3424-3547`）+
+        // `BuildGlobalBonetable`（`simplify.cpp:3616-3695`）的**收骨判据**：
+        //
+        //   入表 = `$definebone`（无条件）∪ `psource->boneref[j] != 0`
+        //
+        // 而 `boneref` 只有六个来源：① **网格源**的顶点权重（`isActiveModel`
+        // 把关，`simplify.cpp:3441-3442`）、② `$attachment`、③ `$ikchain`、
+        // ④ `$mouth`、⑤ `$bonemerge`、⑥ 眼球骨骼；最后沿**父链**上传
+        // （`UpdateBonerefRecursive`，`simplify.cpp:3404-3418`）。
+        //
+        // # 为什么不能「每个 SMD 的每个 node 都收」
+        //
+        // 那会把**只在动画源里挂着、没有任何顶点引用**的骨骼也收进来。官方
+        // 不收，于是 mdlc 的骨骼总数会比官方多 —— 一旦顶过引擎的
+        // `MAXSTUDIOBONES`（128，`hl2sdk-l4d2/public/studio.h:83`），
+        // `CBoneCache::CreateResource` 的 `short studioToCachedIndex[128]`
+        // （`hl2sdk-l4d2/public/bone_setup.cpp:62-89`）就会被逐骨骼无条件写入
+        // 而**越界写栈** ⟹ 游戏加载时无响应 / 闪退。
+        //
+        // ⭐ 实测裁决（`docs/_probe/official_user_qc3.js`）：用户工程
+        // `linnea_replaces_zoey` 的 QC 用官方 studiomdl 编出 **122 根**，
+        // mdlc 旧实现出 **134 根**；且官方 122 与 `definebones.qci` 里生效的
+        // 122 条 `$definebone` **零差异**（`check_db_vs_official.js`），
+        // 多出的 12 根全是「只在动画 SMD 的 nodes 里、零顶点引用」的骨骼。
+        //
+        // ⚠️ 顺序不能动：官方先插 `$definebone`，再按 **source 序 × SMD 内
+        // 下标序** 追加 —— 这个顺序决定了骨骼下标，进而决定 `parent` 的编码。
+        let mut bone_refs: HashMap<String, HashSet<String>> = HashMap::new();
+        {
+            // 眼球骨骼按**模型**归属到它自己的 SMD（`simplify.cpp:3539-3546`）。
+            let mut eyeball_bones: HashMap<&str, HashSet<String>> = HashMap::new();
+            for bp in &self.desc.bodyparts {
+                for m in &bp.models {
+                    for eb in &m.eyeballs {
+                        eyeball_bones
+                            .entry(m.smd.as_str())
+                            .or_default()
+                            .insert(eb.bone.to_ascii_lowercase());
+                    }
+                }
+            }
+            for f in &files {
+                let Some(info) = smd_cache.get(f).and_then(|x| x.as_ref()) else {
+                    continue;
+                };
+                let n = info.nodes.len();
+                let lower: Vec<String> =
+                    info.nodes.iter().map(|s| s.to_ascii_lowercase()).collect();
+                // 本 source 的 `boneflags[]`（官方用 source 内下标，这里用同名布尔）。
+                let mut flagged: Vec<bool> = vec![false; n];
+
+                // ① 顶点权重 —— **只有网格源**算。动画源 / `$lod` / `$collisionmodel`
+                // 的 `isActiveModel` 都是 `false`，它们的顶点权重一律不生效。
+                if self.mesh_sources.contains(f) {
+                    for &i in &info.vert_refs {
+                        if i < n {
+                            flagged[i] = true;
+                        }
+                    }
+                }
+
+                // ② `$attachment`（`simplify.cpp:3464-3489`）。
+                for at in &self.desc.attachments {
+                    let Some(j) = info
+                        .nodes
+                        .iter()
+                        .position(|x| x.eq_ignore_ascii_case(&at.bone))
+                    else {
+                        continue;
+                    };
+                    // `rigid` ⟹ `IS_RIGID`（`0x0002`，`studiomdl.h:278`）。
+                    // ⚠️ 该位在 `g_attachment[].type` 里、**不落盘**，所以判据
+                    // 用 IR 的 [`crate::model::Attachment::rigid`]，
+                    // **不能**去读 `flags`（那里只会有 `0x10000`）。
+                    if at.rigid {
+                        // 刚性附着点：沿父链上溯到第一根**有顶点权重**的骨骼，
+                        // 标它而不是标自己（`simplify.cpp:3478-3484`）。
+                        let mut k = j as i32;
+                        while k >= 0 {
+                            let ki = k as usize;
+                            if ki >= n {
+                                break;
+                            }
+                            if info.vert_refs.contains(&ki) {
+                                flagged[ki] = true;
+                                break;
+                            }
+                            k = info.parents.get(ki).copied().unwrap_or(-1);
+                        }
+                    } else {
+                        flagged[j] = true;
+                    }
+                }
+                // ③ `$ikchain`（`simplify.cpp:3491-3502`）。
+                for ik in &self.desc.ikchains {
+                    if let Some(j) = info.nodes.iter().position(|x| x.eq_ignore_ascii_case(&ik.bone))
+                    {
+                        flagged[j] = true;
+                    }
+                }
+                // ④ `$mouth`（`simplify.cpp:3504-3515`）。
+                for mo in &self.desc.mouths {
+                    if let Some(j) = info.nodes.iter().position(|x| x.eq_ignore_ascii_case(&mo.bone))
+                    {
+                        flagged[j] = true;
+                    }
+                }
+                // ⑤ `$bonemerge`（`simplify.cpp:3517-3528`）。
+                // ⚠️ 官方是「给**已存在**的骨骼打 `BONE_USED_BY_BONE_MERGE`」，
+                // **不能创造骨骼** —— 这里同样只在 `nodes` 里找。
+                for bm in &self.bonemerge_names {
+                    if let Some(j) = info.nodes.iter().position(|x| x.eq_ignore_ascii_case(bm)) {
+                        flagged[j] = true;
+                    }
+                }
+                // ⑥ 眼球（`simplify.cpp:3544`）。
+                if let Some(eb) = eyeball_bones.get(f.as_str()) {
+                    for (j, l) in lower.iter().enumerate() {
+                        if eb.contains(l) {
+                            flagged[j] = true;
+                        }
+                    }
+                }
+
+                // 沿父链上传（`UpdateBonerefRecursive`）。官方注释强调
+                // 「This must come last; after all flags have been set!」
+                for j in 0..n {
+                    if !flagged[j] {
+                        continue;
+                    }
+                    let mut k = info.parents.get(j).copied().unwrap_or(-1);
+                    while k >= 0 {
+                        let ki = k as usize;
+                        if ki >= n {
+                            break;
+                        }
+                        flagged[ki] = true;
+                        k = info.parents.get(ki).copied().unwrap_or(-1);
+                    }
+                }
+
+                bone_refs.insert(
+                    f.clone(),
+                    (0..n).filter(|&j| flagged[j]).map(|j| lower[j].clone()).collect(),
+                );
+            }
+        }
+
         let mut bones: Vec<Bone> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         // 记住哪些名字来自 `$definebone`（`g_bonetable[].bPreDefined`），
@@ -3038,8 +3227,10 @@ impl<'a> Parser<'a> {
             let Some(info) = smd_cache.get(f).and_then(|x| x.as_ref()) else {
                 continue;
             };
+            let Some(refs) = bone_refs.get(f) else { continue };
             for name in &info.nodes {
-                if seen.insert(name.to_ascii_lowercase()) {
+                let key = name.to_ascii_lowercase();
+                if refs.contains(&key) && seen.insert(key) {
                     bones.push(Bone {
                         name: name.clone(),
                         parent: None,
@@ -3541,6 +3732,26 @@ struct SmdInfo {
     materials: Vec<String>,
     /// `skeleton` 段的帧数。
     num_frames: usize,
+    /// **被顶点引用**的 `nodes` 下标（升序去重）。
+    ///
+    /// 官方 `TagUsedBones` 的顶点循环（`simplify.cpp:3441-3455`）只给这些骨骼
+    /// 置 `BONE_USED_BY_VERTEX_LOD0`，而 `BuildGlobalBonetable`
+    /// （`simplify.cpp:3668`）正是靠 `psource->boneref[j]` 决定收不收 ——
+    /// 没有顶点引用的骨骼（只在 `nodes` 段挂着、动画里动一动）**根本进不了
+    /// 骨骼表**。mdlc 早期把每个 SMD 的每个 node 都收进来，多出的骨骼会把
+    /// 总数顶过引擎的 `MAXSTUDIOBONES`（128），导致引擎栈越界崩溃。
+    ///
+    /// 数据源：`triangles` 段每个顶点的 `links[].bone`。注意 `smd.rs` 已保证
+    /// `links` 非空（`links == 0` 时会塞进行首的 `parentBone`），所以这里
+    /// 不必再看 `parent_bone`。
+    vert_refs: std::collections::BTreeSet<usize>,
+    /// `nodes` 段每根骨骼的**父下标**（`-1` 表示无父）。
+    ///
+    /// 对应官方 `psource->localBone[j].parent`。两处判据要用它：
+    /// 刚性 `$attachment` 沿父链找第一根有顶点权重的骨骼
+    /// （`simplify.cpp:3478-3484`），以及 `UpdateBonerefRecursive`
+    /// 的父链上传（`simplify.cpp:3404-3418`）。
+    parents: Vec<i32>,
 }
 /// 把字符串解析成 `f32`（官方 `verify_atof`）。
 ///
@@ -3992,6 +4203,142 @@ $sequence \"idle\" \"a.smd\" fps 30
         );
     }
 
+    /// ⭐ `absolute`/`rigid` **不能**落进 `flags` —— 它们走官方另一个字段 `type`。
+    ///
+    /// 官方 `Cmd_Attachment`（`studiomdl.cpp:5212-5310`）把三个选项写进**两个
+    /// 不同字段**：`absolute` → `type |= IS_ABSOLUTE`（`:5245`）、`rigid` →
+    /// `type |= IS_RIGID`（`:5251`）、`world_align` → `flags |= ATTACHMENT_FLAG_WORLD_ALIGN`
+    /// （`:5255`）。而 `write.cpp:350` 只写 `pattachment[i].flags = g_attachment[i].flags;`
+    /// ⟹ **产物里只可能看到 `world_align`**。
+    ///
+    /// 真 studiomdl 裁决（`docs/_probe/oracle_attachment_flags.js`，5 变体）：
+    /// ```text
+    ///   plain          att=0x0        absolute       att=0x0
+    ///   rigid          att=0x0        world_align    att=0x10000
+    ///   abs_rigid_wa   att=0x10000
+    /// ```
+    /// 修复前 mdlc 写的是 `absolute→0x1` / `rigid→0x2` / `world_align→0x4`
+    /// —— 三个全错，且 `world_align` 的**值**也错（`0x4` 不是 `0x10000`）。
+    #[test]
+    fn attachment_options_do_not_leak_into_flags() {
+        let dir = fixture("attach_flags");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"plain\" \"tip\" 0 0 0
+$attachment \"abs\" \"tip\" 0 0 0 absolute
+$attachment \"rig\" \"tip\" 0 0 0 rigid
+$attachment \"wa\" \"tip\" 0 0 0 world_align
+$attachment \"all\" \"tip\" 0 0 0 absolute rigid world_align
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let f = |n: &str| {
+            d.attachments
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap_or_else(|| panic!("夹具里应有附着点 {n}"))
+                .flags
+                .unwrap_or(0)
+        };
+        assert_eq!(f("plain"), 0x0, "无选项 ⟹ flags 为 0");
+        assert_eq!(f("abs"), 0x0, "`absolute` 走 `type`，**不落盘**");
+        assert_eq!(f("rig"), 0x0, "`rigid` 走 `type`，**不落盘**");
+        assert_eq!(f("wa"), 0x10000, "`world_align` ⟹ ATTACHMENT_FLAG_WORLD_ALIGN");
+        assert_eq!(
+            f("all"),
+            0x10000,
+            "三个选项同时给 ⟹ 只有 `world_align` 那一位"
+        );
+    }
+
+    /// `absolute` / `rigid` 必须落到 IR 自己的字段上（`flags` 里没有它们）。
+    ///
+    /// 收骨判据要用 `rigid`（官方 `TagUsedBones()` 对 rigid 附着点沿父链上溯到
+    /// 第一根被顶点引用的骨骼，`simplify.cpp:3472-3484`）；`absolute` 决定
+    /// `local` 是否被 `poseToBone` 左乘（`simplify.cpp:5379-5388`）。
+    /// 两者都不落盘 ⟹ 若只存在 `flags` 里，收骨判据与写出器就都读不到了。
+    #[test]
+    fn attachment_absolute_and_rigid_land_in_ir_fields() {
+        let dir = fixture("attach_irflags");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"a\" \"tip\" 0 0 0 absolute
+$attachment \"r\" \"tip\" 0 0 0 rigid
+$attachment \"plain\" \"tip\" 0 0 0
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = |n: &str| {
+            d.attachments
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap_or_else(|| panic!("夹具里应有附着点 {n}"))
+        };
+        assert!(g("a").absolute, "`absolute` ⟹ `Attachment::absolute`");
+        assert!(!g("a").rigid);
+        assert!(g("r").rigid, "`rigid` ⟹ `Attachment::rigid`");
+        assert!(!g("r").absolute);
+        assert!(!g("plain").absolute && !g("plain").rigid);
+    }
+
+    /// ⭐ `absolute` 与 `rotate` 的**顺序**决定 `local` 的旋转来自谁。
+    ///
+    /// 官方在选项循环里**顺序覆盖同一个 `local` 矩阵**：`absolute` 写
+    /// `AngleIMatrix( g_defaultrotation )`（`studiomdl.cpp:5246`），`rotate` 写
+    /// `AngleMatrix( angles )`（`:5268`）—— 后写者胜。**两种情形的
+    /// `IS_ABSOLUTE` 都置位**（第 ② 步的左乘照做），只有旋转来源不同。
+    ///
+    /// 官方用一个矩阵自然表达了这点；mdlc 把旋转拆成了欧拉角，所以需要
+    /// [`crate::model::Attachment::absolute_rotation`] 这一个额外的 bit。
+    #[test]
+    fn attachment_absolute_rotation_tracks_option_order() {
+        let dir = fixture("attach_absorder");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$attachment \"abs_only\" \"tip\" 0 0 0 absolute
+$attachment \"abs_then_rot\" \"tip\" 0 0 0 absolute rotate 11 22 33
+$attachment \"rot_then_abs\" \"tip\" 0 0 0 rotate 11 22 33 absolute
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = |n: &str| {
+            d.attachments
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap_or_else(|| panic!("夹具里应有附着点 {n}"))
+        };
+        assert_eq!(
+            g("abs_only").absolute_rotation,
+            Some(true),
+            "只写 `absolute` ⟹ 旋转来自 `AngleIMatrix( g_defaultrotation )`"
+        );
+        assert_eq!(
+            g("abs_then_rot").absolute_rotation,
+            Some(false),
+            "`absolute rotate …` ⟹ `rotate` 后写，旋转来自 `AngleMatrix( angles )`"
+        );
+        assert_eq!(
+            g("rot_then_abs").absolute_rotation,
+            Some(true),
+            "`rotate … absolute` ⟹ `absolute` 后写，旋转来自 `AngleIMatrix`"
+        );
+        // 三种情形的 `absolute` 本身都置位（都要做 `poseToBone` 左乘）。
+        for n in ["abs_only", "abs_then_rot", "rot_then_abs"] {
+            assert!(g(n).absolute, "{n} 的 `IS_ABSOLUTE` 应置位");
+        }
+        assert_eq!(
+            g("abs_then_rot").rotation,
+            Some([33.0, 11.0, 22.0]),
+            "`rotate` 的值仍要按 QAngle→RadianEuler 重排存下来"
+        );
+    }
+
     /// **不写 `rotate` 时旋转必须是零** —— 这是「重排不波及绝大多数附着点」的依据。
     ///
     /// 语料里 315 处带 `rotate`，而 `$attachment` 总数远大于此 ⟹
@@ -4273,6 +4620,395 @@ $sequence \"idle\" \"a.smd\" fps 30
             vec!["is_flexible", "yaw_stiffness", "is_flexible", "pitch_stiffness"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 骨骼表收骨判据 ----
+    //
+    // 官方 `BuildGlobalBonetable()` 只收**两类**骨骼：
+    //
+    // 1. `$definebone` —— 无条件（`simplify.cpp:3624-3654`）；
+    // 2. `psource->boneref[j] != 0`（`simplify.cpp:3668`）。
+    //
+    // `boneref` 的唯一生产者是 `TagUsedBones()`（`simplify.cpp:3424-3547`）：
+    // **网格源**的顶点权重（`:3441-3455`，由 `isActiveModel` 把关）、
+    // `$attachment`（`:3464-3489`）、`$ikchain`（`:3491-3502`）、
+    // `$mouth`（`:3504-3515`）、`$bonemerge`（`:3517-3528`）、
+    // 眼球骨骼（`:3544`），最后沿父链上传（`UpdateBonerefRecursive`）。
+    //
+    // ⭐ **为什么必须复刻**：mdlc 旧实现把每个 SMD 的每个 `node` 都无条件
+    // 收进来，于是用户工程 `linnea_replaces_zoey` 得到 **134 根**，而官方
+    // studiomdl 编**同一份 QC** 只有 **122 根**（裁决实验
+    // `docs/_probe/official_user_qc3.js`）。134 > 引擎的 `MAXSTUDIOBONES`
+    // （128，`hl2sdk-l4d2/public/studio.h:83`）⟹ `CBoneCache::CreateResource`
+    // 里的 `short studioToCachedIndex[128]`（`hl4sdk-l4d2/public/bone_setup.cpp:62-89`）
+    // 被逐骨骼无条件写入而**越界写栈** ⟹ 游戏加载时无响应 / 闪退。
+
+    /// 拼一份 SMD：`nodes` 是 `(下标, 名, 父下标)`，`verts` 是每个顶点的骨骼下标。
+    ///
+    /// 顶点行格式取自 `smd.rs`：`parentBone pos(3) normal(3) uv(2) links 数 bone weight`。
+    fn smd_with(nodes: &[(i32, &str, i32)], verts: &[i32]) -> String {
+        let mut s = String::from("version 1\nnodes\n");
+        for (i, n, p) in nodes {
+            s.push_str(&format!("{i} \"{n}\" {p}\n"));
+        }
+        s.push_str("end\nskeleton\ntime 0\n");
+        for (i, _, _) in nodes {
+            s.push_str(&format!(
+                "{i} 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n"
+            ));
+        }
+        s.push_str("end\ntriangles\nmat\n");
+        for b in verts {
+            s.push_str(&format!(
+                "0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000 \
+                 0.000000 0.000000 1 {b} 1.000000\n"
+            ));
+        }
+        s.push_str("end\n");
+        s
+    }
+
+    /// 解析 QC 后取骨骼名表（按描述文件里的**下标序**）。
+    fn bone_names(qc: &str, dir: &std::path::Path) -> Vec<String> {
+        parse(qc, dir).bones.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// ⭐ **核心回归**：只在**动画源**的 `nodes` 里、零顶点引用的骨骼**不入表**。
+    ///
+    /// 这就是 134 → 122 的那 12 根。官方对动画源（`isActiveModel = false`）
+    /// 的顶点权重一概不认，`boneref` 始终为 0 ⟹ `:3668` 丢弃。
+    #[test]
+    fn anim_only_bone_without_vertex_ref_is_dropped() {
+        let dir = fixture("bone_ref_animonly");
+        std::fs::write(
+            dir.join("b.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "bone1", 0), (2, "anim_only", 1)],
+                &[0, 1, 1],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"idle\" \"b.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "bone1"],
+            "`anim_only` 只在动画源 `b.smd` 的 nodes 里、没有任何顶点引用 \
+             ⟹ 官方 `BuildGlobalBonetable` 的 `if (psource->boneref[j])` 不收它。\
+             收进来就会让骨骼总数顶过引擎上限（用户工程正是 134 > 128 ⟹ 加载闪退）"
+        );
+    }
+
+    /// **网格源**里被顶点引用的骨骼必须保留（动画源完全不提它也一样）。
+    #[test]
+    fn mesh_vertex_ref_keeps_bone() {
+        let dir = fixture("bone_ref_meshvert");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(&[(0, "root", -1), (1, "mesh_only", 0)], &[0, 1, 1]),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "mesh_only"],
+            "`mesh_only` 被网格源顶点引用 ⟹ `BONE_USED_BY_VERTEX_LOD0` ⟹ 必须入表"
+        );
+    }
+
+    /// ⭐ **动画源的顶点权重一概不算** —— 即使那个源自己真的有顶点引用它。
+    ///
+    /// 这是 `isActiveModel` 那半判据（`simplify.cpp:3441-3442`）的专用夹具：
+    /// 上面那条 `anim_only_bone_without_vertex_ref_is_dropped` 的动画源里
+    /// `anim_only` **零顶点引用**，所以即使把网格源门整个删掉它照样被丢 ——
+    /// 那条**抓不到**这个变异。这里让动画源 `b.smd` 的顶点真的引用 `anim_vert`：
+    /// 官方因为 `b.smd` 不是活动模型而不认这些权重 ⟹ `anim_vert` 必须被丢。
+    #[test]
+    fn anim_source_vertex_refs_do_not_count() {
+        let dir = fixture("bone_ref_animvert");
+        std::fs::write(
+            dir.join("b.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "bone1", 0), (2, "anim_vert", 1)],
+                &[0, 1, 2],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"idle\" \"b.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "bone1"],
+            "`anim_vert` 只被**动画源** `b.smd` 的顶点引用。官方 `TagUsedBones` 的\
+             顶点循环由 `psource->isActiveModel` 把关（`simplify.cpp:3441-3442`），\
+             而全树只有 `Option_Studio` 一处传 `true`（`studiomdl.cpp:963`）\
+             ⟹ 动画源的顶点权重对 `boneref` **零贡献** ⟹ `anim_vert` 必须被丢。\
+             若这里出现了 `anim_vert`，说明网格源门失效，骨骼数会重新膨胀"
+        );
+    }
+
+    /// `$definebone` **无条件**入表 —— 顶点不引用、SMD 里甚至没有它，也照收。
+    ///
+    /// 这条同时钉住两件事：① 收骨判据对 `$definebone` **不设条件**（它走的是
+    /// `simplify.cpp:3624-3654` 那条路，压根不看 `boneref`）；② 最终顺序由
+    /// `sort_parents_first` 的**拓扑排序**决定，`extra` 的父是 `root` ⟹ 必须
+    /// 排在 `root` 之后（同层的兄弟按「`$definebone` 先、SMD 序后」的入表序）。
+    #[test]
+    fn definebone_enters_bonetable_unconditionally() {
+        let dir = fixture("bone_ref_definebone");
+        let qc = "\
+$modelname \"t.mdl\"
+$definebone \"extra\" \"root\" 0 0 0 0 0 0 0 0 0 0 0 0
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "bone1", "extra"],
+            "`$definebone` 的 `extra` 顶点不引用、SMD 里也没有 ⟹ 它**只能**靠 \
+             「`$definebone` 无条件入表」（`simplify.cpp:3624-3654`）活下来。\
+             若这里少了 `extra`，说明收骨判据把 `boneref == 0` 也套到了 \
+             `$definebone` 上 —— 官方不这么做（用户工程的 122 根里 \
+             绝大多数正是零顶点引用的 `$definebone`）。\
+             顺序上 `extra` 的父是 `root`，拓扑排序必须把它排在其父之后"
+        );
+    }
+
+    /// `$bonemerge` 只能**保活**已在 `nodes` 里的骨骼，**不能创造**骨骼。
+    ///
+    /// 官方两处都证明它不创造：`TagUsedBones` 的 bonemerge 循环
+    /// （`simplify.cpp:3517-3528`）遍历的是**已存在**的 `psource->localBone[]`；
+    /// `TagUsedImportedBones`（`:3592-3610`）只写 `g_bonetable[j].flags`、
+    /// 不碰 `psource->boneref[]`。
+    #[test]
+    fn bonemerge_keeps_existing_bone_but_never_creates_one() {
+        let dir = fixture("bone_ref_bonemerge");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "unused", 0), (2, "bone1", 0)],
+                &[0, 0, 0],
+            ),
+        )
+        .expect("应能写 SMD");
+        let head = "$modelname \"t.mdl\"\n$body body \"a.smd\"\n";
+        let tail = "$sequence \"idle\" \"a.smd\" fps 30\n";
+
+        // 基线：`unused` 与 `bone1` 都零顶点引用 ⟹ 都被丢。
+        let base = format!("{head}{tail}");
+        assert_eq!(
+            bone_names(&base, &dir),
+            vec!["root"],
+            "零顶点引用的骨骼应被丢弃（`boneref == 0`）"
+        );
+
+        // `$bonemerge` 保活已存在的 `unused`。
+        let merged = format!("{head}$bonemerge \"unused\"\n{tail}");
+        assert_eq!(
+            bone_names(&merged, &dir),
+            vec!["root", "unused"],
+            "`$bonemerge` 应给**已存在**的骨骼打 `BONE_USED_BY_BONE_MERGE` 而保活它"
+        );
+
+        // `$bonemerge` **不能**凭空造出 `ghost`。
+        let ghost = format!("{head}$bonemerge \"ghost\"\n{tail}");
+        assert_eq!(
+            bone_names(&ghost, &dir),
+            vec!["root"],
+            "`$bonemerge \"ghost\"` 里的 `ghost` 不在任何 SMD 的 nodes 里 \
+             ⟹ 官方不会收它（`$bonemerge` 不是骨骼声明）"
+        );
+    }
+
+    /// `$attachment` 保活骨骼；**`rigid` 时改为沿父链上溯到第一根有顶点权重的骨骼**
+    /// （`simplify.cpp:3472-3486`）。
+    ///
+    /// 这条差异很隐蔽：`rigid` 的附着点自己**不**入表，入表的是它的祖先。
+    #[test]
+    fn attachment_keeps_bone_and_rigid_walks_up_to_vertexed_ancestor() {
+        let dir = fixture("bone_ref_attach");
+        // `root` 有顶点；`mid` / `tip` 都零顶点引用。
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "mid", 0), (2, "tip", 1)],
+                &[0, 0, 0],
+            ),
+        )
+        .expect("应能写 SMD");
+        let head = "$modelname \"t.mdl\"\n$body body \"a.smd\"\n";
+        let tail = "$sequence \"idle\" \"a.smd\" fps 30\n";
+
+        assert_eq!(bone_names(&format!("{head}{tail}"), &dir), vec!["root"]);
+
+        // 普通附着点：`tip` 自己保活，再沿父链把 `mid` / `root` 带上来。
+        let plain = format!("{head}$attachment \"a\" \"tip\" 0 0 0\n{tail}");
+        assert_eq!(
+            bone_names(&plain, &dir),
+            vec!["root", "mid", "tip"],
+            "非 rigid 的 `$attachment` 给**自己**置位（`simplify.cpp:3485`），\
+             随后父链上传把祖先一并带入"
+        );
+
+        // 刚性附着点：从 `tip` 上溯到第一根有顶点权重的骨骼 = `root` ⟹ 只保活 `root`。
+        let rigid = format!("{head}$attachment \"a\" \"tip\" 0 0 0 rigid\n{tail}");
+        assert_eq!(
+            bone_names(&rigid, &dir),
+            vec!["root"],
+            "`rigid` 的 `$attachment` 沿父链找第一根 `BONE_USED_BY_VERTEX_LOD0` 的骨骼\
+             （`simplify.cpp:3474-3481`）⟹ 入表的是 `root` 而不是 `tip`"
+        );
+    }
+
+    /// 父链上传（`UpdateBonerefRecursive`，`simplify.cpp:3404-3418`）：只有叶子被引用时，
+    /// **整条祖先链都要入表** —— 否则骨骼树的 `parent` 会指向不存在的下标。
+    #[test]
+    fn boneref_propagates_up_the_parent_chain() {
+        let dir = fixture("bone_ref_chain");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "mid", 0), (2, "leaf", 1)],
+                &[2, 2, 2],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "mid", "leaf"],
+            "顶点只引用 `leaf`，但官方 `UpdateBonerefRecursive` 会沿父链上传 \
+             ⟹ `mid` / `root` 也必须入表（官方注释：This must come last）"
+        );
+    }
+
+    /// `$ikchain` 保活骨骼（`simplify.cpp:3491-3502`）—— 即使零顶点引用。
+    #[test]
+    fn ikchain_keeps_bone() {
+        let dir = fixture("bone_ref_ikchain");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "mid", 0), (2, "tip", 1)],
+                &[0, 0, 0],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$ikchain \"ik\" \"mid\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "mid"],
+            "`$ikchain` 的**第二个** token 是骨骼名（`studiomdl.cpp:4487-4488`）\
+             ⟹ `mid` 保活；`tip` 无人引用，仍应被丢"
+        );
+    }
+
+    /// `$mouth` 保活骨骼（`simplify.cpp:3504-3515`）。
+    #[test]
+    fn mouth_keeps_bone() {
+        let dir = fixture("bone_ref_mouth");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "mid", 0), (2, "tip", 1)],
+                &[0, 0, 0],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    mouth 0 \"m\" \"mid\" 0 0 0
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "mid"],
+            "`mouth <i> <名> <骨骼> <fx> <fy> <fz>` 的第三个 token 是骨骼名 ⟹ `mid` 保活"
+        );
+    }
+
+    /// 眼球骨骼保活（`simplify.cpp:3544`），且**只对自己的模型**生效。
+    #[test]
+    fn eyeball_bone_is_kept() {
+        let dir = fixture("bone_ref_eyeball");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "mid", 0), (2, "tip", 1)],
+                &[0, 0, 0],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"eye\" \"mid\" 0 0 0 \"eye_mat\" 1 0 \"iris_mat\" 1
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "mid"],
+            "`eyeball <名> <骨骼> ...` 的骨骼被 `boneref[...] |= BONE_USED_BY_ATTACHMENT` \
+             ⟹ `mid` 保活；`tip` 仍应被丢"
+        );
+    }
+
+    /// 同一根骨骼出现在**多个源**里时只入表一次（`seen` 去重）。
+    #[test]
+    fn bone_present_in_many_sources_enters_once() {
+        let dir = fixture("bone_ref_dedup");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+$sequence \"idle2\" \"b.smd\" fps 30
+$sequence \"idle3\" \"c.smd\" fps 30
+";
+        let names = bone_names(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            vec!["root", "bone1"],
+            "三份 SMD 的 nodes 完全相同 ⟹ 骨骼表里每根只应出现一次"
+        );
     }
 }
 

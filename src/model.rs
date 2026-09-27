@@ -3355,7 +3355,43 @@ pub struct Attachment {
     /// 相对骨骼的旋转（**角度**）。
     #[serde(default)]
     pub rotation: Option<[f32; 3]>,
-    /// 额外的标志位。
+    /// `absolute`：官方 `IS_ABSOLUTE`（`studiomdl.h:277`）。
+    ///
+    /// 它做两件事：① 官方在**解析期**就把 `local` 的旋转覆盖成
+    /// `AngleIMatrix( g_defaultrotation )`（`studiomdl.cpp:5246`）；
+    /// ② `LinkAttachments()` 里把 `local` 左乘附着点骨骼的 `poseToBone`
+    /// （`simplify.cpp:5379-5388`）⟹ 写出的 `local` 描述的是**世界坐标**下的
+    /// 绝对位姿，与骨骼姿态无关。
+    ///
+    /// ⚠️ 该位**不落盘**（官方 `write.cpp:350` 只写 `flags`）。
+    #[serde(default)]
+    pub absolute: bool,
+    /// `absolute` 是否**覆盖**了 `local` 的旋转。
+    ///
+    /// 官方 `Cmd_Attachment` 的选项循环是「**最后写入者胜**」：
+    /// `absolute` 写 `AngleIMatrix( g_defaultrotation )`（`studiomdl.cpp:5246`），
+    /// `rotate` 写 `AngleMatrix( angles )`（`:5268`）。所以
+    /// `... 0 0 0 absolute` 的旋转来自前者，而 `... 0 0 0 absolute rotate 1 2 3`
+    /// 来自后者 —— **两种情形的 `IS_ABSOLUTE` 都置位**（第 ② 步照做），
+    /// 只有旋转来源不同。官方用同一个 `local` 矩阵自然表达了这点，
+    /// mdlc 把旋转拆成了 `rotation` 欧拉角，所以需要这一个额外的 bit。
+    ///
+    /// `None`（缺省）⟹ **跟随 [`Self::absolute`]** —— 这是 TOML 作者只写
+    /// `absolute = true` 时想要的语义（也是官方最常见的写法）。
+    #[serde(default)]
+    pub absolute_rotation: Option<bool>,
+    /// `rigid`：官方 `IS_RIGID`（`studiomdl.h:278`）。
+    ///
+    /// 同样**不落盘**，只影响骨骼保活：`TagUsedBones()` 对 rigid 附着点会沿父链
+    /// 上溯到第一根被顶点引用的骨骼（`simplify.cpp:3472-3484`）。
+    #[serde(default)]
+    pub rigid: bool,
+    /// 直接写进 `mstudioattachment_t.flags` 的位。
+    ///
+    /// 官方这里**只**可能落 `ATTACHMENT_FLAG_WORLD_ALIGN`（`0x10000`，
+    /// `studiomdl.cpp:5255` + `write.cpp:350`）—— `absolute`/`rigid` 走的是另一个
+    /// 字段 `type`，不写进产物。实测（`docs/_probe/oracle_attachment_flags.js`）：
+    /// 官方对 `absolute`/`rigid` 都写 `0x0`，只有 `world_align` 写 `0x10000`。
     #[serde(default)]
     pub flags: Option<i32>,
 }
@@ -4767,12 +4803,24 @@ smd = "myprop-ref.smd"
 # ---------------------------------------------------------------------------
 # 附着点（挂枪口火焰、弹壳抛出点等）。L4D2 全部武器模型依赖它。
 # position / rotation 相对绑定的骨骼；rotation 是**角度**。
+#
+# `absolute` / `rigid` 对应官方的 `IS_ABSOLUTE` / `IS_RIGID` —— 它们
+# **不落盘**（官方写进 `g_attachment[].type`，而 `write.cpp:350` 只写
+# `flags`），但都影响产物：`absolute` 让 `local` 变成世界坐标下的绝对位姿
+# （官方 `studiomdl.cpp:5246` + `simplify.cpp:5388`），`rigid` 让骨骼保活时
+# 沿父链上溯到第一根被顶点引用的骨骼（`simplify.cpp:3472-3484`）。
+#
+# `flags` 直接落进 `mstudioattachment_t.flags`，官方那里**只**可能是
+# `ATTACHMENT_FLAG_WORLD_ALIGN`（`0x10000`）。
 # ---------------------------------------------------------------------------
 # [[attachments]]
 # name = "muzzle"
 # bone = "tip"
 # position = [0.0, 0.0, 8.0]
 # rotation = [0.0, 0.0, 0.0]
+# absolute = false          # 缺省 false；`absolute` 的旋转来自 g_defaultrotation
+# rigid = false             # 缺省 false
+# flags = 0                 # 缺省 0；`world_align` ⟹ 65536 (0x10000)
 
 # ---------------------------------------------------------------------------
 # $bonemerge：允许该骨骼被合并（L4D2 的 survivor 模型大量使用）。

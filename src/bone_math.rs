@@ -482,6 +482,24 @@ pub fn angle_matrix(angles: [f32; 3]) -> Matrix3x4 {
     ]
 }
 
+/// 欧拉角的**逆**旋转矩阵（官方 `AngleIMatrix(RadianEuler)`）。
+///
+/// 官方 `AngleIMatrix`（`mathlib_base.cpp:2864-2903`）与 [`angle_matrix`]
+/// 的关系就是**转置** —— 逐项展开后完全一致，而正交旋转的转置即逆。
+/// 所以这里直接用转置实现：比再抄一遍 9 个三角函数表达式不容易抄错，
+/// 也不会出现两份公式各自漂移。
+///
+/// 唯一调用方是 `$attachment ... absolute`（官方在**解析期**用它覆盖
+/// `local` 的旋转部分，`studiomdl.cpp:5246`）。
+pub fn angle_imatrix(angles: [f32; 3]) -> Matrix3x4 {
+    let m = angle_matrix(angles);
+    [
+        m[0], m[4], m[8], 0.0, //
+        m[1], m[5], m[9], 0.0, //
+        m[2], m[6], m[10], 0.0,
+    ]
+}
+
 /// 复合变换：`a ∘ b`（先应用 b，再应用 a）。
 ///
 /// 对骨骼层级就是 `world_child = world_parent ∘ local_child`。
