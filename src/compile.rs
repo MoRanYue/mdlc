@@ -426,111 +426,114 @@ fn build_model_lods(
     }
 
     // 逐 LOD 读 SMD 并对齐。
-    let _t_read = crate::prof::Span::new("  LOD: 读 SMD + build_meshes");
-    for (li, lod) in m.lods.iter().enumerate() {
-        let lod_no = li + 1; // LOD 0 是 `m.smd`
-        let lpath = format!("{at}.lods[{li}]");
+    hotpath::measure_block!("  LOD: 读 SMD + build_meshes", {
+        for (li, lod) in m.lods.iter().enumerate() {
+            let lod_no = li + 1; // LOD 0 是 `m.smd`
+            let lpath = format!("{at}.lods[{li}]");
 
-        // 没写 `smd` ⟹ 复用 LOD 0 的网格，只应用骨骼选项。
-        // 官方 `GetLODSources`：`if (!pSource && !found) pSource = pSrcModel->source;`
-        let Some(lod_smd) = lod.smd.as_deref() else {
-            for (ki, mesh) in lod0_meshes.iter().enumerate() {
-                per_mesh[ki].push((mesh.vertices.clone(), mesh.triangles.clone()));
-            }
-            continue;
-        };
+            // 没写 `smd` ⟹ 复用 LOD 0 的网格，只应用骨骼选项。
+            // 官方 `GetLODSources`：`if (!pSource && !found) pSource = pSrcModel->source;`
+            let Some(lod_smd) = lod.smd.as_deref() else {
+                for (ki, mesh) in lod0_meshes.iter().enumerate() {
+                    per_mesh[ki].push((mesh.vertices.clone(), mesh.triangles.clone()));
+                }
+                continue;
+            };
 
-        let smd_path = resolve_smd_path(base_dir, lod_smd);
-        let smd = match read_smd(&smd_path, &lpath) {
-            Ok(s) => s,
-            Err(err) => {
-                errs.push(err);
-                continue;
-            }
-        };
-        // 骨骼必须与 LOD 0 一致（同一个 model 的各 LOD 共用骨架）。
-        let desc_index = desc.bone_index();
-        let missing: Vec<&str> = smd
-            .nodes
-            .iter()
-            .map(|n| n.name.as_str())
-            .filter(|n| !desc_index.contains_key(n))
-            .collect();
-        if !missing.is_empty() {
-            errs.push(e(
-                &lpath,
-                format!(
-                    "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
-                    smd_path.display(),
-                    missing.len(),
-                    missing
-                        .iter()
-                        .take(5)
-                        .copied()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ));
-            continue;
-        }
-        let meshes = match build_meshes(&smd, desc, &smd_path, &lpath, m.flip_triangles) {
-            Ok(v) => v,
-            Err(err) => {
-                errs.push(err);
-                continue;
-            }
-        };
-        // 按材质下标对齐到 LOD 0 的 mesh。
-        // 缺材质 / 多材质都要显式报错 —— 静默对齐会贴错材质。
-        let mut by_material: HashMap<usize, &Mesh> =
-            meshes.iter().map(|k| (k.material, k)).collect();
-        for (ki, mat) in lod0_material_of.iter().enumerate() {
-            let Some(lod_mesh) = by_material.remove(mat) else {
+            let smd_path = resolve_smd_path(base_dir, lod_smd);
+            let smd = match read_smd(&smd_path, &lpath) {
+                Ok(s) => s,
+                Err(err) => {
+                    errs.push(err);
+                    continue;
+                }
+            };
+            // 骨骼必须与 LOD 0 一致（同一个 model 的各 LOD 共用骨架）。
+            let desc_index = desc.bone_index();
+            let missing: Vec<&str> = smd
+                .nodes
+                .iter()
+                .map(|n| n.name.as_str())
+                .filter(|n| !desc_index.contains_key(n))
+                .collect();
+            if !missing.is_empty() {
                 errs.push(e(
                     &lpath,
                     format!(
-                        "LOD {lod_no} 缺少材质下标 {mat} 的 mesh（LOD 0 的 mesh[{ki}] 用了它）—— \
-                         各 LOD 的材质集合必须一致"
+                        "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
+                        smd_path.display(),
+                        missing.len(),
+                        missing
+                            .iter()
+                            .take(5)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                 ));
                 continue;
+            }
+            let meshes = match build_meshes(&smd, desc, &smd_path, &lpath, m.flip_triangles) {
+                Ok(v) => v,
+                Err(err) => {
+                    errs.push(err);
+                    continue;
+                }
             };
-            per_mesh[ki].push((lod_mesh.vertices.clone(), lod_mesh.triangles.clone()));
+            // 按材质下标对齐到 LOD 0 的 mesh。
+            // 缺材质 / 多材质都要显式报错 —— 静默对齐会贴错材质。
+            let mut by_material: HashMap<usize, &Mesh> =
+                meshes.iter().map(|k| (k.material, k)).collect();
+            for (ki, mat) in lod0_material_of.iter().enumerate() {
+                let Some(lod_mesh) = by_material.remove(mat) else {
+                    errs.push(e(
+                        &lpath,
+                        format!(
+                            "LOD {lod_no} 缺少材质下标 {mat} 的 mesh（LOD 0 的 mesh[{ki}] 用了它）—— \
+                             各 LOD 的材质集合必须一致"
+                        ),
+                    ));
+                    continue;
+                };
+                per_mesh[ki].push((lod_mesh.vertices.clone(), lod_mesh.triangles.clone()));
+            }
+            if !by_material.is_empty() {
+                let extra: Vec<usize> = by_material.keys().copied().collect();
+                errs.push(e(
+                    &lpath,
+                    format!("LOD {lod_no} 多出 LOD 0 没有的材质下标 {extra:?}"),
+                ));
+            }
         }
-        if !by_material.is_empty() {
-            let extra: Vec<usize> = by_material.keys().copied().collect();
-            errs.push(e(
-                &lpath,
-                format!("LOD {lod_no} 多出 LOD 0 没有的材质下标 {extra:?}"),
-            ));
+        if !errs.is_empty() {
+            return Err(errs);
         }
-    }
-    if !errs.is_empty() {
-        return Err(errs);
-    }
-    drop(_t_read);
+    });
 
     // 每个 mesh 统一去重（**走骨骼重映射感知的字典**）。
     //
     // `per_mesh[ki]` 是「LOD 0、LOD 1、…」的顶点池，与 `lod_bone_maps` 一一对应。
     let mut bone_lod_usage: Vec<u32> = vec![0; n_bones];
-    let _t_unify = crate::prof::Span::new("  LOD: unify_lods_remapped(全部 mesh)");
-    let mesh_lods: Vec<crate::lod::MeshLods> = per_mesh
-        .iter()
-        .map(|lods| {
-            let srcs: Vec<crate::lod::LodSource> = lods
+    let mesh_lods: Vec<crate::lod::MeshLods> = hotpath::measure_block!(
+        "  LOD: unify_lods_remapped(全部 mesh)",
+        {
+            per_mesh
                 .iter()
-                .enumerate()
-                .map(|(n, (verts, tris))| crate::lod::LodSource {
-                    vertices: verts.clone(),
-                    triangles: tris.clone(),
-                    bone_map: lod_bone_maps.get(n).cloned().unwrap_or_default(),
+                .map(|lods| {
+                    let srcs: Vec<crate::lod::LodSource> = lods
+                        .iter()
+                        .enumerate()
+                        .map(|(n, (verts, tris))| crate::lod::LodSource {
+                            vertices: verts.clone(),
+                            triangles: tris.clone(),
+                            bone_map: lod_bone_maps.get(n).cloned().unwrap_or_default(),
+                        })
+                        .collect();
+                    crate::lod::unify_lods_remapped(&srcs, &mut bone_lod_usage)
                 })
-                .collect();
-            crate::lod::unify_lods_remapped(&srcs, &mut bone_lod_usage)
-        })
-        .collect();
-    drop(_t_unify);
+                .collect()
+        }
+    );
 
     // switchPoint：LOD 0 恒 0；其余用显式值，否则按 20/40/80… 推算。
     let mut switch_points = Vec::with_capacity(num_lods);
@@ -1714,8 +1717,8 @@ fn pose_for(smd: &Smd, node_index: usize) -> Option<&SmdPose> {
 /// 编译：描述 + SMD → IR。
 ///
 /// `base_dir` 是描述文件所在目录，用于解析 SMD 的相对路径。
+#[hotpath::measure(label = "compile() 顶层")]
 pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, Vec<CompileError>> {
-    let _t_total = crate::prof::Span::new("compile() 顶层");
     // 先做描述层校验（能一次报出全部问题，比逐个文件报错友好）。
     if let Err(errs) = desc.validate() {
         return Err(errs
@@ -1730,145 +1733,145 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     let mut errors: Vec<CompileError> = Vec::new();
     let mut bodyparts = Vec::with_capacity(desc.bodyparts.len());
 
-    let _t_body = crate::prof::Span::new("bodyparts: 读 SMD + build_meshes + LOD");
-    for (bi, bp) in desc.bodyparts.iter().enumerate() {
-        let mut models = Vec::with_capacity(bp.models.len());
-        for (mi, m) in bp.models.iter().enumerate() {
-            let at = format!("bodyparts[{bi}].models[{mi}]");
-            let smd_path = resolve_smd_path(base_dir, &m.smd);
-            let text = match std::fs::read_to_string(&smd_path) {
-                Ok(t) => t,
-                Err(err) => {
-                    errors.push(e(
-                        format!("{at}.smd"),
-                        format!("读不到 {}：{err}", smd_path.display()),
-                    ));
-                    continue;
-                }
-            };
-            let smd = match parse_smd(&text) {
-                Ok(s) => s,
-                Err(err) => {
-                    errors.push(e(
-                        format!("{at}.smd"),
-                        format!("{} 解析失败：{err}", smd_path.display()),
-                    ));
-                    continue;
-                }
-            };
-
-            // SMD 里的骨骼必须在描述的骨骼表里能找到，且数量一致 ——
-            // 否则顶点绑定会指向不存在的骨骼。
-            let desc_index = desc.bone_index();
-            let mut missing: Vec<&str> = Vec::new();
-            for n in &smd.nodes {
-                if !desc_index.contains_key(n.name.as_str()) {
-                    missing.push(n.name.as_str());
-                }
-            }
-            if !missing.is_empty() {
-                errors.push(e(
-                    format!("{at}.smd"),
-                    format!(
-                        "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
-                        smd_path.display(),
-                        missing.len(),
-                        missing
-                            .iter()
-                            .take(5)
-                            .copied()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ));
-                continue;
-            }
-
-            let meshes = match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
-                Ok(v) => v,
-                Err(err) => {
-                    errors.push(err);
-                    continue;
-                }
-            };
-
-            // ---- 多 LOD：读每个 LOD 的 SMD，按材质名对齐 mesh ----
-            // 只有描述里写了 `lods` 才走这条路；否则 `lods` 保持 `None`，
-            // 写出器走单 LOD 路径，产物与加这个特性之前完全一致。
-            let lods = if m.lods.is_empty() {
-                None
-            } else {
-                match build_model_lods(m, &meshes, &smd, desc, base_dir, &at) {
-                    Ok(v) => Some(v),
-                    Err(errs) => {
-                        errors.extend(errs);
+    hotpath::measure_block!("bodyparts: 读 SMD + build_meshes + LOD", {
+        for (bi, bp) in desc.bodyparts.iter().enumerate() {
+            let mut models = Vec::with_capacity(bp.models.len());
+            for (mi, m) in bp.models.iter().enumerate() {
+                let at = format!("bodyparts[{bi}].models[{mi}]");
+                let smd_path = resolve_smd_path(base_dir, &m.smd);
+                let text = match std::fs::read_to_string(&smd_path) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        errors.push(e(
+                            format!("{at}.smd"),
+                            format!("读不到 {}：{err}", smd_path.display()),
+                        ));
                         continue;
                     }
+                };
+                let smd = match parse_smd(&text) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        errors.push(e(
+                            format!("{at}.smd"),
+                            format!("{} 解析失败：{err}", smd_path.display()),
+                        ));
+                        continue;
+                    }
+                };
+
+                // SMD 里的骨骼必须在描述的骨骼表里能找到，且数量一致 ——
+                // 否则顶点绑定会指向不存在的骨骼。
+                let desc_index = desc.bone_index();
+                let mut missing: Vec<&str> = Vec::new();
+                for n in &smd.nodes {
+                    if !desc_index.contains_key(n.name.as_str()) {
+                        missing.push(n.name.as_str());
+                    }
                 }
-            };
+                if !missing.is_empty() {
+                    errors.push(e(
+                        format!("{at}.smd"),
+                        format!(
+                            "{} 里有 {} 根骨骼不在 [[bones]] 中：{}",
+                            smd_path.display(),
+                            missing.len(),
+                            missing
+                                .iter()
+                                .take(5)
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ));
+                    continue;
+                }
 
-            let name = model_name(m, &smd_path);
-            // 参考姿态：SMD 第 0 帧（用于自动补全描述里没写的骨骼姿态）。
-            //
-            // ⚠️ **必须把 `p.bone` 从「SMD node 下标」改写成「骨骼表下标」。**
-            //
-            // `f.poses[].bone` 是 **SMD `nodes` 段的下标**，而骨骼表是
-            // `[$definebone 顺序] ++ [SMD node 顺序]`（`$definebone` 的骨骼
-            // 会被提到前面）。两者**不同**，例如 `v_autoshotgun`：
-            //
-            // | 骨骼表 | 名字 | SMD node |
-            // |---|---|---|
-            // | 2 | `ValveBiped.Camera` | 84 |
-            // | 84 | `attachment_jiggle_19` | 22 |
-            //
-            // 而 `resolve_bone_pose` 是按**骨骼表下标**查的
-            // （`m.poses.iter().find(|p| p.bone == bone_index)`）。
-            // 不改写的话，表[84] 会拿到 SMD node 84（= `ValveBiped.Camera`）
-            // 的姿态 —— **静默的骨骼姿态错位**，实测让 `weapon` 的参考位置
-            // 偏 `50.965` 单位、附着点世界位置偏 `70.9` 单位。
-            //
-            // 用**名字**建映射（与上面 `missing` 检查同一份 `desc_index`），
-            // 这样 SMD 的 node 顺序与描述里的 `[[bones]]` 顺序无关。
-            let poses: Vec<SmdPose> = smd
-                .reference_frame()
-                .map(|f| {
-                    f.poses
-                        .iter()
-                        .filter_map(|p| {
-                            let node = smd.nodes.get(p.bone.max(0) as usize)?;
-                            let &di = desc_index.get(node.name.as_str())?;
-                            Some(SmdPose {
-                                bone: di as i32,
-                                position: p.position,
-                                rotation: p.rotation,
+                let meshes = match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        errors.push(err);
+                        continue;
+                    }
+                };
+
+                // ---- 多 LOD：读每个 LOD 的 SMD，按材质名对齐 mesh ----
+                // 只有描述里写了 `lods` 才走这条路；否则 `lods` 保持 `None`，
+                // 写出器走单 LOD 路径，产物与加这个特性之前完全一致。
+                let lods = if m.lods.is_empty() {
+                    None
+                } else {
+                    match build_model_lods(m, &meshes, &smd, desc, base_dir, &at) {
+                        Ok(v) => Some(v),
+                        Err(errs) => {
+                            errors.extend(errs);
+                            continue;
+                        }
+                    }
+                };
+
+                let name = model_name(m, &smd_path);
+                // 参考姿态：SMD 第 0 帧（用于自动补全描述里没写的骨骼姿态）。
+                //
+                // ⚠️ **必须把 `p.bone` 从「SMD node 下标」改写成「骨骼表下标」。**
+                //
+                // `f.poses[].bone` 是 **SMD `nodes` 段的下标**，而骨骼表是
+                // `[$definebone 顺序] ++ [SMD node 顺序]`（`$definebone` 的骨骼
+                // 会被提到前面）。两者**不同**，例如 `v_autoshotgun`：
+                //
+                // | 骨骼表 | 名字 | SMD node |
+                // |---|---|---|
+                // | 2 | `ValveBiped.Camera` | 84 |
+                // | 84 | `attachment_jiggle_19` | 22 |
+                //
+                // 而 `resolve_bone_pose` 是按**骨骼表下标**查的
+                // （`m.poses.iter().find(|p| p.bone == bone_index)`）。
+                // 不改写的话，表[84] 会拿到 SMD node 84（= `ValveBiped.Camera`）
+                // 的姿态 —— **静默的骨骼姿态错位**，实测让 `weapon` 的参考位置
+                // 偏 `50.965` 单位、附着点世界位置偏 `70.9` 单位。
+                //
+                // 用**名字**建映射（与上面 `missing` 检查同一份 `desc_index`），
+                // 这样 SMD 的 node 顺序与描述里的 `[[bones]]` 顺序无关。
+                let poses: Vec<SmdPose> = smd
+                    .reference_frame()
+                    .map(|f| {
+                        f.poses
+                            .iter()
+                            .filter_map(|p| {
+                                let node = smd.nodes.get(p.bone.max(0) as usize)?;
+                                let &di = desc_index.get(node.name.as_str())?;
+                                Some(SmdPose {
+                                    bone: di as i32,
+                                    position: p.position,
+                                    rotation: p.rotation,
+                                })
                             })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let _ = pose_for; // 保留该辅助函数供后续「按名取姿态」使用
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = pose_for; // 保留该辅助函数供后续「按名取姿态」使用
 
-            models.push(CompiledModel {
-                smd_path,
-                name,
-                poses,
-                meshes,
-                lods,
-                eyeballs: Vec::new(),
-                mesh_flexes: Vec::new(),
+                models.push(CompiledModel {
+                    smd_path,
+                    name,
+                    poses,
+                    meshes,
+                    lods,
+                    eyeballs: Vec::new(),
+                    mesh_flexes: Vec::new(),
+                });
+            }
+            bodyparts.push(CompiledBodyPart {
+                name: bp.name.clone(),
+                base: bp.base.unwrap_or(1),
+                models,
             });
         }
-        bodyparts.push(CompiledBodyPart {
-            name: bp.name.clone(),
-            base: bp.base.unwrap_or(1),
-            models,
-        });
-    }
 
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    drop(_t_body);
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+    });
 
     // ---- 动画池：`$animation` 一条，顺序 = 声明顺序 ----
     let mut seq_errors: Vec<CompileError> = Vec::new();
@@ -2004,94 +2007,572 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     }
 
     // ---- 序列：读每个序列的 SMD，取全部帧 ----
-    let _t_seq = crate::prof::Span::new("sequences: 读 SMD 帧");
+    // `sequences` 要在块外声明：它活到 `:2675` 的段表构造和 `:2707` 的
+    // `CompiledModelDesc` 组装，`measure_block!` 会引入新作用域。
     let mut sequences = Vec::with_capacity(desc.sequences.len());
-    for (si, s) in desc.sequences.iter().enumerate() {
-        let at = format!("sequences[{si}]");
-        // ---- `$declaresequence`：前向声明的**空壳** ----
-        //
-        // 官方 `Cmd_DeclareSequence` 只 `memset` 一条 `s_sequence_t` 再置
-        // `STUDIO_OVERRIDE`，**不分配 `panim`、不读 SMD**。
-        // 所以这里**必须**在所有「读 SMD / 解析动画」之前短路 ——
-        // 否则会去读一个空路径。
-        //
-        // 落盘值与普通序列**处处不同**，但那不是特例代码，而是
-        // 「`memset` 之后一个字段都没被赋值」的自然结果。实测表见
-        // [`crate::model::Sequence::forward_declared`]。
-        if s.forward_declared {
-            sequences.push(crate::model::CompiledSequence {
-                name: s.name.clone(),
-                smd_path: std::path::PathBuf::new(),
-                // 官方 `memset` 后 `fps = 0`（普通序列在 `Cmd_Sequence`
-                // 里才被设成 30）。它不落盘，但保持一致以免误导。
-                fps: 0.0,
-                looping: false,
-                // ⚠️ 这两个是**空壳与普通序列差别最大的地方**：
-                // 普通序列 `activity = -1`、`fade = 0.2`，
-                // 空壳全是 `memset` 的 0。
-                activity: 0,
-                activity_name: String::new(),
-                activity_weight: 0,
-                delta: false,
-                frames: Vec::new(),
-                // `groupsize = [0, 0]` ⟹ `cells` 空 ⟹ 写出器走空壳分支。
-                cells: Vec::new(),
-                blend_width: 0,
-                blend_params: [None, None],
-                // `groupsize = [0,0]` ⟹ `CalcPoseParameters` 的
-                // `groupsize[iPose] > 1` 不成立 ⟹ 没有 calc 轴。
-                calc_axes: Vec::new(),
-                blend_ref: None,
-                blend_comp: None,
-                blend_center: None,
-                auto_layers: Vec::new(),
-                events: Vec::new(),
-                fade_in: 0.0,
-                fade_out: 0.0,
-                forward_declared: true,
-                no_auto_ik: false,
-                ik_rules: Vec::new(),
-                iklocks: Vec::new(),
-                movements: Vec::new(),
-                section_frames: 0,
-                num_sections: 0,
-                // ⚠️ **全 0，不是全 1** —— 见 `merge_weights` 的说明：
-                // `groupsize = [0,0]` 让官方的 MAX 循环一次都不跑。
-                weights: vec![0.0; n_bones],
-                pre_subtract_frames: None,
-                extra_flags: None,
-            });
-            continue;
-        }
+    hotpath::measure_block!("sequences: 读 SMD 帧", {
+        for (si, s) in desc.sequences.iter().enumerate() {
+            let at = format!("sequences[{si}]");
+            // ---- `$declaresequence`：前向声明的**空壳** ----
+            //
+            // 官方 `Cmd_DeclareSequence` 只 `memset` 一条 `s_sequence_t` 再置
+            // `STUDIO_OVERRIDE`，**不分配 `panim`、不读 SMD**。
+            // 所以这里**必须**在所有「读 SMD / 解析动画」之前短路 ——
+            // 否则会去读一个空路径。
+            //
+            // 落盘值与普通序列**处处不同**，但那不是特例代码，而是
+            // 「`memset` 之后一个字段都没被赋值」的自然结果。实测表见
+            // [`crate::model::Sequence::forward_declared`]。
+            if s.forward_declared {
+                sequences.push(crate::model::CompiledSequence {
+                    name: s.name.clone(),
+                    smd_path: std::path::PathBuf::new(),
+                    // 官方 `memset` 后 `fps = 0`（普通序列在 `Cmd_Sequence`
+                    // 里才被设成 30）。它不落盘，但保持一致以免误导。
+                    fps: 0.0,
+                    looping: false,
+                    // ⚠️ 这两个是**空壳与普通序列差别最大的地方**：
+                    // 普通序列 `activity = -1`、`fade = 0.2`，
+                    // 空壳全是 `memset` 的 0。
+                    activity: 0,
+                    activity_name: String::new(),
+                    activity_weight: 0,
+                    delta: false,
+                    frames: Vec::new(),
+                    // `groupsize = [0, 0]` ⟹ `cells` 空 ⟹ 写出器走空壳分支。
+                    cells: Vec::new(),
+                    blend_width: 0,
+                    blend_params: [None, None],
+                    // `groupsize = [0,0]` ⟹ `CalcPoseParameters` 的
+                    // `groupsize[iPose] > 1` 不成立 ⟹ 没有 calc 轴。
+                    calc_axes: Vec::new(),
+                    blend_ref: None,
+                    blend_comp: None,
+                    blend_center: None,
+                    auto_layers: Vec::new(),
+                    events: Vec::new(),
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                    forward_declared: true,
+                    no_auto_ik: false,
+                    ik_rules: Vec::new(),
+                    iklocks: Vec::new(),
+                    movements: Vec::new(),
+                    section_frames: 0,
+                    num_sections: 0,
+                    // ⚠️ **全 0，不是全 1** —— 见 `merge_weights` 的说明：
+                    // `groupsize = [0,0]` 让官方的 MAX 循环一次都不跑。
+                    weights: vec![0.0; n_bones],
+                    pre_subtract_frames: None,
+                    extra_flags: None,
+                });
+                continue;
+            }
 
-        // ---- blend 网格（`$sequence` 块里写了多个动画名）----
-        //
-        // ⚠️ **格子只是引用**，不是「每格一个 animdesc」。
-        // 官方把 animdesc 放在全局池 `g_panimation[]` 里，`$sequence`
-        // 里的裸名字先按名字查池（`studiomdl.cpp:2952-2959`），查到就
-        // **复用同一个 animdesc**。实测 `v_autoshotgun.mdl`：27 个
-        // seqdesc / 29 个 animdesc —— `idle` 的两格 `a_run` 共用一份，
-        // `idle` 与 `idle_raw` 的 `a_idle` 共用一份。
-        //
-        // 所以这里只记录**动画下标**，帧数据在下面的动画池里统一建。
-        // 单动画序列走下面的老路径（`s.smd`）。
-        if !s.blends.is_empty() {
-            let (width, height) = match blend_grid_size(s, &at, &mut seq_errors) {
-                Some(v) => v,
-                None => continue,
-            };
-            // 名字 → 动画池下标。查不到就报错（官方的「隐含动画」由
-            // 单动画序列那条路径覆盖，blend 的格子必须已声明）。
-            let mut cell_idx = Vec::with_capacity(s.blends.len());
-            let mut ok = true;
-            for (ci, nm) in s.blends.iter().enumerate() {
-                match anim_index.get(nm.as_str()) {
-                    Some(&i) => cell_idx.push(i),
-                    None => {
+            // ---- blend 网格（`$sequence` 块里写了多个动画名）----
+            //
+            // ⚠️ **格子只是引用**，不是「每格一个 animdesc」。
+            // 官方把 animdesc 放在全局池 `g_panimation[]` 里，`$sequence`
+            // 里的裸名字先按名字查池（`studiomdl.cpp:2952-2959`），查到就
+            // **复用同一个 animdesc**。实测 `v_autoshotgun.mdl`：27 个
+            // seqdesc / 29 个 animdesc —— `idle` 的两格 `a_run` 共用一份，
+            // `idle` 与 `idle_raw` 的 `a_idle` 共用一份。
+            //
+            // 所以这里只记录**动画下标**，帧数据在下面的动画池里统一建。
+            // 单动画序列走下面的老路径（`s.smd`）。
+            if !s.blends.is_empty() {
+                let (width, height) = match blend_grid_size(s, &at, &mut seq_errors) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                // 名字 → 动画池下标。查不到就报错（官方的「隐含动画」由
+                // 单动画序列那条路径覆盖，blend 的格子必须已声明）。
+                let mut cell_idx = Vec::with_capacity(s.blends.len());
+                let mut ok = true;
+                for (ci, nm) in s.blends.iter().enumerate() {
+                    match anim_index.get(nm.as_str()) {
+                        Some(&i) => cell_idx.push(i),
+                        None => {
+                            seq_errors.push(e(
+                                format!("{at}.blends[{ci}]"),
+                                format!(
+                                    "找不到动画 {nm:?}（blend 的每一格都必须是 [[animations]] 里声明过的名字；\
+                                     现有：{}）",
+                                    desc.animations
+                                        .iter()
+                                        .map(|a| a.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            ));
+                            ok = false;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let _ = (width, height);
+
+                // 参数轴：名字 → 下标，并算逐格取值。
+                let mut params: [Option<crate::model::CompiledBlendParam>; 2] = [None, None];
+                let grid = [width as usize, height as usize];
+                let mut bad = false;
+                for (pi, bp) in s.blend_params.iter().take(2).enumerate() {
+                    let idx = match resolve_pose_param_index(desc, &bp.parameter) {
+                        Some(i) => i,
+                        None => {
+                            seq_errors.push(e(
+                                format!("{at}.blend_params[{pi}].parameter"),
+                                format!(
+                                    "找不到姿势参数 {:?}（[[model.pose_parameters]] 里有 {} 个：{}）",
+                                    bp.parameter,
+                                    desc.model.pose_parameters.len(),
+                                    desc.model
+                                        .pose_parameters
+                                        .iter()
+                                        .map(|p| p.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            ));
+                            bad = true;
+                            continue;
+                        }
+                    };
+                    if let Some(att) = &bp.attachment {
+                        // `calcblend` 轴：`paramstart`/`paramend`/`posekey` **全是
+                        // 算出来的**，这里只占位（真值由
+                        // [`apply_calc_blend_axes`] 在序列全部建完后填）。
+                        //
+                        // ⚠️ 附着点名字**必须在编译期解析**（官方在解析期
+                        // `LookupAttachment`，查不到就 `TokenError`），
+                        // 所以这里就查一次，查不到直接报错。
+                        if lookup_attachment(desc, &bone_index, att).is_none() {
+                            seq_errors.push(e(
+                                format!("{at}.blend_params[{pi}].attachment"),
+                                format!(
+                                    "未知的 calcblend 附着点 {att:?}（官方是 Unknown calcblend attachment）"
+                                ),
+                            ));
+                            bad = true;
+                            continue;
+                        }
+                        params[pi] = Some(crate::model::CompiledBlendParam {
+                            parameter_index: idx,
+                            start: 0.0,
+                            end: 0.0,
+                            keys: Vec::new(),
+                        });
+                    } else {
+                        params[pi] = Some(crate::model::CompiledBlendParam {
+                            parameter_index: idx,
+                            start: bp.start,
+                            end: bp.end,
+                            keys: blend_param_keys(bp.start, bp.end, grid[pi]),
+                        });
+                    }
+                }
+                if bad {
+                    continue;
+                }
+
+                // ---- 官方 `CalcPoseParameters` 会遍历**每一根轴** ----
+                //
+                // 判据（`simplify.cpp:5461-5463`）是**两个条件**：
+                //
+                // ```c
+                // if (pseq->groupsize[iPose] > 1) {
+                //     if (pseq->paramattachment[iPose] != -1) { /* calc 分支 */ }
+                //     else { /* 线性插值：param_i[m] = start*(1-f) + end*f */ }
+                // }
+                // ```
+                //
+                // ⚠️ 循环边界是 `groupsize`，**不是**「QC 写了几个
+                // `blend`/`calcblend`」。所以 `blendwidth 3` 配 0 个 `blend` 时
+                // 轴 0 照样被遍历 —— 而它的 `paramattachment[0]` 是 `memset`
+                // 残留的 **0**（`≠ -1`）⟹ 进入 **calc 分支**
+                // ⟹ `paramcontrol[0]` 同样是 0 ⟹ 每格算出 `0.0`
+                // ⟹ `calcblend failed`（`simplify.cpp:5566-5569`）。
+                //
+                // 这条路径**必须复刻**，否则 mdlc 会对官方拒绝的 QC
+                // 静默产出与官方不同的产物（实测：`idle` 的 `paramindex`
+                // 官方 `[0,-1]` / mdlc `[-1,-1]`，且引擎侧 `move_x` 完全失效）。
+                //
+                // 三种轴的归属：
+                //
+                // | 轴的状态 | `paramattachment` | 走哪条分支 |
+                // |---|---|---|
+                // | 写了 `calcblend` | 附着点下标 | **calc** |
+                // | 写了 `blend` | **-1**（`:2742`） | 线性插值 |
+                // | **两个都没写** | **0**（`memset`） | **calc**（恒 0 ⟹ 报错） |
+                let mut calc_axes: Vec<crate::model::CompiledCalcAxis> = Vec::new();
+                for (axis, &gs) in grid.iter().enumerate() {
+                    if gs <= 1 {
+                        continue;
+                    }
+                    let declared = s.blend_params.get(axis);
+                    // 纯 `blend` 轴（声明了但没附着点）走线性插值，**不进** calc。
+                    let is_pure_blend =
+                        matches!(declared, Some(bp) if bp.attachment.is_none());
+                    if is_pure_blend {
+                        continue;
+                    }
+                    calc_axes.push(crate::model::CompiledCalcAxis {
+                        axis,
+                        // `None` = 官方 `memset` 残留那条路径（轴根本没声明）——
+                        // 此时控制轴也是 0，所以结果与「哪个附着点」无关。
+                        attachment: declared.and_then(|bp| bp.attachment.clone()),
+                        control: declared.and_then(|bp| bp.control.clone()),
+                    });
+                }
+
+                // 自动层：序列名 → 下标。时间量在这里就转成落盘值。
+                //
+                // 帧数取**本序列第一格**的（官方用 `panim[0][0]->numframes`，
+                // `write.cpp:541-544`）。
+                let nf = anims[cell_idx[0]].frames.len().max(1) as f32;
+                let mut auto_layers = Vec::with_capacity(s.auto_layers.len());
+                for (li, al) in s.auto_layers.iter().enumerate() {
+                    let Some(seq_idx) = desc
+                        .sequences
+                        .iter()
+                        .position(|x| x.name == al.sequence)
+                    else {
                         seq_errors.push(e(
-                            format!("{at}.blends[{ci}]"),
-                            format!(
-                                "找不到动画 {nm:?}（blend 的每一格都必须是 [[animations]] 里声明过的名字；\
+                            format!("{at}.auto_layers[{li}].sequence"),
+                            format!("找不到序列 {:?}", al.sequence),
+                        ));
+                        bad = true;
+                        continue;
+                    };
+                    auto_layers.push(crate::model::CompiledAutoLayer {
+                        sequence: seq_idx as i16,
+                        pose: al.pose,
+                        flags: al.flags,
+                        // `write.cpp:539-551`：不带 `STUDIO_AL_POSE` 时
+                        // 四个量**除以 `numframes − 1`**（转 cycle）。
+                        start: layer_time(al.start, al.flags, nf),
+                        peak: layer_time(al.peak, al.flags, nf),
+                        tail: layer_time(al.tail, al.flags, nf),
+                        end: layer_time(al.end, al.flags, nf),
+                    });
+                }
+                if bad {
+                    continue;
+                }
+
+                // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23），见
+                // [`sequence_ik_rules_attach_to_first_cell`] 的说明。
+                if let Some(&first_cell) = cell_idx.first() {
+                    anims[first_cell].ik_rules.extend(s.ik_rules.iter().cloned());
+                }
+
+                let first = anims[cell_idx[0]].frames.clone();
+                let nf_i = first.len() as i32;
+                let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
+                let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
+                // `blendcenter` 在网格里的位置（`simplify.cpp:5503-5517`）：
+                // 逐格比 animdesc 指针，命中就记下 `(i0, i1)`。
+                //
+                // ⚠️ 官方比的是**动画对象指针**，所以「同一格被引用两次」时
+                // 取**先命中的那个**（双层循环 `i0` 外层、`i1` 内层）。
+                let blend_center = s.blend_center.as_ref().and_then(|name| {
+                    let want = resolve_lookup_animation(name, &anims, &anim_index, &sequences)?;
+                    (0..grid[1]).find_map(|k| {
+                        (0..grid[0])
+                            .find(|&j| cell_idx.get(k * grid[0] + j) == Some(&want))
+                            .map(|j| [j, k])
+                    })
+                });
+                sequences.push(crate::model::CompiledSequence {
+                    name: s.name.clone(),
+                    smd_path: anims[cell_idx[0]].smd_path.clone(),
+                    fps: s.fps.unwrap_or(30.0),
+                    looping: s.looping,
+                    activity: -1,
+                    activity_name: s.activity.clone().unwrap_or_default(),
+                    activity_weight: s.activity_weight,
+                    delta: s.delta,
+                    frames: first,
+                    cells: cell_idx.clone(),
+                    blend_width: width,
+                    blend_params: params,
+                    calc_axes,
+                    blend_ref: s.blend_ref.clone(),
+                    blend_comp: s.blend_comp.clone(),
+                    blend_center,
+                    auto_layers,
+                    events: s.events.clone(),
+                    fade_in: s.fade_in,
+                    fade_out: s.fade_out,
+                    no_auto_ik: s.no_auto_ik,
+                    ik_rules: s.ik_rules.clone(),
+                    iklocks: s.iklocks.clone(),
+                    movements: s.movements.clone(),
+                    section_frames: if sec_len > 0 && nf_i >= sec_thr { sec_len } else { 0 },
+                    num_sections: 0,
+                    // 本序列的权重 = 各格动画**逐骨骼取 MAX**（`simplify.cpp:302-318`）。
+                    weights: merge_weights(&cell_idx, &anim_weights, desc.bones.len()),
+                    // 取**第一格**减除前的帧（官方按格取，但 blend 的每一格
+                    // 都是独立的 animdesc，这里 `first` 也是第一格的）。
+                    pre_subtract_frames: pre_subtract
+                        .get(cell_idx[0])
+                        .and_then(|p| p.clone()),
+                    extra_flags: s.extra_flags,
+                    forward_declared: false,
+                });
+                continue;
+            }
+
+            // ---- 单动画序列：隐含动画 ----
+            //
+            // QC 里 `$sequence "reload" "reload.smd"` 与 `$sequence "x" "a_idle"`
+            // 是**同一个语法**：块里给的是一个**名字**（token）。官方先按
+            // 这个名字查 `$animation` 池（`studiomdl.cpp:2952-2959`）——
+            //
+            // * 查到 ⟹ **复用**那个 animdesc（不新建）；
+            // * 查不到 ⟹ `Cmd_ImpliedAnimation` 新建一个，名字加 `@` 前缀。
+            //
+            // ⚠️ **隐含动画登记在 `@序列名` 下，不是文件名下。**
+            // 所以 `$sequence "reload" "reload.smd"` 与
+            // `$sequence "reload_layer" "reload.smd"` 是**两条独立动画**
+            // （`@reload` / `@reload_layer`）—— 后者的 token 再去查池时
+            // 找不到 `reload.smd`（池里没有这个名字），于是又建一个。
+            // 早先本实现按**文件名**登记，于是这两条被错误地并成一条
+            // （实测 `numlocalanim` 17 vs 官方 29）。
+            let smd_path = resolve_smd_path(base_dir, &s.smd);
+            let by_name = anim_index.get(s.smd.as_str()).copied();
+            let reused = by_name.is_some();
+            let (anim_ix, mut frames) = match by_name {
+                Some(i) => (i, anims[i].frames.clone()),
+                None => {
+                    let Some((frames, _smd)) = load_smd_frames(
+                        &smd_path,
+                        desc,
+                        &bone_index,
+                        &format!("{at}.smd"),
+                        &mut seq_errors,
+                    ) else {
+                        continue;
+                    };
+                    let i = anims.len();
+                    let name = format!("@{}", s.name);
+                    // 登记在**动画名**下，与官方一致。
+                    anim_index.insert(Box::leak(name.clone().into_boxed_str()), i);
+                    // 隐含动画的权重取**序列**的 `weightlist`
+                    // （官方 `Cmd_ImpliedAnimation` 建完动画后，序列的
+                    // `cmds[]` 里的 `CMD_WEIGHTS` 会作用到它）。
+                    anim_weights.push(weights_of(s.weight_list.as_deref()));
+                    anims.push(crate::model::CompiledAnimation {
+                        name,
+                        smd_path: smd_path.clone(),
+                        fps: s.fps.unwrap_or(30.0),
+                        looping: s.looping,
+                        frames: frames.clone(),
+                        delta: false,
+                        ik_rules: s.ik_rules.clone(),
+                        no_auto_ik: s.no_auto_ik,
+                        pre_subtract_frames: None,
+                    });
+                    (i, frames)
+                }
+            };
+
+            // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23）。
+            //
+            // 隐含动画在上面构造时已经把 `s.ik_rules` 放进去了；只有**复用**
+            // 已声明动画（`$sequence "reload" "a_reload"`）时才需要补 ——
+            // 那种写法下规则在 `$animation` 块里没有，只能从序列搬过来。
+            if reused {
+                anims[anim_ix].ik_rules.extend(s.ik_rules.iter().cloned());
+            }
+
+            // ---- `$sequence` 块里的 `weightlist`（`CMD_WEIGHTS`）----
+            //
+            // 与 `ikrule`（R23）**同一个机制**：官方 `ParseSequence` 把序列块里的
+            // 「动画选项」交给 `ParseAnimationToken(animations[0])`
+            // （`studiomdl.cpp:2944`），而 `weightlist` 只由 `ParseCmdlistToken`
+            // 处理（`studiomdl.cpp:1714-1732`）⟹ 它落成
+            // **`animations[0]->cmds[]` 里的一条 `CMD_WEIGHTS`**，
+            // 由 `processAnimations`（`simplify.cpp:154-166`）执行
+            // `setAnimationWeight(panim, index)` —— **作用在动画对象上**。
+            //
+            // 隐含动画那条路径（`!reused`）已经在上面把 `s.weight_list` 用掉了；
+            // **复用**已声明动画时（`$sequence "fidget" "a_look_mid" weightlist "empty"`）
+            // 必须**覆盖**那个共享动画的权重 —— 官方就是改共享对象。
+            //
+            // ⚠️ 这不是「序列自己的权重」：序列的 `weight[]` 是
+            // `merge_weights`（`simplify.cpp:302-318`）**对各格取 MAX** 得来的。
+            // 所以 `fidget`（单格 = `a_look_mid`）得到**全 0**，而共用
+            // `a_look_mid` 的 `look_poses`（三格）取 MAX 后仍是**全 1** ——
+            // 实测 NekoMDL 与发布版**都是这个形态**（`fidget` 全 0、
+            // `look_poses` 全非零），而 mdlc 修前两边都给全 1。
+            //
+            // 早先只在 `!reused` 分支处理 ⟹ `fidget` / `fidget_layer` 的
+            // `weightlist "empty"` **被静默丢弃**。
+            if s.weight_list.is_some() {
+                anim_weights[anim_ix] = weights_of(s.weight_list.as_deref());
+            }
+
+            // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
+            //
+            // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
+            // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
+            // 执行 `forceNumframes(panim, frames)`。
+            //
+            // 官方实现（`simplify.cpp:1279-1293`）：
+            // ```c
+            // for (j = panim->numframes; j < numframes; j++) {
+            //     panim->sanim[j] = kalloc(1, size);
+            //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
+            // }
+            // panim->numframes = numframes;
+            // ```
+            // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
+            // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
+            // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
+            // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
+            // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
+            //  `a_look_mid` 的 nf = 90）。
+            //
+            // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
+            // `Sequence::num_frames` 后只用于事件 cycle 的换算
+            // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
+            // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
+            // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
+            //
+            // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
+            // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
+            // 则本序列拿到的还是旧副本。
+            // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
+            //
+            // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
+            // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
+            // 执行 `forceNumframes(panim, frames)`。
+            //
+            // 官方实现（`simplify.cpp:1279-1293`）：
+            // ```c
+            // for (j = panim->numframes; j < numframes; j++) {
+            //     panim->sanim[j] = kalloc(1, size);
+            //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
+            // }
+            // panim->numframes = numframes;
+            // ```
+            // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
+            // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
+            // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
+            // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
+            // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
+            //  `a_look_mid` 的 nf = 90）。
+            //
+            // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
+            // `Sequence::num_frames` 后只用于事件 cycle 的换算
+            // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
+            // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
+            // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
+            //
+            // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
+            // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
+            // 则本序列拿到的还是旧副本。
+            if let Some(n) = s.num_frames {
+                let n = n.max(0) as usize;
+                if n > 0 && n > anims[anim_ix].frames.len() {
+                    let last = anims[anim_ix].frames.last().cloned();
+                    if let Some(last) = last {
+                        while anims[anim_ix].frames.len() < n {
+                            anims[anim_ix].frames.push(last.clone());
+                        }
+                    }
+                }
+            }
+            // 本序列的帧副本与共享动画保持一致（`forceNumframes` 只延长）。
+            if s.num_frames.is_some() {
+                frames = anims[anim_ix].frames.clone();
+            }
+
+            // ---- `$sequence` 块里的 `subtract`（`CMD_SUBTRACT`）----
+            //
+            // 官方 `ParseSequence` 在 `numblends || isAppend` 时把 token 交给
+            // `ParseAnimationToken(animations[0])`（`studiomdl.cpp:2944`），所以
+            // `subtract` 在 `$sequence` 里**同样合法**，且作用对象是
+            // `animations[0]` 那个**动画**（cmds 挂在 panim 上）。
+            //
+            // 本实现把减除作用在**本序列自己的帧副本**上，而不是去改共享的
+            // `anims[j].frames` —— 官方那样会让「同一个动画被两条序列引用」时
+            // 互相污染（减除被叠加两次）。后者在本工程里观测不到（每条
+            // `*_layer` 序列各有独立动画），但改共享状态是更差的选择。
+            let mut seq_pre_subtract: Option<Vec<Vec<crate::smd::SmdPose>>> = None;
+            // ⚠️ **`$sequence` 的 `delta` / `subtract` 必须把
+            // `anims[anim_ix].delta` 也置上** —— 官方是**同一个**标志。
+            //
+            // 官方 `ParseSequence`（`studiomdl.cpp:2827-2831`）把 `delta` 置到
+            // `pseq->flags`（**seqdesc**）；而 `ParseAnimationToken` 的
+            // `CMD_SUBTRACT`（`simplify.cpp:163-166`）把 `panim->flags` 置上
+            // `STUDIO_DELTA`。**两条路径最终都作用到动画的 `flags`** ——
+            // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags`，
+            // 而 `anim_writer.rs:3110` 正是照抄这条。
+            //
+            // # 实测症状（R9）
+            //
+            // `vm_test_group` 的 6 个官方 viewmodel 里，`@*_layer` 动画：
+            // ```text
+            //   animdesc.flags   mdlc = 0x000        官方 = 0x004 (STUDIO_DELTA)
+            //   seqdesc.flags    mdlc = 0x014        官方 = 0x014   ✅ 已对
+            // ```
+            // 即 **seqdesc 说「我是增量」，animdesc 却说「我是绝对姿态」** ——
+            // 两者矛盾。`.mdl` 体积也因此差 ~16 KB（3/6 个模型）。
+            //
+            // `delta` 同时驱动**动画数据的编码方式**（`anim_writer.rs:2154/2690/2876`），
+            // 所以这不只是标志位不一致 —— **动画数据本身按错误的方式写了**。
+            // 这正是用户报的「动画错乱」的一个具体成因。
+            //
+            // ⚠️ **但 `subtract` 与 `delta` 对 seqdesc 的影响不同**（R11）：
+            //
+            // | QC 写法 | `animdesc.flags` | `seqdesc.flags` |
+            // |---|---|---|
+            // | 只有 `subtract` | **有** DELTA | **无** DELTA |
+            // | `delta`（可同时有 `subtract`） | 有 DELTA | **有** DELTA |
+            //
+            // 因为官方两条路径落在**不同对象**上：
+            //   * `CMD_SUBTRACT`（`simplify.cpp:163-166`）→ `panim->flags`（**动画**）
+            //   * `delta` 关键字（`studiomdl.cpp:2827-2831`）→ `pseq->flags`（**序列**）
+            // 而 `write.cpp:436` 是 `pseqdesc->flags = g_sequence[i].flags`、
+            // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags` —— 各写各的。
+            //
+            // 实测（更新后的 `vm_test_group`）：`helping_hand_extend_layer` /
+            // `item_extend_layer` 等 6 条只有 `subtract` 没有 `delta`，
+            // 官方 seqdesc = `0x000`，而第一版修复给了 `0x004`。
+            let seq_is_delta = s.delta || s.subtract.is_some();
+            if seq_is_delta {
+                anims[anim_ix].delta = true;
+            }
+            if let Some(ref_name) = s.subtract.as_deref() {
+                match anim_index.get(ref_name) {
+                    Some(&j) => {
+                        let src = anims[j].frames.clone();
+                        let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
+                        if bf >= src.len() {
+                            seq_errors.push(CompileError {
+                                at: format!("{at}.subtract_frame"),
+                                message: format!(
+                                    "参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧",
+                                    src.len()
+                                ),
+                            });
+                            continue;
+                        }
+                        // 包围盒用**减除前**的姿态（与 `[[animations]]` 同规则）。
+                        seq_pre_subtract = Some(frames.clone());
+                        // 权重 ≤ 0 的骨骼不减除（`simplify.cpp:1088`）。
+                        let w = weights_of(s.weight_list.as_deref());
+                        subtract_base_frames(&mut frames, &src, bf, &w);
+                    }
+                    None => {
+                        seq_errors.push(CompileError {
+                            at: format!("{at}.subtract"),
+                            message: format!(
+                                "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名**，\
                                  现有：{}）",
                                 desc.animations
                                     .iter()
@@ -2099,204 +2580,78 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ),
-                        ));
-                        ok = false;
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            let _ = (width, height);
-
-            // 参数轴：名字 → 下标，并算逐格取值。
-            let mut params: [Option<crate::model::CompiledBlendParam>; 2] = [None, None];
-            let grid = [width as usize, height as usize];
-            let mut bad = false;
-            for (pi, bp) in s.blend_params.iter().take(2).enumerate() {
-                let idx = match resolve_pose_param_index(desc, &bp.parameter) {
-                    Some(i) => i,
-                    None => {
-                        seq_errors.push(e(
-                            format!("{at}.blend_params[{pi}].parameter"),
-                            format!(
-                                "找不到姿势参数 {:?}（[[model.pose_parameters]] 里有 {} 个：{}）",
-                                bp.parameter,
-                                desc.model.pose_parameters.len(),
-                                desc.model
-                                    .pose_parameters
-                                    .iter()
-                                    .map(|p| p.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                        ));
-                        bad = true;
+                        });
                         continue;
                     }
-                };
-                if let Some(att) = &bp.attachment {
-                    // `calcblend` 轴：`paramstart`/`paramend`/`posekey` **全是
-                    // 算出来的**，这里只占位（真值由
-                    // [`apply_calc_blend_axes`] 在序列全部建完后填）。
-                    //
-                    // ⚠️ 附着点名字**必须在编译期解析**（官方在解析期
-                    // `LookupAttachment`，查不到就 `TokenError`），
-                    // 所以这里就查一次，查不到直接报错。
-                    if lookup_attachment(desc, &bone_index, att).is_none() {
-                        seq_errors.push(e(
-                            format!("{at}.blend_params[{pi}].attachment"),
-                            format!(
-                                "未知的 calcblend 附着点 {att:?}（官方是 Unknown calcblend attachment）"
-                            ),
-                        ));
-                        bad = true;
-                        continue;
-                    }
-                    params[pi] = Some(crate::model::CompiledBlendParam {
-                        parameter_index: idx,
-                        start: 0.0,
-                        end: 0.0,
-                        keys: Vec::new(),
-                    });
-                } else {
-                    params[pi] = Some(crate::model::CompiledBlendParam {
-                        parameter_index: idx,
-                        start: bp.start,
-                        end: bp.end,
-                        keys: blend_param_keys(bp.start, bp.end, grid[pi]),
-                    });
                 }
             }
-            if bad {
-                continue;
-            }
 
-            // ---- 官方 `CalcPoseParameters` 会遍历**每一根轴** ----
-            //
-            // 判据（`simplify.cpp:5461-5463`）是**两个条件**：
-            //
-            // ```c
-            // if (pseq->groupsize[iPose] > 1) {
-            //     if (pseq->paramattachment[iPose] != -1) { /* calc 分支 */ }
-            //     else { /* 线性插值：param_i[m] = start*(1-f) + end*f */ }
-            // }
-            // ```
-            //
-            // ⚠️ 循环边界是 `groupsize`，**不是**「QC 写了几个
-            // `blend`/`calcblend`」。所以 `blendwidth 3` 配 0 个 `blend` 时
-            // 轴 0 照样被遍历 —— 而它的 `paramattachment[0]` 是 `memset`
-            // 残留的 **0**（`≠ -1`）⟹ 进入 **calc 分支**
-            // ⟹ `paramcontrol[0]` 同样是 0 ⟹ 每格算出 `0.0`
-            // ⟹ `calcblend failed`（`simplify.cpp:5566-5569`）。
-            //
-            // 这条路径**必须复刻**，否则 mdlc 会对官方拒绝的 QC
-            // 静默产出与官方不同的产物（实测：`idle` 的 `paramindex`
-            // 官方 `[0,-1]` / mdlc `[-1,-1]`，且引擎侧 `move_x` 完全失效）。
-            //
-            // 三种轴的归属：
-            //
-            // | 轴的状态 | `paramattachment` | 走哪条分支 |
-            // |---|---|---|
-            // | 写了 `calcblend` | 附着点下标 | **calc** |
-            // | 写了 `blend` | **-1**（`:2742`） | 线性插值 |
-            // | **两个都没写** | **0**（`memset`） | **calc**（恒 0 ⟹ 报错） |
-            let mut calc_axes: Vec<crate::model::CompiledCalcAxis> = Vec::new();
-            for (axis, &gs) in grid.iter().enumerate() {
-                if gs <= 1 {
-                    continue;
-                }
-                let declared = s.blend_params.get(axis);
-                // 纯 `blend` 轴（声明了但没附着点）走线性插值，**不进** calc。
-                let is_pure_blend =
-                    matches!(declared, Some(bp) if bp.attachment.is_none());
-                if is_pure_blend {
-                    continue;
-                }
-                calc_axes.push(crate::model::CompiledCalcAxis {
-                    axis,
-                    // `None` = 官方 `memset` 残留那条路径（轴根本没声明）——
-                    // 此时控制轴也是 0，所以结果与「哪个附着点」无关。
-                    attachment: declared.and_then(|bp| bp.attachment.clone()),
-                    control: declared.and_then(|bp| bp.control.clone()),
-                });
-            }
-
-            // 自动层：序列名 → 下标。时间量在这里就转成落盘值。
-            //
-            // 帧数取**本序列第一格**的（官方用 `panim[0][0]->numframes`，
-            // `write.cpp:541-544`）。
-            let nf = anims[cell_idx[0]].frames.len().max(1) as f32;
-            let mut auto_layers = Vec::with_capacity(s.auto_layers.len());
-            for (li, al) in s.auto_layers.iter().enumerate() {
-                let Some(seq_idx) = desc
-                    .sequences
-                    .iter()
-                    .position(|x| x.name == al.sequence)
-                else {
-                    seq_errors.push(e(
-                        format!("{at}.auto_layers[{li}].sequence"),
-                        format!("找不到序列 {:?}", al.sequence),
-                    ));
-                    bad = true;
-                    continue;
-                };
-                auto_layers.push(crate::model::CompiledAutoLayer {
-                    sequence: seq_idx as i16,
-                    pose: al.pose,
-                    flags: al.flags,
-                    // `write.cpp:539-551`：不带 `STUDIO_AL_POSE` 时
-                    // 四个量**除以 `numframes − 1`**（转 cycle）。
-                    start: layer_time(al.start, al.flags, nf),
-                    peak: layer_time(al.peak, al.flags, nf),
-                    tail: layer_time(al.tail, al.flags, nf),
-                    end: layer_time(al.end, al.flags, nf),
-                });
-            }
-            if bad {
-                continue;
-            }
-
-            // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23），见
-            // [`sequence_ik_rules_attach_to_first_cell`] 的说明。
-            if let Some(&first_cell) = cell_idx.first() {
-                anims[first_cell].ik_rules.extend(s.ik_rules.iter().cloned());
-            }
-
-            let first = anims[cell_idx[0]].frames.clone();
-            let nf_i = first.len() as i32;
+            let nf = frames.len() as i32;
             let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
             let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
-            // `blendcenter` 在网格里的位置（`simplify.cpp:5503-5517`）：
-            // 逐格比 animdesc 指针，命中就记下 `(i0, i1)`。
+            // ---- 自动层（`addlayer <序列名>`）----
             //
-            // ⚠️ 官方比的是**动画对象指针**，所以「同一格被引用两次」时
-            // 取**先命中的那个**（双层循环 `i0` 外层、`i1` 内层）。
-            let blend_center = s.blend_center.as_ref().and_then(|name| {
-                let want = resolve_lookup_animation(name, &anims, &anim_index, &sequences)?;
-                (0..grid[1]).find_map(|k| {
-                    (0..grid[0])
-                        .find(|&j| cell_idx.get(k * grid[0] + j) == Some(&want))
-                        .map(|j| [j, k])
-                })
-            });
+            // ⚠️ **单动画序列与 blend 序列走的是两条不同的代码路径**，而
+            // `addlayer` 在**两条路径上都必须处理**。
+            //
+            // 官方 `ParseSequence` 的 `addlayer` 分支（`studiomdl.cpp:2867-2872`）
+            // 只把序列名记进 `pseq->autolayer[]`，**与 `numblends` 无关** ——
+            // 所以 `$sequence "reload_layer" "al_reload" … addlayer "look_poses"`
+            // （单动画 + addlayer）与 `$sequence "idle" "a_run" "a_idle" … addlayer …`
+            // （blend + addlayer）**是同一件事**。
+            //
+            // 早先这里对单动画路径写死了 `auto_layers: Vec::new()` ⟹
+            // `reload_layer` / `reload_loop_layer` / `reload_end_layer` 三条序列的
+            // `addlayer "look_poses"` **被静默丢弃**（NekoMDL 有、mdlc 没有）。
+            // 自动层丢失 ⟹ 引擎不会把这些序列与 `look_poses` 混合 ⟹
+            // **手部/上身姿态少了一层**。
+            //
+            // 帧数取**本序列第一格**的（官方用 `panim[0][0]->numframes`，
+            // `write.cpp:541-544`），与 blend 路径同一口径。
+            let mut auto_layers = Vec::with_capacity(s.auto_layers.len());
+            {
+                let nf = frames.len().max(1) as f32;
+                for (li, al) in s.auto_layers.iter().enumerate() {
+                    let Some(seq_idx) = desc.sequences.iter().position(|x| x.name == al.sequence) else {
+                        seq_errors.push(e(
+                            format!("{at}.auto_layers[{li}].sequence"),
+                            format!("找不到序列 {:?}", al.sequence),
+                        ));
+                        continue;
+                    };
+                    auto_layers.push(crate::model::CompiledAutoLayer {
+                        sequence: seq_idx as i16,
+                        pose: al.pose,
+                        flags: al.flags,
+                        // `write.cpp:539-551`：不带 `STUDIO_AL_POSE` 时
+                        // 四个量**除以 `numframes − 1`**（转 cycle）。
+                        start: layer_time(al.start, al.flags, nf),
+                        peak: layer_time(al.peak, al.flags, nf),
+                        tail: layer_time(al.tail, al.flags, nf),
+                        end: layer_time(al.end, al.flags, nf),
+                    });
+                }
+            }
             sequences.push(crate::model::CompiledSequence {
                 name: s.name.clone(),
-                smd_path: anims[cell_idx[0]].smd_path.clone(),
+                smd_path,
                 fps: s.fps.unwrap_or(30.0),
                 looping: s.looping,
                 activity: -1,
                 activity_name: s.activity.clone().unwrap_or_default(),
                 activity_weight: s.activity_weight,
                 delta: s.delta,
-                frames: first,
-                cells: cell_idx.clone(),
-                blend_width: width,
-                blend_params: params,
-                calc_axes,
-                blend_ref: s.blend_ref.clone(),
-                blend_comp: s.blend_comp.clone(),
-                blend_center,
+                frames,
+                cells: vec![anim_ix],
+                blend_width: 1,
+                blend_params: [None, None],
+                // 单动画序列的 `groupsize` 是 1×1 ⟹ 官方
+                // `CalcPoseParameters` 的 `groupsize[iPose] > 1` **不成立**
+                // ⟹ 一根轴都不遍历 ⟹ 没有 calc 轴。
+                calc_axes: Vec::new(),
+                blend_ref: None,
+                blend_comp: None,
+                blend_center: None,
                 auto_layers,
                 events: s.events.clone(),
                 fade_in: s.fade_in,
@@ -2305,370 +2660,20 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 ik_rules: s.ik_rules.clone(),
                 iklocks: s.iklocks.clone(),
                 movements: s.movements.clone(),
-                section_frames: if sec_len > 0 && nf_i >= sec_thr { sec_len } else { 0 },
-                num_sections: 0,
-                // 本序列的权重 = 各格动画**逐骨骼取 MAX**（`simplify.cpp:302-318`）。
-                weights: merge_weights(&cell_idx, &anim_weights, desc.bones.len()),
-                // 取**第一格**减除前的帧（官方按格取，但 blend 的每一格
-                // 都是独立的 animdesc，这里 `first` 也是第一格的）。
-                pre_subtract_frames: pre_subtract
-                    .get(cell_idx[0])
-                    .and_then(|p| p.clone()),
+                section_frames: if sec_len > 0 && nf >= sec_thr { sec_len } else { 0 },
+                num_sections: 0, // 下面按 section_frames 算（依赖 frames 数）
+                // 序列级 `subtract` 的「减除前帧」优先；否则用动画自己的。
+                pre_subtract_frames: seq_pre_subtract
+                    .or_else(|| pre_subtract.get(anim_ix).and_then(|p| p.clone())),
                 extra_flags: s.extra_flags,
                 forward_declared: false,
+                weights: merge_weights(&[anim_ix], &anim_weights, n_bones),
             });
-            continue;
         }
-
-        // ---- 单动画序列：隐含动画 ----
-        //
-        // QC 里 `$sequence "reload" "reload.smd"` 与 `$sequence "x" "a_idle"`
-        // 是**同一个语法**：块里给的是一个**名字**（token）。官方先按
-        // 这个名字查 `$animation` 池（`studiomdl.cpp:2952-2959`）——
-        //
-        // * 查到 ⟹ **复用**那个 animdesc（不新建）；
-        // * 查不到 ⟹ `Cmd_ImpliedAnimation` 新建一个，名字加 `@` 前缀。
-        //
-        // ⚠️ **隐含动画登记在 `@序列名` 下，不是文件名下。**
-        // 所以 `$sequence "reload" "reload.smd"` 与
-        // `$sequence "reload_layer" "reload.smd"` 是**两条独立动画**
-        // （`@reload` / `@reload_layer`）—— 后者的 token 再去查池时
-        // 找不到 `reload.smd`（池里没有这个名字），于是又建一个。
-        // 早先本实现按**文件名**登记，于是这两条被错误地并成一条
-        // （实测 `numlocalanim` 17 vs 官方 29）。
-        let smd_path = resolve_smd_path(base_dir, &s.smd);
-        let by_name = anim_index.get(s.smd.as_str()).copied();
-        let reused = by_name.is_some();
-        let (anim_ix, mut frames) = match by_name {
-            Some(i) => (i, anims[i].frames.clone()),
-            None => {
-                let Some((frames, _smd)) = load_smd_frames(
-                    &smd_path,
-                    desc,
-                    &bone_index,
-                    &format!("{at}.smd"),
-                    &mut seq_errors,
-                ) else {
-                    continue;
-                };
-                let i = anims.len();
-                let name = format!("@{}", s.name);
-                // 登记在**动画名**下，与官方一致。
-                anim_index.insert(Box::leak(name.clone().into_boxed_str()), i);
-                // 隐含动画的权重取**序列**的 `weightlist`
-                // （官方 `Cmd_ImpliedAnimation` 建完动画后，序列的
-                // `cmds[]` 里的 `CMD_WEIGHTS` 会作用到它）。
-                anim_weights.push(weights_of(s.weight_list.as_deref()));
-                anims.push(crate::model::CompiledAnimation {
-                    name,
-                    smd_path: smd_path.clone(),
-                    fps: s.fps.unwrap_or(30.0),
-                    looping: s.looping,
-                    frames: frames.clone(),
-                    delta: false,
-                    ik_rules: s.ik_rules.clone(),
-                    no_auto_ik: s.no_auto_ik,
-                    pre_subtract_frames: None,
-                });
-                (i, frames)
-            }
-        };
-
-        // `$sequence` 块里的 `ikrule` 属于**第一格动画**（R23）。
-        //
-        // 隐含动画在上面构造时已经把 `s.ik_rules` 放进去了；只有**复用**
-        // 已声明动画（`$sequence "reload" "a_reload"`）时才需要补 ——
-        // 那种写法下规则在 `$animation` 块里没有，只能从序列搬过来。
-        if reused {
-            anims[anim_ix].ik_rules.extend(s.ik_rules.iter().cloned());
+        if !seq_errors.is_empty() {
+            return Err(seq_errors);
         }
-
-        // ---- `$sequence` 块里的 `weightlist`（`CMD_WEIGHTS`）----
-        //
-        // 与 `ikrule`（R23）**同一个机制**：官方 `ParseSequence` 把序列块里的
-        // 「动画选项」交给 `ParseAnimationToken(animations[0])`
-        // （`studiomdl.cpp:2944`），而 `weightlist` 只由 `ParseCmdlistToken`
-        // 处理（`studiomdl.cpp:1714-1732`）⟹ 它落成
-        // **`animations[0]->cmds[]` 里的一条 `CMD_WEIGHTS`**，
-        // 由 `processAnimations`（`simplify.cpp:154-166`）执行
-        // `setAnimationWeight(panim, index)` —— **作用在动画对象上**。
-        //
-        // 隐含动画那条路径（`!reused`）已经在上面把 `s.weight_list` 用掉了；
-        // **复用**已声明动画时（`$sequence "fidget" "a_look_mid" weightlist "empty"`）
-        // 必须**覆盖**那个共享动画的权重 —— 官方就是改共享对象。
-        //
-        // ⚠️ 这不是「序列自己的权重」：序列的 `weight[]` 是
-        // `merge_weights`（`simplify.cpp:302-318`）**对各格取 MAX** 得来的。
-        // 所以 `fidget`（单格 = `a_look_mid`）得到**全 0**，而共用
-        // `a_look_mid` 的 `look_poses`（三格）取 MAX 后仍是**全 1** ——
-        // 实测 NekoMDL 与发布版**都是这个形态**（`fidget` 全 0、
-        // `look_poses` 全非零），而 mdlc 修前两边都给全 1。
-        //
-        // 早先只在 `!reused` 分支处理 ⟹ `fidget` / `fidget_layer` 的
-        // `weightlist "empty"` **被静默丢弃**。
-        if s.weight_list.is_some() {
-            anim_weights[anim_ix] = weights_of(s.weight_list.as_deref());
-        }
-
-        // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
-        //
-        // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
-        // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
-        // 执行 `forceNumframes(panim, frames)`。
-        //
-        // 官方实现（`simplify.cpp:1279-1293`）：
-        // ```c
-        // for (j = panim->numframes; j < numframes; j++) {
-        //     panim->sanim[j] = kalloc(1, size);
-        //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
-        // }
-        // panim->numframes = numframes;
-        // ```
-        // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
-        // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
-        // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
-        // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
-        // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
-        //  `a_look_mid` 的 nf = 90）。
-        //
-        // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
-        // `Sequence::num_frames` 后只用于事件 cycle 的换算
-        // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
-        // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
-        // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
-        //
-        // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
-        // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
-        // 则本序列拿到的还是旧副本。
-        // ---- `$sequence` 块里的 `numframes <N>`（`CMD_NUMFRAMES`）----
-        //
-        // 同一条机制：官方把它落成 `animations[0]->cmds[]` 里的
-        // `CMD_NUMFRAMES`，由 `processAnimations`（`simplify.cpp:248-252`）
-        // 执行 `forceNumframes(panim, frames)`。
-        //
-        // 官方实现（`simplify.cpp:1279-1293`）：
-        // ```c
-        // for (j = panim->numframes; j < numframes; j++) {
-        //     panim->sanim[j] = kalloc(1, size);
-        //     memcpy( panim->sanim[j], panim->sanim[panim->numframes-1], size );
-        // }
-        // panim->numframes = numframes;
-        // ```
-        // ⟹ **只延长，不缩短**：把**最后一帧**复制到 `numframes` 为止。
-        // 而且它改的是**共享的动画对象** —— 所以 `$sequence "fidget" "a_look_mid"
-        // … numframes 90` 会把 `a_look_mid` 本身变成 90 帧，
-        // 引用同一个 `a_look_mid` 的 `look_poses` 也**跟着变成 90 帧**
-        // （实测 NekoMDL 与发布版都是这个形态：`look_poses` 的 blend 表里
-        //  `a_look_mid` 的 nf = 90）。
-        //
-        // 早先 mdlc **完全没实现** `CMD_NUMFRAMES` —— QC 解析器把值读进
-        // `Sequence::num_frames` 后只用于事件 cycle 的换算
-        // （`qc/parse.rs` 的 `nf`），动画帧数**从未被改过** ⟹
-        // `a_look_mid` 停在 1 帧（`look_poses.smd` 只有 3 帧，
-        // `frames 1 1` 取第 1 帧），而 `fidget` 序列期望 90 帧。
-        //
-        // ⚠️ 必须**同时**改共享动画与本地副本 —— 只改本地 `frames` 会让
-        // 「共享」这件事丢掉（`look_poses` 仍是 1 帧），只改 `anims[]`
-        // 则本序列拿到的还是旧副本。
-        if let Some(n) = s.num_frames {
-            let n = n.max(0) as usize;
-            if n > 0 && n > anims[anim_ix].frames.len() {
-                let last = anims[anim_ix].frames.last().cloned();
-                if let Some(last) = last {
-                    while anims[anim_ix].frames.len() < n {
-                        anims[anim_ix].frames.push(last.clone());
-                    }
-                }
-            }
-        }
-        // 本序列的帧副本与共享动画保持一致（`forceNumframes` 只延长）。
-        if s.num_frames.is_some() {
-            frames = anims[anim_ix].frames.clone();
-        }
-
-        // ---- `$sequence` 块里的 `subtract`（`CMD_SUBTRACT`）----
-        //
-        // 官方 `ParseSequence` 在 `numblends || isAppend` 时把 token 交给
-        // `ParseAnimationToken(animations[0])`（`studiomdl.cpp:2944`），所以
-        // `subtract` 在 `$sequence` 里**同样合法**，且作用对象是
-        // `animations[0]` 那个**动画**（cmds 挂在 panim 上）。
-        //
-        // 本实现把减除作用在**本序列自己的帧副本**上，而不是去改共享的
-        // `anims[j].frames` —— 官方那样会让「同一个动画被两条序列引用」时
-        // 互相污染（减除被叠加两次）。后者在本工程里观测不到（每条
-        // `*_layer` 序列各有独立动画），但改共享状态是更差的选择。
-        let mut seq_pre_subtract: Option<Vec<Vec<crate::smd::SmdPose>>> = None;
-        // ⚠️ **`$sequence` 的 `delta` / `subtract` 必须把
-        // `anims[anim_ix].delta` 也置上** —— 官方是**同一个**标志。
-        //
-        // 官方 `ParseSequence`（`studiomdl.cpp:2827-2831`）把 `delta` 置到
-        // `pseq->flags`（**seqdesc**）；而 `ParseAnimationToken` 的
-        // `CMD_SUBTRACT`（`simplify.cpp:163-166`）把 `panim->flags` 置上
-        // `STUDIO_DELTA`。**两条路径最终都作用到动画的 `flags`** ——
-        // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags`，
-        // 而 `anim_writer.rs:3110` 正是照抄这条。
-        //
-        // # 实测症状（R9）
-        //
-        // `vm_test_group` 的 6 个官方 viewmodel 里，`@*_layer` 动画：
-        // ```text
-        //   animdesc.flags   mdlc = 0x000        官方 = 0x004 (STUDIO_DELTA)
-        //   seqdesc.flags    mdlc = 0x014        官方 = 0x014   ✅ 已对
-        // ```
-        // 即 **seqdesc 说「我是增量」，animdesc 却说「我是绝对姿态」** ——
-        // 两者矛盾。`.mdl` 体积也因此差 ~16 KB（3/6 个模型）。
-        //
-        // `delta` 同时驱动**动画数据的编码方式**（`anim_writer.rs:2154/2690/2876`），
-        // 所以这不只是标志位不一致 —— **动画数据本身按错误的方式写了**。
-        // 这正是用户报的「动画错乱」的一个具体成因。
-        //
-        // ⚠️ **但 `subtract` 与 `delta` 对 seqdesc 的影响不同**（R11）：
-        //
-        // | QC 写法 | `animdesc.flags` | `seqdesc.flags` |
-        // |---|---|---|
-        // | 只有 `subtract` | **有** DELTA | **无** DELTA |
-        // | `delta`（可同时有 `subtract`） | 有 DELTA | **有** DELTA |
-        //
-        // 因为官方两条路径落在**不同对象**上：
-        //   * `CMD_SUBTRACT`（`simplify.cpp:163-166`）→ `panim->flags`（**动画**）
-        //   * `delta` 关键字（`studiomdl.cpp:2827-2831`）→ `pseq->flags`（**序列**）
-        // 而 `write.cpp:436` 是 `pseqdesc->flags = g_sequence[i].flags`、
-        // `write.cpp:1013` 是 `panimdesc[i].flags = srcanim->flags` —— 各写各的。
-        //
-        // 实测（更新后的 `vm_test_group`）：`helping_hand_extend_layer` /
-        // `item_extend_layer` 等 6 条只有 `subtract` 没有 `delta`，
-        // 官方 seqdesc = `0x000`，而第一版修复给了 `0x004`。
-        let seq_is_delta = s.delta || s.subtract.is_some();
-        if seq_is_delta {
-            anims[anim_ix].delta = true;
-        }
-        if let Some(ref_name) = s.subtract.as_deref() {
-            match anim_index.get(ref_name) {
-                Some(&j) => {
-                    let src = anims[j].frames.clone();
-                    let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
-                    if bf >= src.len() {
-                        seq_errors.push(CompileError {
-                            at: format!("{at}.subtract_frame"),
-                            message: format!(
-                                "参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧",
-                                src.len()
-                            ),
-                        });
-                        continue;
-                    }
-                    // 包围盒用**减除前**的姿态（与 `[[animations]]` 同规则）。
-                    seq_pre_subtract = Some(frames.clone());
-                    // 权重 ≤ 0 的骨骼不减除（`simplify.cpp:1088`）。
-                    let w = weights_of(s.weight_list.as_deref());
-                    subtract_base_frames(&mut frames, &src, bf, &w);
-                }
-                None => {
-                    seq_errors.push(CompileError {
-                        at: format!("{at}.subtract"),
-                        message: format!(
-                            "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名**，\
-                             现有：{}）",
-                            desc.animations
-                                .iter()
-                                .map(|a| a.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    });
-                    continue;
-                }
-            }
-        }
-
-        let nf = frames.len() as i32;
-        let sec_len = s.section_frames.unwrap_or(DEFAULT_SECTION_FRAMES);
-        let sec_thr = s.section_threshold.unwrap_or(DEFAULT_SECTION_THRESHOLD);
-        // ---- 自动层（`addlayer <序列名>`）----
-        //
-        // ⚠️ **单动画序列与 blend 序列走的是两条不同的代码路径**，而
-        // `addlayer` 在**两条路径上都必须处理**。
-        //
-        // 官方 `ParseSequence` 的 `addlayer` 分支（`studiomdl.cpp:2867-2872`）
-        // 只把序列名记进 `pseq->autolayer[]`，**与 `numblends` 无关** ——
-        // 所以 `$sequence "reload_layer" "al_reload" … addlayer "look_poses"`
-        // （单动画 + addlayer）与 `$sequence "idle" "a_run" "a_idle" … addlayer …`
-        // （blend + addlayer）**是同一件事**。
-        //
-        // 早先这里对单动画路径写死了 `auto_layers: Vec::new()` ⟹
-        // `reload_layer` / `reload_loop_layer` / `reload_end_layer` 三条序列的
-        // `addlayer "look_poses"` **被静默丢弃**（NekoMDL 有、mdlc 没有）。
-        // 自动层丢失 ⟹ 引擎不会把这些序列与 `look_poses` 混合 ⟹
-        // **手部/上身姿态少了一层**。
-        //
-        // 帧数取**本序列第一格**的（官方用 `panim[0][0]->numframes`，
-        // `write.cpp:541-544`），与 blend 路径同一口径。
-        let mut auto_layers = Vec::with_capacity(s.auto_layers.len());
-        {
-            let nf = frames.len().max(1) as f32;
-            for (li, al) in s.auto_layers.iter().enumerate() {
-                let Some(seq_idx) = desc.sequences.iter().position(|x| x.name == al.sequence) else {
-                    seq_errors.push(e(
-                        format!("{at}.auto_layers[{li}].sequence"),
-                        format!("找不到序列 {:?}", al.sequence),
-                    ));
-                    continue;
-                };
-                auto_layers.push(crate::model::CompiledAutoLayer {
-                    sequence: seq_idx as i16,
-                    pose: al.pose,
-                    flags: al.flags,
-                    // `write.cpp:539-551`：不带 `STUDIO_AL_POSE` 时
-                    // 四个量**除以 `numframes − 1`**（转 cycle）。
-                    start: layer_time(al.start, al.flags, nf),
-                    peak: layer_time(al.peak, al.flags, nf),
-                    tail: layer_time(al.tail, al.flags, nf),
-                    end: layer_time(al.end, al.flags, nf),
-                });
-            }
-        }
-        sequences.push(crate::model::CompiledSequence {
-            name: s.name.clone(),
-            smd_path,
-            fps: s.fps.unwrap_or(30.0),
-            looping: s.looping,
-            activity: -1,
-            activity_name: s.activity.clone().unwrap_or_default(),
-            activity_weight: s.activity_weight,
-            delta: s.delta,
-            frames,
-            cells: vec![anim_ix],
-            blend_width: 1,
-            blend_params: [None, None],
-            // 单动画序列的 `groupsize` 是 1×1 ⟹ 官方
-            // `CalcPoseParameters` 的 `groupsize[iPose] > 1` **不成立**
-            // ⟹ 一根轴都不遍历 ⟹ 没有 calc 轴。
-            calc_axes: Vec::new(),
-            blend_ref: None,
-            blend_comp: None,
-            blend_center: None,
-            auto_layers,
-            events: s.events.clone(),
-            fade_in: s.fade_in,
-            fade_out: s.fade_out,
-            no_auto_ik: s.no_auto_ik,
-            ik_rules: s.ik_rules.clone(),
-            iklocks: s.iklocks.clone(),
-            movements: s.movements.clone(),
-            section_frames: if sec_len > 0 && nf >= sec_thr { sec_len } else { 0 },
-            num_sections: 0, // 下面按 section_frames 算（依赖 frames 数）
-            // 序列级 `subtract` 的「减除前帧」优先；否则用动画自己的。
-            pre_subtract_frames: seq_pre_subtract
-                .or_else(|| pre_subtract.get(anim_ix).and_then(|p| p.clone())),
-            extra_flags: s.extra_flags,
-            forward_declared: false,
-            weights: merge_weights(&[anim_ix], &anim_weights, n_bones),
-        });
-    }
-    if !seq_errors.is_empty() {
-        return Err(seq_errors);
-    }
-    drop(_t_seq);
+    });
 
     // 段表条目数 = `floor(numframes / sectionframes) + 2`（**不是 ceil**）。
     // 引擎索引的最大下标是 `numframes/sectionframes + 1`（`studio.cpp:345`）。
@@ -2732,99 +2737,99 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     // `LinkIKChains()`（7233）—— 所以 `$ikchain` 推出来的 `childbone[]`
     // 此时已经就绪。它**早于** `SetupHitBoxes()`（7319），所以自动 hitbox
     // 用的是重排后的 `boneToPose`。
-    let _t_realign = crate::prof::Span::new("realign + flex/jiggle 收尾");
-    compiled.realigned = compute_realigned_poses(&compiled);
+    hotpath::measure_block!("realign + flex/jiggle 收尾", {
+        compiled.realigned = compute_realigned_poses(&compiled);
 
-    // 动画帧也要搬进重排后的空间（`simplify.cpp:1527`）：
-    //
-    // ```cpp
-    // ConcatTransforms( srcBoneToWorld[q], g_bonetable[k].srcRealign, destBoneToWorld[k] );
-    // ```
-    //
-    // 即「源骨架的第 f 帧世界变换」右乘 `srcRealign` 就得到重排后的世界变换，
-    // 再由它反解出新的**局部**姿态。漏掉这一步的症状：骨骼表是对的，
-    // 但动画的骨骼位置整体错位 —— `hull`/`seqdesc` 包围盒、`rotscale`、
-    // 动画链头全都跟着错，而**不会报任何错**。
-    if compiled.realigned.is_some() {
-        realign_sequence_frames(&mut compiled);
-    }
-
-    // ---- 顶点搬到最终参考姿态的空间（`RemapVerticesToGlobalBones`）----
-    //
-    // 官方时序：`RealignBones()`（`:7237`）→ **本步**（`:7258`）→
-    // `UnifyLODs()`（`:7262`）。
-    //
-    // ⚠️ mdlc 的 `build_model_lods`（LOD 统一池）是在上面的 bodypart 循环里
-    // 跑的，**早于**这里 —— 但它把 `mesh.vertices` **克隆**进 LOD 0 池
-    // （`compile.rs:244` 的 `per_mesh[ki].push((mesh.vertices.clone(), …))`），
-    // 所以统一池里的 LOD 0 顶点是**当时**的值。若在这里才改
-    // `mesh.vertices`，统一池就与它分叉了。
-    //
-    // 因此本步必须在**读 LOD 之前**做。但 `resolve_bone_pose` 需要
-    // `compiled.bodyparts[].models[].poses`（SMD 第 0 帧），而那是 bodypart
-    // 循环里才填的 —— 循环依赖。
-    //
-    // 解法：本函数**同时**改 `mesh.vertices` 与 `lods.meshes[].vertices`
-    // （两者都要改，各恰好一次）。见 `remap_vertices_to_reference_pose`。
-    let _t_remap = crate::prof::Span::new("remap_vertices_to_reference_pose");
-    let remapped = remap_vertices_to_reference_pose(&mut compiled);
-    drop(_t_remap);
-    let _ = remapped;
-
-    // ---- `$ikchain` 的 kneeDir 自动推导 ----
-    //
-    // 官方 `simplify.cpp:2839-2912`：QC 没写 `knee` 时，**从动画里算**出来。
-    // 语料里 272 条链有 **263 条非零**，所以这条不是可选项。
-    derive_ikchain_knee_dirs(&mut compiled);
-
-    // ---- `CalcPoseParameters`（`simplify.cpp:5448-5596`）----
-    //
-    // 官方在 `ProcessData` 的**末尾**调用（`simplify.cpp:7315`），晚于
-    // `LinkAttachments`（7298）与 `ProcessIKRules`（7311）。这里放在
-    // kneeDir 之后 —— 两者互不影响（kneeDir 只看 `$ikchain` 的骨骼，
-    // calcblend 只看附着点），但保持「序列/动画/附着点全就绪」的前提。
-    //
-    // ⚠️ 这是**硬错误**路径：官方在这里 `MdlError` 直接中止编译。
-    apply_calc_blend_axes(&mut compiled, &anim_weights, base_dir)?;
-
-    // ---- flex / eyeball / mouth 解析（在重排定稿后）----
-    // eyeball 的 `up`/`forward`/`org` 用 [`internal_bone_world`] 的世界矩阵
-    // 逆变换 —— 与自动 hitbox / 姿态包围盒**同一份口径**（官方
-    // `g_bonetable[k].boneToPose`，不是骨骼表最终矩阵）。
-    //
-    // ⚠️ VTA 的 flexdesc 注册必须在这里做（**早于** flexrule/eyeball 的
-    // 名字解析），因为 `flex` 会**追加** flexdesc，而后续所有按名查表
-    // 都依赖最终的下标。所以先注册 VTA 的 desc，再统一解析。
-    resolve_vta_flexes(&mut compiled, base_dir)?;
-
-    resolve_flex_eyeball_mouth(&mut compiled)?;
-
-    // ---- jigglebone（`mstudiojigglebone_t`，L4D2 独有的 `$jigglebone`）----
-    //
-    // 程序化骨骼块夹在骨骼数组与 `bonecontroller` 之间（`write.cpp:214-285`），
-    // 所以 `layout.rs` 的公式依赖这里的条数；解析必须在写出之前完成。
-    resolve_jiggle_bones(&mut compiled)?;
-    resolve_quat_interp_bones(&mut compiled)?;
-
-    if compiled.desc.hitboxes.boxes.is_empty() {
-        let auto = auto_hitboxes(&compiled);
-        // **即使 `auto` 为空也要建 set** —— 官方在过滤前就建好了 set 并置了
-        // 标志（`simplify.cpp:6884-6892` 在建 set 与置标志之后才过滤）。
-        // 实测语料 166 个模型是「set 存在但 0 box」且**全部**带 `0x1` 标志。
-        compiled.desc.hitboxes.set_name = Some("default".to_string());
-        compiled.desc.hitboxes.boxes = auto;
-        compiled.desc.hitboxes.autogenerated = true;
-        // `simplify.cpp:6892`：自动生成路径置
-        // `gflags |= STUDIOHDR_FLAGS_AUTOGENERATED_HITBOX`（**0x1**）。
+        // 动画帧也要搬进重排后的空间（`simplify.cpp:1527`）：
         //
-        // 注意它是 flags 的**最低位**，不是 0x2000。
-        // 实测 `ip_official.mdl`（`ip.qc` 没写 `$hbox`）的 `flags == 0x1`
-        // 正是它。
-        let f = compiled.desc.model.extra_flags.unwrap_or(0);
-        compiled.desc.model.extra_flags =
-            Some(f | crate::mdl_writer::FLAG_AUTOGENERATED_HITBOX);
-    }
-    drop(_t_realign);
+        // ```cpp
+        // ConcatTransforms( srcBoneToWorld[q], g_bonetable[k].srcRealign, destBoneToWorld[k] );
+        // ```
+        //
+        // 即「源骨架的第 f 帧世界变换」右乘 `srcRealign` 就得到重排后的世界变换，
+        // 再由它反解出新的**局部**姿态。漏掉这一步的症状：骨骼表是对的，
+        // 但动画的骨骼位置整体错位 —— `hull`/`seqdesc` 包围盒、`rotscale`、
+        // 动画链头全都跟着错，而**不会报任何错**。
+        if compiled.realigned.is_some() {
+            realign_sequence_frames(&mut compiled);
+        }
+
+        // ---- 顶点搬到最终参考姿态的空间（`RemapVerticesToGlobalBones`）----
+        //
+        // 官方时序：`RealignBones()`（`:7237`）→ **本步**（`:7258`）→
+        // `UnifyLODs()`（`:7262`）。
+        //
+        // ⚠️ mdlc 的 `build_model_lods`（LOD 统一池）是在上面的 bodypart 循环里
+        // 跑的，**早于**这里 —— 但它把 `mesh.vertices` **克隆**进 LOD 0 池
+        // （`compile.rs:244` 的 `per_mesh[ki].push((mesh.vertices.clone(), …))`），
+        // 所以统一池里的 LOD 0 顶点是**当时**的值。若在这里才改
+        // `mesh.vertices`，统一池就与它分叉了。
+        //
+        // 因此本步必须在**读 LOD 之前**做。但 `resolve_bone_pose` 需要
+        // `compiled.bodyparts[].models[].poses`（SMD 第 0 帧），而那是 bodypart
+        // 循环里才填的 —— 循环依赖。
+        //
+        // 解法：本函数**同时**改 `mesh.vertices` 与 `lods.meshes[].vertices`
+        // （两者都要改，各恰好一次）。见 `remap_vertices_to_reference_pose`。
+        hotpath::measure_block!("remap_vertices_to_reference_pose", {
+            let remapped = remap_vertices_to_reference_pose(&mut compiled);
+            let _ = remapped;
+        });
+
+        // ---- `$ikchain` 的 kneeDir 自动推导 ----
+        //
+        // 官方 `simplify.cpp:2839-2912`：QC 没写 `knee` 时，**从动画里算**出来。
+        // 语料里 272 条链有 **263 条非零**，所以这条不是可选项。
+        derive_ikchain_knee_dirs(&mut compiled);
+
+        // ---- `CalcPoseParameters`（`simplify.cpp:5448-5596`）----
+        //
+        // 官方在 `ProcessData` 的**末尾**调用（`simplify.cpp:7315`），晚于
+        // `LinkAttachments`（7298）与 `ProcessIKRules`（7311）。这里放在
+        // kneeDir 之后 —— 两者互不影响（kneeDir 只看 `$ikchain` 的骨骼，
+        // calcblend 只看附着点），但保持「序列/动画/附着点全就绪」的前提。
+        //
+        // ⚠️ 这是**硬错误**路径：官方在这里 `MdlError` 直接中止编译。
+        apply_calc_blend_axes(&mut compiled, &anim_weights, base_dir)?;
+
+        // ---- flex / eyeball / mouth 解析（在重排定稿后）----
+        // eyeball 的 `up`/`forward`/`org` 用 [`internal_bone_world`] 的世界矩阵
+        // 逆变换 —— 与自动 hitbox / 姿态包围盒**同一份口径**（官方
+        // `g_bonetable[k].boneToPose`，不是骨骼表最终矩阵）。
+        //
+        // ⚠️ VTA 的 flexdesc 注册必须在这里做（**早于** flexrule/eyeball 的
+        // 名字解析），因为 `flex` 会**追加** flexdesc，而后续所有按名查表
+        // 都依赖最终的下标。所以先注册 VTA 的 desc，再统一解析。
+        resolve_vta_flexes(&mut compiled, base_dir)?;
+
+        resolve_flex_eyeball_mouth(&mut compiled)?;
+
+        // ---- jigglebone（`mstudiojigglebone_t`，L4D2 独有的 `$jigglebone`）----
+        //
+        // 程序化骨骼块夹在骨骼数组与 `bonecontroller` 之间（`write.cpp:214-285`），
+        // 所以 `layout.rs` 的公式依赖这里的条数；解析必须在写出之前完成。
+        resolve_jiggle_bones(&mut compiled)?;
+        resolve_quat_interp_bones(&mut compiled)?;
+
+        if compiled.desc.hitboxes.boxes.is_empty() {
+            let auto = auto_hitboxes(&compiled);
+            // **即使 `auto` 为空也要建 set** —— 官方在过滤前就建好了 set 并置了
+            // 标志（`simplify.cpp:6884-6892` 在建 set 与置标志之后才过滤）。
+            // 实测语料 166 个模型是「set 存在但 0 box」且**全部**带 `0x1` 标志。
+            compiled.desc.hitboxes.set_name = Some("default".to_string());
+            compiled.desc.hitboxes.boxes = auto;
+            compiled.desc.hitboxes.autogenerated = true;
+            // `simplify.cpp:6892`：自动生成路径置
+            // `gflags |= STUDIOHDR_FLAGS_AUTOGENERATED_HITBOX`（**0x1**）。
+            //
+            // 注意它是 flags 的**最低位**，不是 0x2000。
+            // 实测 `ip_official.mdl`（`ip.qc` 没写 `$hbox`）的 `flags == 0x1`
+            // 正是它。
+            let f = compiled.desc.model.extra_flags.unwrap_or(0);
+            compiled.desc.model.extra_flags =
+                Some(f | crate::mdl_writer::FLAG_AUTOGENERATED_HITBOX);
+        }
+    });
 
     // ---- 顶点超限的 mesh 自动拆分（`split_oversized_meshes`，默认开）----
     //
@@ -2833,8 +2838,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     //
     // 不超限时它是 **no-op**（第一行就返回），所以对既有产物零影响。
     if compiled.desc.model.split_oversized_meshes {
-        let _t_split = crate::prof::Span::new("split_oversized_meshes");
-        split_oversized_meshes(&mut compiled)?;
+        hotpath::measure_block!("split_oversized_meshes", {
+            split_oversized_meshes(&mut compiled)?;
+        });
     }
 
     Ok(compiled)

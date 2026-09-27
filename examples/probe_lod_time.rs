@@ -14,11 +14,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// 分段计时报告写到 CWD 的 `mdlc-prof.txt`（`HOTPATH_OUTPUT_PATH` 可改路径）。
+/// 未开 `hotpath` feature 时属性宏原样返回函数，零开销。
+#[hotpath::main(
+    percentiles = [50, 95, 99],
+    functions_limit = 0,
+    output_path = "mdlc-prof.txt"
+)]
 fn main() {
-    // 分段计时：guard 必须绑定到具名变量，否则当场析构（见 `src/prof.rs`）。
-    // 未开 `hotpath` feature 或未设 `MDLC_PROF` 时是零开销的 `None`。
-    let _prof = mdlc::prof::start();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut reps = 3usize;
     let mut toml: Option<PathBuf> = None;

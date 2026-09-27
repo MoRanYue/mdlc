@@ -1675,70 +1675,74 @@ fn unify_lods_impl<const USE_INDEX: bool>(
                 tangent: cand_t,
                 lod_flags: 0,
             };
-            // ⚠️ 这几个 `Span` 是 §49 定位热点的**证据来源**，
-            // 默认 feature 下是零开销的空实现（见 `src/prof.rs`）。
-            let t1 = crate::prof::Span::new("    unify: 1) 根区间几何匹配");
-            match lookup_best::<USE_INDEX>(
-                &mut index, &pool, root_start, root_end, cand, &cand_t, true, true,
-            ) {
-                // 命中 ⟹ **整条拷贝**（含根 LOD 的权重与切线）。
-                Some(k) => ideal = pool[k].clone(),
-                // 未命中 ⟹ 从根 LOD 源里按位置找最近的权重。
-                None => {
-                    ideal.v.bones = find_bone_weight_within_model(cand, &cand_t, &pool[root_start..root_end]);
+            // ⚠️ 这 4 个 `measure_block!` 是 §49 定位热点的**证据来源**。
+            // 未开 `hotpath` feature 时它退化成 `{ $expr }`（hotpath 的
+            // `lib_off.rs`），零开销，所以调用点不需要任何 `#[cfg]`。
+            hotpath::measure_block!("    unify: 1) 根区间几何匹配", {
+                match lookup_best::<USE_INDEX>(
+                    &mut index, &pool, root_start, root_end, cand, &cand_t, true, true,
+                ) {
+                    // 命中 ⟹ **整条拷贝**（含根 LOD 的权重与切线）。
+                    Some(k) => ideal = pool[k].clone(),
+                    // 未命中 ⟹ 从根 LOD 源里按位置找最近的权重。
+                    None => {
+                        ideal.v.bones = find_bone_weight_within_model(cand, &cand_t, &pool[root_start..root_end]);
+                    }
                 }
-            }
-            drop(t1);
+            });
 
             // 2) 再用**全部属性**在 [0, prev_count) 里找理想顶点。
-            let t2 = crate::prof::Span::new("    unify: 2) 全属性匹配");
-            if let Some(k) = lookup_best::<USE_INDEX>(
-                &mut index,
-                &pool,
-                0,
-                prev_count,
-                &ideal.v,
-                &ideal.tangent,
-                false,
-                false,
-            ) {
-                ideal = pool[k].clone();
-            }
-            drop(t2);
+            hotpath::measure_block!("    unify: 2) 全属性匹配", {
+                if let Some(k) = lookup_best::<USE_INDEX>(
+                    &mut index,
+                    &pool,
+                    0,
+                    prev_count,
+                    &ideal.v,
+                    &ideal.tangent,
+                    false,
+                    false,
+                ) {
+                    ideal = pool[k].clone();
+                }
+            });
 
             // 3) 重映射 → 折叠 → 按权重排序 → 标记本档用到的骨骼。
-            let t3 = crate::prof::Span::new("    unify: 3) remap+collapse");
-            remap_bone_weights(&mut ideal.v, &src.bone_map);
-            collapse_and_sort_bone_weights(&mut ideal.v);
+            //
+            // `bit` 必须提在块外：`measure_block!` 引入新作用域，而第 4 步
+            // 还要用它（`pool[k].lod_flags |= bit;`）。
             let bit: LodFlags = 1u32 << n;
-            for p in &ideal.v.bones {
-                let b = p[0] as usize;
-                if b < bone_usage.len() {
-                    bone_usage[b] |= bit;
+            hotpath::measure_block!("    unify: 3) remap+collapse", {
+                remap_bone_weights(&mut ideal.v, &src.bone_map);
+                collapse_and_sort_bone_weights(&mut ideal.v);
+                for p in &ideal.v.bones {
+                    let b = p[0] as usize;
+                    if b < bone_usage.len() {
+                        bone_usage[b] |= bit;
+                    }
                 }
-            }
-            ideal.lod_flags = bit;
-            drop(t3);
+                ideal.lod_flags = bit;
+            });
 
             // 4) 精确查重或追加。
-            let t4 = crate::prof::Span::new("    unify: 4) 精确查重");
-            let id = match lookup_exact::<USE_INDEX>(
-                &mut index, &pool, 0, prev_count, &ideal.v, &ideal.tangent,
-            ) {
-                Some(k) => {
-                    pool[k].lod_flags |= bit;
-                    k
-                }
-                None => {
-                    let k = pool.len();
-                    if USE_INDEX {
-                        index.insert(k, ideal.v.pos);
+            let id = hotpath::measure_block!("    unify: 4) 精确查重", {
+                match lookup_exact::<USE_INDEX>(
+                    &mut index, &pool, 0, prev_count, &ideal.v, &ideal.tangent,
+                ) {
+                    Some(k) => {
+                        pool[k].lod_flags |= bit;
+                        k
                     }
-                    pool.push(ideal);
-                    k
+                    None => {
+                        let k = pool.len();
+                        if USE_INDEX {
+                            index.insert(k, ideal.v.pos);
+                        }
+                        pool.push(ideal);
+                        k
+                    }
                 }
-            };
-            drop(t4);
+            });
             remap_ids.push(id as u32);
         }
 

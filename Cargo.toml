@@ -29,16 +29,24 @@ parry3d = "0.31.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
 
-# 分段计时探针（`src/prof.rs`）。**optional**：不打开下面那个 feature 时，
-# 它连编译都不参与（依赖树只剩 hotpath/hotpath-macros 两项）。
-hotpath = { version = "0.26.1", optional = true }
+# 分段计时探针。**故意不加 `optional = true`**：调用点是裸的
+# `hotpath::measure_block!(...)`，而 optional 依赖在 feature 关掉时不在
+# extern prelude 里，那些调用点会直接解析失败。让依赖常驻之后，
+# hotpath 自己的 `hotpath` feature 关着时它走 `lib_off` 分支，
+# `measure_block!` 退化成 `{ $expr }`（参数被丢弃，零开销），
+# 于是**调用点不需要任何 `#[cfg(...)]` 门禁**，两种构建写法完全一致。
+hotpath = "0.26.1"
 
 [features]
-# 分段计时探针（`src/prof.rs`）。**默认关闭** —— 打开后 `Span::new` 会做
-# 一次原子读，实测给单 LOD 常见路径带来约 2.5% 开销（见 src/prof.rs 注释）。
-# 只有 `MDLC_PROF=1` 的测量场景才需要：
+# 分段计时探针。**默认关闭** —— 打开后 `measure_block!` 会在每个计时点做
+# 一次原子读，实测给单 LOD 常见路径带来约 2.5% 开销（历史数据见 `src/lod.rs`
+# `unify_lods_impl` 的注释）。只有测量场景才需要：
 #   cargo build --release --features hotpath
 #
-# `hotpath/hotpath` 是 hotpath 自己的开关，关掉时它整体退化成空实现 ——
-# 两个 feature 必须一起开，否则拿到的是不记任何东西的探针。
-hotpath = ["dep:hotpath", "hotpath/hotpath"]
+# 打开后**没有运行时开关**：`#[hotpath::main]` 一进 `main` 就无条件建 guard
+# （起 worker 线程 + 本地 metrics server）并在退出时写出报告。想改报告路径用
+# `HOTPATH_OUTPUT_PATH`，想关掉 metrics server 用 `HOTPATH_METRICS_SERVER_OFF=1`。
+#
+# 这一行只是把上面那个依赖的 `hotpath` feature 转发出去；关掉时 hotpath
+# 整体退化成空实现，仍然参与编译（依赖树多 hotpath + hotpath-macros 两项）。
+hotpath = ["hotpath/hotpath"]

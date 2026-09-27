@@ -78,15 +78,27 @@ mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
       官方单横线选项会被归一化接受；未实现的（如 -minlod）会警告后忽略。
 ";
 
+// 分段计时。`#[hotpath::main]` 在函数体最前面插入一个活到 `main` 返回的
+// guard，析构时把报告写出来 —— 所以**任何**退出路径（包括 `run_official`
+// 里的早退）都能拿到报告。
+//
+// `functions_limit = 0` 是必须的：hotpath 默认只列前 15 个函数，而本仓库
+// 的分段标签加上顶层 wrapper 一共 17 行，默认值会把它们截掉。
+//
+// 报告**写到文件**而不是 stdout —— 理由见 `src/diag.rs`：官方
+// `studiomdl.exe` 把包括 `ERROR:` 在内的所有输出都写 stdout，Crowbar 靠
+// stdout 判断「编译器是否活着」，往那里塞一张性能表格会污染宿主日志。
+// 路径可用 `HOTPATH_OUTPUT_PATH` 覆盖。
+//
+// 没开 `hotpath` feature 时这个属性宏原样返回函数，零开销；开了之后
+// **没有运行时开关**，每次运行都会起 worker 线程 + 本地 metrics server
+// （默认端口 6770，`HOTPATH_METRICS_SERVER_OFF=1` 可关）并写出报告。
+#[hotpath::main(
+    percentiles = [50, 95, 99],
+    functions_limit = 0,
+    output_path = "mdlc-prof.txt"
+)]
 fn main() -> ExitCode {
-    // 分段计时（见 `src/prof.rs`）。**必须绑定到具名变量** —— 写成
-    // `let _ = ...` 会让 guard 立刻析构，报告当场写出且什么都没测到。
-    // 它活到 `main` 返回，报告在析构时落到 `mdlc-prof.txt`。
-    //
-    // 没开 `hotpath` feature 时这里拿到 `None`，零开销；开了 feature 但
-    // 没设 `MDLC_PROF` 时同样是 `None`（连 worker 线程都不起）。
-    let _prof = mdlc::prof::start();
-
     let argv: Vec<String> = std::env::args().collect();
     let rest: Vec<String> = argv.iter().skip(1).cloned().collect();
 
@@ -374,18 +386,18 @@ fn compile_and_write(
     out_root: &Path,
     cli_optimize_vtx: bool,
 ) -> ExitCode {
-    let _t_compile = mdlc::prof::Span::new("main: compile()");
-    let mut compiled = match compile(desc, base) {
-        Ok(c) => c,
-        Err(errs) => {
-            diagln!("编译失败，{} 处错误：", errs.len());
-            for e in &errs {
-                diagln!("  - {e}");
+    let mut compiled = hotpath::measure_block!("main: compile()", {
+        match compile(desc, base) {
+            Ok(c) => c,
+            Err(errs) => {
+                diagln!("编译失败，{} 处错误：", errs.len());
+                for e in &errs {
+                    diagln!("  - {e}");
+                }
+                return ExitCode::from(1);
             }
-            return ExitCode::from(1);
         }
-    };
-    drop(_t_compile);
+    });
 
     // ---- 碰撞 SMD：**必须在 `write_mdl` 之前**解析 ----
     //
@@ -438,36 +450,38 @@ fn compile_and_write(
             mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
     }
 
-    let _t_mdl = mdlc::prof::Span::new("main: write_mdl");
-    let out = match write_mdl(&compiled) {
-        Ok(o) => o,
-        Err(e) => {
-            diagln!("错误：{e}");
+    let out = hotpath::measure_block!("main: write_mdl", {
+        match write_mdl(&compiled) {
+            Ok(o) => o,
+            Err(e) => {
+                diagln!("错误：{e}");
+                return ExitCode::from(1);
+            }
+        }
+    });
+    // `vvd` 只在块内用（自检读它的字段）；逃逸出去的只有字节。
+    let vvd_bytes = hotpath::measure_block!("main: build_vvd + to_bytes", {
+        let vvd = match build_vvd(&compiled, out.checksum) {
+            Ok(v) => v,
+            Err(e) => {
+                diagln!("错误：构造 VVD 失败：{e}");
+                return ExitCode::from(1);
+            }
+        };
+        let vvd_bytes = match vvd.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                diagln!("错误：写出 VVD 失败：{e}");
+                return ExitCode::from(1);
+            }
+        };
+        // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
+        if let Err(e) = check_invariants(&vvd, vvd_bytes.len()) {
+            diagln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
             return ExitCode::from(1);
         }
-    };
-    drop(_t_mdl);
-    let _t_vvd = mdlc::prof::Span::new("main: build_vvd + to_bytes");
-    let vvd = match build_vvd(&compiled, out.checksum) {
-        Ok(v) => v,
-        Err(e) => {
-            diagln!("错误：构造 VVD 失败：{e}");
-            return ExitCode::from(1);
-        }
-    };
-    let vvd_bytes = match vvd.to_bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            diagln!("错误：写出 VVD 失败：{e}");
-            return ExitCode::from(1);
-        }
-    };
-    // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
-    if let Err(e) = check_invariants(&vvd, vvd_bytes.len()) {
-        diagln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
-        return ExitCode::from(1);
-    }
-    drop(_t_vvd);
+        vvd_bytes
+    });
 
     // VTX：没有它模型在游戏里根本不渲染。
     //
@@ -477,15 +491,15 @@ fn compile_and_write(
     let vtx_opts = vtx_writer::VtxOptions {
         optimize_vertex_cache: desc.model.optimize_vtx || cli_optimize_vtx,
     };
-    let _t_vtx = mdlc::prof::Span::new("main: write_vtx");
-    let vtx = match write_vtx_with(&compiled, vtx_opts) {
-        Ok(v) => v,
-        Err(e) => {
-            diagln!("错误：写出 VTX 失败：{e}");
-            return ExitCode::from(1);
+    let vtx = hotpath::measure_block!("main: write_vtx", {
+        match write_vtx_with(&compiled, vtx_opts) {
+            Ok(v) => v,
+            Err(e) => {
+                diagln!("错误：写出 VTX 失败：{e}");
+                return ExitCode::from(1);
+            }
         }
-    };
-    drop(_t_vtx);
+    });
     if let Err(e) = vtx_writer::check_invariants(&vtx, &compiled) {
         diagln!("错误：写出的 VTX 不自洽（本实现的 bug）：{e}");
         return ExitCode::from(1);
