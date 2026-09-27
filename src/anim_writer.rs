@@ -1736,6 +1736,21 @@ fn write_chain_body(
         } else if use_animpos {
             flags |= STUDIO_ANIM_ANIMPOS;
         }
+        // 结构不变式：两条同址冲突都不得出现（见 `docs\animation-layout.md` §2.5.1）。
+        //
+        // 这个断言守的是**一整类** bug，而不是某两个具体组合 —— 上面两条
+        // 同址冲突（`RAWPOS|ANIMROT`、`RAWROT2|ANIMPOS`）各自都有对称的
+        // 让位方向，历史上正是「只堵了一条、漏了同构的另一条」让这个缺陷
+        // 躲过五轮排查（`RAWROT2|ANIMPOS` 在 40 个动画里产出 50 条记录，
+        // 引擎读到的位移偏差达 1.62e+2）。
+        debug_assert!(
+            !(flags & STUDIO_ANIM_RAWPOS != 0 && flags & STUDIO_ANIM_ANIMROT != 0),
+            "同址冲突 ①：RAWPOS 与 ANIMROT 都取 pData()+0（flags={flags:#04x}）"
+        );
+        debug_assert!(
+            !(flags & STUDIO_ANIM_RAWROT2 != 0 && flags & STUDIO_ANIM_ANIMPOS != 0),
+            "同址冲突 ②：pPosV() 不含 RAWROT2 ⟹ 与 pQuat64() 同址（flags={flags:#04x}）"
+        );
         anim_data.push(flags);
         let next_pos = anim_data.len();
         anim_data.extend_from_slice(&0i16.to_le_bytes());
