@@ -1,799 +1,692 @@
-# mdlc — Source 引擎模型编译器（studiomdl 重写的 MVP）
+# mdlc
 
-把 **TOML 描述文件 + SMD 网格**编译成 Source 引擎能加载的 `.mdl` + `.vvd`。
+**Source 引擎模型编译器** —— Valve `studiomdl.exe` 的 Rust 独立重写。
 
-本工程是 `studiomdl.exe` 重写的**第一阶段**：先打通「描述 + 网格 → 二进制」
-这条主动脉，用真实编译器做参照物逐字段对齐，再逐步扩展覆盖面。
+把 **TOML 描述文件**或 **QC 脚本** + **SMD 网格**编译成 Source 引擎能加载的
+`.mdl` + `.vvd` + `.dx90.vtx`（带碰撞时另有 `.phy`，用 `$animblocksize` 时另有 `.ani`）。
 
-- **构建**：Rust **1.89+**（源码用了 `let`-chains，1.88 才稳定；`edition 2024`）
-- **平台**：无平台专有 API，代码本身可移植；开发与验证在 Windows 上进行
+- **语言**：Rust **1.89+**（源码用了 `let`-chains，1.88 才稳定；`edition 2024`）
+- **平台**：无平台专有 API；CI 在 Windows 与 Linux 上同时构建与测试
 - **许可证**：[GPL-3.0-only](LICENSE)
 
 ```powershell
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 526 passed / 0 failed（不需要任何外部素材）
+cargo test --release        # 618 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
-> ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），
-> 依据的是 Source SDK 头文件、公开格式文档，以及对官方产物的**实测**。
-> 它**不包含**任何 Valve 的二进制或美术资源。使用它编译的模型若要分发，
-> 请自行确认你拥有相应素材的权利。Source 引擎与 `studiomdl` 是
-> Valve Corporation 的商标/作品，本项目与之无隶属关系。
+> ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
+> Source SDK 头文件、公开格式文档，以及对官方产物的**实测**。它**不包含**任何
+> Valve 的二进制或美术资源。使用它编译的模型若要分发，请自行确认你拥有相应素材的
+> 权利。Source 引擎与 `studiomdl` 是 Valve Corporation 的商标/作品，本项目与之无
+> 隶属关系。
 
-## 职责划分（与 QC 一致）
+---
+
+## 目录
+
+- [快速开始](#快速开始)
+- [产物](#产物)
+- [两套输入格式，一个 IR](#两套输入格式一个-ir)
+- [TOML 描述文件](#toml-描述文件)
+- [QC 支持与 Crowbar 直接替换](#qc-支持与-crowbar-直接替换)
+- [命令行参考](#命令行参考)
+- [格式上限：只保留格式能表示的那些](#格式上限只保留格式能表示的那些)
+- [顶点超限自动拆分](#顶点超限自动拆分)
+- [多 LOD](#多-lod)
+- [验证方法：差分对照，不是自证](#验证方法差分对照不是自证)
+- [测试](#测试)
+- [代码结构](#代码结构)
+- [已知未实现](#已知未实现)
+- [延伸文档](#延伸文档)
+
+---
+
+## 快速开始
+
+```powershell
+cargo build --release
+
+# 打印一份带注释的完整 TOML 模板（含全部可用表与字段说明）
+.\target\release\mdlc.exe template > myprop.toml
+
+# 只校验，不写文件（退出码 0 = 合法）
+.\target\release\mdlc.exe check myprop.toml
+
+# 编译 → myprop.mdl / myprop.vvd / myprop.dx90.vtx
+.\target\release\mdlc.exe build myprop.toml --out .\out
+
+# 直接用 QC 编译（等价于 qc2toml 后再 build，中间描述不落盘）
+.\target\release\mdlc.exe build-qc myprop.qc --out .\out
+```
+
+`mdlc template` 的输出是**权威的字段参考** —— 它由 `src/model.rs` 的
+`TEMPLATE_TOML` 常量维护，并且有一个测试断言它能被 `ModelDesc::from_toml` 解析，
+所以它不会和代码脱节。
+
+> ⚠️ **但模板里的注释有两处是过期的，别照着取消注释：**
+>
+> 1. **`mass` 不在 `[model]` 里，它在 `[physics]` 里。** 模板顶部仍列着
+>    `# [model].mass <- $mass` 与 `# mass = 1.0`。官方 studiomdl **没有**顶层
+>    `$mass` —— 它只出现在 `$collisionmodel {}` / `$collisionjoints {}` 块里，
+>    并且同一个值同时写进 `.phy` 的 `editparams.totalmass` 与 `.mdl` 头部的 `mass`。
+>    由于所有 TOML 结构体都是 `deny_unknown_fields`，**在 `[model]` 下写
+>    `mass = 1.0` 会直接解析失败**（实测）。
+> 2. **`contents` 的缺省是 `1`（`CONTENTS_SOLID`），不是 `0`。** 模板注释写的是
+>    `默认 0`。实测编译一个不写 `contents` 的模型，产物头部 `+0x14C` 是 **1**。
+>
+> 另外模板**没有列出** `[physics]`、`[[animations]]`、`[[flex_descriptors]]`、
+> `[[flex_controllers]]`、`[[flex_rules]]`、`[[flex_controller_ui]]`、`[[mouths]]`、
+> `[[jiggle_bones]]`、`[[quat_interp_bones]]`、`[[bonecontrollers]]`、
+> `include_models`、`skin_families`、`key_values`、`pose_parameters`、
+> `flip_triangles`、`eyeballs`、`flexes`、`no_facial` 等表与字段 ——
+> 它们都在代码里实现了，语义见本文档其余小节与 `src/model.rs` 的文档注释。
+
+> ⚠️ **所有 TOML 表都是 `deny_unknown_fields`：未知键一律是硬错误**，包括未知的
+> 顶层表。所以字段名写错不会被静默忽略，而是解析失败并列出全部合法字段名。
+
+---
+
+## 产物
+
+| 扩展名 | 内容 | 何时产出 |
+|---|---|---|
+| `.mdl` | 头部、骨骼、材质、bodypart/model/mesh、动画链、序列、flex、IK、jigglebone… | 总是 |
+| `.vvd` | 顶点池（位置/法线/UV/权重）+ 切线，多 LOD 时含 fixup 表 | 总是 |
+| `.dx90.vtx` | 索引缓冲（strip group / strip / 顶点调色板） | 总是 |
+| `.phy` | IVP 碰撞体（凸包 / `$concave` / `$collisionjoints`） | 有 `[physics]` 或 `$collisionmodel` |
+| `.ani` | 外置动画块 | 写了 `[model].anim_block_size` 或 `$animblocksize`，**且该动画 ≥ 2 帧** |
+
+> ⚠️ **`.ani` 只对一个 `studiomdl` 构建负责，不能拿语料 `.ani` 当 oracle。**
+> mdlc 复刻的是本机 `Left 4 Dead 2\bin\studiomdl.exe`（2024-06-04 构建），
+> 而 `mdl-corpus` 里那 121 个 `.ani` 来自**更早的构建、载荷格式不同**
+> （头部 `+0` 恒为 28 vs 语料的 56/84/88/92；`+0 == 28` 在语料里只有 **10/2969**
+> 命中）。容器层（416 字节头 / `IDAG` / version 49）两个构建一致（121/121）。
+> 所以这条路径的验收只能用**受控实验**（真实 `studiomdl.exe` 编译 `parity/ab_*.smd`
+> 的产物），拿语料做差分只会得到「全错」的假象。
+
+> ⚠️ **单帧动画不进 `.ani`** —— 判据是 `anim_block_size > 0 && numframes >= 2`，
+> 单帧动画留在 `.mdl` 内联。`.ani` 的文件名**强制**是 `models/<模型名>.ani`，
+> 因为 `.mdl` 头部 `+0x15C` 存的就是这个路径，写错名字引擎就找不到。
+
+产物根目录 = `--out`（默认当前目录），再叠加模型名里的相对路径。所以
+`name = "models/mymod/myprop.mdl"` 会写到 `<out>\models\mymod\myprop.mdl`。
+
+四个文件共享同一个 **`checksum`** 配对令牌。它**不是内容哈希** —— 引擎与 Crowbar
+都只比较、从不计算它。mdlc 缺省用模型名的 FNV-1a 生成（稳定、跨进程一致），
+也可以用 `[model].checksum` 显式指定。
+
+编译成功后 stdout 会打印一份摘要（骨骼数、材质数、顶点数、三角形数与各文件字节数）。
+
+---
+
+## 两套输入格式，一个 IR
+
+```text
+TOML 描述 ──┐
+            ├──► ModelDesc（IR）──► compile() ──► 写出器 ──► .mdl/.vvd/.vtx/.phy/.ani
+QC 脚本  ──┘
+```
+
+两套输入**共用同一个 IR**（`src/model.rs` 的 `ModelDesc`），所以写出器完全不关心
+输入来自哪一边。QC 支持是后加的，**没有改动任何写出代码**。
+
+网格**不写在描述里** —— 真实模型有几万到几十万个顶点（官方 `v_autoshotgun` 有
+388,765 个），内联会让描述文件膨胀到几百 MB 且无法用文本工具处理。描述文件只
+**引用** SMD。
+
+职责划分：
 
 | 内容 | 由谁承载 | 对应 QC |
 |---|---|---|
-| 模型名 / 材质 / 骨骼 / body part 树 | TOML 描述文件 | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
+| 模型名 / 材质 / 骨骼 / bodypart 树 | TOML 描述文件 | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
 | **网格（顶点、法线、UV、蒙皮）** | **SMD 文件** | `studio "x.smd"` |
 | **参考姿态** | **SMD 的 `skeleton` 第 0 帧** | 参考 SMD |
 
-网格**不写在 TOML 里** —— 真实模型有几万到几十万顶点（官方
-`v_autoshotgun` 有 388,765 个），内联会让描述文件膨胀到几百 MB
-且无法用文本工具处理。描述文件只**引用** SMD。
+---
 
-> 输入格式有 **两套并存**：TOML（自有，主线）与 **QC**（`build-qc` /
-> `qc2toml`，与官方 QC 脚本兼容）。两者共用同一个 IR。
+## TOML 描述文件
 
-## 当前状态
+> 下面只列**结构与要点**；每个字段的完整语义、默认值、实测依据都在
+> `mdlc template` 的输出与 `src/model.rs` 的文档注释里。
 
-> 下表每一项都有**对真实 `studiomdl.exe` 产物的差分判据**，不是「按结构定义
-> 写完就算」。判据脚本在 `docs/_probe/`（该目录未进仓库，见下「测试」一节）。
+### `[model]`
 
-| 项 | 状态 |
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `name` | string | **必填** | 输出路径，相对游戏目录；反斜杠自动规范化为正斜杠 |
+| `version` | int | `49` | 只支持 **44 / 48 / 49** |
+| `checksum` | int | 按模型名生成 | 四件套配对令牌，不是内容哈希 |
+| `static_prop` | bool | `false` | `$staticprop`，自动置头部 `0x10` |
+| `surface_prop` | string | — | `$surfaceprop`；也是每根骨骼的缺省 `surface_prop` |
+| `eye_position` / `illum_position` | `[f32; 3]` | — | `$eyeposition` / `$illumposition` |
+| `max_eye_deflection` | f32 | `0` | `$maxeyedeflection`，**写角度**（落盘时转成 `cos`）。不写 = 0，引擎回退到 `cos(30°)` |
+| `hull_min` / `hull_max` | `[f32; 3]` | 由 SMD 顶点算 | 包围盒 |
+| `extra_flags` | int | `0` | 额外的 `STUDIOHDR_FLAGS_*` 位 |
+| `contents` | int | **`1`**（`CONTENTS_SOLID`） | `$contents`。官方 `s_nDefaultContents = CONTENTS_SOLID`，**不是 0** |
+| `skip_bone_in_bbox` | bool | `false` | `$skipboneinbbox` |
+| `optimize_vtx` | bool | **`false`** | 顶点缓存优化（`meshopt`）；只重排索引，不改几何 |
+| `split_oversized_meshes` | bool | **`true`** | 顶点超限自动拆分，见[下文](#顶点超限自动拆分) |
+| `key_values` | string | — | `$keyvalues` 内容（不含外层 `mdlkeyvalue` 包装） |
+| `pose_parameters` | table array | `[]` | `$poseparameter` |
+| `realign_bones` | bool | `false` | `$realignbones` |
+| `anim_block_size` | int | — | `$animblocksize`，触发 `.ani` 外置动画块 |
+
+### `[materials]`
+
+```toml
+[materials]
+search_paths = ["models/mymod"]              # $cdmaterials
+skin_families = [[0, 1, 2], [3, 4]]          # 可选，$texturegroup
+textures = [ { name = "models/mymod/myprop" } ]
+```
+
+SMD 里的材质名按**首次出现顺序**映射到 `textures`；名字带 `search_paths`
+前缀时落盘会自动剥掉（与 studiomdl 一致）。
+
+### `[[bones]]`
+
+```toml
+[[bones]]
+name = "root"                # 根骨骼必须排在最前；parent 只能指向更靠前的骨骼
+# position = [0.0, 0.0, 0.0] # 留空则取自 SMD skeleton 第 0 帧
+# rotation = [0.0, 0.0, 0.0] # 角度；留空同上
+# flags = 1280               # 留空则按用途逐根计算（见下）
+# surface_prop = "metal"     # 缺省继承 [model].surface_prop
+bonemerge = true             # $bonemerge：允许该骨骼被合并
+```
+
+`flags` 留空时会按**用途**逐根计算（被顶点使用 / 被 hitbox 使用 / 被 attachment
+使用 / 被 ikchain 使用 / bonemerge）并沿父链向上传播，与官方逐位一致。
+`0x500`（`DEFAULT_BONE_FLAGS`）只是「该骨骼确实被顶点与 hitbox 使用」时的结果，
+**不是**一个无条件缺省值 —— 一律写 `0x500` 会把未被顶点使用的骨骼误标为已使用。
+
+### `[[bodyparts]]` / `[[bodyparts.models]]` / `.lods`
+
+```toml
+[[bodyparts]]
+name = "body"
+base = 1                     # bodygroup 预设权重基数（可省略，缺省 1）
+models = []                  # 必填键；至少一个
+
+[[bodyparts.models]]
+smd = "myprop-ref.smd"       # LOD 0（相对描述文件所在目录）；必填
+flip_triangles = true        # 缺省 true（Source 正面是 CW）
+
+[[bodyparts.models.lods]]
+smd = "myprop-lod1.smd"
+switch_point = 20.0          # 可省略，缺省 20·2^k
+```
+
+`[[bodyparts.models]]` 还接受 `eyeballs`（`$eyeball`/`$eyelid`）与 `flexes`
+（`$flex`/`$flexpair`，指向 `.vta`），以及 `name`（缺省取 SMD 文件名）。
+
+### `[hitboxes]` / `[[attachments]]`
+
+```toml
+[hitboxes]
+set_name = "default"         # 可省略
+[[hitboxes.boxes]]
+bone = "root"
+bbmin = [-8.0, -8.0, -8.0]
+bbmax = [ 8.0,  8.0,  8.0]
+# group = 0                  # 相交分组
+# name  = "body"
+
+[[attachments]]
+name = "muzzle"              # $attachment
+bone = "tip"
+position = [0.0, 0.0, 8.0]
+rotation = [0.0, 0.0, 0.0]   # 角度
+```
+
+**没写显式 hitbox 时会自动生成**一个 `default` set（官方 `SetupHitBoxes` 语义），
+并置 `autogenerated` 标志 —— 实测真实 L4D2 模型 100% 都有 hitbox，没有它子弹打不中。
+
+### `[[sequences]]` 与 `[[animations]]`
+
+```toml
+# 单动画序列
+[[sequences]]
+name = "idle"
+smd = "idle.smd"
+fps = 30.0
+looping = true
+# delta = true                 # $sequence ... delta（同时置 DELTA|POST）
+# activity = "ACT_VM_IDLE"
+# activity_weight = 1
+# weight_list = "upper"        # 按名字引用 [[weight_lists]]
+# no_auto_ik = true            # 抑制自动补的 IK_RELEASE 规则
+
+# blend 网格序列
+[[sequences]]
+name = "walk"
+blends = ["a_run", "a_idle", "a_run", "a_idle"]   # 必须是完全平方数
+blend_width = 2
+[[sequences.blend_params]]
+parameter = "move_x"
+start = -1.0
+end = 1.0
+```
+
+序列级可用字段（对应 QC 的 `$sequence` 块选项）：
+`fps` / `looping` / `delta` / `activity` / `activity_weight` / `events` /
+`fade_in` / `fade_out` / `forward_declared` / `no_auto_ik` / `ik_rules` /
+`iklocks` / `blends` / `blend_width` / `blend_params` / `blend_ref` /
+`blend_comp` / `blend_center` / `auto_layers` / `movements` / `section_frames` /
+`section_threshold` / `extra_flags` / `weight_list` / `subtract` /
+`subtract_frame` / `num_frames`。
+
+`[[animations]]`（QC 的 `$animation`）声明**可被多条序列复用的动画**。
+官方把 animdesc 放在全局池里，`$sequence` 只是引用它 —— 所以一个 `$animation`
+只有**一份**数据，多条序列引用同一格时共享它。这带来一个容易写错的地方：
+`weightlist` / `numframes` / `subtract` / `ikrule` 改的是**共享的动画对象**，
+而不只是当前这条序列。
+
+`forward_declared = true` 对应 `$declaresequence` —— **前向声明的空壳序列**
+（survivor 模组的核心机制）：主模型里声明一堆空名字，真正的动画在
+`$includemodel` 进来的 `anim_<survivor>.mdl` 里，引擎加载时按名字替换。
+空壳**不要写 `smd`**（官方连 `panim` 都不分配），写了会被 `validate()` 拒。
+
+> ⚠️ **已知缺口：`weight_list` / `num_frames` / `subtract` 在 blend 序列上被静默丢弃。**
+>
+> `compile.rs` 对 `$sequence` 有**两条互斥路径**：`if !s.blends.is_empty()`
+> （blend 网格）与后面的单动画路径。这三个选项目前**只实现在单动画路径上**。
+>
+> **实测**：给 `parity/blend1.toml` 的 blend 序列加一张全 0 权重表，
+> 产物与不加**逐字节相同**（3880 字节，0 处差异）；同样一张表加在单动画序列上
+> 则产物从 3880 变成 3872 字节（生效）。所以这是**静默的数据丢失**，
+> 不是解析错误。
+>
+> 同一族的历史 bug（`ikrule`、`addlayer`）已经**两条路径都修好**了，
+> 这三个是遗留项。**加新选项时必须同时问「两条路径都处理了吗」。**
+
+### `[[weight_lists]]`
+
+```toml
+[[weight_lists]]
+name = "upper"
+[[weight_lists.bones]]
+bone = "mid"
+weight = 0.5
+pos_weight = 0.25            # 可选，只参与编译期 IK 误差计算，不落盘
+```
+
+权重表用于**增量动画（delta）的重建缩放**：`s = 0` 的骨骼完全不参与该序列的增量
+叠加（保持基准姿态）。模组作者用它做「只让上半身动」。
+
+> ⚠️ 语义**不是**「没列出的骨骼就是 1」。官方算法是：① 具名表的**根骨骼默认 0**；
+> ② 显式条目覆盖；③ 沿父链**继承**。骨骼链 `root → mid → leaf → tip` 只写
+> `mid 0.5` 会得到 `[0, 0.5, 0.5, 0.5]`。
+
+### `[physics]`
+
+```toml
+[physics]
+smd = "physics.smd"          # $collisionmodel 的 SMD
+concave = true               # $concave：按连通分量拆成多个凸块
+joints = false               # true = $collisionjoints（每骨骼一个 solid 的 ragdoll）
+# mass / damping / rot_damping / inertia / drag / root_bone
+# mass_center / auto_mass / no_self_collisions
+# joint_overrides / constraints / animated_friction / collision_pairs / merge
+```
+
+`concave` 与 `joints` **互斥**：ragdoll 每根骨骼本来就是一个凸包，
+`$concave` 只作用于单 solid 的 prop 路径。
+
+> ⚠️ **`concave` 不是 VHACD 式的「体分解」。** 官方 `$concave` 是
+> **连通分量分解**：顶点焊接（位置相同**且**法线夹角 < 2°）→ 按共享焊接顶点做
+> 并查集 → 每个连通分量各算一个凸包。所以一个**连通的**凹体（U 形、圆环）
+> 只会得到**一个**把凹口**填平**的凸包。mdlc 照此实现。
+>
+> 需要**保留凹口**的真凹形碰撞体时，用独立的 `mdlc phy --vhacd`（parry3d 的
+> VHACD）—— 那是**非官方语义**，且**不能**从 TOML/QC 编译路径触发。
+
+碰撞几何的世界空间转换用的是**第一条序列的第 0 帧**，不是碰撞 SMD 自己的姿态
+（受控实验结论）。`[physics]` 的 `joint_overrides` / `constraints` /
+`collision_pairs` 在 `joints = false` 时会**报错**（它们只对 ragdoll 有意义）；
+`auto_mass = true` 也会报错 —— 它需要一张 mdlc 没有的表面材质密度表。
+
+### 其余表
+
+| 表 | 对应 QC | 说明 |
+|---|---|---|
+| `[[ikchains]]` | `$ikchain` | `name` / `bone`（**末端**骨骼）/ `knee_dir` |
+| `[[ik_autoplay_locks]]` | `$ikautoplaylock` | `chain` / `pos_weight` / `local_q_weight` |
+| `[[flex_descriptors]]` | `flex` / `eyelid` / `mouth` | `name` |
+| `[[flex_controllers]]` | `flexcontroller` | `name` / **`type`** / `min` / `max` |
+| `[[flex_rules]]` | `%<flex> = <expr>` | `flex` + `ops`（每项 `op` + `value`/`controller`/`flexdesc`） |
+| `[[flex_controller_ui]]` | — | `name` / `stereo` / `left` / `right` |
+| `[[mouths]]` | `mouth` | `index`（显式，决定 `g_nummouths`）/ `flexdesc` / `bone` / `forward` |
+| `[[jiggle_bones]]` | `$jigglebone` | `bone` + `is_flexible` / `is_rigid` / `has_base_spring` |
+| `[[quat_interp_bones]]` | `$proceduralbones`（proctype 2） | `bone` / `control` / `base_pos` / `triggers` |
+| `[[bonecontrollers]]` | `$controller` | L4D2 已废弃该特性（语料 0 次），但段仍占位。⚠️ 键名是字面的 **`type_`**（带下划线） |
+| `include_models` | `$includemodel` | 顶层字符串数组；**必须自己写 `models/` 前缀**，mdlc 不替你补 |
+
+> ⚠️ **两个 TOML 键名与 Rust 字段名不同**：`[[sequences.ik_rules]]` 与
+> `[[flex_controllers]]` 的类型键在 TOML 里写作 **`type`**（Rust 侧字段叫 `kind`）。
+> 只有这两处做了 serde rename，其余字段名与 Rust 一致（snake_case）。
+
+> ⚠️ **`[[flex_rules]]` 的 `op` 取值**共 21 个：`const` `fetch1` `fetch2` `add`
+> `sub` `mul` `div` `neg` `exp` `open` `close` `comma` `max` `min` `2way_0`
+> `2way_1` `nway` `combo` `dominate` `dme_lower_eyelid` `dme_upper_eyelid`。
+
+> ⚠️ **`include_models` 里指不存在的文件也能编译** —— 官方**只写名字**，
+> 从不读被包含的 `.mdl`（合并骨骼/序列是**引擎**运行时做的）。
+
+> **`[[ikchains]]` 会自动补 IK 规则**：只要模型有 IK 链，官方会给每个「没有任何
+> 显式 ikrule 的链」追加一条 `type = 4`（`IK_RELEASE`）的规则。所以绝大多数情况下
+> **不需要**手写 `[[sequences.ik_rules]]`。要抑制它就在该序列上写 `no_auto_ik = true`。
+
+### TOML 的一个陷阱
+
+**顶层键必须写在所有 `[[表]]` 之前。** 例如把 `bonemerge = [...]` 写在
+`[[attachments]]` 之后，TOML 会把它解析成 `attachments` 的字段而报错。
+本实现因此把 `bonemerge` 放在 `[[bones]]` 里（`bonemerge = true`），
+而不是设一个顶层数组。
+
+---
+
+## QC 支持与 Crowbar 直接替换
+
+### 官方兼容形态
+
+```powershell
+.\target\release\mdlc.exe -game "<gamedir>" [-nop4] [-verbose] myprop.qc
+```
+
+产物写到 `<gamedir>\models\<$modelname>` —— 与官方 `studiomdl` 的规则一致。
+
+**为什么需要它**：[Crowbar](https://github.com/ZeqMacaw/Crowbar) 把编译器路径当
+**不透明配置项**，只传 `-game "<gamedir>" <选项> "<qc 文件名>"` 并把 CWD 设为 QC
+所在目录。它的成败判定只有两条 —— ① 编译器有输出；②
+`<gamedir>\models\<$modelname>.mdl` 存在。**它不看退出码，也不解析错误文本。**
+所以把 Crowbar 的「编译器路径」指向 `mdlc.exe` 即可直接替换。
+
+兼容层细节（官方是**单横线长选项**，而 clap 只认 `--long`，故需归一化）见
+`src/cli.rs` 的模块文档。已知**未实现**的官方选项（`-minlod`、`-striplods`、
+`-definebones`、`-t`、`-a`）会**警告并忽略**，不会静默改变产物。
+
+> ⚠️ **诊断流的走向是按调用形态决定的**：官方 `studiomdl` 把 `ERROR:` 写在
+> **stdout**，而 Crowbar 的「编译器是否活着」标志只在 stdout 处理器里置位。
+> 所以兼容形态下 mdlc 的诊断也走 **stdout**（与官方一致）；mdlc 自有子命令仍走
+> stderr。判据是**调用形态**而非父进程名 —— 零依赖、跨平台。
+
+### QC 命令覆盖
+
+QC 前端（`src/qc/`）已实现完整的词法/语法分析、`$include`、`$definevariable`、
+`$pushd`/`$popd`、`$cd` 目录栈，以及下面这些命令：
+
+`$modelname` `$cd` `$pushd` `$popd` `$cdmaterials` `$surfaceprop`
+`$contents` `$eyeposition` `$illumposition` `$maxeyedeflection` `$bbox` `$cbox`
+`$staticprop` `$realignbones` `$skipboneinbbox` `$animblocksize` `$keyvalues`
+`$sectionframes` `$poseparameter` `$texturegroup` `$body` `$bodygroup` `$model`
+`$sequence` `$animation` `$definebone` `$bonemerge` `$attachment` `$hboxset`
+`$hbox` `$ikchain` `$ikautoplaylock` `$includemodel` `$lod` `$shadowlod`
+`$jigglebone` `$proceduralbones` `$collisionmodel` `$collisionjoints`
+`$jointsurfaceprop` `$weightlist` `$declaresequence`
+`$jointconstrain` `$animatedfriction` `$noselfcollisions` `$jointcollide`
+`$jointmerge` `$unlockdefinebones`，以及一批头部 flag（`$opaque` `$mostlyopaque`
+`$noforcedfade` `$casttextureshadows` `$ambientboost` `$donotcastshadows`
+`$forcephonemecrossfade` `$constantdirectionallight`）。
+
+**已知但故意不支持的**：
+
+| 命令 | 行为 |
 |---|---|
-| VVD 读写（逐字节往返） | ✅ 官方模型 24,881,024 字节**完全一致** |
-| **VVD fixup 表 + 多 LOD** | ✅ **语料 3302/3302 逐字节往返**（含 53 个 fixup、230 个多 LOD） |
-| **真实切线计算** | ✅ **与官方 studiomdl 同几何对照：w 8/8、方向 8/8**（见下） |
-| SMD 解析 | ✅ 真实文件验证（89 骨骼 / 22,911 三角形） |
-| MDL 写出（头部/骨骼/材质/body part/model/mesh/字符串池） | ✅ 与 studiomdl 产物**逐字段对齐** |
-| **VTX 写出** | ✅ **与 studiomdl 产物逐字段完全一致（0 差异）** |
-| **VTX 多 LOD** | ✅ 结构树 / `switchPoint` / `origMeshVertID` 按实测规则写出 |
-| **hitbox set** | ✅ **全部字段一致**（`$hboxset` / `$hbox`） |
-| **`$attachment`** | ✅ **全部字段一致**（含 `local` 矩阵） |
-| **`$bonemerge` + 骨骼 flags 按用途计算** | ✅ **与官方逐位相同**（如 `0x40700`） |
-| **动画 / 序列（`$sequence`）** | ✅ **动画链语义与官方完全一致**（见下） |
-| 骨骼 `poseToBone` / `quat` | ✅ 官方模型 89 根骨骼**逐骨骼吻合** |
-| **QC 解析** | ✅ **已实现**（`src/qc/`；`qc2toml` / `build-qc` 可用。以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准，见 [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md)） |
-| **flex（`.vta` 形状）** | ✅ 已实现（`src/flex.rs` + `src/vta.rs`） |
-| **PHY 碰撞模型** | ✅ 已实现（`phy` 子命令；凸包 / `$concave` / `$collisionjoints`） |
-| **`.phy` 写出** | ✅ 自检通过（`phy::check_invariants`） |
-| **数值上限** | ✅ 只保留**格式可表示**的上限，**不复刻 studiomdl 的人为限制**（见下） |
-| **`studiomdl` 兼容 CLI** | ✅ `mdlc -game <gamedir> <x.qc>`，可直接替换 Crowbar 的编译器路径 |
-| **LOD 的自动生成（简化网格 / decimate）** | ❌ **未实现** —— 只支持**输入**多 LOD |
-| DMX 输入 | ❌ 刻意不实现（`$nekomodel` / `studio "x.dmx"` 显式报错） |
+| `$nekomodel` | **显式报错** —— 它指向 DMX 源，mdlc 不实现 DMX（官方也委托 `dmxconvert.exe`） |
+| `$defaultweightlist` | **显式报错** —— 它会覆盖**所有**未显式指定 weightlist 的序列，静默忽略会产出「看起来对但语义错」的模型。mdlc 的隐式表 0 是常量，没有可覆盖的存储。语料出现 **0 次**；要等价效果请用 `$weightlist` 并在序列上显式引用 |
+| `$fakevta` | 跳过整个块（无产物痕迹） |
+| `$scale` | **接受但无效果**（`default_scale` 只被写入、从未被读取）。语料 0 次 |
+| `$cbox` / `$maxconvexpieces` / `$phyname`、`$ikchain` 的 `height`/`pad`/`floor`/`center`、`$attachment … x_and_z_axes`、ikrule 的 `usesequence` | 参数被消费但**不落盘**（语料 0 次，或由其它字段等价表达） |
+| 一批语料 0 次的命令（`$minlod` `$maxverts` `$renamebone` `$hierarchy` `$collapsebones` `$screenalign` `$upaxis` `$origin` `$maxbones` `$controller` …） | **忽略本行**（不报错、不留痕迹） |
+| 其它未知命令 | 报错（对应官方的 `bad command`） |
 
-> **三件套齐全**：`.mdl` + `.vvd` + `.dx90.vtx` 都已产出并通过布局自检
-> （带 `$collisionmodel` 时另有 `.phy`）。
-> 特性差距的完整清单（137 条 QC 命令逐组对照、8 层分解、拦路虎）
-> 见 [`docs/feature-gap.md`](docs/feature-gap.md) 与
-> [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md)。
+> ⚠️ **`$sequence` 块里出现未知关键字时，它会被当成「动画名」。** 例如
+> `$sequence "x" "a.smd" nodefaults` 里的 `nodefaults` 会进 `blends`，
+> 然后在查动画池时报 `找不到动画 "nodefaults"`。**不是静默忽略，但报错信息会误导。**
 
-### 数值上限：只保留格式能表示的那些
+> ⚠️ **`$maxverts` 被忽略**（不是实现，也不报错）。它是第三方 NekoMDL 的**非官方
+> 扩展**，会把超限模型按三角形切成多个 **bodypart** —— 那会改变 `$bodygroup` 的
+> 按下标选择语义。mdlc 用[同 model 内多 mesh](#顶点超限自动拆分)的等价且更安全的
+> 方式解决同一个问题。
 
-studiomdl 里有一批**人为**上限（例如单 SMD 65536 顶点、材质 32 个），
-它们不是文件格式的约束。本实现**不复刻**这些限制，只保留格式本身
-表示不了的上限：
+> ⚠️ **`$sequence` 块里可以写「动画选项」。** 官方 `ParseSequence` 在
+> `numblends || isAppend` 时把 token 交给 `ParseAnimationToken`，后者会走到
+> `ParseCmdlistToken`。所以 `subtract` / `numframes` / `weightlist` / `ikrule` /
+> `addlayer` / `blendlayer` / `calcblend` 这些**在 `$sequence` 里同样合法**，
+> 而且它们改的是**被引用的那个共享动画对象**。
+> 判据是「它由官方哪个函数处理」，不是「它写在哪个块里」。
+
+---
+
+## 命令行参考
+
+### mdlc 自有形态
+
+```text
+mdlc build <model.toml> [--out <目录>] [--optimize-vtx]
+mdlc check <model.toml>
+mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]
+mdlc qc2toml <model.qc> [--out <path.toml>]
+mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
+                          [--concave] [--vhacd] [--decompose] [--ragdoll]
+mdlc vvd-info <file.vvd>
+mdlc vvd-roundtrip <file.vvd>
+mdlc template
+```
+
+| 子命令 | 作用 |
+|---|---|
+| `build` | TOML 描述 → `.mdl`/`.vvd`/`.vtx`（主线） |
+| `check` | 只校验描述文件，不写文件。退出码 0=合法，1=有错误 |
+| `build-qc` | 直接从 QC 编译，中间描述不落盘 |
+| `qc2toml` | QC → TOML（**只写文本，不编译**）。用于迁移或人工核对解析结果 |
+| `phy` | 从 SMD 三角形算凸包并写出 `.phy` |
+| `vvd-info` | 解析并打印 VVD 头部、统计与自洽性检查结果 |
+| `vvd-roundtrip` | VVD 读入再写出并逐字节比对（布局判据） |
+| `template` | 打印带注释的完整 TOML 模板 |
+
+`--optimize-vtx` 用 `meshopt` 对每个 strip group 重排索引以提升 GPU 后变换顶点
+缓存命中率。它**只改索引顺序**，顶点池与三角形集合都不变（写出前有守门断言校验
+这两条），所以渲染结果相同。默认**关闭**，以保持与既有产物逐字节相同。
+
+---
+
+## 格式上限：只保留格式能表示的那些
+
+`studiomdl` 里有一批**人为**上限（例如单 model 65536 顶点、材质 32 个），它们不是
+文件格式的约束。本实现**不复刻**这些限制，只保留**位宽 / 偏移算术**推出的硬上限：
 
 | 维度 | 上限 | 依据 |
 |---|---|---|
-| 被引用的骨骼**下标** | **127** | VVD `mstudiovertex_t.bone[]` 是**有符号** `char` |
-| 骨骼**总数** | **256** | 动画链 `mstudioanim_t.bone` 是 `byte` |
-| 每 **mesh** 顶点 | **65536** | VTX `Vertex_t.origMeshVertID` 是 `unsigned short` |
+| 被**引用**的骨骼**下标** | **127** | VVD `mstudioboneweight_t.bone[]` 与 VTX `Vertex_t.boneID[]` 都是**有符号** `char` |
+| 骨骼**总数** | 无上限 | `mstudiobone_t` 数组长度是 `int32`（`MAXSTUDIOBONES = 128` 只是引擎上限，不作拒绝条件） |
+| 动画链能**寻址**的骨骼数 | **256** | `mstudioanim_t.bone` 是 `byte`（判据是 `≤255`） |
+| 每 **strip** 的骨骼调色板 | **127** | VTX `Vertex_t.boneID[]` 是 `char`（官方 `maxBonesPerStrip = 53`） |
+| 每 **mesh** 顶点 | **65536** | VTX `Vertex_t.origMeshVertID` 是 `uint16` |
 | 每 **model** 顶点 | **44,739,242** | `vertexindex` 是 int32 字节偏移 ÷ 48 |
-| **材质**表条数 | **32768** | `short pSkinref[]` 是**有符号** `short` |
+| **材质**表条数 | **32768** | `pSkinref[]` 是**有符号** `short` |
 | **三角形**数 | 无上限 | VTX `numIndices` 是 int32 |
-| **LOD** 档数 | 8 | `MAX_NUM_LODS` |
+| **LOD** 档数 | **8** | 引擎 `MAX_NUM_LODS` |
+
+写出后还会各自跑一次**自检**（VVD 的 `check_invariants`、VTX 的 `check_invariants`、
+PHY 的 13 条硬约束），失败会以「本实现的 bug」中止而不是留下坏文件。
 
 > ⚠️ **约束的是「被引用的骨骼下标」，不是「骨骼总数」。**
 > 早期版本误把「总数 ≤ 128」当格式约束，结果**打死真实模型**
 > （`linnea-export` 有 134 根骨骼，但只引用到下标 118）。
-> **没被引用的骨骼不占 VVD 下标空间。**
->
-> ⚠️ 「每 mesh 顶点 ≤ 65536」的**粒度是 mesh（= 一个材质）**，
-> 不是 bodypart：加一个材质就多一个 mesh，各自独立计数，
-> **不需要手工把 SMD 拆开**。
->
-> ⚠️ 但**一个材质**如果本身就有 30 万顶点（真实案例：某改模工程的 `chain`
-> 段有 305,703 顶点），官方 `studiomdl` 会直接拒绝
-> （`ERROR: too many indices in source`）。这是格式的真实上限，不是本实现的
-> 限制 —— 但 mdlc **会自动帮你拆**（见下节）。
+> **没被引用的骨骼不占 VVD 下标空间** —— 它们只出现在骨骼表里。
 
-#### 单个 mesh 超过 65536 顶点怎么办
+> ⚠️ **「每 mesh 顶点 ≤ 65536」的粒度是 mesh（= 一个材质）**，不是 bodypart：
+> 加一个材质就多一个 mesh，各自独立计数。判据是 `n > 65536`（**不是 `>=`**）——
+> 恰好 65536 个顶点时下标是 `0..65535`，全部装得下。
 
-**默认不用管** —— mdlc 会自动拆。这是**格式**约束
-（VTX 的 `origMeshVertID` 是 `uint16`），官方 `studiomdl` 会拒绝，mdlc 则
-在编译期把超限的 mesh **按三角形顺序切成多个 mesh**：
+---
+
+## 顶点超限自动拆分
+
+**默认不用管** —— mdlc 会自动拆。VTX 的 `origMeshVertID` 是 `uint16`，
+所以**一个 mesh（= 一个材质）最多 65536 个顶点**。官方 `studiomdl` 会直接拒绝
+（`ERROR: too many indices in source`）；mdlc 在编译期把超限的 mesh
+**按三角形顺序切成多个 mesh**：
 
 | | |
 |---|---|
-| 开关 | TOML `[model] split_oversized_meshes`，**默认 `true`** |
+| 开关 | `[model].split_oversized_meshes`，**默认 `true`** |
 | 拆到什么粒度 | 每块 ≤ 65536 顶点 |
 | 放在哪里 | **同一个 model** 里（**不新增 bodypart**） |
 | 材质 | 所有块**共用原材质下标**（`mesh.material` 只是 `pSkinref[]` 的下标） |
 | 渲染结果 | 与拆分前**逐像素相同**（只是多几个 draw call） |
-| 关掉它 | `split_oversized_meshes = false` ⟹ 回到「报错并给出替代路径」 |
+| 关掉它 | `= false` ⟹ 回到「报错并给出替代路径」 |
 
-**为什么不拆成新 bodypart**（第三方 NekoMDL 的 `$maxverts` 是那样做的）：
-bodypart 数量一变，引擎的 `$bodygroup` 选择（**按下标**）就会错位；
-而且 NekoMDL 自己的产物里出现了重名 bodypart（实测两个 `clamped1`）。
-`mesh.material` 只是 `pSkinref[]` 的下标，多个 mesh 共用它完全合法。
+**为什么不拆成新 bodypart**（NekoMDL 的 `$maxverts` 是那样做的）：bodypart 数量
+一变，引擎的 `$bodygroup` 选择（**按下标**）就会错位。
 
-> **实测**（某改模工程，单个材质 305,703 顶点，`v_autoshotgun.qc`）：
-> 拆分前 mesh 20 个、最大单 mesh 305,703 顶点 ⟹ 编译**失败**；
-> 拆分后 mesh 24 个、**最大单 mesh 恰好 65,536**、0 个超限，
-> **三角形总数守恒 232,099**，bodypart 数**仍是 2**（未变）。
-> 产物：MDL 849,612 B / VVD 27,620,800 B / VTX 5,278,585 B。
-> 校验探针：`node docs\_probe\verify_split_output.js <out_dir>`（7 项结构判据）。
+> **实测**（某改模工程，单个材质 305,703 顶点）：拆分前 mesh 20 个、最大单 mesh
+> 305,703 顶点 ⟹ 编译**失败**；拆分后 mesh 24 个、**最大单 mesh 恰好 65,536**、
+> 0 个超限，**三角形总数守恒 232,099**，bodypart 数**仍是 2**（未变）。
 
-> **NekoMDL 的 `$maxverts` 逆向结论**（Ghidra + 产物双向验证，见
-> `docs/_probe/nekomdl_maxverts_findings.js`）：
-> 在 QC 里写 `$maxverts 50000`，NekoMDL 会把超限的模型**按三角形顺序切成
-> 多个模型**，每块 ≤ 该值，新 bodypart 命名 `clamped1`、`clamped2`…
-> 反编译证据：`$maxverts` @ `0x1404f6640` → `FUN_140076778`
-> （`MaxVertexLimit = clamp(atoi, 1024, 511451)`），使用点 `FUN_14007d550`
-> 打印 `"model has too many verts, cutting into multiple models"`。
-> 实测 `$maxverts 50000` 编译一个 305,703 顶点的 mesh：产出 9 个 bodypart
-> （`clamped1..6` + 一个重名 `clamped1`），VTX 里最大单 mesh **49,999 顶点**。
->
-> **mdlc 不实现 `$maxverts`**（它改变 MDL 的 bodypart 结构，属非官方行为），
-> 改为上面那个「同 model 内多 mesh」的等价且更安全的行为。
+对不超限的模型这条路径**完全不碰**（提前返回），所以对既有产物零影响。
 
-其他仍可用的替代路径：
+---
 
-| 办法 | 说明 |
-|---|---|
-| **把该材质拆成多张材质** | 一个材质 = 一个 mesh = 一份独立配额。缺点是渲染时多一个 draw call。 |
-| **分多个 `$bodygroup` 子模型** | 每个子模型是独立的 `model`，各自有 65536 配额。 |
-| 关掉自动拆分 | `split_oversized_meshes = false` ⟹ 报错并提示上面两条路径（适合想自己控制拆分方式的场合）。 |
-
-
-### 切线、多 LOD、fixup（实测报告）
-
-这三块都是「写错**不会报错**、只会在游戏里表现异常」的类型，所以全部结论
-都来自对真实产物的实测，探针脚本在 `docs/_probe/`。
-
-#### 1. 真实切线：算法与吻合率
-
-算法逐字对应 studiomdl 的 `CalcTriangleTangentSpace` /
-`CalcModelTangentSpaces`（`hl2sdk-episode1\utils\studiomdl\simplify.cpp`
-4920 / 5037 行），实现在 [`src/tangent.rs`](src/tangent.rs)。
-
-**语料实测**（3072 个单 LOD 模型、631 万个顶点，用真实 VVD 的顶点 +
-配套 VTX 的三角形重算，与官方写下的切线逐条比对）：
-
-| 指标 | 实测 |
-|---|---|
-| 方向一致（cos > 0.999） | **96.69%** |
-| 手性 `w` 一致 | **99.96%** |
-| 逐 float 位完全相同 | 2.23% |
-| ≤ 4 ULP | 56.98% |
-
-逐位吻合率低是**浮点运算顺序**导致的（x87/SSE 混合路径 vs Rust f32），
-方向（cos）才是语义判据。
-
-**剩下 3.31% 是什么**：逐模型统计是**双峰**的 —— 3013/3067 个模型 > 99%，
-54 个接近 0%。对后者做独立判据：
-
-```text
-|dot(normalize(官方切线), VVD 里存的法线)|
-  好的模型（3013 个）：平均 0.000000，最大 0.000012
-  差的模型（  54 个）：平均 0.468690，最大 1.000000
-```
-
-也就是说这些模型的**官方切线根本不垂直于它自己 VVD 里的法线** ——
-矛盾出在数据本身（法线是另一套来源），不是重算算法的问题。
-代表模型：`v_autoshotgun` / `v_rifle` / `v_chainsaw` / `v_medkit`。
-另验证过 8 种候选约定（S/T 互换、UV 翻转、各种叉积组合），
-没有任何替代约定能同时解释那 54 个（`probe_tangent_hypotheses.js`）。
-
-#### 2. SMD 的 V 必须翻转（一条曾漏掉的关键规则）
-
-studiomdl 在**解析 SMD 时**就把 UV 的 V 翻转
-（`hl2sdk-episode1\utils\studiomdl\v1support.cpp:161`）：
-
-```c
-// invert v
-t[1] = 1.0 - t[1];
-```
-
-翻转后的值才进 `s_source_t.vertex[].texcoord`，因此它**同时**决定
-VVD 里的 UV 与切线的计算。两条独立实测判据：
-
-| 判据 | 结果 |
-|---|---|
-| SMD ↔ 官方 VVD 逐顶点 UV 对照（`myprop` / `rb`） | **11/11 顶点满足 `vvd.v == 1 - smd.v`** |
-| 切线手性 `w`（同几何，翻转 vs 不翻转） | 翻转 **8/8**；不翻转 **0/8** |
-
-修正后与官方 studiomdl 的同几何产物对照：**`w` 8/8、方向 8/8、
-4/8 逐 float 位相同**。
-
-> 注意：VVD 里存的**已经是翻转后**的值，所以「读真实 VVD 反推切线」时
-> **不能**再翻一次 —— 那会把 w 吻合率从 99.96% 打到 2.29%
-> （`probe_vflip_corpus.js` 实测）。翻转只发生**一次**，在 SMD 解析这一步。
-
-#### 3. 多 LOD 与 fixup 表
-
-布局与排序规则来自 `write.cpp` 的 `BuildSortedVertexList`（2407 行）、
-`FindVertexOffsets`（2326 行）、`FixupVvdFile`（2700 行）与
-`_CompareUsedVertexes`（2370 行）；实现在 [`src/lod.rs`](src/lod.rs)。
-
-关键语义（**都不是从 `studio.h` 猜的，是实测反推的**）：
-
-- 每个顶点带一个 `lodFlags` 位掩码（bit n = 被 LOD n 使用）。
-- 排序键：**最高置位 bit 降序** → mesh 序升序 → mesh 内顶点号升序。
-- `numLODVertexes[n]` 是**累计值**（渲染 LOD n 所需的顶点数 =
-  所有「细节不低于 n」的块之和），所以**单调不增**；尾部槽位 ripple 成
-  最后一个有效值。
-- fixup 表：每个 mesh 内按 LOD **从粗到细**，每段
-  `{lod, sourceVertexID, numVertexes}`。
-- `mstudiomesh_t.numvertices` = 该 mesh **跨全部 LOD 去重后**的顶点总数
-  （不是 LOD 0 的顶点数）。
-- `origMeshVertID` = `finalMeshVertID`（把 LOD 排序的块拼回 mesh 顺序后的编号）。
-
-**实测验证**（53 个真实 fixup 模型，7 条不变式 **53/53 全通过**，
-`probe_vvd_lod_model.js`）：
-
-| 不变式 | 含义 |
-|---|---|
-| R1 | 各 block 精确铺满 `[0, numLODVertexes[0])`，不重叠无空洞 |
-| R2 | `numLODVertexes[n] == Σ_{k>=n} 独占数` |
-| R3 | 按 `sourceVertexID` 扫描时最高位非递增 |
-| R4 | 同一 mesh 内 block 按 LOD 降序 |
-| R5 | fixup 的 mesh 分组数 == MDL 的 mesh 总数 |
-| R6 | `MDL.mesh.numvertices == Σ block 长度` |
-| R7 | VTX 的 `origMeshVertID` 落在该 LOD 的 block 覆盖范围内 |
-
-**头部偏移**（53/53 实测，`probe_vvd_fixup_semantics2.js`）：
-
-```text
-fixupTableStart  = ALIGN4(64)                     = 64
-vertexDataStart  = ALIGN16(fixupTableStart + numFixups * 12)
-tangentDataStart = ALIGN16(vertexDataStart + numLODVertexes[0] * 48)
-文件长度          = tangentDataStart + numLODVertexes[0] * 16   （尾部无填充）
-```
-
-`ALIGN16` **不能省略** —— 例如 3 条 fixup = 36 字节时顶点块从 100 对齐到 112。
-
-**往返判据**：语料 **3302/3302 个 VVD 逐字节往返相同**（含全部 53 个
-带 fixup、230 个多 LOD 的模型），由
-`real_fixup_vvds_round_trip_byte_for_byte` 测试钉住。
-
-**单 LOD 不受影响**：`numLODs == 1` 时排序是恒等变换、`numFixups == 0`，
-产物与加这个特性之前**逐字节相同**。
-
-**输入格式**（TOML）：
+## 多 LOD
 
 ```toml
 [[bodyparts.models]]
-smd = "lod0.smd"          # LOD 0（最精细）
+smd = "lod0.smd"             # LOD 0（最精细）
 
 [[bodyparts.models.lods]]
 smd = "lod1.smd"
-switch_point = 20.0       # 可省略，缺省按 20/40/80… 推算
+switch_point = 20.0          # 可省略，缺省 20·2^k（LOD 1→20、LOD 2→40、LOD 3→80）
 
 [[bodyparts.models.lods]]
 smd = "lod2.smd"
 switch_point = 40.0
 ```
 
-各 LOD 的**材质集合必须一致**（否则报错，不静默对齐）；
-LOD 0 之外的网格由 `lods` 给出，最多 8 层。
+每个 LOD 是一个**完整独立的 SMD**（不是「删掉一些三角形」）。本实现把它们跨 LOD
+精确去重合并成一个顶点池，按 LOD 归属排序，并生成 fixup 表 —— 与 studiomdl 的
+`UnifyLODs` 一致。
 
-> **未实现**：LOD 的**自动生成**（网格简化 / decimate）。
-> 本实现只接受显式给出的多 LOD 输入，不会替你简化网格。
+三条约束：
 
-### 动画：与官方产物的实测对照
+1. 各 LOD 的**材质集合必须一致** —— 违反会**显式报错**（缺材质与多材质都报，
+   静默对齐会贴错材质）；
+2. 最多 **8** 层（含 LOD 0）—— 违反会报错；
+3. 每个 LOD 的顶点数**应当**单调不增（LOD 越高越粗）—— 这是**建议**而不是硬检查；
+   `numLODVertexes[n]` 由各块长度按累计口径算出，所以写出的值始终自洽。
 
-**小模型（2 骨骼 × 5 帧，`anim.toml`）——逐值完全一致：**
+> **未实现**：LOD 的**自动生成**（网格简化 / decimate）。本实现只接受显式给出的
+> 多 LOD 输入，**不会替你简化网格**。这是与官方 `studiomdl` 差距最大的一块。
 
-| 项 | 官方 studiomdl | mdlc |
+`[[bodyparts.models.lods]]` 还接受 `bone_tree_collapse` / `replace_bone` /
+`no_facial`（对应 `$lod` 的这些选项）。`smd` 可省略 —— 省略时复用 LOD 0 的网格，
+只应用骨骼选项。
+
+---
+
+## 验证方法：差分对照，不是自证
+
+**每项特性的验收都是与真实 `studiomdl.exe` 的产物逐字段对照**，而不是「单元测试
+全绿」。这不是洁癖 —— 本项目的绝大多数 bug 都属于「**写错不会报错，只会在游戏里
+表现异常**」的类型：
+
+- 字段偏移错位 → 能解析，但引擎读到别的块；
+- 旋转矩阵转置 → 顶点被反向旋转（对 `rotation = 0` 的合成模型完全看不出来）；
+- UV 不翻转 V → 法线贴图凹凸方向整体反了；
+- 三角形绕序反了 → 面法向整体朝内；
+- 动画常量载荷存成差值 → 骨骼整体少转一个参考旋转；
+- VTX 调色板写错 → 顶点蒙皮到错误骨骼，模型撕裂。
+
+这些**全部**只能靠与真实产物对照才能发现。
+
+### 判据分三层
+
+| 层 | 手段 | 例子 |
 |---|---|---|
-| `bone[0]`（root）编码 | `flags=0x20` `RAWROT2` | **相同** |
-| `bone[0]` 四元数 | `[0, 0, 0.707106, 0.707107]` | **逐位相同** |
-| `bone[1]`（tip）编码 | `flags=0x08` `ANIMROT` | **相同** |
-| `bone[1]` valueptr 偏移 | `[0, 0, 6]` | **相同** |
-| `bone[1]` Z 轴采样 | `[0, 10922, 21844, 32767, 0]` | **逐值相同** |
-| `fps` / `numframes` / `numblends` | 30 / 5 / 1 | **相同** |
-| 解码后采样 | 5 个 | **差异 0 个** |
+| **布局判据** | 官方文件读入再写出必须**逐字节相同** | 语料 **3302/3302** 个 VVD 往返一致（含 53 个 fixup、230 个多 LOD） |
+| **编译判据** | 同一几何分别用两个编译器编译，产物**逐字段对照** | `verify_parity.ps1` + oracle 工具 |
+| **回归判据** | 改动前后对 101 个夹具出 SHA256 快照，逐文件比对 | `parity_snapshot.js` —— **101/101** |
 
-**真实规模（89 骨骼 × 30 帧，`biganim.toml`）：**
-
-| 项 | 结果 |
-|---|---|
-| `rotscale` / `posscale`（267 个轴） | **100% 逐位相同** |
-| 解码后采样（5370 个） | 18 个差 **1 LSB**（0.33%） |
-
-剩下 0.33% 的 1-LSB 差异来自 studiomdl 内部中间量的浮点精度
-（约 6 ulp），**不影响任何语义** —— 差 1 个量化步长，
-在 30 fps 的插值动画里完全不可见。
-
-复现命令：
-
-```powershell
-.\verify_parity.ps1                        # MDL/VVD/VTX 逐字段
-node docs\_probe\decode_chain.js <mdl>      # 解码动画链（形态对照）
-node docs\_probe\cmp_anim_semantics.js <官方> <mdlc>   # 逐值语义对照
-```
-
-### 动画实现的关键规则（都曾写错，且都不会报错）
-
-1. **存储值是「规范化欧拉角 − 参考姿态」，不是「相对第 0 帧的增量」。**
-   这是最重要的一条。早先的结论（见 `docs/animation-layout.md` §3.5）
-   来自 `exp50`/`exp53`/`exp64`/`exp65` —— 那些 SMD 的**第 0 帧旋转
-   恰好都是 0**，于是两种模型给出**完全相同**的结果，实验无法区分。
-   在 89 骨骼 × 30 帧上实测命中率：**13.14% vs 100.00%**。
-
-   ```text
-   stored[f][k] = wrapToPi( canonical_euler(pose[f])[k] − ref_rot[k] )
-                  + (k == 2 && 根骨骼 ? π/2 : 0)
-   stored_pos[f][k] = pose[f].pos[k] − ref_pos[k]
-   ```
-
-   其中 `ref_rot`/`ref_pos` 是**骨骼表里的参考姿态**（SMD 第 0 帧或
-   `$definebone` 覆盖后的值）—— 所以它必须由调用方显式传入，
-   不能自己从 `seq.frames[0]` 取。
-
-2. **`canonical_euler` 必须全程 `f64`。** 降到 f32 会让规范化结果差
-   约 4e-6（`bone 66 "bolt"` 的 `rot[0]`：f32 给 `3.135712`，
-   f64 给 `3.135716`，官方是 `3.135716`），进而使动画存储值差 1 LSB。
-
-3. **量化是「向零截断」**，不是四舍五入、也不是向下取整。两条独立判据：
-   `exp65`（正数 10° → 8191.75 → 官方 **8191**）、
-   `negq`（负数 −0.1 → −8344.05 → 官方 **−8344**；floor 会给 −8345）。
-   89 骨骼模型上的逐值命中率：`trunc` **99.59%** vs `round` 54.15%
-   vs `floor` 26.89%。
-
-4. **量化除数按极值符号选择**：极值为负 → `/32768`，为正 → `/32767`。
-   `i16` 的范围 `[-32768, +32767]` **不对称**，studiomdl 让极值正好
-   压在边界上。实测反解 `div = maxAbs / 官方scale`：极值为负的 31 个轴
-   平均 **32767.995**，为正的 22 个轴平均 **32766.998**，零反例。
-   下限主导时（`floor` 是正数常量）恒用 32767。
-
-5. **`rotscale`/`posscale` 要两趟扫描。** 它们在 bone 表里是**全局一份**
-   （所有序列共用）。边扫边量化的话，后面的序列抬高 scale 会让前面
-   已量化的整数作废，解码后表现为「动画幅度被压缩」。
-
-6. **根骨骼 Z 的 +90° 偏置在「减参考姿态」之后加。** `gen_rootbias`
-   实验（根 Z 参考姿态非零）实测 `2.234459` 对上「减完再加」的
-   `2.234464`；「先给参考加偏置」会给出 `−0.907129`。
-
-7. **`LOOPING` 末帧照抄第 0 帧的存储值**，不是「归零」。
-   `gen_loop` 实验（第 0 帧偏离参考姿态）实测末帧 = `0.499991`
-   （即第 0 帧的值），而不是 0。文档 §3.4 的「末帧强制 0」只在
-   「第 0 帧 == 参考姿态」时成立。
-
-8. **增量要 `wrapToPi` 包裹。** `canonical_euler` 的值域是 `(−π, π]`
-   （`atan2` 割线），而参考姿态可能也在 π 附近。直接相减会在割线处
-   产生 ±2π 跳变（实测 `bone 66 "bolt"` 的 roll ≈ ±π，2 帧跳到 −32768）。
-
-9. **两个 valueptr 必须紧挨着，中间不能插流。** `mstudio_rle_anim_t`
-   的 `pPosV()` 只按 `ANIMROT` 是否置位偏移 6 字节，所以顺序必须是
-   「常量载荷 → rotV → posV → 各轴的流」。写成「rotV → rot 流 → posV」
-   会让 `pPosV()` 落进 rot 的流里，解码器顺着垃圾偏移读到文件尾。
-
-10. **骨骼表的 `rot` 也要规范化。** `gimbal` 实验（pitch = π/2）实测
-    官方把 SMD 的 `[0.35, π/2, −0.25]` 写成 `[0, π/2, −0.6]`。
-    不规范化会让骨骼表与动画的参考姿态基准不一致，整个动画偏移一个常量。
-
-### 与官方产物的实测差距（同一份几何）
-
-| 项 | 结果 |
-|---|---|
-| MDL 语义差异 | **0**（40 处差异中 32 处是我方未实现的段，8 处是结构性偏移） |
-| 骨骼参考姿态 | **仅 f32 舍入级**（最大绝对误差 2e-4，出现在 89 根骨骼链末端） |
-| VVD 顶点 | 排列顺序不同 + 法线约 1e-7 量化误差（语义等价） |
-
-**尚未对齐的骨骼字段**（已知，属未实现功能）：
-`contents`（官方 1 vs 我方 0）、`procedural_rule_*`（jigglebone 等程序化骨骼）、
-`surface_prop_offset`（值不同但指向同一字符串，属布局差异）。
-`flags` 已按用途逐根计算并与官方逐位一致。
-
-## 为什么 MVP 用 TOML 而不是 QC
-
-QC 有约 140 条命令、多套块语法、宏展开、`$include` 与 `$pushd/$popd` 目录栈，
-还有只在特定上下文合法的命令（`flexfile` 写在顶层会报 `bad command`）。
-把 QC 解析和二进制写出**同时**做，等于一次面对两个未验证的子系统，
-出错时无法判断是哪一边的问题。
-
-所以 MVP 先把输入定义成 TOML。QC 适配放到后续阶段 ——
-届时只需把 QC 解析成同一个 IR，写出器一行都不用改。
-
-## 用法
-
-### mdlc 自有形态
-
-```powershell
-cargo build --release
-
-# 打印带注释的模板（含 hitbox / attachment / bonemerge 的示例）
-.\target\release\mdlc.exe template > myprop.toml
-
-# 校验描述文件 + SMD（材质是否声明、骨骼是否对得上都会查）
-.\target\release\mdlc.exe check myprop.toml
-
-# 编译（产出 .mdl + .vvd + .dx90.vtx）
-.\target\release\mdlc.exe build myprop.toml --out .\out
-
-# 直接用 QC 编译（等价于 qc2toml 之后再 build，中间描述不落盘）
-.\target\release\mdlc.exe build-qc myprop.qc --out .\out
-
-# QC → TOML（只转文本，不编译；用于迁移或人工核对）
-.\target\release\mdlc.exe qc2toml myprop.qc --out myprop.toml
-
-# SMD 三角形 → 凸包 → .phy 碰撞文件
-.\target\release\mdlc.exe phy body.smd out.phy --concave --ragdoll
-
-# 布局判据：官方 VVD 读入再写出必须逐字节相同
-.\target\release\mdlc.exe vvd-roundtrip <官方.vvd>
-```
-
-### 官方 `studiomdl` 兼容形态（可直接替换 Crowbar 的编译器）
-
-```powershell
-.\target\release\mdlc.exe -game "<gamedir>" [-nop4] [-verbose] myprop.qc
-```
-
-产物写到 `<gamedir>\models\<$modelname>` —— 与官方 `studiomdl` 的规则一致
-（`write.cpp:1321-1331`）。
-
-**为什么需要它**：[Crowbar](https://github.com/ZeqMacaw/Crowbar) 把编译器路径
-当**不透明配置项**，只传
-`-game "<gamedir>" <选项> "<qc 文件名>"` 并把 CWD 设为 QC 所在目录；
-它的成败判定只有两条 —— ① 编译器有输出；②
-`<gamedir>\models\<$modelname>.mdl` 存在。**它不看退出码，也不解析错误文本。**
-所以把 Crowbar 的「编译器路径」指向 `mdlc.exe` 即可直接替换。
-
-兼容层细节（官方是**单横线长选项**，而 clap 只认 `--long`，故需归一化）
-见 `src/cli.rs` 的模块文档。已知**未实现**的官方选项（`-minlod`、
-`-striplods`、`-definebones`、`-t`、`-a`）会**警告并忽略**，不会静默改变产物。
-
-### 回归脚本
-
-```powershell
-.\verify_parity.ps1    # 同一几何：mdlc vs 真实 studiomdl，逐字段对照
-.\cmp_features.ps1     # hitbox / attachment / bonemerge 三项的逐字段对照
-```
-
-> ⚠️ 这两个脚本**未进仓库**（见「测试」一节的说明），只在开发机上存在。
-> `cmp_features.ps1` 需要先用 studiomdl 编译 `parity\myprop.qc`
-> （`verify_parity.ps1` 会做这件事），再用
-> `mdlc build parity\hb.toml --out parity\hb` 生成对照产物。
-
-### TOML 的一个陷阱
-
-**顶层键必须写在所有 `[[表]]` 之前**。例如把 `bonemerge = [...]` 写在
-`[[attachments]]` 之后，TOML 会把它解析成 `attachments` 的字段而报错。
-本实现因此把 `bonemerge` 放在 `[[bones]]` 里（`bonemerge = true`），
-而不是设一个顶层数组。
-
-## 与 studiomdl 的逐字段对照（核心验证手段）
-
-一键回归：
-
-```powershell
-.\verify_parity.ps1     # 编译 → 用真实 studiomdl 编译同一几何 → 逐字段对照
-```
-
-
-`D:\GITHUB\mdlc-oracle` 是配套的 oracle 工具，用**独立解析器**读两边的产物再逐字段比：
+配套的 oracle 工具在 `D:\GITHUB\mdlc-oracle`（独立仓库），用**独立解析器**读两边的
+产物再逐字段比：
 
 ```powershell
 cd D:\GITHUB\mdlc-oracle
 cargo build --release
-
-# 同一份几何分别用 studiomdl 与 mdlc 编译后：
 .\target\release\oracle.exe diff <studiomdl产物>.mdl <mdlc产物>.mdl
 ```
 
-### 实测结论（`mymod/myprop.mdl`，8 顶点立方体）
+### 回归三连
 
-- **42 处差异中 32 处是「MVP 未实现的段」**（studiohdr2、hitbox set、
-  bone controller、序列、skin、flex、ik 等，我方写 0）—— 预期差异。
-- 其余 8 处**全部是结构性偏移**：因为 studiomdl 多写了那些段，
-  后面所有块的起始偏移与文件长度随之推后。
-- **语义差异为 0。**
-
-## 靠差分揪出的真实缺陷（全部已修）
-
-这些**都不会报错**，只会产出「能解析但进游戏就错」的文件 ——
-正是 Phase 0 先建 oracle 的价值所在：
-
-1. **`mstudiobone_t` 字段偏移整体错位**：`pos` 在 `0x20` 不是 `0x0C`、
-   `rot` 在 `0x3C` 不是 `0x24`（`0x08..0x1F` 是 6 个 bonecontroller 下标）。
-   实测依据：官方 `v_autoshotgun.mdl` 的 `bone[0].rot @0x3C = [1.5708,0,0]`。
-2. **`sznameindex` 是相对自身而非绝对**：骨骼、材质、body part 三处都是。
-   实测依据：官方 `bone[0].sznameindex = 614136`，骨骼表在 664，
-   文件偏移 614136 处是空串，**664+614136** 处才是 `ValveBiped.ValveBiped`。
-3. **`mstudiobodyparts_t.modelindex` / `mstudiomodel_t.meshindex` 是相对父结构**，
-   不是绝对偏移。
-4. **`mstudiotexture_t.flags` 在 `0x04`**，不是 `0x40`（0x40 是下一项的名字偏移）。
-5. **头部 `0x140` 之后整段偏移错位**：`mass` 在 `0x148`（且缺省值是 **1.0** 不是 0）、
-   `contents` 在 `0x14C`。
-6. **`numLODVertexes` 八个槽位都要填**，只填 `[0]` 会让引擎的 LOD 切换读到 0 顶点。
-7. **`mesh.modelindex` 写的是 `-148`**（`-MODEL_SIZE`），不是 model 下标。
-8. **`$cdmaterials` 落盘时规范化为反斜杠 + 结尾分隔符**（`models\mymod\`），
-   且数组项是**绝对**偏移、数组与字符串是**分开的两块**。
-9. **材质名落盘时剥掉 `$cdmaterials` 前缀**（`models/mymod/myprop` → `myprop`）。
-10. **骨骼缺省 `flags` 是 `0x500`**（`BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_HITBOX`），
-    写 0 会被判定为「未被使用」。
-11. **骨骼 `surfaceprop` 缺省继承头部的 `$surfaceprop`**。
-12. **`view_bb` 在没写 `$cbox` 时留 0**，不复用 hull。
-13. **`angle_matrix` 的欧拉约定与 Source 的 `AngleMatrix` 相反**（写成了转置）。
-    这条最凶险：它让 `poseToBone` 变成 `R` 而不是 `R⁻¹`，**顶点被反向旋转**。
-    对 `rotation = 0` 的合成模型完全看不出来，而真实模型的第一根骨骼
-    几乎都带 π/2 旋转。当时的代码注释还写着「实测依据：官方 bone[0].rot…」
-    —— 那条实测**根本没跑过**，注释在撒谎。
-    现在由 `real_model_pose_to_bone_matches_official` 钉住：89 根骨骼逐字段比对，
-    任何约定错误都会让它全线失败。
-14. **SMD 三角形顶点行是 12 个 token**（行首是 `parentBone`），
-    且**没有索引行** —— 每个三角形是「材质名 + 3 个顶点行」。
-    写成 OBJ 风格会让 studiomdl 报 `bogus bone index` 或直接崩溃。
-15. **`mstudiobone_t.quat` 不是可选字段**，必须写 `AngleQuaternion(rot)`。
-    留 0 是**非法四元数**（模长 0，无法归一化），引擎的 `InitPose`
-    直接读它，会让参考姿态失效。实测官方 `bone[0]`：
-    `rot=[1.570796,0,0]` ↔ `quat=[0.7071066,0,0,0.7071069]`。
-16. **L4D2 的 VTX 没有 v49+ 扩展** —— `StripGroupHeader_t` 是 **25** 字节、
-    `StripHeader_t` 是 **27** 字节（不是 33/35）。
-    这条纠正了本工程与 `plank` 早先按「MDL ≥ 49 即有扩展」的判断。
-    判据见 `mdlc-oracle/src/vtx.rs` 的模块文档与
-    `real_model_strip_group_chain_closes_at_25` 测试。
-17. **`stripGroup.flags` 用 `HWSKINNED`(0x02)**，不是 `FLEXED`(0x01)。
-    无 flex 的模型写 1 会让引擎去查不存在的 flex 数据。
-18. **`boneWeightIndex` 恒写 `[0,1,2]`**（固定序列），不是「0..boneCount」。
-    写 0 填充会让槽位 1/2 都指向 `weight[0]`。
-19. **`materialReplacementList.replacementOffset` 写 0**，不是「指向数组末尾」。
-20. **`mstudiomesh_t.vertexoffset` 是相对 model 的**，不是全局顶点下标。
-    实测官方 `bp[2].model[0]` 从 VVD 顶点 99996 开始，但它的
-    `mesh[0].vertexoffset` 是 **0**。
-21. **`mstudiomesh_t.modelindex` = model 绝对位置 − mesh 绝对位置**
-    （负值）。实测官方三个 body part 分别是 −2572 / −4512 / −4480 ——
-    **各不相同**，所以不能写死 `-148`（那只是「单 mesh 且 mesh 紧跟
-    model」时的巧合，我一开始正是这么错的）。
-22. **`mstudiobbox_t.hitboxindex` 是相对 hitbox set 自身**的偏移
-    （实测官方 = 12），不是绝对偏移。
-23. **`mstudioattachment_t.local` 的平移列在矩阵下标 3/7/11，
-    即字节偏移 `0x0C + 3*4 / 7*4 / 11*4`** —— 我漏乘 4 写成
-    `+3/+7/+11`，结果附着点位置全丢（写成极小浮点数的位模式）。
-    这类错误不会报错，只会让枪口火焰出现在错误的位置。
-24. **骨骼 `flags` 必须按用途计算，且沿父链向上传播**。
-    实测官方：`$hbox 0 "root"` + `$attachment "muzzle" "tip"`
-    → `bone[0] = 0x40700`、`bone[1] = 0x200`。
-    早先一律写 `0x500` 会把未被顶点使用的骨骼误标为已使用。
-    `DEFAULT_BONE_FLAGS` 只在**完全无信息**时兜底。
-25. **动画量化是「向零截断」**（`trunc`），不是四舍五入，也不是向下取整。
-    两条独立实测判据：`exp65` 正数 10° → 8191.75 → 官方 **8191**；
-    `negq` 负数 −0.1 → −8344.05 → 官方 **−8344**（floor 会给 −8345）。
-26. **量化除数按极值符号选**：极值为负 → `/32768`，为正 → `/32767`。
-    `i16` 范围 `[-32768, +32767]` 不对称，studiomdl 让极值正好压在边界上。
-    实测反解 `div = maxAbs / 官方scale`：负的 31 个轴平均 **32767.995**，
-    正的 22 个轴平均 **32766.998**，零反例。恒用 32767 会让所有负向
-    通道幅度偏大约 1/32767。
-27. **动画存储值是「规范化欧拉角 − 参考姿态」**，不是「相对第 0 帧的增量」。
-    这条推翻了 `docs/animation-layout.md` §3.5 —— 那个结论的依据
-    （`exp50`/`exp53`/`exp64`/`exp65`）第 0 帧旋转恰好都是 0，
-    两种模型给出相同结果，实验**无法区分**。89 骨骼 × 30 帧实测：
-    13.14% vs **100.00%**。
-28. **`canonical_euler` 必须全程 `f64`。** 降到 f32 会让规范化结果差
-    约 4e-6（`bone 66` 的 `rot[0]`：f32 `3.135712` vs 官方 `3.135716`），
-    进而使动画存储值差 1 LSB。
-29. **`LOOPING` 末帧照抄第 0 帧的存储值**，不是「归零」。
-    `gen_loop` 实验（第 0 帧偏离参考姿态）实测末帧 = `0.499991`。
-30. **根骨骼 Z 的 +90° 偏置在「减参考姿态」之后加。**
-    `gen_rootbias` 实测 `2.234459` 对上「减完再加」的 `2.234464`。
-31. **增量要 `wrapToPi` 包裹。** `canonical_euler` 值域是 `(−π, π]`，
-    参考姿态可能也在 π 附近，直接相减会在割线处产生 ±2π 跳变。
-32. **两个 `valueptr` 必须紧挨着**，中间不能插流 —— `pPosV()` 只按
-    `ANIMROT` 是否置位偏移 6 字节。写成「rotV → rot 流 → posV」会让
-    解码器顺着垃圾偏移读到文件尾。
-33. **骨骼表的 `rot` 也要规范化。** `gimbal` 实验实测官方把
-    `[0.35, π/2, −0.25]` 写成 `[0, π/2, −0.6]`。
-34. **`RAWROT2` 的判定是「旋转逐轴都不随时间变化」**，不是「三轴同一个角度」。
-    `Absent` 轴记 0、`Constant` 轴取值，三轴合起来是常量就用 `RAWROT2`。
-    最小模型里恰好是 `[0,0,π/2]`，容易被误读成「整体一个角度」。
-35. **`mstudioanim_valueptr_t.offset[i] == 0` 表示该轴无数据**
-    （`pAnimvalue` 返回 NULL），不是「偏移 0」。
-    实测 `exp50` 的 `rotV = [6, 0, 16]`：中间的 0 就是恒 0 的 Y 轴。
-36. **`mstudioanimvalue_t` 是 union**（`{valid,total}` ∪ `short value`）。
-    解码循环是「读 `valid` 个采样，再把最后一个重复 `total - valid` 次」，
-    `total == 0` 才终止。把 `value` 当成「run 的代表值」是错的。
-37. **链尾有一条 4 字节全零记录**，且末条记录的 `nextoffset == 0`。
-38. **空链写 `numbones` 条 `ff 00 00 00`** —— `bone == 255` 是
-    「该骨骼在本动画无数据」的**占位记录，不是终止符**。
-39. **SMD 的 UV 必须翻转 V**（`v → 1-v`），且翻转发生在**解析 SMD 时**
-    （`v1support.cpp:162` 的 `t[1] = 1.0 - t[1];`），不是写 VVD 时。
-    漏掉它会让 VVD 的 UV 与官方不一致，**并让切线手性 `w` 系统性错一个符号**
-    —— 表现为法线贴图的凹凸方向整体反了，且不会报任何错。
-    实测：修正后与官方同几何产物的 `w` 一致率从 0/8 变成 **8/8**。
-40. **切线要用真实三角形算，不能用「法线叉积」占位。**
-    占位切线在引擎的静态光照路径下看不出问题，但法线贴图会发黑/方向错。
-    算法见 `src/tangent.rs`；语料 631 万顶点的方向吻合率 **96.69%**，
-    其余 3.31% 集中在 54 个「官方切线不垂直于自己法线」的模型上
-    （数据本身矛盾，不是算法差异）。
-41. **`numLODVertexes[n]` 是累计值**（渲染 LOD n 所需的顶点数），
-    不是「第 n 个 LOD 各自的顶点数」。它**单调不增**，且尾部槽位
-    ripple 成最后一个有效值。当成「各自顶点数」会让 LOD 切换读到错误范围。
-42. **`mstudiomesh_t.numvertices` 在多 LOD 下是「跨全部 LOD 去重后的总数」**，
-    不是 LOD 0 的顶点数；`vertexoffset` 按这个总数累加。
-    用 LOD 0 的值会让 `origMeshVertID` 越界（实测 53/53 个真实模型
-    满足 `numvertices == Σ block 长度`）。
-43. **有 fixup 时 `vertexDataStart != 64`**：顶点块被推到
-    `ALIGN16(64 + numFixups*12)`。沿用单 LOD 的「三偏移都是 64」会让
-    引擎把 fixup 表当顶点读。`ALIGN16` 在 `numFixups*12` 不是 16 的倍数时
-    才真的移动偏移（3 条 fixup：100 → 112），所以**不能靠巧合通过**。
-44. **单 mesh 的多 LOD 模型 `numFixups == 0`**（`write.cpp` 2777 行显式跳过：
-    数据本来就连续，不需要重定位表）。实测 177 个「多 LOD 且单 mesh」的
-    真实模型全部为 0，53 个「多 LOD 且多 mesh」的全部非 0。
-    无条件写 fixup 表会与官方形态不同（虽然仍可读）。
-45. **`mstudiomesh_t` 偏移 `0x20` 是 `meshid`（全局序号），不是 `numBones`。**
-    实测 5585/5585 个真实 mesh 的 `0x20` 恰好等于它在该 model 内的序号
-    （0,1,2…），骨骼数完全对不上。早先把它当 `numBones`、把 `0x24` 当
-    `boneIds[8]` 是错的 —— `0x24` 是 `center`（`Vector`，实测恒为 0）。
-    写错会让引擎读到一个非法的 `meshid`。
-    判据：`docs/_probe/probe_mesh_offsets.js`。
-46. **`mstudiomesh_t` 偏移 `0x34` 是 `numLODVertexes[8]`**，语义与 VVD 的
-    同名数组同构但**作用域是单个 mesh**：`[n]` = 该 mesh 中「最高 LOD 位
-    >= n」的顶点数（累计值，单调不增）。
-    实测 **448/448** 个多 LOD 模型的 mesh 满足，且
-    **`Σ_mesh mesh.numLODVertexes[n] == VVD.numLODVertexes[n]`**。
-    单 LOD 时八个槽位都填 `numvertices`（实测官方是 `[8,8,8,8,8,8,8,8]`）；
-    留 0 会让引擎认为该 mesh 在该 LOD 没有顶点。
-    判据：`docs/_probe/probe_mesh_numlodvertexes.js`。
-
-## 一条重要的格式事实：checksum 不是内容哈希
-
-`.mdl` / `.vvd` / `.vtx` / `.phy` 四件套里的 `checksum` **只是配对令牌**：
-
-- Crowbar 与 plank 都只**比较**、从不计算它；
-- 引擎只做配对校验，报错形如
-  `Error Vertex File for '...' checksum 1875668995 should be -1530146530`。
-
-所以编译器只需生成一个值并原样写进四个文件，**不需要逆向任何哈希算法**。
-本实现用模型名的 FNV-1a（稳定、跨进程一致；`DefaultHasher` 不保证跨进程稳定）。
-
-## 已知未实现（后续阶段）
-
-优先级与完整清单见 [`docs/feature-gap.md`](docs/feature-gap.md)。要点：
-
-- QC 解析（→ IR）；**137 条命令目前只支持约 8 条**
-- 动画的 **RLE run 合并**（当前只做常量折叠，见下）
-- 动画的 `sectionframes` 分段、IK rule、movement、`STUDIO_FRAMEANIM`
-- flex / eyeball / mouth / ik
-- **LOD 的自动生成**（网格简化 / decimate）—— 多 LOD 的**输入与写出**已支持，
-  但不会替你简化网格
-- PHY
-- 程序化骨骼（jigglebone 的 `procedural_rule_type` / `procindex`）
-- DMX 输入（`dmxconvert` 子进程）、VTA、VRD
-- `$definebone` 语义、`$illumposition` 轴交换等 QC 级变换
-
-> **注**：`studiohdr2`、`bonetablename`、动画 events、`$keyvalues`、
-> `bonecontroller` 段已实现（见下「已实现的新增段」）。
-
-### 段布局是一个**框架**，不是一个长函数
-
-MDL 的段偏移集中在 [`src/layout.rs`](src/layout.rs) 里声明式地计算
-（`SectionOffsets::compute` + `SectionCounts`）。`write_mdl` 只负责
-「填计数」和「按算出的偏移写字节」。
-
-**加一个新段只需三步**（以 `flexdesc` 为例）：
-
-1. `SectionCounts` 加字段（已预留，填真实数量即可）；
-2. `compute` 里把 `+ 0` 换成 `+ n * SIZE`（已写成可累加形式）；
-3. `write_mdl` 里按 `layout.flexdesc` 写字节。
-
-顺序**不需要**判断 —— 它在 `compute` 里硬编码为权威顺序，写错会被
-`check_monotonic()` 抓到。这个设计的目的是让「一点点实现剩余特性」
-不会因为布局耦合而互相干扰。
-
-### 已实现的新增段（2026-09）
-
-| 段 | 实测频率 | 说明 |
-|---|---|---|
-| `studiohdr2` | **3333/3333 (100%)** | 固定放 408（Crowbar 硬编码该位置） |
-| `bonetablename` | **3333/3333 (100%)** | `byte[numbones]` 名字索引表 |
-| 动画 events | **1802/3333 (54.1%)** | `mstudioevent_t` = 80 字节，名字是**相对偏移**（不是内联） |
-| `$keyvalues` | **735/3333 (22.1%)** | `"mdlkeyvalue\n{…}\n\0"`，与官方逐字节一致 |
-| `bonecontroller` | 0/3333 (0%) | 段占位（L4D2 已废弃该特性） |
-
-**空段的偏移语义**：实测 studiomdl 对**计数为 0** 的段仍写「该段应处的
-位置」，而不是 0（3333/3333 模型的 `bonecontroller` 如此）。早先的实现
-一律写 0，与官方逐字段对照时会产生十几处假差异。
-
-### 段顺序的权威结论（3333 个真实模型实测）
-
-```text
-studiohdr2 → bone → bonecontroller → attachment → hitboxset
-  → bonetablename → localanim → 动画链 → localseq → seq 子表
-  → bodypart → localnodename → model 数组
-  → flexdesc → flexcontroller → flexrule → ikchain → mouth
-  → poseparam → ikautoplaylock → mesh 数组
-  → texture → includemodel → animblock → cdtexture → skin
-  → 字符串池 → keyvalues → $cdmaterials 数组
-```
-
-两条最容易写错的（早先的实现**两条都错了**）：
-
-1. **`attachment` 恒在 `hitboxset` 之前**（3333/3333 实测）；
-2. **`mesh` 数组在 flex/ik/poseparam 之后**，不是紧跟 model（3300/3300 实测）。
-
-归纳脚本：`docs/_probe/canonical_order2.js`。
-
-### 重建验证语料
+改任何东西之后都跑：
 
 ```powershell
-# 从 pak01 解出全部 3333 个模型（含 2498 个 .phy）
-node docs\_probe\vpk_extract.js `
-  "E:\SteamLibrary\steamapps\common\Left 4 Dead 2\left4dead2\pak01_dir.vpk" `
-  "D:\DSH\L4D2ReverseEngineering\mdl-corpus"
+cd D:\GITHUB\mdlc
+cargo test --release                  # 应为 618 passed / 0 failed / 6 ignored
+cargo clippy --release --all-targets  # 应为 0 warning
+node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
 
-> **不要用 L4D2 自带的 `bin\vpk.exe`** —— 它在本机写出**全零文件**
-> （打印 `extracting` 后跟 `FS: Tried to Write NULL file handle!`），
-> 且一次传 200 个文件名时会静默失败。所以自实现了 VPK v1 解包器。
+> ⚠️ **`cargo clippy -- -D warnings` 会被缓存骗过**：cargo 的 clippy 结果按
+> **源码内容**缓存，**不区分 `-D warnings`**。先跑过一次不带它的 clippy，之后带它
+> 的那次会**复用缓存直接返回成功**，于是 allow-by-default 的 lint 全部漏掉 ——
+> 症状是「本地 clippy 干净，CI 却红」。CI 里已改成显式
+> `-W clippy::all -D warnings`，且 CI 总是全新构建。
 
-特性频率统计脚本：`docs/_probe/survey_features.js`。
+> ⚠️ **纯性能改动必须做「基线二进制 A/B」**：只比快照不够 —— 快照证明「产物没变」，
+> 但不证明「你没把别的路径改慢」。
 
-### 动画的已知取舍（不影响正确性）
+### 变异测试
 
-- **不做 RLE run 合并**，只做常量折叠。`mstudioanimvalue_t` 的
-  `{valid, total}` 语义允许 `valid == total == N`（逐帧完整数据），
-  任何合规解码器都能读。代价是动画区比官方大 **约 4–6×**
-  （整模型量级 2.5–3.5 MB）。这是**体积**问题，不是正确性问题。
-- 超过 255 帧的通道会拆成多条 run（`total` 是 `u8`）。
-- `seqdesc.bbmin/bbmax` 用顶点 AABB，官方用的是**逐帧蒙皮后的并集**
-  （多帧模型精确匹配，1 帧/常量姿态模型有差异，见
-  `docs/animation-layout.md` §12 的 U4）。
-- 不做 `sectionframes` 分段（实测 `sectionindex = sectionframes = 0`
-  在 60+ 样本上均合法）。
+新增或修改差分测试后，会把被测代码**故意改坏**，确认测试变红。本项目已被
+「测试全绿但改坏了也全绿」坑过多次，所以这是**必做收尾**。
 
-### VTX 的已知取舍（不影响正确性）
+> ⚠️ **一个恒真的测试比没有测试更危险。** 边界测试的夹具必须能**精确落在边界值
+> 上**（用「每三角形 3 个独立顶点」的夹具永远够不到 65536，把 `>` 变异成 `>=`
+> 照样全绿）；判据里「差异计数等于 0」的形式天然会被**空夹具**满足，所以必须在
+> 判定前加「夹具非空」硬门。
 
-- 每个 mesh 固定 **1 个 strip group + 1 个 tri-list strip**，不做 strip 优化。
-  实测 L4D2 全部是 tri-list（0 个 tri-strip），所以这不会导致错误；
-  代价是渲染时顶点缓存命中率略低于官方产物。
-- 顶点**不重排**（studiomdl 会按内部哈希重排，实测最小文件的映射是
-  `[7,1,0,4,5,3,2,6]`）。重排不影响语义 —— 已用「各自配套的 VVD 解析出
-  三角形集合」证明两者几何完全等价。
-- **多 LOD 已支持**（结构树 / `switchPoint` / `origMeshVertID` 按实测规则写出），
-  但**不做 LOD 的自动生成** —— 需要显式给出每个 LOD 的 SMD。
-  单 LOD 的产物与加这个特性之前逐字节相同。
-- **`switchPoint` 的缺省值是推算的**（`20 * 2^(n-1)`），不是 studiomdl 的算法 ——
-  真实模型的 `switchPoint` 来自 QC 里显式写的距离。写错只影响 LOD 切换距离，
-  不影响渲染正确性。实测真实取值分布：`0`（LOD 0 恒为 0）、
-  `10/15/20/25/30/40/50/60/65/80/100/150/200`，以及 `-1`（不切换）。
-
-### 一条会影响后续工作的版本事实
-
-本地 `hl2sdk-l4d2\public\studio.h` 声明 **`STUDIO_VERSION 48`**，
-但真实 L4D2 模型是 **v49**（官方 `v_autoshotgun.mdl` 实测 `version = 49`）。
-两者的结构大小相同，但**若干槽位语义不同，动画编码真正不同**。
-
-**所以做动画层时不要照 `hl2sdk-l4d2` 的头文件写位流** ——
-应改用 `hl2sdk-doi`（实测其 `studio.h` 是 `STUDIO_VERSION 49`）。
+---
 
 ## 测试
 
 ```powershell
-cargo test --release          # 526 passed / 0 failed / 6 ignored
+cargo test --release          # 618 passed / 0 failed / 6 ignored
 ```
 
-**526 个测试默认全跑**，不需要任何外部素材，覆盖：TOML 解析与校验（含各类
-非法输入）、各结构体偏移与大小的**硬编码断言**（防止实现与测试一起跑偏）、
-相对/绝对偏移语义、字符串池规范化、官方 VVD 的逐字节往返、
-**切线算法**（轴对齐四边形 / 手性翻转 / 共享顶点累加 / 退化 UV / 孤立顶点）、
-**多 LOD 与 fixup**（排序不变式、分段铺满、fixup 分组、单 mesh 不做 fixup、
-VTX 的 `origMeshVertID` 范围）、**QC 词法/语法**、**flex/VTA**、**PHY**。
+**618 个测试默认全跑，不需要任何外部素材。** 按模块分布：
+
+| 模块 | 数量 | 覆盖 |
+|---|---|---|
+| `compile` | 105 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
+| `qc` | 78 | QC 词法 / 语法 / 命令语义 |
+| `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
+| `phy` | 77 | 凸包、`$concave`、ragdoll、IVP 布局不变量 |
+| `mdl_writer` | 77 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
+| `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
+| `vtx_writer` | 24 | strip group 链、骨骼调色板、缓存优化守门 |
+| `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
+| `model` | 23 | TOML 解析与校验（含各类非法输入） |
+| `smd` | 18 | SMD 解析（含 9/10 token 顶点行） |
+| `bone_math` | 17 | 欧拉/四元数、矩阵约定 |
+| `ani_writer` | 16 | `.ani` 容器与块对齐 |
+| `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
+| `vta` | 14 | `.vta` 解析 |
+| `lib.rs` 的 `tests` | 10 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
+| `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
+| `layout` | 6 | 段偏移计算与单调性 |
 
 ### 6 个需要真实素材的测试（默认 `#[ignore]`）
 
 另有 6 个测试拿**真实 `studiomdl.exe` 产物**做判据。这些素材**不能进仓库**
-（体量大、含 Valve 版权内容），所以它们标了 `#[ignore]` ——
-默认 `cargo test` **不跑**，结果行里显示 `6 ignored`：
+（体量大、含 Valve 版权内容），所以它们标了 `#[ignore]`：
 
 ```powershell
-cargo test --release -- --ignored        # 显式跑它们
+cargo test --release -- --ignored
 ```
 
 素材用**环境变量**指定（不设则回退到开发机的历史路径）：
@@ -803,7 +696,7 @@ cargo test --release -- --ignored        # 显式跑它们
 | `MDLC_TEST_VVD` | 官方 `v_autoshotgun.vvd`（388,765 顶点 / 24.8 MB） |
 | `MDLC_TEST_MDL` | 官方 `v_autoshotgun.mdl`（89 骨骼） |
 | `MDLC_TEST_SMD` | 真实反编译 SMD（22,911 三角形） |
-| `MDLC_TEST_VTX` | 官方 `myprop.dx90.vtx`（由 `studiomdl` 编译 `parity/myprop.qc` 得到） |
+| `MDLC_TEST_VTX` | 官方 `myprop.dx90.vtx`（须由 `studiomdl` 编译 `parity/myprop.qc` 得到） |
 | `MDLC_TEST_CORPUS` | 真实语料根目录（3333 个 `.mdl` / 3302 个 `.vvd`） |
 
 ```powershell
@@ -812,55 +705,111 @@ cargo test --release -- --ignored
 ```
 
 > ⚠️ **为什么用 `#[ignore]` 而不是「读不到就 `return`」。**
-> 后者在 `cargo test` 的默认输出里**显示成 `ok`**（跳过的 stderr 被测试
-> 框架吞掉），看起来像「验过了」，实际什么也没验 ——
-> **一个恒真的测试比没有测试更危险**。改成 `#[ignore]` 后，
-> 「跳过」与「通过」在结果行里**不再混淆**：显式跑它们时素材缺失会**失败**
-> 并打印该设哪个环境变量，而不是静默变绿。
->
-> 这个改动**当场就抓到了**：本机 `D:\GITHUB\plank\examples\` 已被清理，
-> 其中 4 个测试的素材早已不存在 —— 它们此前一直以 `ok` 出现在结果里。
+> 后者在 `cargo test` 的默认输出里**显示成 `ok`**，看起来像「验过了」，实际什么
+> 也没验。改成 `#[ignore]` 后，「跳过」与「通过」在结果行里**不再混淆**：显式跑
+> 它们时素材缺失会**失败**并打印该设哪个环境变量，而不是静默变绿。
 
-### 验证方法：差分对照，不是自证
+### 仓库里没有的东西
 
-每项特性的验收都是**与真实 `studiomdl.exe` 的产物逐字段对照**，
-而不是「单元测试全绿」。核心脚本（**未进仓库**，见下）：
+以下内容**存在于开发机但不在仓库里**（`.gitignore` 逐条写明了理由：体量大、
+含 L4D2 解包素材）：
 
-| 脚本 | 作用 |
+| 路径 | 内容 |
 |---|---|
-| `docs/_probe/parity_snapshot.js` | 全量编译 101 个 TOML 并出快照；`--compare` 逐字节比两次快照 |
-| `docs/_probe/cmp_crowbar_alias.js` | 与真 `studiomdl.exe` **同参数**对照兼容 CLI 的产物路径与文件集 |
-| `docs/_probe/qc_vs_official.js` | 同一批 QC 分别喂 mdlc 与官方，比「谁能编过」 |
+| `docs/_probe/` | 判据脚本（1100+ 个 `.js`）、受控实验夹具、官方与 mdlc 的对照产物 |
+| `parity/` | 101 个 `.toml` + 64 个 `.smd` + 11 个 `.qc` 输入，以及 `_snap/` 快照 |
+| `out/`、`mymod/` | mdlc 自己的编译输出 |
+| `verify_parity.ps1`、`cmp_features.ps1` | 两个回归脚本（依赖上面两项） |
 
-> ⚠️ **`docs/_probe/`、`parity/`、`out/` 与两个 `*.ps1` 回归脚本都未进仓库**
-> （`.gitignore` 里写明了理由：体量大、含 L4D2 解包素材）。
-> 因此本 README 与源码注释里对它们的引用，在**只克隆本仓库时是悬空的** ——
-> 它们描述的是**验证过程**，不是运行本程序的依赖。
-> 重建方式见 `.gitignore` 各条目的说明。
+因此本 README 与源码注释里对它们的引用，在**只克隆本仓库时是悬空的** ——
+它们描述的是**验证过程**，不是运行本程序的依赖。重建方式见 `.gitignore` 各条目。
 
-### 变异测试（证明测试不是空洞的）
+> ⚠️ **`git clean -xdf` 会把它们真的删掉** —— 探针脚本与夹具目前只有这一份，
+> 而 `parity/` 与 `docs/_probe/` **不在版本控制里**，删了不可回滚。
+> 源码（`src/`、`docs/*.md`、`Cargo.toml`）则是受 git 保护的。
 
-新增或修改差分测试后，会把被测代码**故意改坏**，确认测试变红。
-本项目已被「测试全绿但改坏了也全绿」坑过多次，所以这是**必做收尾**。
-最近一轮（CLI 兼容层）10/10 处变异全部被捕获，且 oracle 探针自身也做了
-变异验证（改坏 `official_out_root` ⟹ 探针从 2/2 变 0/2）。
+---
 
-## 后续阶段
+## 代码结构
 
-已完成的（QC 前端、动画、flex、VTX、PHY、hitbox/attachment/bonemerge、
-`studiomdl` 兼容 CLI）见上「当前状态」。**剩下的大块**：
+```text
+src/
+  main.rs         命令行入口与编排（编译 → 写出 → 摘要）
+  cli.rs          clap 定义 + 官方 studiomdl 单横线选项的归一化兼容层
+  diag.rs         诊断输出的流路由（兼容形态走 stdout）
+  lib.rs          库根：模块声明与 VVD 往返判据
+  model.rs        IR（ModelDesc）与全部校验规则；含 TEMPLATE_TOML
+  smd.rs          SMD 网格 / 骨架解析
+  compile.rs      TOML|QC + SMD → 编译期 IR（跨文件校验、拆分、LOD 统一）
+  qc/             QC 前端
+    lexer.rs        词法（含官方 TokenAvailable 的行内语义）
+    parse.rs        命令分发表 → ModelDesc
+    flexrule.rs     %<flex> = <expr> 表达式编译
+  mdl_writer.rs   .mdl 写出（头部、骨骼、材质、bodypart、mesh、flex、IK…）
+  vvd.rs          .vvd 解析 / 写出 / 往返比对 / 自洽性检查
+  vtx_writer.rs   .dx90.vtx 写出（strip group、骨骼调色板、缓存优化）
+  anim_writer.rs  动画链写出（量化、RLE、常量载荷、IK 误差、段表、外置块）
+  ani_writer.rs   .ani 容器写出
+  lod.rs          多 LOD 与 fixup 表（顶点池排序、分段、重映射）
+  flex.rs         VTA 形状解析（就近匹配 → 差量 → smoothstep → 载荷）
+  vta.rs          .vta 顶点动画解析
+  phy.rs          .phy 碰撞体写出（凸包 / $concave / ragdoll / 阻尼 / 惯量）
+  tangent.rs      切线空间计算（法线贴图用）
+  bone_math.rs    骨骼矩阵与四元数工具
+  layout.rs       MDL 段偏移的声明式计算
+  prof.rs         分段计时探针（profiling feature，默认关闭）
+  test_assets.rs  真实素材测试的路径解析（仅测试）
+```
 
-1. **LOD 的自动生成**（网格简化 / decimate）—— 目前只支持**输入**多 LOD，
-   不做简化。这是与官方 `studiomdl` 差距最大的一块。
-2. `-definebones`（Crowbar 勾选「Define Bones」时用到：从 SMD 推导骨骼并
-   打印 `$definebone` 行）。
-3. `-minlod` / `-striplods`（按官方语义截断 LOD；现在传了会**警告并忽略**）。
-4. `-t` / `-a` 等官方纹理替换与法线混合角选项。
-5. DX8/DX7 回退变体（官方额外产出 `.dx80.vtx` / `.sw.vtx`；L4D2 是 DX9 引擎，
-   目前只产 `.dx90.vtx`）。
+**段布局是一个框架，不是一个长函数。** MDL 的段偏移集中在 `src/layout.rs` 里
+声明式地计算（`SectionOffsets::compute` + `SectionCounts`），`write_mdl` 只负责
+「填计数」和「按算出的偏移写字节」。顺序在 `compute` 里硬编码为权威顺序，写错会被
+`check_monotonic()` 抓到。加一个新段只需三步：加计数字段、在 `compute` 里把 `+ 0`
+换成 `+ n * SIZE`、在 `write_mdl` 里按偏移写字节。
+
+**数学用现成 crate**：`parry3d`（quickhull 凸包、VHACD、质量属性）、`meshopt`
+（顶点缓存优化）、`clap`（CLI）、`toml` + `serde`（描述文件）。
+
+---
+
+## 已知未实现
+
+| 项 | 说明 |
+|---|---|
+| **LOD 自动生成** | 网格简化 / decimate。多 LOD 的**输入与写出**已支持，但不会替你简化。**这是与官方差距最大的一块** |
+| **DMX 输入** | 刻意不实现。`$nekomodel` 会**显式报错**；`studio "x.dmx"` 不会被专门识别，而是在读文件/解析 SMD 时失败（官方也是委托 `dmxconvert.exe`） |
+| `$maxverts` | NekoMDL 的非官方扩展，被忽略。用自动拆分替代 |
+| `ikrule footstep`（type 3） | 需要 `$ikchain` 的 `center`，mdlc 尚未建模该量。**语料出现 0 次**；写出时会**显式报错**而不是静默产出错误载荷 |
+| 若干语料 0 次的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` / `$maxbones` … 被忽略 |
+| 官方 CLI 的 `-minlod` / `-striplods` / `-definebones` / `-t` / `-a` | 参数被接受但**警告并忽略** |
+| `$bodygroup { … blank }` | `blank` 成员（一个空 model）**报错** —— `BodyModel.smd` 是必填字段，mdlc 没有表达「无网格 model」的方式 |
+| **blend 序列上的 `weightlist` / `numframes` / `subtract`** | **被静默丢弃**（见下）。单动画序列上它们正常生效 |
+| `[[sequences.movements]]` 只能从 TOML 写 | QC 前端没有对应关键字（`mstudiomovement_t` 的**写出**是完整实现的，只是 QC 侧无法表达） |
+| DX8 / DX7 回退变体 | 官方额外产出 `.dx80.vtx` / `.sw.vtx`；L4D2 是 DX9 引擎，目前只产 `.dx90.vtx` |
 
 ### 已知的语义等价差异（不必追）
 
-同一几何经两个编译器，VVD 里顶点的**排列顺序**不同（studiomdl 按它内部的
-哈希/去重顺序重排），法线还有约 `1e-7` 的量化误差（`-0.9999998807907104`
-vs `-1.0`）。这些不影响渲染 —— 顶点索引表会跟着一起变，两边自洽。
+- **VVD 顶点排列顺序**不同：`studiomdl` 按它内部的哈希/去重顺序重排，mdlc 按 SMD
+  出现顺序。顶点索引表会跟着一起变，两边自洽，**不影响渲染**。
+- **法线有约 `1e-7` 的量化误差**（`-0.9999998807907104` vs `-1.0`）。
+- **逐 float 位完全相同的切线比例较低**（浮点运算顺序不同：x87/SSE 混合路径 vs
+  Rust f32）。方向（cos）才是语义判据。
+
+---
+
+## 延伸文档
+
+仓库内的 `docs/` 收录了五份**实测反推**的规格报告（结论全部来自对真实产物的
+逐字节分析，不是从 `studio.h` 推断的）：
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/animation-layout.md`](docs/animation-layout.md) | MDL 动画数据布局的实测规格（含已推翻结论的勘误） |
+| [`docs/blend-sequences.md`](docs/blend-sequences.md) | blend 序列的完整规格（QC 侧 + 二进制侧） |
+| [`docs/coordinate-systems.md`](docs/coordinate-systems.md) | 坐标系约定与 `$staticprop` 几何旋转 |
+| [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | 以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准的 QC 覆盖对照 |
+| [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
+
+> ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
+> 带有明确的快照日期（当时的文件 SHA256 与测试数）。**它们描述的是历史状态**，
+> 「当前实现了什么」应以**源码与 `README.md` 为准**。
