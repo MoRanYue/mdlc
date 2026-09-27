@@ -210,8 +210,45 @@ fn weld_or_push(
 ) -> u32 {
     let key = vertex_key(v);
     // ① 精确命中（绝大多数顶点走这条，O(1)）。
+    //
+    // ⚠️ **即便位置/法线/UV/骨骼全部逐位相同，也还要过法线判据。**
+    //
+    // 官方的判据只有一条（`v1support.cpp:39`）：
+    //
+    // ```c
+    // if (v_listdata[i].m == material
+    //     && DotProduct( g_normal[i], normal ) > normal_blend   // ← 唯一的法线判据
+    //     && VectorCompare( g_vertex[i], vertex )
+    //     && g_texcoord[i][0] == texcoord[0]
+    //     && g_texcoord[i][1] == texcoord[1])
+    // ```
+    //
+    // `DotProduct` 对**零法线**恒为 `0`，而 `0 > cos(2°) = 0.99939` 为 **false**
+    // ⟹ 官方**永远不会**因为「两个零法线长得一样」而复用顶点，它总是追加。
+    //
+    // 精确命中路径里两侧法线**逐位相同**，所以点积恰好是 `|n|²`：
+    //
+    // | 法线 | `|n|²` | 官方 | mdlc 修前 |
+    // |---|---|---|---|
+    // | 单位向量 | `1` | 复用 ✅ | 复用 ✅ |
+    // | **零法线** | `0` | **追加** | **复用** ❌ |
+    // | `|n| = 0.5` | `0.25` | 追加 | 复用 ❌ |
+    //
+    // 实测（`v_dual_pistola`，用户工程）：4 个 `nrm=[0,0,0]` 的顶点被
+    // 多焊掉，VVD 少 4 个顶点（`111113 → 111109`），
+    // 两个 bodypart 的 `mesh[4]` 由官方/NekoMDL 的 **5532** 变成 **5530**。
+    // 顶点池一变，`origMeshVertID` 与整条 VTX 索引全部错位
+    // ⟹ **HLMV 里网格被撕开**。
+    //
+    // 这一条对单位法线是**恒真**的（`1 > 0.99939`），所以只影响退化法线。
     if let Some(&i) = table.get(&key) {
-        return i;
+        let e = &pool[i as usize];
+        let d = e.normal[0] * v.normal[0]
+            + e.normal[1] * v.normal[1]
+            + e.normal[2] * v.normal[2];
+        if d > NORMAL_BLEND {
+            return i;
+        }
     }
     // ② 法线容差命中：同位置 + 同 UV，且法线夹角 < 2°。
     //
@@ -6047,6 +6084,170 @@ mod tests {
             uv: [0.0, 0.0],
             bones: bones.to_vec(),
         })
+    }
+
+    /// **法线判据是严格 `>`，不是 `>=`**（边界值必须不焊）。
+    ///
+    /// 官方：`DotProduct(g_normal[i], normal) > normal_blend`
+    /// （`v1support.cpp:39`）。点积**恰好等于** `cos(2°)` 时不成立 ⟹ 追加。
+    ///
+    /// # 判据用「最小的 `|n|²` 超过阈值」来钉
+    ///
+    /// `cos(2°)` 不是任何 f32 的精确平方（实测搜遍邻近 128 个位模式都没有），
+    /// 所以无法构造 `d == c`。退而求其次，钉住**两个相邻的 `|n|²` 落在
+    /// 阈值的哪一侧**：取使 `len*len` 恰好跨过阈值的那一对 `len`，
+    /// 断言小的那侧不复用、大的那侧复用。`>` 与 `>=` 在这两侧**必须**
+    /// 给出不同结果，否则测试失败。
+    #[test]
+    fn normal_blend_is_a_strict_inequality() {
+        let c = NORMAL_BLEND;
+        // 找一对相邻的 f32 `len`，使 `len²` 从 `<= c` 跳到 `> c`。
+        let base = c.sqrt();
+        let mut below = None; // len² <= c
+        let mut above = None; // len² >  c
+        for delta in -256i32..=256 {
+            let cand = f32::from_bits((base.to_bits() as i32 + delta) as u32);
+            let sq = cand * cand;
+            if sq <= c {
+                if below.is_none_or(|b: f32| b < cand) {
+                    below = Some(cand);
+                }
+            } else if above.is_none_or(|a: f32| cand < a) {
+                above = Some(cand);
+            }
+        }
+        let below = below.expect("应能找到 |n|² <= c 的 f32");
+        let above = above.expect("应能找到 |n|² >  c 的 f32");
+        assert!(below * below <= c && above * above > c, "夹具不满足跨阈值条件");
+        // 二者应相邻（否则判据跨度太大，测不出 `>` vs `>=`）。
+        assert_eq!(
+            above.to_bits(),
+            below.to_bits() + 1,
+            "取到的两个 len 不相邻，夹具太松"
+        );
+
+        let mk = |n: [f32; 3]| Vertex {
+            pos: [1.0, 2.0, 3.0],
+            normal: n,
+            uv: [0.5, 0.5],
+            bones: vec![[0.0, 1.0]],
+        };
+        let run = |len: f32| {
+            let mut pool: Vec<Vertex> = Vec::new();
+            let mut table: HashMap<VertexKey, u32> = HashMap::new();
+            let mut secondary: HashMap<PosUvKey, Vec<u32>> = HashMap::new();
+            let n = [0.0f32, 0.0, len];
+            weld_or_push(&mut pool, &mut table, &mut secondary, &mk(n));
+            weld_or_push(&mut pool, &mut table, &mut secondary, &mk(n));
+            pool.len()
+        };
+
+        // `|n|² <= c` ⟹ `>` 与 `>=` 都**不**复用（`<=` 时 `>=` 也不成立）。
+        assert_eq!(run(below), 2, "`|n|² <= cos(2°)` ⟹ 必须新增（严格 `>`）");
+        // `|n|² > c` ⟹ 都复用。
+        assert_eq!(run(above), 1, "`|n|² > cos(2°)` ⟹ 必须复用");
+
+        // ⚠️ 这条才是把 `>` 与 `>=` 分开的判据：阈值本身。
+        // 用 `f32` 能表示的、**恰好等于** `c` 的 `|n|²` 不存在，
+        // 所以直接构造「法线位模式相同且 `|n|² == c`」不可能；
+        // 但可以用**非单位法线**走容差路径，让点积精确等于 `c`：
+        // `n1 = [1,0,0]`、`n2 = [c,0,0]` ⟹ 点积 = `1*c = c` **精确**。
+        let mut pool3: Vec<Vertex> = Vec::new();
+        let mut t3: HashMap<VertexKey, u32> = HashMap::new();
+        let mut s3: HashMap<PosUvKey, Vec<u32>> = HashMap::new();
+        // 注意：两者法线**不同** ⟹ 走的是容差路径，`d = n1·n2 = c` 精确。
+        weld_or_push(&mut pool3, &mut t3, &mut s3, &mk([1.0, 0.0, 0.0]));
+        weld_or_push(&mut pool3, &mut t3, &mut s3, &mk([c, 0.0, 0.0]));
+        assert_eq!(
+            pool3.len(),
+            2,
+            "点积**恰好等于** `cos(2°)` 时官方不复用（严格 `>`，不是 `>=`）"
+        );
+    }
+
+    /// **零法线顶点绝不能被焊接** —— 官方的法线判据是 `DotProduct > cos(2°)`，
+    /// 对零法线恒为 `0 > 0.99939` = **false**。
+    ///
+    /// # 这是「HLMV 里网格被撕开」的根因
+    ///
+    /// 实测（`v_dual_pistola`，用户工程）有 4 个 `nrm=[0,0,0]` 的顶点：
+    /// mdlc 的**精确位匹配**快路径把它们当成「完全相同 ⟹ 复用」，
+    /// 而官方**永不**复用它们（法线判据不成立）⟹ 官方追加、mdlc 合并。
+    ///
+    /// 后果：VVD 少 4 个顶点（`111113 → 111109`），两个 bodypart 的
+    /// `mesh[4]` 由 **5532** 变成 **5530**（官方与 NekoMDL 都是 5532）。
+    /// 顶点池一变，`origMeshVertID` 与整条 VTX 索引全部错位 ⟹ 网格撕裂。
+    ///
+    /// 判据：三个顶点「除法线外逐位相同」，法线分别是单位向量 / 零 / 半个单位。
+    /// 只有**单位向量**那一对能焊，另两个必须各自成点。
+    #[test]
+    fn zero_and_short_normals_are_never_welded() {
+        let mk = |n: [f32; 3]| Vertex {
+            pos: [1.0, 2.0, 3.0],
+            normal: n,
+            uv: [0.5, 0.5],
+            bones: vec![[0.0, 1.0]],
+        };
+        let mut pool: Vec<Vertex> = Vec::new();
+        let mut table: HashMap<VertexKey, u32> = HashMap::new();
+        let mut secondary: HashMap<PosUvKey, Vec<u32>> = HashMap::new();
+        let mut push = |v: &Vertex| weld_or_push(&mut pool, &mut table, &mut secondary, v);
+
+        let unit = mk([0.0, 0.0, 1.0]);
+        let a = push(&unit);
+        // 同一个单位法线 ⟹ 必须复用（`|n|² = 1 > 0.99939`）。
+        let b = push(&unit);
+        assert_eq!(a, b, "单位法线且其余逐位相同 ⟹ 应复用");
+
+        // 零法线：`DotProduct = 0`，官方不复用 ⟹ 必须新增。
+        let zero = mk([0.0, 0.0, 0.0]);
+        let c = push(&zero);
+        assert_ne!(a, c, "零法线绝不能被焊到单位法线上（官方判据不成立）");
+        // 再来一个零法线：**同样不能互相焊接**（`0 > 0.99939` 仍为 false）。
+        let d = push(&zero);
+        assert_ne!(c, d, "两个零法线也不能互相焊接 —— 官方每次都追加");
+
+        // 半个单位长度：`DotProduct = 0.25`，同样不成立。
+        let half = mk([0.0, 0.0, 0.5]);
+        let e = push(&half);
+        assert_ne!(a, e, "`|n|² = 0.25` 不满足 2° 容差 ⟹ 不能复用");
+        let f = push(&half);
+        assert_ne!(e, f, "非单位法线之间也不能互相焊接");
+
+        assert_eq!(
+            pool.len(),
+            5,
+            "应恰好 5 个独立顶点：1 个单位 + 2 个零 + **2 个半长**\
+             （非单位法线连自己都不能复用 —— `|n|² = 0.25 < 0.99939`）"
+        );
+    }
+
+    /// **单位法线仍然走 O(1) 精确路径**（性能护栏）。
+    ///
+    /// 上面那条修复只在精确命中后**多算一次点积**；对正常（单位）法线
+    /// 结果不变，所以绝大多数模型完全不受影响 ——
+    /// 实测 parity 101 个夹具**逐字节不变**。
+    #[test]
+    fn unit_normals_still_use_the_exact_path() {
+        let mut pool: Vec<Vertex> = Vec::new();
+        let mut table: HashMap<VertexKey, u32> = HashMap::new();
+        let mut secondary: HashMap<PosUvKey, Vec<u32>> = HashMap::new();
+        // 1000 个顶点，位置各不同 ⟹ 全部新增，一个都不该被误焊。
+        for i in 0..1000 {
+            let v = Vertex {
+                pos: [i as f32, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[0.0, 1.0]],
+            };
+            weld_or_push(&mut pool, &mut table, &mut secondary, &v);
+        }
+        assert_eq!(pool.len(), 1000, "位置不同 ⟹ 1000 个独立顶点");
+        // 再把第 0 个重复一次 ⟹ 必须复用，不新增。
+        let again = Vertex { pos: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0], bones: vec![[0.0, 1.0]] };
+        let i = weld_or_push(&mut pool, &mut table, &mut secondary, &again);
+        assert_eq!(i, 0, "重复顶点应复用下标 0");
+        assert_eq!(pool.len(), 1000, "复用时不得新增");
     }
 
     fn hash_of(k: &VertexKey) -> u64 {
