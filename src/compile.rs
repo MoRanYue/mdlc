@@ -4636,6 +4636,12 @@ pub fn sequence_pose_bounds(
         s_w.push(wt);
     }
 
+    // 帧循环一次都不跑时（`cells` 全部越界，或每格的帧数都是 0），
+    // `bmin`/`bmax` 必须**停在 ±INF** —— 尾部据此返回 `None`。所以下面
+    // `has_orphan` 的并入必须以「确实跑过至少一帧」为前提，否则会把
+    // ±INF 改写成 `0.0`，把原实现的 `None` 变成 `Some(([0,0,0],[0,0,0]))`。
+    let any_frames = cell_frames.iter().any(|f| !f.is_empty());
+
     for frames in cell_frames {
         for frame in frames {
             // 1) 该帧的局部世界矩阵（官方 `CalcBoneTransforms`）。
@@ -4725,8 +4731,9 @@ pub fn sequence_pose_bounds(
     }
 
     // 全部骨骼都越界的顶点：`pos` 恒为 `[0,0,0]`，原实现照样并进包围盒。
-    // 常量只需并一次（min/max 幂等）。
-    if has_orphan {
+    // 常量只需并一次（min/max 幂等）—— 但**必须**至少跑过一帧，否则
+    // `bmin`/`bmax` 仍是 ±INF，此处会把 `None` 变成 `Some([0,0,0])`。
+    if has_orphan && any_frames {
         for a in 0..3 {
             if 0.0f32 < bmin[a] {
                 bmin[a] = 0.0;
@@ -7994,6 +8001,562 @@ smd = "a_same"
             span_x.max(span_y) >= 25.0,
             "包围盒应覆盖 `tip` 的 30 单位伸展（说明用了**减除前**的姿态）；\
              实际 span=[{span_x}, {span_y}] —— 偏小说明误用了减除后的帧"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // ---- `sequence_pose_bounds` 的分组重写（`91bac84`）差分对照 ----
+    //
+    // 该 commit 把「4) 并入蒙皮后的顶点」从**帧循环内的逐顶点遍历**改成
+    // **帧循环外建表 + 按骨骼分组的局部 min/max 归约**（单骨骼顶点），
+    // 多骨骼顶点保持原遍历顺序。这条路径在真实视角模型上是 `write_mdl`
+    // 的 84%，但 `parity/` 的 101 个夹具里 91 个只有 1 条序列、且
+    // `linnea-export.toml` 只有 1 帧 —— 语料对这条路径**结构性失明**。
+    //
+    // 所以下面这份 `sequence_pose_bounds_naive` 是**改动前的原实现逐字
+    // 拷贝**（`git show 91bac84^:src/compile.rs` 的 4595-4622 段 + 尾部
+    // 判据），作为 oracle 与生产实现**逐位**对照 —— 不是近似比较，
+    // 因为重写引入的任何浮点重结合都会改变输出字节。
+
+    fn sequence_pose_bounds_naive(
+        desc: &ModelDesc,
+        compiled: &CompiledModelDesc,
+        seq_index: usize,
+        render_bounds: &[([f32; 3], [f32; 3])],
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let seq = compiled.sequences.get(seq_index)?;
+        let n = desc.bones.len();
+        if n == 0 || seq.frames.is_empty() {
+            return None;
+        }
+
+        let parents: Vec<i32> = bone_parents(desc);
+        let ref_world: Vec<crate::bone_math::Matrix3x4> = internal_bone_world(compiled, &parents);
+
+        let mut bmin = [f32::INFINITY; 3];
+        let mut bmax = [f32::NEG_INFINITY; 3];
+
+        let identity_frames: Vec<Vec<crate::smd::SmdPose>> = if desc.model.static_prop {
+            let mut row = vec![
+                crate::smd::SmdPose {
+                    bone: 0,
+                    position: [0.0; 3],
+                    rotation: [0.0; 3],
+                };
+                n
+            ];
+            for (k, p) in row.iter_mut().enumerate() {
+                p.bone = k as i32;
+            }
+            vec![row]
+        } else {
+            Vec::new()
+        };
+
+        let cell_frames: Vec<&[Vec<crate::smd::SmdPose>]> = if desc.model.static_prop {
+            vec![&identity_frames]
+        } else if seq.cells.is_empty() {
+            vec![seq.pre_subtract_frames.as_ref().unwrap_or(&seq.frames)]
+        } else {
+            seq.cells
+                .iter()
+                .filter_map(|c| compiled.animations.get(*c))
+                .map(|a| a.pre_subtract_frames.as_ref().unwrap_or(&a.frames).as_slice())
+                .collect()
+        };
+
+        for frames in cell_frames {
+            for frame in frames {
+                let world = frame_worlds(desc, &parents, frame);
+                let posetransform: Vec<crate::bone_math::Matrix3x4> = world
+                    .iter()
+                    .zip(ref_world.iter())
+                    .map(|(w, r)| crate::bone_math::concat(w, &crate::bone_math::invert(r)))
+                    .collect();
+
+                for (k, w) in world.iter().enumerate() {
+                    let (mn, mx) = render_bounds.get(k).copied().unwrap_or(([0.0; 3], [0.0; 3]));
+                    let (tmn, tmx) = transform_aabb(w, mn, mx);
+                    for a in 0..3 {
+                        if tmn[a] < bmin[a] {
+                            bmin[a] = tmn[a];
+                        }
+                        if tmx[a] > bmax[a] {
+                            bmax[a] = tmx[a];
+                        }
+                    }
+                }
+
+                // ★ 原实现：逐顶点遍历，且**在帧循环内**。
+                for bp in &compiled.bodyparts {
+                    for m in &bp.models {
+                        for mesh in &m.meshes {
+                            for v in &mesh.vertices {
+                                let mut pos = [0.0f32; 3];
+                                for pair in &v.bones {
+                                    let k = pair[0] as usize;
+                                    if k >= n {
+                                        continue;
+                                    }
+                                    let t = transform_point(&posetransform[k], v.pos);
+                                    for a in 0..3 {
+                                        pos[a] += pair[1] * t[a];
+                                    }
+                                }
+                                for a in 0..3 {
+                                    if pos[a] < bmin[a] {
+                                        bmin[a] = pos[a];
+                                    }
+                                    if pos[a] > bmax[a] {
+                                        bmax[a] = pos[a];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if bmin[0].is_finite() && bmax[0].is_finite() {
+            Some((bmin, bmax))
+        } else {
+            None
+        }
+    }
+
+    /// 两个包围盒**逐位**相同（含 `None` 的一致性）。
+    fn assert_bounds_bit_eq(
+        got: Option<([f32; 3], [f32; 3])>,
+        want: Option<([f32; 3], [f32; 3])>,
+        ctx: &str,
+    ) {
+        match (got, want) {
+            (None, None) => {}
+            (Some(g), Some(w)) => {
+                for a in 0..3 {
+                    assert_eq!(
+                        g.0[a].to_bits(),
+                        w.0[a].to_bits(),
+                        "{ctx}：bbmin[{a}] 与朴素实现逐位不同 —— 分组 {} vs 朴素 {}",
+                        g.0[a],
+                        w.0[a]
+                    );
+                    assert_eq!(
+                        g.1[a].to_bits(),
+                        w.1[a].to_bits(),
+                        "{ctx}：bbmax[{a}] 与朴素实现逐位不同 —— 分组 {} vs 朴素 {}",
+                        g.1[a],
+                        w.1[a]
+                    );
+                }
+            }
+            (g, w) => panic!("{ctx}：有无包围盒不一致 —— 分组 {g:?} vs 朴素 {w:?}"),
+        }
+    }
+
+    /// 与 [`SPB_SMD`] 配套的描述（2 骨骼 + 1 条单动画序列）。
+    fn spb_toml(seq_smd: &str) -> String {
+        format!(
+            r#"
+[model]
+name = "models/test/spb.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{{ name = "models/test/myprop" }}]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "tip"
+parent = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "spb.smd"
+
+[[sequences]]
+name = "idle"
+smd = "{seq_smd}"
+"#
+        )
+    }
+
+    /// 网格 SMD：**11 个单骨骼 + 2 个多骨骼**顶点，且第一个顶点的 x 是
+    /// `-0.0`（`0.0f32 +` 归一化那条注释的对照）。
+    ///
+    /// 后段顶点刻意用**满尾数**坐标、并混入 2²⁴ 量级与 1e-6 量级 ——
+    /// 只有三项乘积都非零且量级悬殊时，`m0*x + m1*y + m2*z + m3` 的
+    /// 舍入误差才可能被括号顺序放大到改变结果（坐标里只要有 `0.0`，
+    /// `m*0.0` 与 `+0.0` 都是精确运算，怎么重新结合都逐位相同）。
+    ///
+    /// **变异测试实测（重要，勿夸大本测试的强度）**：
+    /// * ✅ 系数互换 `m0*x + m1*y` → `m1*x + m0*y`：**被抓住**（确定性差异）。
+    /// * ✅ 中间量提到 f64 再降回 f32：**被抓住**（`38.766354` vs `38.76635`）。
+    /// * ✅ **FMA 收缩** `m0.mul_add(x, m1.mul_add(y, m2.mul_add(z, m3)))`：
+    ///   **被抓住** —— 这正是向量化最现实的失效模式（SIMD 后端默认允许
+    ///   收缩），所以本测试对「向量化是否改变输出」是有实际约束力的。
+    /// * ❌ 纯括号重结合 `(m0*x + m1*y) + (m2*z + m3)`：**未被抓住**。
+    ///   即这份夹具（含 2²⁴ 与 1e-6 量级）也还没构造出能让该顺序产生
+    ///   不同舍入的组合。这是**已知的覆盖缺口**，不要把它说成「逐位
+    ///   比较能挡住一切重结合」。
+    ///
+    /// 真正兜底的是 `parity_snapshot.js --compare`（101 个夹具逐字节）与
+    /// 6 个真实视角模型的逐字节对照 —— 本测试是快速反馈层，不是唯一防线。
+    const SPB_SMD: &str = r#"version 1
+nodes
+  0 "root" -1
+  1 "tip" 0
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    1 10.000000 0.000000 3.000000 0.000000 0.000000 0.000000
+end
+triangles
+myprop
+  0 -0.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 0 1.000000
+  0 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000
+  0 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 2 0 0.750000 1 0.250000
+  1 4.000000 0.000000 2.000000 0.000000 0.000000 1.000000 0.250000 0.500000 1 1 1.000000
+  0 -8.000000 0.000000 -4.000000 0.000000 0.000000 1.000000 0.750000 0.250000 2 1 0.400000 0 0.600000
+  1 -4.000000 0.000000 2.000000 0.000000 0.000000 1.000000 0.250000 0.750000 1 0 1.000000
+  1 12.345678 -23.456789 34.567891 0.000000 0.000000 1.000000 0.125000 0.125000 1 1 1.000000
+  1 -31.415927 17.283185 -27.182818 0.000000 0.000000 1.000000 0.375000 0.625000 1 1 1.000000
+  0 2.7182818 -3.1415927 1.4142136 0.000000 0.000000 1.000000 0.625000 0.875000 1 0 1.000000
+  1 1048576.000000 -2097152.000000 4194304.000000 0.000000 0.000000 1.000000 0.062500 0.937500 1 1 1.000000
+  1 -8388608.000000 4194304.000000 -1048576.000000 0.000000 0.000000 1.000000 0.187500 0.312500 1 1 1.000000
+  0 16777216.000000 8388608.000000 -4194304.000000 0.000000 0.000000 1.000000 0.437500 0.562500 1 0 1.000000
+  0 0.000000976562 -0.000001953125 0.00000390625 0.000000 0.000000 1.000000 0.687500 0.812500 1 0 1.000000
+end
+"#;
+
+    /// 3 帧，两根骨骼都有非平凡旋转（逼 `canonical_euler` 真走一遍分解）。
+    ///
+    /// 第 1、2 帧的 `tip` 旋转刻意用满尾数的弧度值：只有骨骼的
+    /// `posetransform` 真的带旋转时，矩阵项才会是「非精确」的
+    /// （纯平移矩阵是 `[1,0,0,tx; …]`，乘 `0`/加 `0` 全精确，任何重新
+    /// 结合都逐位相同）。
+    const SPB_ANIM: &str = r#"version 1
+nodes
+  0 "root" -1
+  1 "tip" 0
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    1 10.000000 0.000000 3.000000 0.000000 0.000000 0.000000
+  time 1
+    0 1.000000 2.000000 3.000000 0.100000 0.200000 0.300000
+    1 10.000000 4.000000 3.000000 0.432100 0.123400 0.987600
+  time 2
+    0 -2.000000 1.000000 0.500000 0.300000 0.000000 -0.200000
+    1 12.000000 0.000000 -3.000000 1.2345678 -0.7654321 2.3456789
+end
+triangles
+end
+"#;
+
+    /// 与 [`SPB_ANIM`] 同形但姿态与帧数都不同（blend 多格对照用）。
+    const SPB_ANIM2: &str = r#"version 1
+nodes
+  0 "root" -1
+  1 "tip" 0
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+    1 10.000000 0.000000 3.000000 0.000000 0.000000 0.000000
+  time 1
+    0 5.000000 -3.000000 1.000000 -0.400000 0.150000 0.250000
+    1 6.000000 0.000000 3.000000 0.200000 0.000000 0.000000
+end
+triangles
+end
+"#;
+
+    /// 分组路径（单骨骼）与多骨骼路径都必须与朴素实现**逐位**相同。
+    ///
+    /// 夹具里 11 个单骨骼顶点走新的分组归约、2 个多骨骼顶点走保留原序
+    /// 的累加 —— 两条路径都要覆盖，否则这条测试等于没测。
+    #[test]
+    fn pose_bounds_grouped_path_matches_naive() {
+        let d = tmpdir("spb-grouped");
+        write(&d, "spb.smd", SPB_SMD);
+        write(&d, "spb_anim.smd", SPB_ANIM);
+        let desc = ModelDesc::from_toml(&spb_toml("spb_anim.smd")).unwrap();
+        let c = compile(&desc, &d).expect("应能编译");
+
+        assert_eq!(c.sequences[0].frames.len(), 3, "夹具应是 3 帧");
+        let verts = &c.bodyparts[0].models[0].meshes[0].vertices;
+        let n_single = verts.iter().filter(|v| v.bones.len() == 1).count();
+        let n_multi = verts.iter().filter(|v| v.bones.len() >= 2).count();
+        assert!(n_single >= 3, "夹具应有单骨骼顶点（分组路径），实际 {n_single}");
+        assert!(n_multi >= 2, "夹具应有多骨骼顶点（保持原序路径），实际 {n_multi}");
+
+        // ① 真实调用形态：`bone_render_bounds` 的自动命中盒。
+        let rb = bone_render_bounds(&c.desc, &c);
+        assert_bounds_bit_eq(
+            sequence_pose_bounds(&c.desc, &c, 0, &rb),
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &rb),
+            "单/多骨骼混合 + 3 帧（自动命中盒）",
+        );
+
+        // ② 零盒 —— 这一路才是**真正在测顶点并入**的那一条。
+        //
+        // 自动命中盒本身就包住所有顶点，于是顶点并入永远不改变极值，
+        // 测试会退化成空转：实测把 `m0 * x + m1 * y` 写成
+        // `m1 * x + m0 * y` 这种确定性变异都被放了过去。零盒只剩每根
+        // 骨骼的原点（`bone_render_bounds` 在 `hitboxes.autogenerated
+        // = false` 且无显式盒子时返回的正是它），顶点贡献必然决定极值。
+        let zero = vec![([0.0f32; 3], [0.0f32; 3]); c.desc.bones.len()];
+        let got = sequence_pose_bounds(&c.desc, &c, 0, &zero).expect("夹具应有包围盒");
+        assert_bounds_bit_eq(
+            Some(got),
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &zero),
+            "单/多骨骼混合 + 3 帧（零盒）",
+        );
+
+        // 反证：顶点并入确实决定了极值 —— 去掉全部顶点后包围盒必须变窄。
+        let mut c_noverts = c.clone();
+        for mesh in c_noverts.bodyparts[0].models[0].meshes.iter_mut() {
+            mesh.vertices.clear();
+        }
+        let noverts = sequence_pose_bounds(&c_noverts.desc, &c_noverts, 0, &zero)
+            .expect("仅 render bounds 也应有包围盒");
+        assert!(
+            noverts.0 != got.0 || noverts.1 != got.1,
+            "去掉全部顶点后包围盒应当变窄（{noverts:?} vs {got:?}）—— \
+             否则说明顶点并入那条路径没生效，本测试是空转"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 全骨骼越界的顶点（`has_orphan`）必须与朴素实现一致。
+    ///
+    /// 正常编译路径**产生不了**这种顶点 —— `smd_vertex_to_ir` 保证每个
+    /// 顶点至少有一组有效绑定（`compile.rs` 的 `bones.is_empty()` 报错），
+    /// `$staticprop` 更是把所有权重塌到骨骼 0（而 `n` 也已塌缩为 1）。
+    /// 所以只能手工构造。但生产实现里 `has_orphan` 是**独立分支**，
+    /// 必须有测试锁住它。
+    #[test]
+    fn pose_bounds_orphan_vertices_match_naive() {
+        let d = tmpdir("spb-orphan");
+        write(&d, "spb.smd", SPB_SMD);
+        write(&d, "spb_anim.smd", SPB_ANIM);
+        let desc = ModelDesc::from_toml(&spb_toml("spb_anim.smd")).unwrap();
+        let mut c = compile(&desc, &d).expect("应能编译");
+
+        // 骨骼 99 越界（`n == 2`）⟹ `nvalid == 0` ⟹ `pos` 恒为 `[0,0,0]`。
+        //
+        // 为了让这个 `+0.0` 成为 `bbmin` 的**唯一来源**，其余每一项贡献都
+        // 必须落在正半轴。这里有个坑：非 `$staticprop` 的根骨骼带一个
+        // `Rz(90°)` 偏置（`frame_worlds_from_locals`，`compile.rs:4315-4323`），
+        // 点变换是 `(x,y,z) → (-y, x, z)` —— 所以「全正」的输入盒子会被
+        // 转出负坐标（实测 `bbmin[0] = -202`）。**必须把输入放在 x>0、y<0
+        // 的象限**，转完才是全正：
+        //   * 帧换成**零旋转**的纯平移帧（避免再叠加一层旋转）；
+        //   * `render_bounds` 手工放到 `[100,-200,100]..[101,-199,101]`
+        //     （不用 `bone_render_bounds` —— 它按零盒算，本身就会带上原点）；
+        //   * 其余顶点全部绑到骨骼 1 且位置推到 `[200,-200,200]`。
+        let zero_frames: Vec<Vec<crate::smd::SmdPose>> = vec![
+            vec![
+                crate::smd::SmdPose {
+                    bone: 0,
+                    position: [0.0, 0.0, 0.0],
+                    rotation: [0.0; 3],
+                },
+                crate::smd::SmdPose {
+                    bone: 1,
+                    position: [10.0, 0.0, 3.0],
+                    rotation: [0.0; 3],
+                },
+            ],
+            vec![
+                crate::smd::SmdPose {
+                    bone: 0,
+                    position: [1.0, 2.0, 3.0],
+                    rotation: [0.0; 3],
+                },
+                crate::smd::SmdPose {
+                    bone: 1,
+                    position: [10.0, 0.0, 3.0],
+                    rotation: [0.0; 3],
+                },
+            ],
+        ];
+        c.sequences[0].cells = Vec::new();
+        c.sequences[0].pre_subtract_frames = None;
+        c.sequences[0].frames = zero_frames;
+
+        let verts = &mut c.bodyparts[0].models[0].meshes[0].vertices;
+        verts[0].bones = vec![[99.0, 1.0]];
+        for v in verts.iter_mut().skip(1) {
+            v.bones = vec![[1.0, 1.0]];
+            v.pos = [200.0, -200.0, 200.0];
+        }
+        let rb = vec![([100.0f32, -200.0, 100.0], [101.0f32, -199.0, 101.0]); c.desc.bones.len()];
+
+        let got = sequence_pose_bounds(&c.desc, &c, 0, &rb);
+        assert!(got.is_some(), "有帧可算时仍应有包围盒");
+        assert_bounds_bit_eq(
+            got,
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &rb),
+            "含全越界顶点",
+        );
+
+        // 该顶点贡献的 `[0,0,0]` 必须是 `bbmin` 的**唯一来源**（其余顶点
+        // 与 `render_bounds` 全部落在正半轴）。
+        let g = got.unwrap();
+        for a in 0..3 {
+            assert_eq!(
+                g.0[a].to_bits(),
+                0.0f32.to_bits(),
+                "越界顶点贡献的 +0.0 应成为 bbmin[{a}]，实际 {}",
+                g.0[a]
+            );
+            assert!(
+                g.1[a] > 0.0,
+                "bbmax[{a}] 应来自正半轴的顶点，实际 {}",
+                g.1[a]
+            );
+        }
+
+        // 反证：把该顶点**整个摘掉**，`bbmin` 必须离开 0 —— 否则说明
+        // `has_orphan` 那条分支根本没生效，上面的断言是空转。
+        // （`sequence_pose_bounds` 只看 `mesh.vertices`，不看三角形，
+        // 所以直接 `remove` 是安全的。）
+        let mut c2 = c.clone();
+        c2.bodyparts[0].models[0].meshes[0].vertices.remove(0);
+        let valid = sequence_pose_bounds(&c2.desc, &c2, 0, &rb).expect("应仍有包围盒");
+        for a in 0..3 {
+            assert!(
+                valid.0[a] > 0.0,
+                "摘掉越界顶点后 bbmin[{a}] 必须离开 0（实际 {}）—— 说明该分支是活的",
+                valid.0[a]
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **帧循环一次都不跑时必须返回 `None`** —— 这是 `91bac84` 之后、
+    /// 补本测试时发现并修掉的一处回归。
+    ///
+    /// `has_orphan` 的并入原本在帧循环内（每帧并一次常量），重写后提到
+    /// 循环外「只需并一次」。但当 `cell_frames` 为空（`cells` 全部越界 ⟹
+    /// `filter_map` 收出空 `Vec`）时，`bmin`/`bmax` 会停在 ±INF，此时再并
+    /// 一个 `0.0` 就把「没有包围盒」变成了 `Some(([0,0,0],[0,0,0]))`。
+    #[test]
+    fn pose_bounds_empty_cell_frames_match_naive() {
+        let d = tmpdir("spb-noframes");
+        write(&d, "spb.smd", SPB_SMD);
+        write(&d, "spb_anim.smd", SPB_ANIM);
+        let desc = ModelDesc::from_toml(&spb_toml("spb_anim.smd")).unwrap();
+        let base = compile(&desc, &d).expect("应能编译");
+
+        // ① 无越界顶点：两侧都返回 None。
+        let mut c = base.clone();
+        c.sequences[0].cells = vec![999];
+        let rb = bone_render_bounds(&c.desc, &c);
+        let got = sequence_pose_bounds(&c.desc, &c, 0, &rb);
+        assert!(got.is_none(), "cells 全越界 ⟹ 没有帧可算 ⟹ 应无包围盒");
+        assert_bounds_bit_eq(
+            got,
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &rb),
+            "空 cell_frames",
+        );
+
+        // ② 有越界顶点：修复前这里返回 `Some(([0,0,0],[0,0,0]))`，
+        //    而朴素实现返回 `None`。
+        let mut c = base.clone();
+        c.sequences[0].cells = vec![999];
+        c.bodyparts[0].models[0].meshes[0].vertices[0].bones = vec![[99.0, 1.0]];
+        let rb = bone_render_bounds(&c.desc, &c);
+        let got = sequence_pose_bounds(&c.desc, &c, 0, &rb);
+        assert!(
+            got.is_none(),
+            "没有帧可算时不该凭空造出 [0,0,0] 包围盒，实际 {got:?}"
+        );
+        assert_bounds_bit_eq(
+            got,
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &rb),
+            "空 cell_frames + 越界顶点",
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// blend 多格（`cell_frames` 多条、每格帧数不同）也要逐位一致。
+    #[test]
+    fn pose_bounds_blend_cells_match_naive() {
+        let d = tmpdir("spb-blend");
+        write(&d, "spb.smd", SPB_SMD);
+        write(&d, "a1.smd", SPB_ANIM);
+        write(&d, "a2.smd", SPB_ANIM2);
+        let toml = r#"
+[model]
+name = "models/test/spb-blend.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{ name = "models/test/myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "tip"
+parent = "root"
+
+[[model.pose_parameters]]
+name = "p"
+start = 0.0
+end = 1.0
+
+[[animations]]
+name = "a1"
+smd = "a1.smd"
+
+[[animations]]
+name = "a2"
+smd = "a2.smd"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "spb.smd"
+
+[[sequences]]
+name = "poses"
+smd = "a1.smd"
+blend_width = 2
+blends = ["a1", "a2"]
+
+[[sequences.blend_params]]
+parameter = "p"
+start = 0.0
+end = 1.0
+"#;
+        let desc = ModelDesc::from_toml(toml).unwrap();
+        let c = compile(&desc, &d).expect("应能编译");
+        assert_eq!(c.sequences[0].cells.len(), 2, "夹具应是 2 格");
+        // 两格的帧数**不同**（3 vs 2），这正是官方逐格用自己的 numframes 的情形。
+        assert_eq!(c.animations[0].frames.len(), 3);
+        assert_eq!(c.animations[1].frames.len(), 2);
+
+        let rb = bone_render_bounds(&c.desc, &c);
+        let got = sequence_pose_bounds(&c.desc, &c, 0, &rb);
+        assert!(got.is_some(), "blend 序列应有包围盒");
+        assert_bounds_bit_eq(
+            got,
+            sequence_pose_bounds_naive(&c.desc, &c, 0, &rb),
+            "blend 2 格（3 帧 + 2 帧）",
         );
         std::fs::remove_dir_all(&d).ok();
     }
