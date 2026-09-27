@@ -49,7 +49,7 @@
 //! | [`vta`] | **`.vta` 顶点动画解析**（SMD 语法、7 字段行、相对帧号） |
 //! | [`flex`] | **VTA 形状解析**（就近匹配 → 差量 → smoothstep → 载荷） |
 //! | [`qc`] | **QC 前端**（`.qc` 脚本 → [`model::ModelDesc`]） |
-//! | [`prof`] | 分段计时探针（`profiling` feature，默认关闭） |
+//! | [`prof`] | 分段计时探针（`hotpath` feature，默认关闭） |
 //! | `test_assets` | 真实素材测试的路径解析（**仅 `#[cfg(test)]`**，故此处不作链接） |
 
 pub mod anim_writer;

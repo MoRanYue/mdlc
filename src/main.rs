@@ -79,6 +79,14 @@ mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
 ";
 
 fn main() -> ExitCode {
+    // 分段计时（见 `src/prof.rs`）。**必须绑定到具名变量** —— 写成
+    // `let _ = ...` 会让 guard 立刻析构，报告当场写出且什么都没测到。
+    // 它活到 `main` 返回，报告在析构时落到 `mdlc-prof.txt`。
+    //
+    // 没开 `hotpath` feature 时这里拿到 `None`，零开销；开了 feature 但
+    // 没设 `MDLC_PROF` 时同样是 `None`（连 worker 线程都不起）。
+    let _prof = mdlc::prof::start();
+
     let argv: Vec<String> = std::env::args().collect();
     let rest: Vec<String> = argv.iter().skip(1).cloned().collect();
 
@@ -655,7 +663,6 @@ fn compile_and_write(
     }
     println!();
     println!("**编译成功**（各文件布局自检均通过）");
-    mdlc::prof::dump();
     ExitCode::SUCCESS
 }
 

@@ -63,3 +63,8 @@
 __pycache__/
 *.pyc
 *.bak
+
+# 分段计时报告（`--features hotpath` + `MDLC_PROF=1` 时写到工作目录）。
+# 路径可用 `HOTPATH_OUTPUT_PATH` 改，但默认名就这一个，先在这里挡掉，
+# 免得跑一次探针就在 `git status` 里留一个未跟踪文件。
+mdlc-prof.txt

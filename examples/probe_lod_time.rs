@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() {
+    // 分段计时：guard 必须绑定到具名变量，否则当场析构（见 `src/prof.rs`）。
+    // 未开 `hotpath` feature 或未设 `MDLC_PROF` 时是零开销的 `None`。
+    let _prof = mdlc::prof::start();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut reps = 3usize;
     let mut toml: Option<PathBuf> = None;
@@ -73,5 +77,4 @@ fn main() {
         ms,
         ms / n_tris.max(1) as f64
     );
-    mdlc::prof::dump();
 }

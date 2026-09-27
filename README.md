@@ -757,7 +757,7 @@ src/
   tangent.rs      切线空间计算（法线贴图用）
   bone_math.rs    骨骼矩阵与四元数工具
   layout.rs       MDL 段偏移的声明式计算
-  prof.rs         分段计时探针（profiling feature，默认关闭）
+  prof.rs         分段计时探针（hotpath feature，默认关闭）
   test_assets.rs  真实素材测试的路径解析（仅测试）
 ```
 
