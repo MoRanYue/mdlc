@@ -302,9 +302,96 @@ pub fn resolve_flex(
 /// 所以同一 `(model, vta)` 下的所有 flex 应当共用一份。真实模型上
 /// `build_vanim_map` 是十万×十万量级，逐条 flex 重算是纯浪费
 /// （`main.vta` 42 条 flex 共用一个文件，重算 42 次曾让编译从秒级涨到分钟级）。
+///
+/// > 调用方若要在同一 `.vta` 上跑多条 flex，应当用
+/// > [`resolve_flex_indexed`] 并把 [`BaseIndex`] 也缓存起来 ——
+/// > 本函数每次都会重建一份基准表。
 pub fn resolve_flex_mapped(
     flex: &Flex,
     vta: &Vta,
+    map: &VanimMap,
+    mesh_of_vertex: &[(usize, u32)],
+    flexdesc: (i32, i32),
+    spec_index: usize,
+) -> Result<Vec<MeshFlexes>, FlexError> {
+    let base_index = BaseIndex::build(vta);
+    resolve_flex_indexed(
+        flex,
+        vta,
+        &base_index,
+        map,
+        mesh_of_vertex,
+        flexdesc,
+        spec_index,
+    )
+}
+
+/// 第 0 帧的「VTA 顶点下标 → 帧内位置」索引，即**差量基准表**。
+///
+/// # 为什么单独抽成一个可复用的值
+///
+/// [`resolve_flex_indexed`] 原先每次调用都现场建一份
+/// `HashMap<u32, &VtaVert>`。这份表**只取决于 `vta.frame(0)`**，
+/// 与 flex 完全无关，于是同一 `.vta` 下的每条 flex 都在重建同一份内容。
+///
+/// 实测（`parity/linnea-export.toml`，第 0 帧 180180 个顶点、42 条 flex
+/// 共用一份 `main.vta`）：**757 万次带 SipHash 的插入**，
+/// 占一次完整编译的 **约 25%**（117.8 ms / 460 ms）。
+///
+/// 换成按 `index` 直接寻址的扁平数组后，建表退化成一次线性写
+/// （无哈希、无 rehash），查询退化成一次数组读。
+pub struct BaseIndex {
+    /// `slots[i]` = 第 0 帧里 `index == i` 的**第一条**在帧内的位置；
+    /// [`NO_BASE`] 表示第 0 帧没有这个下标。
+    slots: Vec<usize>,
+}
+
+/// 「第 0 帧没有这个下标」的哨兵。
+///
+/// 用 `usize::MAX` 而不是 `Option<usize>`，把每槽从 16 B 压到 8 B ——
+/// 18 万顶点是 1.4 MB，比 2.9 MB 更容易留在 cache 里。
+const NO_BASE: usize = usize::MAX;
+
+impl BaseIndex {
+    /// 按 `vta` 的**第 0 帧**建表。
+    pub fn build(vta: &Vta) -> Self {
+        let base = vta.frame(0).unwrap_or(&[]);
+        let mut slots = vec![NO_BASE; vta.num_vertices];
+        for (i, b) in base.iter().enumerate() {
+            let k = b.index as usize;
+            // ⚠️ 必须显式「**先到先得**」：重复下标保留**第一条**。
+            //
+            // 这与原先 `HashMap::entry().or_insert()` 的语义一致，
+            // 也对应更早那版 `base.iter().find(|b| b.index == vi)`
+            // （`find` 返回第一条）。**不能**改成「后者覆盖」——
+            // 那会让差量基准取错条目，且**不会报任何错**，
+            // 只表现为形状偏移。
+            if k < slots.len() && slots[k] == NO_BASE {
+                slots[k] = i;
+            }
+        }
+        Self { slots }
+    }
+
+    /// 第 0 帧里 `index == vi` 的那一条在帧内的位置。
+    #[inline]
+    fn pos_of(&self, vi: u32) -> Option<usize> {
+        match self.slots.get(vi as usize) {
+            Some(&p) if p != NO_BASE => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// 与 [`resolve_flex_mapped`] 相同，但复用**已算好的**差量基准表。
+///
+/// `base_index` 只取决于 `vta` 的第 0 帧（见 [`BaseIndex`]），
+/// 所以同一 `.vta` 下的所有 flex 应当共用一份。
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_flex_indexed(
+    flex: &Flex,
+    vta: &Vta,
+    base_index: &BaseIndex,
     map: &VanimMap,
     mesh_of_vertex: &[(usize, u32)],
     flexdesc: (i32, i32),
@@ -358,13 +445,9 @@ pub fn resolve_flex_mapped(
     // 而 `HashMap` 的 `collect` 在键重复时保留**最后**一条 —— 两者语义不同。
     // 虽然规范 `.vta` 的 `index` 在帧内唯一，但这里不能依赖它：
     // 重复下标会让差量基准取错条目，且**不会报任何错**，只表现为形状偏移。
-    let mut base_by_index: HashMap<u32, &crate::vta::VtaVert> =
-        HashMap::with_capacity(base.len());
-    for b in base {
-        base_by_index.entry(b.index).or_insert(b);
-    }
+    // （该裁决在 [`BaseIndex::build`] 里，仍是先到先得。）
     let base_of = |vi: u32| -> Option<&crate::vta::VtaVert> {
-        base_by_index.get(&vi).copied()
+        base_index.pos_of(vi).map(|p| &base[p])
     };
 
     // ---- 逐顶点算差量 ----

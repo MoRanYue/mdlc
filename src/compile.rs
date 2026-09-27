@@ -5148,6 +5148,14 @@ fn resolve_vta_flexes(
                 crate::flex::VanimMap,
             > = HashMap::new();
 
+            // `base_index` 同样只取决于 `(vta 第 0 帧)`，与 flex 无关。
+            // 逐条 flex 重建是 42 × 180180 = 757 万次 SipHash 插入 ——
+            // 实测占一次完整编译的约 25%，是当前最大的单项开销。
+            let mut base_index_cache: HashMap<
+                std::path::PathBuf,
+                crate::flex::BaseIndex,
+            > = HashMap::new();
+
             for (fi, f) in m.iter().enumerate() {
                 let fat = format!("{at}.flexes[{fi}]");
                 let vta_path = resolve_smd_path(base_dir, &f.vta);
@@ -5186,9 +5194,13 @@ fn resolve_vta_flexes(
                 let vanim_map = vanim_map_cache
                     .entry(vta_path.clone())
                     .or_insert_with(|| crate::flex::build_vanim_map(vta, &pool));
-                match crate::flex::resolve_flex_mapped(
+                let base_index = base_index_cache
+                    .entry(vta_path.clone())
+                    .or_insert_with(|| crate::flex::BaseIndex::build(vta));
+                match crate::flex::resolve_flex_indexed(
                     f,
                     vta,
+                    base_index,
                     vanim_map,
                     &mesh_of_vertex,
                     (fd.0 as i32, fd.1 as i32),
