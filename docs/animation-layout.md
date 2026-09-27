@@ -193,6 +193,21 @@ last record @30380, payloadEnd = 30556
 
 实测出现的 flags 组合：`0x20`（12B）、`0x21`（RAWROT2+RAWPOS = 18B）、`0x08`（10B）、`0x0C`（ANIMROT+ANIMPOS = 16B）。**RAWROT2 与 RAWROT 在实测中从未同时出现**（互斥）。
 
+#### ⚠️ 2.5.1 两条同址冲突（写编码器时必须显式避让）
+
+上面的取址公式里，`pRotV()` 与 `pQuat*()` 都固定在 `pData()+0`，而 `pPosV()`/`pPos()` 的偏移**各自由另一侧的 flag 决定**。于是有两组 flag 组合会让两个指针落到同一地址：
+
+| 冲突 | 机制 | 非法组合 | 正确避让 |
+|---|---|---|---|
+| ① | `pRotV() = pData()`（**永远**），`pPos() = pData() + RAWROT*6 + RAWROT2*8`。旋转走 RLE 时 `pRotV` 占 `+0`，位移若走 `RAWPOS` 也会落在 `+0`（无 `RAWROT`/`RAWROT2` 时）。 | `RAWPOS\|ANIMROT` | 位移让位 → `ANIMPOS`；或旋转让位 |
+| ② | `pQuat64() = pData()`（**永远**），而 `pPosV() = pData() + ANIMROT*6` —— **不含 `RAWROT2`**。`RAWROT2` 成立时 `ANIMROT` 必为假 ⟹ `pPosV() = pData()+0`，与 `pQuat64()` 同址。 | `RAWROT2\|ANIMPOS` | 位移非常量 ⟹ 旋转降级为 `ANIMROT`；位移是常量 ⟹ 保留 `RAWROT2`（`pPos() = pData()+8`，不重叠） |
+
+★ 官方 `studiomdl` 从不产生这两种组合（`write.cpp` 的多帧路径只写 `ANIMROT`/`ANIMPOS`；`RAWROT`/`RAWROT2`/`RAWPOS` 只出现在单帧与 zeroframe 路径）。
+
+**实测规模**（`v_dual_pistolA`，40 个动画）：mdlc 修前冲突 ② 共 **50 条**（`0x24` 47 条 + `0x34` 3 条），分布在 **13 个动画**（含 `a_idle_1` 4 条、`a_run` 9 条）；官方与 NekoMDL 各 **0 条**。引擎口径逐帧逐骨解码的位移偏差：`a_idle_1` `bone[75] tag_weapon_left` 达 **1.62e+2**（对照组官方 vs NekoMDL 全动画仅 **6.77e-3**）。
+
+诊断探针：`docs\_probe\diag_flags4way.js`（三方 flags 冲突普查）、`docs\_probe\diag_collide24.js`（逐条冲突地址与引擎读到的 offset）、`docs\_probe\diag_engine_decode.js`（引擎口径逐帧逐骨位移/角度偏差）。
+
 ---
 
 ## 3. 每骨骼记录的出现规则
