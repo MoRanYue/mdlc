@@ -1604,7 +1604,9 @@ fn write_chain_body(
         // （`pos_frames.iter().all(|t| *t == *first)`），天然自洽。
         // 旋转侧是「判据用 `ch.rot`（量化后）、载荷用 `rot_const_raw`
         // （原始）」两套来源 ⟹ 又一处**不对称路径** bug（HANDBOOK §45.28）。
-        let use_rawrot2 = ch.rot_const_raw.is_some() && rot_angle.is_some_and(|a| a != [0.0; 3]);
+        // ⚠️ 这只是**候选** —— `RAWROT2` 与 `ANIMPOS` 同址互斥，最终判定
+        // 还要看位移放不放得下（见下方 `use_rawrot2`）。
+        let rawrot2_ok = ch.rot_const_raw.is_some() && rot_angle.is_some_and(|a| a != [0.0; 3]);
         // ⚠️ **旋转完全无数据时不能写 `ANIMROT`。**
         //
         // 早先这里是 `use_animrot = !use_rawrot2 && n > 1` —— 只看帧数，
@@ -1616,6 +1618,31 @@ fn write_chain_body(
         // 且不是常量 → `ANIMROT`。这也与 `write.cpp:736-740` 一致 ——
         // `numanim` 六轴全 0 的骨骼**直接 `continue`**，根本不进链。
         let rot_all_absent = ch.rot.iter().all(|a| matches!(a, AxisData::Absent));
+        let pos_has_data = !ch.pos_all_absent();
+        let pos_can_const = ch.pos_delta_is_const && pos_has_data;
+
+        // ⚠️ **`RAWROT2` 与 `ANIMPOS` 同址互斥** —— `RAWPOS`/`ANIMROT` 之外
+        // 的**第二条**同构冲突，mdlc 早先漏了（`studio.h:574-586`）：
+        // ```c
+        // pQuat64() = pData()                 // **永远**在 pData()
+        // pPosV()   = pData() + ANIMROT*6     // **不含** RAWROT2！
+        // ```
+        // `RAWROT2` 成立时 `ANIMROT` 必为假 ⟹ `pPosV() = pData()+0`，与
+        // `pQuat64()` **指向同一处**；引擎把 `Quaternion64` 的 8 字节当成
+        // `mstudioanim_valueptr_t.offset[3]` 读。
+        //
+        // 实测 mdlc 产出 **50 条** `0x24`/`0x34`（`a_idle_1` 4 条、
+        // `a_run` 9 条，共 13 个动画）；官方 studiomdl 与 NekoMDL 在全部
+        // 40 个动画里各 **0 条**。引擎口径解码（`docs\_probe\diag_engine_decode.js`）
+        // 的位移偏差最大 **1.62e+2**（`a_idle_1` `bone[75] tag_weapon_left`），
+        // 而对照组（官方 vs NekoMDL）全动画仅 `6.77e-3`。
+        //
+        // 让位方向由官方实测决定（`docs\_probe\diag_flags4way.js`，50/50 条）：
+        // * 位移**是**常量 ⟹ `RAWPOS` 放得下（`pPos() = pData()+8`），
+        //   旋转保持 `RAWROT2` → `0x21`（29 条）。
+        // * 位移**不是**常量 ⟹ 只能 `ANIMPOS`，旋转让位降级成 `ANIMROT`
+        //   → `0x0c`（21 条）。
+        let use_rawrot2 = rawrot2_ok && (pos_can_const || !pos_has_data);
         let use_animrot = !use_rawrot2 && !rot_all_absent && n > 1;
         // ⚠️ **位移与旋转对称**：位移三轴**都不随时间变化**时用常量
         // `RAWPOS`（`Vector48`，6 字节），**与帧数无关**。
@@ -1678,10 +1705,13 @@ fn write_chain_body(
         // `rotV` 之前 —— 解码差 **3.62 rad**。修好后该记录
         // **逐字节相同**（`0c 0c e8 00 0c 00 50 00 94 00 d2 00 d6 00 da 00`）。
         //
-        // 退让顺序：`RAWROT2` > `ANIMROT` > `RAWPOS` > `ANIMPOS`
-        // —— 位移让位给旋转（旋转没有常量替代编码，位移有 `ANIMPOS`）。
-        let use_rawpos = ch.pos_delta_is_const && !ch.pos_all_absent() && !use_animrot;
-        let use_animpos = !use_rawpos && !ch.pos_all_absent();
+        // 退让顺序（**两条**同址冲突都要让）：
+        //   * `RAWPOS` vs `ANIMROT` —— 位移让位给旋转（旋转没有常量替代编码，
+        //     位移有 `ANIMPOS`）。
+        //   * `RAWROT2` vs `ANIMPOS` —— 已在上面 `use_rawrot2` 处解掉：
+        //     位移不是常量时 `RAWROT2` 主动降级为 `ANIMROT`。
+        let use_rawpos = pos_can_const && !use_animrot;
+        let use_animpos = !use_rawpos && pos_has_data;
         anim_data.push(b as u8);
         let mut flags = 0u8;
         // `subtract` 出来的动画带 `STUDIO_DELTA`（`write.cpp:744-748`）：
@@ -5913,6 +5943,23 @@ mod tests {
 
     // ---- 位移 ----
 
+    /// **`RAWROT2` 必须给 `ANIMPOS` 让位**（`pQuat64()` 与 `pPosV()` 同址）。
+    ///
+    /// 本测试原先断言 `flags == RAWROT2|ANIMPOS`（`0x24`），并把位移 valueptr
+    /// 放在 `payload + 8`。那是**把 bug 固化成了规格**：`studio.h:574-586`
+    /// 里 `pPosV() = pData() + ANIMROT*6` —— **不含 `RAWROT2`**。所以
+    /// `RAWROT2|ANIMPOS`（无 `ANIMROT`）时 `pPosV()` 落在 `pData()+0`，
+    /// 与 `pQuat64()` **同一地址**，引擎把 `Quaternion64` 的 8 字节当成
+    /// `mstudioanim_valueptr_t.offset[3]` 读。
+    ///
+    /// 官方 studiomdl 与 NekoMDL 在全部 40 个动画里各写 **0 条**
+    /// `0x24`/`0x34`；mdlc 修前写 **50 条**（13 个动画，含 `a_idle_1`/`a_run`），
+    /// 引擎口径解码位移偏差最大 **1.62e+2**（对照组仅 `6.77e-3`）。
+    ///
+    /// 让位方向由官方实测决定（`docs\_probe\diag_flags4way.js`，50/50 条）：
+    /// 位移**不是**常量时只能 `ANIMPOS` ⟹ 旋转降级成 `ANIMROT` → `0x0c`；
+    /// 位移**是**常量时 `RAWPOS` 放得下（`pPos() = pData()+8`）⟹ 保留
+    /// `RAWROT2` → `0x21`。
     #[test]
     fn varying_pos_uses_animpos_and_writes_pos_after_rot() {
         let frames: Vec<Vec<SmdPose>> = (0..3)
@@ -5921,10 +5968,15 @@ mod tests {
         let c = compiled(vec![seq("idle", false, frames)], 1);
         let out = write_with_f0_refs(&c, &[-1]).expect("写出动画");
         let (_, flags, payload) = walk_chain(&out.anim_data, 0)[0];
-        // 旋转恒定（根 Z 偏置）→ RAWROT2；位移变化 → ANIMPOS。
-        assert_eq!(flags, STUDIO_ANIM_RAWROT2 | STUDIO_ANIM_ANIMPOS);
-        // RAWROT2 占 8 字节，位移 valueptr 紧随其后。
-        let pos_vp = payload + 8;
+        // 旋转恒定但位移变化 ⟹ 旋转必须让位：RAWROT2 降级为 ANIMROT。
+        assert_eq!(
+            flags,
+            STUDIO_ANIM_ANIMROT | STUDIO_ANIM_ANIMPOS,
+            "位移变化时 RAWROT2 必须让位（pPosV 与 pQuat64 同址）"
+        );
+        assert_eq!(flags & STUDIO_ANIM_RAWROT2, 0, "不得出现 RAWROT2|ANIMPOS");
+        // ANIMROT 占 6 字节，位移 valueptr 紧随其后。
+        let pos_vp = payload + VALUEPTR_SIZE;
         let d = &out.anim_data;
         let offs = [
             i16::from_le_bytes([d[pos_vp], d[pos_vp + 1]]),
@@ -5936,6 +5988,35 @@ mod tests {
         assert!(offs[2] > 0, "Z 变化 → 有流");
         let zs = decode_stream(d, pos_vp + offs[2] as usize, 3);
         assert!(zs[2] > zs[1] && zs[1] > zs[0], "位移应单调递增：{zs:?}");
+    }
+
+    /// **位移是常量时 `RAWROT2` 可以保留**（另一侧的让位方向）。
+    ///
+    /// 官方在 `docs\_probe\diag_flags4way.js` 的 50 条里，29 条选 `0x21`
+    /// （`RAWPOS|RAWROT2`）—— 因为位移常量走 `RAWPOS`，而
+    /// `pPos() = pData() + RAWROT2*8` 恰好**跳过**了 `Quaternion64`，
+    /// 两个常量互不重叠。
+    ///
+    /// ⚠️ 参考姿态必须**不同于**帧 0，否则差值为 0 ⟹ `pos` 三轴全 `Absent`
+    /// ⟹ 走的是「无位移数据」分支而不是常量分支。
+    #[test]
+    fn constant_pos_keeps_rawrot2_and_writes_rawpos_after_quat64() {
+        // 三帧位移全同（差值恒定且非零），旋转也恒定且**非零**。
+        let frames: Vec<Vec<SmdPose>> = (0..3)
+            .map(|_| vec![pose([1.0, 2.0, 3.0], [0.0, 0.0, 1.5])])
+            .collect();
+        let c = compiled(vec![seq("idle", false, frames)], 1);
+        // 参考位移取 (0,0,0) ⟹ 差值 = (1,2,3)，恒定且非零。
+        let refs = [([0.0f32; 3], [0.0f32; 3])];
+        let out = write_animations(&c, &[-1], &refs, 0).expect("写出动画");
+        let (_, flags, payload) = walk_chain(&out.anim_data, 0)[0];
+        assert_eq!(
+            flags,
+            STUDIO_ANIM_RAWROT2 | STUDIO_ANIM_RAWPOS,
+            "位移常量 ⟹ RAWPOS 放得下，RAWROT2 保留"
+        );
+        // 载荷顺序固定：RAWROT2(8) → RAWPOS(6) ⟹ 至少 14 字节。
+        assert!(payload + 14 <= out.anim_data.len(), "载荷不得越界");
     }
 
     // ---- 段（`mstudioanimsections_t`）----
