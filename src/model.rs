@@ -1810,7 +1810,7 @@ pub struct BlendParam {
     /// 而 `CalcPoseParameterValue` 对 0 **不匹配任何 case** ⟹ 返回 `0.0`
     /// （`simplify.cpp:5445`）。这正是「只写 `blendwidth` 不写 `blend`」
     /// 的序列会报 `calcblend failed` 的根因 —— 见
-    /// [`CompiledSequence::param_axis_count`] 的说明。
+    /// [`CompiledSequence::calc_axes`] 的说明。
     ///
     /// 用 `None` 表达「0」；无法识别的名字也回落到 `None`
     /// （官方 `lookupControl` 返回 `-1`，而 `-1` 同样不匹配任何 case ⟹ 也是 0）。

@@ -103,7 +103,7 @@
 //!
 //! 早先这里写的是「故意偏离规格、用 parry 的密度 1 惯性张量对角元」。
 //! **那是错的** —— 实测语料 404 个 solid 后定死了官方公式（见
-//! [`rotation_inertia_of`]）：
+//! `rotation_inertia_of`）：
 //!
 //! ```text
 //!   A = ∫x'²dV / V      B = ∫y'²dV / V      C = ∫z'²dV / V

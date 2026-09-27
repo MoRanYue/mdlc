@@ -675,7 +675,7 @@ pub mod off {
     /// `bonetablebynameindex`：指向 `byte[numbones]` 的**骨骼名索引表**。
     ///
     /// 表内容 = 骨骼下标按**骨骼名（大小写不敏感）升序**排列的结果，
-    /// 由 [`bone_table_by_name`] 生成。**不是恒等置换** —— 骨骼表本身是
+    /// 由 `bone_table_by_name` 生成。**不是恒等置换** —— 骨骼表本身是
     /// 拓扑序（父在子前），与名字序无关。
     pub const BONE_TABLE_NAME_OFFSET: usize = 0x16C;
     /// `pVertexBase`（`void*`）：**只在工具进程内使用的运行时指针**
@@ -685,7 +685,7 @@ pub mod off {
     /// > 早先这里叫 `VERIFICATION_HASH`，是个**误读**：`studio.h:2179-2180`
     /// > 明确写着 `void *pVertexBase; void *pIndexBase;`。
     pub const VERTEX_BASE: usize = 0x170;
-    /// `pIndexBase`（`void*`）：同 [`Self::VERTEX_BASE`]，官方产物恒为 0。
+    /// `pIndexBase`（`void*`）：同 [`VERTEX_BASE`]，官方产物恒为 0。
     ///
     /// > 早先这里叫 `NUM_BONE_TABLE_NAME` 并**被写入 `bone_count`**，
     /// > 是个**误读**（`studio.h:2180`）。
