@@ -942,9 +942,45 @@ fn blend_grid_size(
 ///
 /// # 缺失骨骼的姿态从哪来
 ///
-/// 只能取 `$definebone` 声明的 `position`/`rotation`（TOML 的
-/// `[[bones]]`）。**没声明就是错误** —— 无法凭空发明一个参考姿态，
-/// 静默用 0 会让骨骼塌到原点，表现为顶点被拉向世界原点。
+/// 优先取 `$definebone` 声明的 `position`/`rotation`（TOML 的
+/// `[[bones]]`）；**两者都没有时退回零姿态，不报错**。
+///
+/// 官方在这一点上**从不报错**。`TranslateAnimations`
+/// （`simplify.cpp:1498-1529`）逐骨骼查 `psource->boneGlobalToLocal[k]`：
+///
+/// ```cpp
+/// int q = psource->boneGlobalToLocal[k];
+/// if (q == -1) {
+///     // unknown bone, copy over defaults
+///     if (g_bonetable[k].parent >= 0) {
+///         AngleMatrix( g_bonetable[k].rot, g_bonetable[k].pos, bonematrix );
+///         ConcatTransforms( destBoneToWorld[g_bonetable[k].parent], bonematrix, destBoneToWorld[k] );
+///     } else { AngleMatrix( g_bonetable[k].rot, g_bonetable[k].pos, destBoneToWorld[k] ); }
+/// } else { ConcatTransforms( srcBoneToWorld[q], g_bonetable[k].srcRealign, destBoneToWorld[k] ); }
+/// ```
+///
+/// 即「该 source 没有这根骨骼」时，**拿骨骼表的参考姿态当默认值**继续，
+/// 而不是拒绝编译。`Grab_Animation`（`studiomdl.cpp:1065-1135`）同理：
+/// `rawanim[t]` 由 `kalloc`（= `calloc`）零填充，只检查**帧**是否存在，
+/// 从不检查「每根骨骼都有数据」。
+///
+/// 实测（`docs/_probe/oracle_definebone_partial_smd.js`，2026-09）：
+///
+/// ```text
+/// $unlockdefinebones
+/// $definebone "b0" ""    0 0 0  0 0 0
+/// $definebone "b1" "b0"  0 0 20 0 0 0     ← 与 SMD 的 z=10 冲突
+/// $body    body "part.smd"                 ← nodes 有 b1
+/// $sequence idle "nopart.smd"              ← nodes **没有** b1
+///
+/// 官方：✅ numbones=2  b1.pos=[0,0,10]      ← SMD 赢，且对缺失零抱怨
+/// 旧 mdlc：❌ exit=1「nopart.smd 里没有骨骼 "b1"…无法确定参考姿态」
+/// ```
+///
+/// 用户报的 `linnea_replaces_zoey`（`anims/foot_fix.smd` 缺
+/// `ValveBiped.forward`）正是同一形态：官方跑到 `SMD MODEL` 阶段之后才因
+/// 无关的 `Too many materials used, max 32` 失败，对该骨骼缺失**零抱怨**
+/// （`docs/_probe/oracle_linnea_real.js`）。
 fn load_smd_frames(
     smd_path: &std::path::Path,
     desc: &ModelDesc,
@@ -990,26 +1026,21 @@ fn load_smd_frames(
         )));
         return None;
     }
-    // 描述里有、SMD 里没有的骨骼 —— 官方会保留它们，姿态取 `$definebone`。
+    // 描述里有、SMD 里没有的骨骼 —— 官方会保留它们，姿态优先取 `$definebone`
+    // 的 `rawLocal`（`position`/`rotation` 任一或两者都有）。
     //
-    // 只有在**显式声明了姿态**时才允许（`position` 或 `rotation` 任一）：
-    // 那是 `$definebone` 的语义。完全没声明的骨骼若又不在 SMD 里，
-    // 就没有任何姿态来源，必须报错。
+    // 两者都没有时退回**零姿态**，而不是报错：官方 `TranslateAnimations`
+    // 的 `q == -1` 分支（见上方文档注释）拿骨骼表参考姿态当默认值继续，
+    // 对「某 SMD 缺某骨骼」从不报错。若在此报错，就会出现「官方能编过、
+    // mdlc 编不过」的假阳性（`anims/foot_fix.smd` 缺 `ValveBiped.forward`
+    // 即此例）。零姿态也自洽：该骨骼在别的 SMD 里若被覆盖，覆盖值照样
+    // 生效；本 SMD 里它本来就没有数据。
     let smd_names: std::collections::HashSet<&str> =
         smd.nodes.iter().map(|n| n.name.as_str()).collect();
     let mut fallback: Vec<Option<crate::smd::SmdPose>> = vec![None; bone_count];
     for (di, b) in desc.bones.iter().enumerate() {
         if smd_names.contains(b.name.as_str()) {
             continue;
-        }
-        if b.position.is_none() && b.rotation.is_none() {
-            errs.push(e(format!(
-                "{} 里没有骨骼 {:?}，而 [[bones]] 也没给它 position/rotation —— \
-                 无法确定参考姿态（官方会取 $definebone 的 rawLocal）",
-                smd_path.display(),
-                b.name
-            )));
-            return None;
         }
         fallback[di] = Some(crate::smd::SmdPose {
             bone: di as i32,
@@ -1975,16 +2006,91 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let Some((ref_name, ref_frame)) = sub else {
             continue;
         };
-        let Some(&j) = anim_index.get(ref_name.as_str()) else {
+        // ⚠️ **参考名可以是「序列名」，不只是「动画名」。**
+        //
+        // 官方 `LookupAnimation`（`studiomdl.cpp:1674-1692`）**先查动画池
+        // `g_panimation`、查不到再退回 `LookupSequence`**，命中序列时返回
+        // 它的 `panim[0][0]`（第一格动画）。`subtract` 走的正是它
+        // （`studiomdl.cpp:1733-1751` 的 `else if (stricmp("subtract", token) == 0)`）。
+        //
+        // 用户工程的 `$animation "a_proportions" "anims/foot_fix.smd"
+        // subtract "reference" 0` 里，`reference` 就是 QC 上一行那条
+        // `$sequence "reference" "anims/ref.smd" fps 1` 的**序列名** ——
+        // 官方接受（实测见 `docs/_probe/oracle_subtract_seqname.js`）。
+        //
+        // mdlc 是**分阶段**编译的（先全部 `$animation`、再全部 `$sequence`），
+        // 而官方是**流式**解析 QC ⟹ 动画阶段 `anims` 里还没有序列建的隐含
+        // 动画。所以这里手工补上「序列池」那一半：命中 `desc.sequences`
+        // 里的某条序列时，参考帧 = 它的第一格动画（`panim[0][0]`）的帧。
+        //
+        // * 该序列的 token 指向一条**已声明动画** ⟹ 复用它的帧；
+        // * 否则那是 `Cmd_ImpliedAnimation` 建的**隐含动画**，其帧就是
+        //   那个 SMD 的帧 ⟹ **现场读一遍 SMD**（不建动画对象，序列阶段
+        //   会自己建；同一份 SMD 因此被读两次，但 `subtract` 引用序列名
+        //   是罕见写法，代价可接受）。
+        //
+        // 已知的宽松处：官方在**流式**解析时解析名字，所以被引用的序列
+        // 必须**写在前面**；mdlc 分阶段后拿不到「书写先后」，这里对
+        // `desc.sequences` 里**任意位置**的序列都接受。这会比官方**宽松**
+        // （官方对「引用了后面的序列」会报 `unknown subtract animation`）。
+        let resolved: Option<Vec<Vec<crate::smd::SmdPose>>> =
+            if let Some(&j) = anim_index.get(ref_name.as_str()) {
+                Some(anims[j].frames.clone())
+            } else {
+                match desc
+                    .sequences
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(ref_name))
+                {
+                    // `$declaresequence` 的空壳没有 `panim` ⟹ 官方
+                    // `pseq->panim[0][0]` 是 NULL ⟹ 解析失败。
+                    Some(sq) if sq.forward_declared => None,
+                    Some(sq) => {
+                        // `pseq->panim[0][0]`：blend 序列取**第一格**的名字；
+                        // 单动画序列取它的 token（`sq.smd`）。
+                        let cell = sq
+                            .blends
+                            .first()
+                            .map(|n| n.as_str())
+                            .unwrap_or(sq.smd.as_str());
+                        match anim_index.get(cell) {
+                            Some(&j) => Some(anims[j].frames.clone()),
+                            None => {
+                                let p = resolve_smd_path(base_dir, &sq.smd);
+                                load_smd_frames(
+                                    &p,
+                                    desc,
+                                    &bone_index,
+                                    &format!("animations[{i}].subtract（序列 {ref_name:?}）"),
+                                    &mut seq_errors,
+                                )
+                                .map(|(frames, _smd)| frames)
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            };
+        let Some(src) = resolved else {
             seq_errors.push(CompileError {
                 at: format!("animations[{i}].subtract"),
                 message: format!(
-                    "找不到参考动画 {ref_name:?}（subtract 引用的是 [[animations]] 里的**动画名**）"
+                    "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
+                     现有动画：{}；现有序列：{}）",
+                    desc.animations
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    desc.sequences
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ),
             });
             continue;
         };
-        let src = anims[j].frames.clone();
         let bf = (*ref_frame).max(0) as usize;
         if bf >= src.len() {
             seq_errors.push(CompileError {
@@ -2548,8 +2654,13 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 anims[anim_ix].delta = true;
             }
             if let Some(ref_name) = s.subtract.as_deref() {
-                match anim_index.get(ref_name) {
-                    Some(&j) => {
+                // ⚠️ 与 `[[animations]]` 那条路径**同一个** `LookupAnimation`
+                // （`studiomdl.cpp:1674-1692`）：**先查动画池、再退回序列池**，
+                // 命中序列时取它的 `panim[0][0]`。这里 `sequences` 里已经有
+                // 前面处理过的序列（本序列自己还没 push）—— 与官方「流式解析，
+                // 只能看到写在前面、且已进 `g_sequence` 的序列」同序。
+                match resolve_lookup_animation(ref_name, &anims, &anim_index, &sequences) {
+                    Some(j) => {
                         let src = anims[j].frames.clone();
                         let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
                         if bf >= src.len() {
@@ -2572,11 +2683,16 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         seq_errors.push(CompileError {
                             at: format!("{at}.subtract"),
                             message: format!(
-                                "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名**，\
-                                 现有：{}）",
+                                "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
+                                 现有动画：{}；现有序列：{}）",
                                 desc.animations
                                     .iter()
                                     .map(|a| a.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                desc.sequences
+                                    .iter()
+                                    .map(|x| x.name.as_str())
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ),
@@ -5791,8 +5907,31 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
     let mut out = Vec::with_capacity(desc.jiggle_bones.len());
     for (i, j) in desc.jiggle_bones.iter().enumerate() {
         let at = format!("jiggle_bones[{i}]");
+        // 目标骨骼找不到 ⟹ **丢弃这一条**，不是错误。
+        //
+        // 官方 `TagProceduralBones`（`simplify.cpp:3911-3989`）对每一类程序化
+        // 骨骼都先 `findGlobalBone`，`bone == -1` 时只
+        // `printf("… \"%s\" unused\n", …)` 然后 `continue;
+        // // optimized out, don't complain`（`:3922-3929` axisinterp、
+        // `:3948-3955` quatinterp、`:3972-3979` aimat）。
+        //
+        // jigglebone 是 L4D2 新增的（darkm 的 `TagProceduralBones` 里
+        // **没有**这个分支，grep `jiggle` 在该目录 0 命中），但 L4D2 官方
+        // exe 里有同形串 `jigglebone "%s" unused`（@0x5763e4，与
+        // `axisinterpbone "%s" unused` / `quatinterpbone "%s" unused` /
+        // `<aimconstraint> "%s" unused` 并排）⟹ 同一条语义。
+        //
+        // ⭐ 实测 `docs/_probe/oracle_jiggle_missing_bone.js`：官方对
+        // `$jigglebone "nosuchbone"` **编过**，stdout 只打
+        // `jigglebone "nosuchbone" unused`，产物里既没有该 proctype 条目、
+        // 也不影响同一 QC 里其它 jigglebone。修前 mdlc 在这里报
+        // `jiggle_bones[1]: 骨骼 "nosuchbone" 找不到` 并 `exit=1`。
+        //
+        // ⚠️ 注意：**control/parent 骨骼**找不到才是硬错误
+        // （`Missing control bone "%s" for procedural bone "%s"`），
+        // 见 `resolve_quat_interp_bones` 里的 control 段。
         let Some(&bone) = desc.bone_index().get(j.bone.as_str()) else {
-            errs.push(e(&at, format!("骨骼 {:?} 找不到", j.bone)));
+            crate::diagln!("jigglebone {:?} unused", j.bone);
             continue;
         };
 
@@ -5955,8 +6094,12 @@ fn resolve_quat_interp_bones(
 
     for (qi, q) in compiled.desc.quat_interp_bones.iter().enumerate() {
         let at = format!("quat_interp_bones[{qi}]");
+        // 目标骨骼找不到 ⟹ **丢弃这一条**，不是错误（同 `resolve_jiggle_bones`）。
+        // 官方 `simplify.cpp:3948-3955`：`printf("quatinterpbone \"%s\" unused\n")`
+        // 后 `continue; // optimized out, don't complain`。L4D2 exe 里该串在
+        // @0x5764a4。修前 mdlc 在这里报「骨骼 {:?} 找不到」并中止编译。
         let Some(&bone) = bone_index.get(q.bone.as_str()) else {
-            errs.push(e(&at, format!("骨骼 {:?} 找不到", q.bone)));
+            crate::diagln!("quatinterpbone {:?} unused", q.bone);
             continue;
         };
         let bone = bone as i32;
@@ -6762,6 +6905,127 @@ subtract_frame = 0
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// ⭐ `subtract` 可以引用**序列名**，不只是动画名。
+    ///
+    /// 官方 `LookupAnimation`（`studiomdl.cpp:1674-1692`）**先查动画池
+    /// `g_panimation`、查不到再退回 `LookupSequence`**，命中序列时返回它的
+    /// `panim[0][0]`（第一格动画）。`subtract` 走的正是它
+    /// （`studiomdl.cpp:1733-1751` 的 `else if (stricmp("subtract", token) == 0)`）。
+    ///
+    /// 用户工程（`linnea_replaces_zoey`）正是这种写法：
+    ///
+    /// ```text
+    /// $sequence  "reference"     "anims/ref.smd"      fps 1
+    /// $animation "a_proportions" "anims/foot_fix.smd" subtract "reference" 0
+    /// ```
+    ///
+    /// 修前 mdlc 报 `animations[0].subtract: 找不到参考动画 "reference"`
+    /// 并中止编译（官方照编不误）。
+    ///
+    /// 夹具刻意让序列名**不与任何动画同名**、且序列的 `smd` 也不是任何
+    /// `[[animations]]` 的 `smd` —— 逼实现走「序列池 ⟹ 现场读该 SMD」
+    /// 那条分支（而不是靠 `anim_index` 里恰好有同名条目蒙对）。
+    #[test]
+    fn subtract_can_reference_a_sequence_name() {
+        let d = tmpdir("subtract-seqname");
+        // base.smd：root(0), mid(1), tip(2)；tip 绕 Z 20°（0.349066 rad）
+        let base = r#"version 1
+nodes
+  0 "root" -1
+  1 "mid" 0
+  2 "tip" 1
+end
+skeleton
+  time 0
+    0 0 0 0 0 0 0
+    1 0 0 4 0 0 0
+    2 0 0 8 0 0 0.349066
+end
+triangles
+myprop
+  2 -8 -8 8 0 0 1 0 0 1 2 1
+  2 8 -8 8 0 0 1 1 0 1 2 1
+  2 0 8 8 0 0 1 0.5 1 1 2 1
+end
+"#;
+        // pose.smd：**骨骼顺序相同**，只有 tip 是 35°（0.610865 rad）
+        let pose = r#"version 1
+nodes
+  0 "root" -1
+  1 "mid" 0
+  2 "tip" 1
+end
+skeleton
+  time 0
+    0 0 0 0 0 0 0
+    1 0 0 4 0 0 0
+    2 0 0 8 0 0 0.610865
+end
+triangles
+myprop
+  2 -8 -8 8 0 0 1 0 0 1 2 1
+  2 8 -8 8 0 0 1 1 0 1 2 1
+  2 0 8 8 0 0 1 0.5 1 1 2 1
+end
+"#;
+        write(&d, "base.smd", base);
+        write(&d, "pose.smd", pose);
+        let toml = r#"
+[model]
+name = "models/test/subseq.mdl"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{ name = "models/test/myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "mid"
+parent = "root"
+
+[[bones]]
+name = "tip"
+parent = "mid"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "pose.smd"
+
+[[sequences]]
+name = "reference"
+smd = "base.smd"
+
+[[animations]]
+name = "posed"
+smd = "pose.smd"
+subtract = "reference"
+subtract_frame = 0
+"#;
+        let desc: ModelDesc = toml::from_str(toml).expect("TOML 解析");
+        let c = compile(&desc, &d).expect(
+            "`subtract` 引用**序列名**必须能编译（官方 `LookupAnimation` \
+             查不到动画时会退回序列池）",
+        );
+        // 按名字取：序列阶段会另建隐含动画（登记在 `@reference` 下），
+        // 所以下标不能假定。
+        let posed = c
+            .animations
+            .iter()
+            .find(|a| a.name == "posed")
+            .expect("产物里应有 posed 动画");
+        assert!(posed.delta, "subtract ⇒ delta");
+        let deg = posed.frames[0][2].rotation[2].to_degrees();
+        assert!(
+            (deg - 15.0).abs() < 0.01,
+            "tip 的 Z 应为 35° − 20° = 15°，实际 {deg}°（序列名没解析到参考动画？）"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `subtract` 出来的动画在**写出阶段**只保留真正变化的骨骼。
     ///
     /// 这是 miku `look_*` 的核心判据：官方 `look_down` 只有 **1** 条轨道
@@ -6895,12 +7159,32 @@ fps = 30.0
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 反向：SMD 里没有、`[[bones]]` 也**没给**姿态的骨骼必须**报错**。
+    /// SMD 里没有、`[[bones]]` 也**没给**姿态的骨骼：**不报错**，参考姿态兜底零。
     ///
-    /// 静默用 `[0,0,0]` 会让骨骼塌到原点，表现为顶点被拉向世界原点 ——
-    /// 不会报错，只会让模型在游戏里扭曲。
+    /// # 为什么不再是错误
+    ///
+    /// 这条曾经是硬错误，理由是「静默用 `[0,0,0]` 会让骨骼塌到原点」。
+    /// 但官方**从不做这个检查**：
+    ///
+    /// - `Grab_Animation`（`studiomdl.cpp:1065-1135`）给每帧
+    ///   `kalloc(1, size)`（= `calloc`，**零填充**），再逐骨骼从上一帧拷贝，
+    ///   最后才用本帧的骨骼行覆盖。**它从不检查「每根骨骼都有数据」** ——
+    ///   本帧没写的骨骼保留上一帧的值（第 0 帧就是 `(0,0,0)`/单位旋转）。
+    /// - `TranslateAnimations`（`simplify.cpp:1498-1529`）里查不到骨骼时
+    ///   （`q == -1`）只 printf 一句，**不报错**。
+    ///
+    /// ⭐ 而 L4D2 官方 exe 里根本**没有**「某骨骼在某 SMD 里缺失」类的错误串
+    /// （已逐字扫描：只有 `%s is missing frame %d`、`Missing frame start(%d) : %s`、
+    /// `Imported bone %s tried to access parent bone %s and failed!` 等）
+    /// ⟹ 官方不可能抛这种错。
+    ///
+    /// 实测反例（用户工程 `survivor_teenangst.qc`）：`anims/foot_fix.smd`
+    /// 的 `nodes` 没有 `ValveBiped.forward`，官方照编不误。
+    ///
+    /// 兜底零与 mdlc 自身的 `resolve_bone_pose`（`compile.rs:4916-4955`）
+    /// 口径一致 —— 那里对「body SMD 里没有该骨骼」也是回退 `[0,0,0]`。
     #[test]
-    fn bone_absent_from_smd_without_explicit_pose_errors() {
+    fn bone_absent_from_smd_without_explicit_pose_falls_back_to_zero() {
         let d = tmpdir("definebone-missing");
         let smd = r#"version 1
 nodes
@@ -6946,10 +7230,15 @@ smd = "myprop-ref.smd"
 fps = 30.0
 "#;
         let desc: ModelDesc = toml::from_str(toml).expect("TOML 解析");
-        let errs = compile(&desc, &d).expect_err("缺姿态的骨骼必须报错");
-        assert!(
-            errs.iter().any(|e| e.message.contains("tip")),
-            "错误里应点名 tip，实际：{errs:?}"
+        let c = compile(&desc, &d).expect("官方对「SMD 里没有该骨骼」不报错（Grab_Animation 零填充）");
+        assert_eq!(c.desc.bones.len(), 2, "tip 必须保留（官方 numbones = 2）");
+        let frames = &c.animations[0].frames;
+        assert_eq!(
+            frames[0][1].position,
+            [0.0, 0.0, 0.0],
+            "没有姿态来源的骨骼兜底零（与官方 Grab_Animation 的 calloc 一致），\
+             实际 {:?}",
+            frames[0][1].position
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -7536,6 +7825,94 @@ $sequence \"idle\" \"myprop-ref.smd\" fps 30
         assert_eq!(j.base_stiffness, 800.0);
         assert_eq!(j.base_min_left, -0.5);
         assert_eq!(j.base_forward_friction, 12.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：`$jigglebone` 指向**不存在**的骨骼 ⟹ **丢弃该条**，不是错误。
+    ///
+    /// 官方 `TagProceduralBones`（`simplify.cpp:3922-3929`）对每一类程序化
+    /// 骨骼都是 `bone == -1` ⟹ `printf("… \"%s\" unused\n")` + `continue;
+    /// // optimized out, don't complain`。jigglebone 是 L4D2 新增的
+    /// （darkm 无此分支），但 L4D2 exe 里有同形串
+    /// `jigglebone "%s" unused`（@0x5763e4）。
+    ///
+    /// 实测 `docs/_probe/oracle_jiggle_missing_bone.js`：官方对
+    /// `$jigglebone "nosuchbone"` 编过，stdout 只打一句 `unused`，产物里
+    /// 既无该 proctype 条目、也不影响同一 QC 里其它 jigglebone。
+    ///
+    /// 修前 mdlc 报 `jiggle_bones[1]: 骨骼 "nosuchbone" 找不到` 并中止编译
+    /// —— 用户的 `survivor_teenangst.qc` 正是这样被卡住的
+    /// （`jigglebones.qci` 有 36 条，其中 `hb_13_1_L`/`hb_13_1_R` 在
+    /// `definebones.qci` 与所有 SMD 里都不存在）。
+    #[test]
+    fn jiggle_missing_bone_is_dropped_not_an_error() {
+        let d = tmpdir("jigmiss");
+        write(&d, "myprop-ref.smd", SMD);
+        let base = desc_toml("myprop-ref.smd");
+
+        // ① 全都不存在 ⟹ 编过，且一条记录都不产出。
+        let t = format!("{base}\n[[jiggle_bones]]\nbone = \"nosuchbone\"\n");
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d)
+            .expect("官方对找不到骨骼的 jigglebone 是 `unused` + 丢弃，不应报错");
+        assert!(
+            c.resolved_jiggle_bones.is_empty(),
+            "找不到骨骼的那条应被丢弃，实际：{:?}",
+            c.resolved_jiggle_bones.len()
+        );
+
+        // ② 混着一条存在的 ⟹ 存在的照常产出，缺的只丢自己。
+        let t = format!(
+            "{base}\n[[jiggle_bones]]\nbone = \"tip\"\n\
+             [jiggle_bones.is_rigid]\ntip_mass = 400.0\n\n\
+             [[jiggle_bones]]\nbone = \"nosuchbone\"\n"
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).expect("应能编译");
+        assert_eq!(c.resolved_jiggle_bones.len(), 1, "只应留下 tip 那条");
+        assert_eq!(c.resolved_jiggle_bones[0].bone, 1, "tip 是骨骼下标 1");
+        assert_eq!(c.resolved_jiggle_bones[0].flags, 0x22, "IS_RIGID|LENGTH");
+        assert_eq!(c.resolved_jiggle_bones[0].tip_mass, 400.0);
+
+        // ③ 名称匹配是**精确**的（官方 `findGlobalBone` 走 `stricmp` 全名，
+        //    **不**做 XSI 后缀匹配）⟹ `"ip"` 不该命中 `tip`。
+        let t = format!("{base}\n[[jiggle_bones]]\nbone = \"ip\"\n");
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).expect("应能编译");
+        assert!(
+            c.resolved_jiggle_bones.is_empty(),
+            "后缀 `ip` 不该匹配 `tip`（oracle 的 leaf_prefixed 变体）"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：`[[quat_interp_bones]]` 的**目标骨骼**找不到 ⟹ 丢弃该条；
+    /// 但 **`control` 骨骼**找不到仍是**硬错误**。
+    ///
+    /// 官方 `simplify.cpp:3948-3955` 对目标骨骼是
+    /// `printf("quatinterpbone \"%s\" unused\n")` + `continue`；
+    /// `:3957-3959` 对 control 是
+    /// `MdlError("Missing control bone \"%s\" for procedural bone \"%s\"\n")`。
+    /// 两条串都在 L4D2 exe 里（@0x5764a4 / @0x5764c0）。
+    #[test]
+    fn quat_interp_missing_bone_dropped_but_missing_control_is_error() {
+        let d = tmpdir("qimiss");
+        write(&d, "myprop-ref.smd", SMD);
+        let base = desc_toml("myprop-ref.smd");
+
+        // ① 目标骨骼不存在 ⟹ 丢弃，不报错。
+        let t = format!(
+            "{base}\n[[quat_interp_bones]]\nbone = \"nosuchbone\"\ncontrol = \"root\"\n"
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d)
+            .expect("官方对找不到目标骨骼的 quatinterp 是 `unused` + 丢弃");
+        assert!(c.resolved_quat_interp_bones.is_empty(), "该条应被丢弃");
+
+        // ② control 不存在 ⟹ **硬错误**（官方 `Missing control bone`）。
+        let t = format!("{base}\n[[quat_interp_bones]]\nbone = \"tip\"\ncontrol = \"nosuchbone\"\n");
+        let errs = compile(&ModelDesc::from_toml(&t).unwrap(), &d)
+            .expect_err("control 找不到官方是 MdlError，必须报错");
+        assert!(
+            errs.iter().any(|x| x.message.contains("control 骨骼")),
+            "错误信息应点名 control 骨骼：{errs:?}"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

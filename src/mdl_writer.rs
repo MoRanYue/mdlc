@@ -6537,10 +6537,14 @@ motionflags = 7
                 num_lods: 1,
                 num_lod_vertexes: [1, 0, 0, 0, 0, 0, 0, 0],
                 num_fixups: 0,
-                // 三个偏移重合在 64（无 fixup 的形态）—— 与 `to_bytes` 的重算一致
+                // 无 fixup 的形态：`fixup_table_start == vertex_data_start == 64`，
+                // 但 `tangent_data_start` 仍按公式递推 ——
+                // `ALIGN16(64 + 1×48) = ALIGN16(112) = 112`。
+                // （第一版这里写 64，只有在 debug 下 `debug_assert_eq!` 才会抓到；
+                //  release 把 debug_assert 编掉了，所以长期没暴露。）
                 fixup_table_start: 64,
                 vertex_data_start: 64,
-                tangent_data_start: 64,
+                tangent_data_start: 112,
             },
             vertices: vec![VvdVertex {
                 weight: [1.0, 0.0, 0.0],
