@@ -295,11 +295,34 @@ pub const MAX_WEIGHT_LISTS: usize = 128;
 /// `0x3C` 当 `minPitch`）—— 这里的顺序以 `jig1.mdl` 的 QC 值逐槽反解为准：
 /// `minPitch = -20° = -0.34906585` 落在 `0x38`。
 ///
-/// # 语义
+/// # 语义：**扁平记录 + token 顺序「后写覆盖」**
 ///
-/// QC 的 `$jigglebone "bone" { is_flexible {…} is_rigid {…} has_base_spring {…} }`
-/// 三段各自独立，`flags` 按出现情况置位（见 [`JiggleBone`] 各字段的说明）。
-/// **角度输入是「度」，写盘转弧度**（`angle_constraint 60` → `π/3`）。
+/// ⚠️ 这一条是反编译 + 受控实验一起钉死的，**反直觉**：
+/// 官方解析器并**不**为三个块各存一份、再按固定块优先级合并。
+/// 它只有**一个扁平记录**（`+0x88` 起 30 个槽），每个键**按 QC 里出现的
+/// 先后顺序**直接写进那一个记录，**后写覆盖先写**；`flags` 则是**按位 OR 累积**
+/// （但 `is_flexible` 进入时置的 `0x20` 会被 `allow_length_flex` 清掉，
+/// 所以 `flags` 也依赖顺序）。
+///
+/// 决定性对照（两个夹具只有**块顺序**不同，值完全一样，结果却不同）：
+///
+/// | 夹具 | QC 写法 | 实测 `min_yaw`/`max_yaw` |
+/// |---|---|---|
+/// | `jig47` | `is_rigid { yaw_constraint -10 20 }` → `has_base_spring { yaw_constraint -30 40 }` | `−30°`/`40°` |
+/// | `jig48` | `has_base_spring { yaw_constraint -30 40 }` → `is_rigid { yaw_constraint -10 20 }` | `−10°`/`20°` |
+///
+/// ⟹ **任何「固定块合并顺序」的实现都无法同时复现这两个**。
+///
+/// # 两种输入形式（互斥，`validate()` 会拒绝同时出现）
+///
+/// * **`writes`**（QC 路径）：官方语义的**无损**表示 —— 一个按 token 顺序排的
+///   写入日志。QC 解析器只填它。
+/// * **三个块**（TOML 路径）：手写 TOML 的**便捷**语法，按固定顺序
+///   `is_flexible` → `is_rigid` → `has_base_spring` 依次应用（同块内按字段序）。
+///   它**表达不了** `jig47`/`jig48` 那种顺序差异 —— 需要精确顺序时用 `writes`。
+///
+/// 两条路径最终都收敛到同一个扁平记录，**角度输入都是「度」、写盘转弧度**
+/// （`angle_constraint 60` → `π/3`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct JiggleBone {
@@ -314,6 +337,175 @@ pub struct JiggleBone {
     /// `has_base_spring { … }` 块（存在 ⟹ `flags |= 0x40`）。
     #[serde(default)]
     pub has_base_spring: Option<JiggleBaseSpring>,
+    /// **按 QC token 顺序**的写入日志 —— 官方语义的无损表示。
+    ///
+    /// 非空 ⟹ 三个块被**忽略**（`validate()` 会拒绝两者同时出现）。
+    /// 空 ⟹ 走三个块的固定顺序合并。
+    ///
+    /// `qc2toml` 会把它原样写出来，所以 QC → TOML → 编译是**无损**的。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<JiggleWrite>,
+}
+
+/// `$jigglebone` 里**一条**按 token 顺序记录的写入。
+///
+/// `key` 用**官方键名**（小写）；三个块名也走同一条通道，`values` 为空，
+/// 表示「进入该块」（置 `flags`）。这样 `flags` 的累积顺序也一并被保真。
+///
+/// ⚠️ `values` 存的是 QC 里的**原始数值**（角度仍是度）——
+/// 单位换算与钳位统一在 `compile::resolve_jiggle_bones` 里做一次，
+/// 避免 QC 侧和 resolve 侧各转一次（那正是原来的双转弧度 bug）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JiggleWrite {
+    /// 官方键名（小写）；`is_flexible`/`is_rigid`/`has_base_spring` 表示块进入。
+    pub key: String,
+    /// 该键的数值：标量 1 个、对偶键 2 个、`allow_length_flex` 与块进入 0 个。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<f32>,
+}
+
+impl JiggleBone {
+    /// 把三个「便捷块」展开成**按固定顺序**的写入日志（TOML 路径用）。
+    ///
+    /// 顺序是 `is_flexible` → `is_rigid` → `has_base_spring`，块内按结构体
+    /// 字段声明序。这个顺序**表达不了** `jig47`/`jig48` 那种「块间交错」
+    /// 的顺序差异 —— 需要精确顺序请直接用 [`JiggleBone::writes`]。
+    ///
+    /// `writes` 非空时**原样返回**（QC 路径的日志优先，两者互斥由
+    /// `validate()` 保证）。
+    ///
+    /// # 为什么要有这一步
+    ///
+    /// 官方的语义是「一个扁平记录 + token 顺序后写覆盖」。把 TOML 的块
+    /// 也展开成同一个日志，`resolve_jiggle_bones` 就**只有一条代码路径**
+    /// —— 不会出现「只改了某一条路径」的 bug（本仓库 R23/R26b/R26c 三次
+    /// 都栽在同一个形态上）。
+    pub fn effective_writes(&self) -> Vec<JiggleWrite> {
+        if !self.writes.is_empty() {
+            return self.writes.clone();
+        }
+        let mut w = Vec::new();
+        // 缺省值随字段序展开；`None` 的字段不写（保持 resolve 侧缺省）。
+        if let Some(f) = &self.is_flexible {
+            let mut push = |key: &str, values: Vec<f32>| {
+                w.push(JiggleWrite {
+                    key: key.into(),
+                    values,
+                })
+            };
+            push("is_flexible", vec![]);
+            for (k, v) in [
+                ("length", f.length),
+                ("tip_mass", f.tip_mass),
+                ("yaw_stiffness", f.yaw_stiffness),
+                ("yaw_damping", f.yaw_damping),
+                ("pitch_stiffness", f.pitch_stiffness),
+                ("pitch_damping", f.pitch_damping),
+                ("along_stiffness", f.along_stiffness),
+                ("along_damping", f.along_damping),
+                ("angle_constraint", f.angle_constraint),
+            ] {
+                if let Some(v) = v {
+                    push(k, vec![v]);
+                }
+            }
+            if f.allow_length_flex {
+                push("allow_length_flex", vec![]);
+            }
+            if let Some([a, b]) = f.yaw_constraint {
+                push("yaw_constraint", vec![a, b]);
+            }
+            if let Some(v) = f.yaw_friction {
+                push("yaw_friction", vec![v]);
+            }
+            if let Some(v) = f.yaw_bounce {
+                push("yaw_bounce", vec![v]);
+            }
+            if let Some([a, b]) = f.pitch_constraint {
+                push("pitch_constraint", vec![a, b]);
+            }
+            if let Some(v) = f.pitch_friction {
+                push("pitch_friction", vec![v]);
+            }
+            if let Some(v) = f.pitch_bounce {
+                push("pitch_bounce", vec![v]);
+            }
+        }
+        if let Some(r) = &self.is_rigid {
+            let mut push = |key: &str, values: Vec<f32>| {
+                w.push(JiggleWrite {
+                    key: key.into(),
+                    values,
+                })
+            };
+            push("is_rigid", vec![]);
+            for (k, v) in [
+                ("length", r.length),
+                ("tip_mass", r.tip_mass),
+                ("angle_constraint", r.angle_constraint),
+            ] {
+                if let Some(v) = v {
+                    push(k, vec![v]);
+                }
+            }
+            if let Some([a, b]) = r.yaw_constraint {
+                push("yaw_constraint", vec![a, b]);
+            }
+            if let Some(v) = r.yaw_friction {
+                push("yaw_friction", vec![v]);
+            }
+            if let Some(v) = r.yaw_bounce {
+                push("yaw_bounce", vec![v]);
+            }
+            if let Some([a, b]) = r.pitch_constraint {
+                push("pitch_constraint", vec![a, b]);
+            }
+            if let Some(v) = r.pitch_friction {
+                push("pitch_friction", vec![v]);
+            }
+            if let Some(v) = r.pitch_bounce {
+                push("pitch_bounce", vec![v]);
+            }
+        }
+        if let Some(b) = &self.has_base_spring {
+            let mut push = |key: &str, values: Vec<f32>| {
+                w.push(JiggleWrite {
+                    key: key.into(),
+                    values,
+                })
+            };
+            push("has_base_spring", vec![]);
+            if let Some(v) = b.base_mass {
+                push("base_mass", vec![v]);
+            }
+            if let Some(v) = b.base_stiffness {
+                push("stiffness", vec![v]);
+            }
+            if let Some(v) = b.base_damping {
+                push("damping", vec![v]);
+            }
+            if let Some([a, c]) = b.base_left {
+                push("left_constraint", vec![a, c]);
+            }
+            if let Some(v) = b.base_left_friction {
+                push("left_friction", vec![v]);
+            }
+            if let Some([a, c]) = b.base_up {
+                push("up_constraint", vec![a, c]);
+            }
+            if let Some(v) = b.base_up_friction {
+                push("up_friction", vec![v]);
+            }
+            if let Some([a, c]) = b.base_forward {
+                push("forward_constraint", vec![a, c]);
+            }
+            if let Some(v) = b.base_forward_friction {
+                push("forward_friction", vec![v]);
+            }
+        }
+        w
+    }
 }
 
 /// `is_flexible { … }` 块。
@@ -384,6 +576,23 @@ pub struct JiggleFlexible {
 }
 
 /// `is_rigid { … }` 块。`flags |= 0x02`，**`0x20 LENGTH` 同样无条件置位**。
+///
+/// # ⚠️ 它与 `is_flexible` / `has_base_spring` 的键集**不是**超集关系
+///
+/// 反编译 `FUN_004549d0`（`is_rigid`）显示它**不调用**共享子解析器
+/// `FUN_004545b0`，而是把全部键**内联**在自己体内。因此：
+///
+/// * 它**接受** `yaw_constraint` / `yaw_friction` / `yaw_bounce` /
+///   `pitch_constraint` / `pitch_friction` / `pitch_bounce`
+///   （这 6 个原来在 mdlc 里**缺失**，导致官方 QC 里的写法被静默丢弃 ——
+///   例如 `v_silenced_smg.qc` 的 `ValveBiped.strap`）。
+/// * 它**不接受** `allow_length_flex`（那是 `is_flexible` 独有；
+///   夹具 `jig45` 实测官方 abort：`invalid syntax 'allow_length_flex'`）。
+///
+/// 实测 `jig43`（`is_rigid { yaw_friction 7 / pitch_bounce 8 /
+/// yaw_constraint -30 40 / pitch_constraint -20 50 }`）→
+/// `flags = 0x2e`（`RIGID|YAW|PITCH|LENGTH`，**无 `0x10`**，因为没写
+/// `angle_constraint`），四个角度槽都是**弧度**。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct JiggleRigid {
@@ -396,11 +605,57 @@ pub struct JiggleRigid {
     /// `angle_constraint <度>`（缺省 0）→ `angleLimit` + `flags |= 0x10`。
     #[serde(default)]
     pub angle_constraint: Option<f32>,
+    /// `yaw_constraint <min> <max>`（**度**）→ `flags |= 0x04`。
+    #[serde(default)]
+    pub yaw_constraint: Option<[f32; 2]>,
+    /// `yaw_friction`（缺省 0）。
+    #[serde(default)]
+    pub yaw_friction: Option<f32>,
+    /// `yaw_bounce`（缺省 0）。
+    #[serde(default)]
+    pub yaw_bounce: Option<f32>,
+    /// `pitch_constraint <min> <max>`（**度**）→ `flags |= 0x08`。
+    #[serde(default)]
+    pub pitch_constraint: Option<[f32; 2]>,
+    /// `pitch_friction`（缺省 0）。
+    #[serde(default)]
+    pub pitch_friction: Option<f32>,
+    /// `pitch_bounce`（缺省 0）。
+    #[serde(default)]
+    pub pitch_bounce: Option<f32>,
 }
 
 /// `has_base_spring { … }` 块（`flags |= 0x40`）。
 ///
 /// 三组 `min/max/friction` 的缺省都是 **±100 / 0**。
+///
+/// # ⚠️ 字段名是 mdlc 自创的 `base_*` 前缀，与官方 QC 键名不同
+///
+/// 官方 QC 里写的是**裸键**（见 `D:\SOURCE\SOURCEMDLS\linnea_replaces_zoey\
+/// models\survivors\decompiled\jigglebones.qci`）：
+///
+/// | 官方 QC 键 | mdlc TOML 字段 |
+/// |---|---|
+/// | `base_mass` | `base_mass`（同名） |
+/// | `stiffness` | `base_stiffness` |
+/// | `damping` | `base_damping` |
+/// | `left_constraint` | `base_left` |
+/// | `up_constraint` | `base_up` |
+/// | `forward_constraint` | `base_forward` |
+/// | `left_friction` | `base_left_friction` |
+/// | `up_friction` | `base_up_friction` |
+/// | `forward_friction` | `base_forward_friction` |
+///
+/// **这个 `base_*` 命名必须保留** —— `parity\*.toml`（101 个）与
+/// `qc2toml` 的产物都用它，改名会改动全部 parity 快照。
+/// 只有 **QC 解析侧**需要认官方裸键（`writes[].key` 存官方键名）。
+///
+/// # ⚠️ 三个 `*_constraint` **不是角度**，不转弧度
+///
+/// 实测 `jig38`：QC 写 `left_constraint -0.5 0.5` → 盘上
+/// `baseMinLeft = -0.5` `baseMaxLeft = 0.5`（**原值**）。
+/// 而 `yaw_constraint`/`pitch_constraint` 是角度（转弧度）——
+/// 原 mdlc 把 `base_left`/`base_up`/`base_forward` 也 `to_rad` 了，是 bug。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct JiggleBaseSpring {
@@ -4069,23 +4324,26 @@ pub struct ResolvedQuatInterpTrigger {
     pub quat: [f32; 4],
 }
 
-/// `mstudiojigglebone_t.flags` 的位（`studio.h`，受控实验 `jig{1,2,4,6,7,8}` 钉死）。
-/// ⚠️ **`LENGTH(0x20)` 在 `is_flexible` 与 `is_rigid` 下都无条件置位**
-/// （受控实验：`jig4`（只有 `yaw_stiffness`）得 `0x01` 而非 `0x21`，
-/// 而 `jig6` 的 `is_flexible`/`is_rigid` 分别得 `0x21`/`0x22` ——
-/// 只要**块**出现就置 `LENGTH`）。
+/// `mstudiojigglebone_t.flags` 的位（`studio.h`，受控实验 `jig{1,2,4,6,7,8,43}` 钉死）。
+///
+/// ⚠️ **`LENGTH(0x20)` 在 `is_flexible` 与 `is_rigid` 下都无条件置位** ——
+/// 只要**块**出现就置位，但 `allow_length_flex` 会把它**清掉**
+/// （`is_flexible` 独有键，实测 `jig4` = `0x01`）。
+///
+/// `flags` 是**按位 OR 累积**的（不是按块覆盖），所以块/键的出现顺序
+/// 只影响 `0x20` 这一位（被 `allow_length_flex` 清除时）。
 pub mod jiggle_flags {
     /// `is_flexible` 块出现。
     pub const IS_FLEXIBLE: i32 = 0x01;
     /// `is_rigid` 块出现。
     pub const IS_RIGID: i32 = 0x02;
-    /// `is_flexible` 内出现 `yaw_constraint`。
+    /// `yaw_constraint` 出现（`is_flexible` **或** `is_rigid` 内）。
     pub const HAS_YAW_CONSTRAINT: i32 = 0x04;
-    /// `is_flexible` 内出现 `pitch_constraint`。
+    /// `pitch_constraint` 出现（`is_flexible` **或** `is_rigid` 内）。
     pub const HAS_PITCH_CONSTRAINT: i32 = 0x08;
     /// `angle_constraint` 出现。
     pub const HAS_ANGLE_CONSTRAINT: i32 = 0x10;
-    /// `is_flexible`/`is_rigid` 出现 ⟹ **自动置位**。
+    /// `is_flexible`/`is_rigid` 出现 ⟹ **自动置位**（`allow_length_flex` 可清）。
     pub const HAS_LENGTH_CONSTRAINT: i32 = 0x20;
     /// `has_base_spring` 块出现。
     pub const HAS_BASE_SPRING: i32 = 0x40;
@@ -4101,7 +4359,85 @@ pub mod jiggle_defaults {
     pub const BASE_MAX: f32 = 100.0;
     /// `base*` 三轴的 min 缺省。
     pub const BASE_MIN: f32 = -100.0;
+    /// stiffness / damping 的**钳位上限**。
+    ///
+    /// 反编译 `FUN_004542d0`（被 `is_flexible` 的 6 个 stiffness/damping 与
+    /// `has_base_spring` 的 `stiffness`/`damping` 调用）：
+    /// `if v <= 1000.0 { if 0.0 <= v { v } else { 0.0 } } else { 1000.0 }`。
+    ///
+    /// 实测 `jig35`：`yaw_stiffness 5000 → 1000`、`yaw_damping -5 → 0`、
+    /// `pitch_stiffness 1000.5 → 1000`、`along_stiffness -100 → 0`；
+    /// `jig36`：`stiffness 5000 → 1000`、`damping -3 → 0`。
+    ///
+    /// ⚠️ **`yaw_friction`/`yaw_bounce`/`pitch_friction`/`pitch_bounce` 不钳位**
+    /// （实测 `jig41`/`jig42` 的 `5000`/`6000`/`-7` 全原值透传）。
+    pub const STIFFNESS_MAX: f32 = 1000.0;
 }
+
+/// `stiffness`/`damping` 的官方钳位（`[0, 1000]`）。
+///
+/// 见 [`jiggle_defaults::STIFFNESS_MAX`]。`NaN` 归 0（官方比较在 NaN 上
+/// 两个分支都落空、返回 `fVar3`，其值为 `1000.0`——但 QC 里写不出 NaN，
+/// 这里取更安全的 0）。
+pub fn clamp_stiffness(v: f32) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(0.0, jiggle_defaults::STIFFNESS_MAX)
+    }
+}
+
+/// **官方 `$jigglebone` 接受的键全集**（含三个块名）。
+///
+/// 由反编译 + 27 个受控夹具（`jig1`–`jig50`）共同钉死：
+///
+/// | 键 | `is_flexible` | `is_rigid` | `has_base_spring` |
+/// |---|---|---|---|
+/// | `tip_mass` `length` `angle_constraint` `yaw_constraint` `yaw_friction` `yaw_bounce` `pitch_constraint` `pitch_friction` `pitch_bounce` | ✓（共享子解析器） | ✓（内联） | ✓（共享子解析器） |
+/// | `yaw_stiffness` `yaw_damping` `pitch_stiffness` `pitch_damping` `along_stiffness` `along_damping` | ✓ | ✗ | ✗ |
+/// | `allow_length_flex` | ✓ | ✗ | ✗ |
+/// | `stiffness` `damping` `base_mass` `left_constraint` `up_constraint` `forward_constraint` `left_friction` `up_friction` `forward_friction` | ✗ | ✗ | ✓ |
+///
+/// 官方对**任何**不在此表的键（含顶层裸键）走 `_ => abort`
+/// （`$jigglebone: invalid syntax '%s'` + `Aborted Processing`），
+/// **不是**静默忽略。实测 `jig5`/`jig31` 报 `invalid syntax 'tip_mass'`。
+///
+/// ⚠️ mdlc 的 TOML 侧键名是自创的 `base_*` 前缀（见 [`JiggleBaseSpring`]），
+/// 与官方 QC 键名不同 —— 本表只约束 **QC 侧**与 `writes[].key`。
+pub const KNOWN_JIGGLE_KEYS: [&str; 28] = [
+    // 三个块名（`writes` 里表示「进入该块」）。
+    "is_flexible",
+    "is_rigid",
+    "has_base_spring",
+    // 三块共享的 9 个通用键。
+    "tip_mass",
+    "length",
+    "angle_constraint",
+    "yaw_constraint",
+    "yaw_friction",
+    "yaw_bounce",
+    "pitch_constraint",
+    "pitch_friction",
+    "pitch_bounce",
+    // is_flexible 独有的 7 个。
+    "yaw_stiffness",
+    "yaw_damping",
+    "pitch_stiffness",
+    "pitch_damping",
+    "along_stiffness",
+    "along_damping",
+    "allow_length_flex",
+    // has_base_spring 独有的 9 个（注意：**裸键**，无 `base_` 前缀）。
+    "stiffness",
+    "damping",
+    "base_mass",
+    "left_constraint",
+    "up_constraint",
+    "forward_constraint",
+    "left_friction",
+    "up_friction",
+    "forward_friction",
+];
 
 /// 一个**已解析**的 eyeball：`up`/`forward`/`org` 已转成骨骼空间，
 /// lid 的 flexdesc 名已解析成下标。
@@ -4984,6 +5320,42 @@ impl ModelDesc {
                     path: format!("animations[{i}].weight_list"),
                     message: format!("找不到权重表 {n:?}"),
                 });
+            }
+        }
+
+        // ---- jiggle bones ----
+        // 两种输入形式互斥：`writes`（QC 的无损日志）与三个块（TOML 便捷语法）。
+        // 同时给出会让「谁说了算」变成隐式规则，宁可报错。
+        for (i, j) in self.jiggle_bones.iter().enumerate() {
+            let path = format!("jiggle_bones[{i}]");
+            if j.bone.trim().is_empty() {
+                errs.push(DescError {
+                    path: format!("{path}.bone"),
+                    message: "不能为空".into(),
+                });
+            }
+            let has_blocks =
+                j.is_flexible.is_some() || j.is_rigid.is_some() || j.has_base_spring.is_some();
+            if !j.writes.is_empty() && has_blocks {
+                errs.push(DescError {
+                    path: path.clone(),
+                    message: "`writes` 与 `is_flexible`/`is_rigid`/`has_base_spring` \
+                              不能同时给出：`writes` 是 QC 的无损写入日志（含顺序），\
+                              三个块是按固定顺序合并的便捷语法，两者含义不同"
+                        .into(),
+                });
+            }
+            for (k, w) in j.writes.iter().enumerate() {
+                if !KNOWN_JIGGLE_KEYS.contains(&w.key.as_str()) {
+                    errs.push(DescError {
+                        path: format!("{path}.writes[{k}].key"),
+                        message: format!(
+                            "未知的 `$jigglebone` 键 {:?}（官方会 abort：\
+                             `$jigglebone: invalid syntax`）",
+                            w.key
+                        ),
+                    });
+                }
             }
         }
 

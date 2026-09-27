@@ -5732,29 +5732,55 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
 }
 
 /// 把 `$jigglebone` 解析成「可直接写字节」的形态：算 `flags`、角度转弧度、
-/// 填缺省、骨骼名查下标。
+/// 钳位 stiffness、填缺省、骨骼名查下标。
 ///
-/// # `flags`（受控实验 `jig{1,2,4,6,7,8}` 钉死）
+/// # 官方语义：**扁平记录 + token 顺序「后写覆盖」**
+///
+/// 反编译 + 受控实验一起钉死（`jig47`/`jig48` 是决定性的）：
+/// 官方并**不**为三个块各存一份再合并 —— 它只有**一个扁平记录**，
+/// 每个键**按 QC 里出现的先后顺序**写进那一个记录，**后写覆盖先写**。
+/// `flags` 则是**按位 OR 累积**（只有 `0x20` 会被 `allow_length_flex` 清掉）。
+///
+/// | 夹具 | QC 写法 | 实测 `min_yaw`/`max_yaw` |
+/// |---|---|---|
+/// | `jig47` | `is_rigid{yaw_constraint -10 20}` → `has_base_spring{yaw_constraint -30 40}` | `−30°/40°` |
+/// | `jig48` | `has_base_spring{yaw_constraint -30 40}` → `is_rigid{yaw_constraint -10 20}` | `−10°/20°` |
+///
+/// ⟹ 所以这里**只有一条路径**：拿 [`JiggleBone::effective_writes`] 的顺序日志，
+/// 逐条按序应用。TOML 的三个块也先被展开成同一个日志（见 `effective_writes`），
+/// 于是「QC 路径」与「TOML 路径」不会各写一套逻辑。
+///
+/// # `flags`（受控实验 `jig{1,2,4,6,7,8,43,47,48,49,50}` 钉死）
 ///
 /// | 位 | 何时置位 |
 /// |---|---|
 /// | `0x01 IS_FLEXIBLE` | `is_flexible` 块出现 |
 /// | `0x02 IS_RIGID` | `is_rigid` 块出现 |
-/// | `0x04 YAW_CONSTRAINT` | `is_flexible` 内出现 `yaw_constraint` |
-/// | `0x08 PITCH_CONSTRAINT` | `is_flexible` 内出现 `pitch_constraint` |
-/// | `0x10 ANGLE_CONSTRAINT` | `angle_constraint` 出现（两种块都算） |
-/// | **`0x20 LENGTH_CONSTRAINT`** | **`is_flexible` 或 `is_rigid` 出现就置位** |
+/// | `0x04 YAW_CONSTRAINT` | `yaw_constraint` 出现（`is_flexible` **或** `is_rigid` 内） |
+/// | `0x08 PITCH_CONSTRAINT` | `pitch_constraint` 出现（同上） |
+/// | `0x10 ANGLE_CONSTRAINT` | `angle_constraint` 出现（任何块） |
+/// | **`0x20 LENGTH_CONSTRAINT`** | **`is_flexible` 或 `is_rigid` 出现就置位**；`allow_length_flex` 清掉它 |
 /// | `0x40 BASE_SPRING` | `has_base_spring` 块出现 |
 ///
-/// ⚠️ `0x20` 是**无条件**的（只要块在）—— 受控实验 `jig4`（只有
-/// `yaw_stiffness`）得 `0x01` 而非 `0x21`，但 `jig6` 的 `is_flexible`/`is_rigid`
-/// 分别得 `0x21`/`0x22`。区别在**块**在不在，不在里头的字段。
+/// ⚠️ `0x20` 与**块**有关、与里头的字段无关（`jig6` 的 `is_flexible`/`is_rigid`
+/// 分别得 `0x21`/`0x22`）；而 `jig4`（`is_flexible` 里有 `allow_length_flex`）
+/// 得 `0x01`。`jig43`（`is_rigid` 里写 yaw/pitch 约束）得 `0x2e`。
 ///
-/// # 角度单位
+/// # 角度单位：**只有 `yaw_constraint`/`pitch_constraint`/`angle_constraint` 是角度**
 ///
-/// `angle_constraint`/`yaw_constraint`/`pitch_constraint` 的输入是**度**，
-/// 写盘转**弧度**（实测 `angle_constraint 60` → `1.0471976` = π/3）。
+/// 输入是**度**，写盘转**弧度**（实测 `angle_constraint 60` → `1.0471976` = π/3，
+/// 转换公式是反编译出的 `d * π / 180`，**只转一次**）。
+///
+/// ⚠️ `left_constraint`/`up_constraint`/`forward_constraint` **不是角度**、
+/// **不转**（实测 `jig38`：QC 的 `-0.5 0.5` → 盘上 `baseMinLeft = -0.5`）。
+///
+/// # 钳位
+///
+/// `is_flexible` 的 6 个 `*_stiffness`/`*_damping` 与 `has_base_spring` 的
+/// `stiffness`/`damping` 经官方 `FUN_004542d0` 钳到 `[0, 1000]`（实测 `jig35`/`jig36`）。
+/// **`*_friction`/`*_bounce` 不钳位**（实测 `jig41`/`jig42` 的 `5000`/`6000`/`-7` 原值透传）。
 fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<CompileError>> {
+    use crate::model::clamp_stiffness;
     use crate::model::jiggle_defaults as def;
     use crate::model::jiggle_flags as fl;
 
@@ -5794,109 +5820,73 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
         let (mut base_min_fwd, mut base_max_fwd, mut base_fwd_friction) =
             (def::BASE_MIN, def::BASE_MAX, 0.0);
 
-        if let Some(fx) = &j.is_flexible {
-            flags |= fl::IS_FLEXIBLE | fl::HAS_LENGTH_CONSTRAINT;
-            // `allow_length_flex` 清除 `0x20`（见 `JiggleFlexible` 的说明）——
-            // 实测 `jig4`（只写那个键 + `yaw_stiffness`）得 `0x01`，
-            // 而 `jig6`（不写它）得 `0x21`。
-            if fx.allow_length_flex {
-                flags &= !fl::HAS_LENGTH_CONSTRAINT;
-            }
-            if let Some(v) = fx.length {
-                length = v;
-            }
-            if let Some(v) = fx.tip_mass {
-                tip_mass = v;
-            }
-            if let Some(v) = fx.yaw_stiffness {
-                yaw_stiffness = v;
-            }
-            if let Some(v) = fx.yaw_damping {
-                yaw_damping = v;
-            }
-            if let Some(v) = fx.pitch_stiffness {
-                pitch_stiffness = v;
-            }
-            if let Some(v) = fx.pitch_damping {
-                pitch_damping = v;
-            }
-            if let Some(v) = fx.along_stiffness {
-                along_stiffness = v;
-            }
-            if let Some(v) = fx.along_damping {
-                along_damping = v;
-            }
-            if let Some(v) = fx.angle_constraint {
-                angle_limit = deg2rad(v);
-                flags |= fl::HAS_ANGLE_CONSTRAINT;
-            }
-            if let Some([a, b]) = fx.yaw_constraint {
-                min_yaw = deg2rad(a);
-                max_yaw = deg2rad(b);
-                flags |= fl::HAS_YAW_CONSTRAINT;
-            }
-            if let Some(v) = fx.yaw_friction {
-                yaw_friction = v;
-            }
-            if let Some(v) = fx.yaw_bounce {
-                yaw_bounce = v;
-            }
-            if let Some([a, b]) = fx.pitch_constraint {
-                min_pitch = deg2rad(a);
-                max_pitch = deg2rad(b);
-                flags |= fl::HAS_PITCH_CONSTRAINT;
-            }
-            if let Some(v) = fx.pitch_friction {
-                pitch_friction = v;
-            }
-            if let Some(v) = fx.pitch_bounce {
-                pitch_bounce = v;
-            }
-        }
-        if let Some(rg) = &j.is_rigid {
-            flags |= fl::IS_RIGID | fl::HAS_LENGTH_CONSTRAINT;
-            if let Some(v) = rg.length {
-                length = v;
-            }
-            if let Some(v) = rg.tip_mass {
-                tip_mass = v;
-            }
-            if let Some(v) = rg.angle_constraint {
-                angle_limit = deg2rad(v);
-                flags |= fl::HAS_ANGLE_CONSTRAINT;
-            }
-        }
-        if let Some(b) = &j.has_base_spring {
-            flags |= fl::HAS_BASE_SPRING;
-            if let Some(v) = b.base_mass {
-                base_mass = v;
-            }
-            if let Some(v) = b.base_stiffness {
-                base_stiffness = v;
-            }
-            if let Some(v) = b.base_damping {
-                base_damping = v;
-            }
-            if let Some([a, c]) = b.base_left {
-                base_min_left = a;
-                base_max_left = c;
-            }
-            if let Some(v) = b.base_left_friction {
-                base_left_friction = v;
-            }
-            if let Some([a, c]) = b.base_up {
-                base_min_up = a;
-                base_max_up = c;
-            }
-            if let Some(v) = b.base_up_friction {
-                base_up_friction = v;
-            }
-            if let Some([a, c]) = b.base_forward {
-                base_min_fwd = a;
-                base_max_fwd = c;
-            }
-            if let Some(v) = b.base_forward_friction {
-                base_fwd_friction = v;
+        // ---- 唯一的一条应用路径：按 token 顺序逐条写 ----
+        for (k, w) in j.effective_writes().iter().enumerate() {
+            let v0 = w.values.first().copied().unwrap_or(0.0);
+            let v1 = w.values.get(1).copied().unwrap_or(0.0);
+            match w.key.as_str() {
+                // 块进入：只动 `flags`。
+                "is_flexible" => flags |= fl::IS_FLEXIBLE | fl::HAS_LENGTH_CONSTRAINT,
+                "is_rigid" => flags |= fl::IS_RIGID | fl::HAS_LENGTH_CONSTRAINT,
+                "has_base_spring" => flags |= fl::HAS_BASE_SPRING,
+                // `allow_length_flex` 清 `0x20`（唯一会**清**位的键）。
+                "allow_length_flex" => flags &= !fl::HAS_LENGTH_CONSTRAINT,
+                // 三块共享的通用键（值不钳位，除非是 stiffness/damping）。
+                "length" => length = v0,
+                "tip_mass" => tip_mass = v0,
+                "angle_constraint" => {
+                    angle_limit = deg2rad(v0);
+                    flags |= fl::HAS_ANGLE_CONSTRAINT;
+                }
+                "yaw_constraint" => {
+                    min_yaw = deg2rad(v0);
+                    max_yaw = deg2rad(v1);
+                    flags |= fl::HAS_YAW_CONSTRAINT;
+                }
+                "yaw_friction" => yaw_friction = v0,
+                "yaw_bounce" => yaw_bounce = v0,
+                "pitch_constraint" => {
+                    min_pitch = deg2rad(v0);
+                    max_pitch = deg2rad(v1);
+                    flags |= fl::HAS_PITCH_CONSTRAINT;
+                }
+                "pitch_friction" => pitch_friction = v0,
+                "pitch_bounce" => pitch_bounce = v0,
+                // `is_flexible` 独有：6 个 stiffness/damping **要钳位**。
+                "yaw_stiffness" => yaw_stiffness = clamp_stiffness(v0),
+                "yaw_damping" => yaw_damping = clamp_stiffness(v0),
+                "pitch_stiffness" => pitch_stiffness = clamp_stiffness(v0),
+                "pitch_damping" => pitch_damping = clamp_stiffness(v0),
+                "along_stiffness" => along_stiffness = clamp_stiffness(v0),
+                "along_damping" => along_damping = clamp_stiffness(v0),
+                // `has_base_spring` 独有：`stiffness`/`damping` **要钳位**。
+                "stiffness" => base_stiffness = clamp_stiffness(v0),
+                "damping" => base_damping = clamp_stiffness(v0),
+                "base_mass" => base_mass = v0,
+                // ⚠️ 这三个**不是角度**，原值透传（实测 `jig38`）。
+                "left_constraint" => {
+                    base_min_left = v0;
+                    base_max_left = v1;
+                }
+                "up_constraint" => {
+                    base_min_up = v0;
+                    base_max_up = v1;
+                }
+                "forward_constraint" => {
+                    base_min_fwd = v0;
+                    base_max_fwd = v1;
+                }
+                "left_friction" => base_left_friction = v0,
+                "up_friction" => base_up_friction = v0,
+                "forward_friction" => base_fwd_friction = v0,
+                other => {
+                    // `validate()` 已经拦过；这里兜底，绝不静默忽略
+                    // （官方是 `$jigglebone: invalid syntax` + abort）。
+                    errs.push(e(
+                        format!("{at}.writes[{k}]"),
+                        format!("未知的 `$jigglebone` 键 {other:?}"),
+                    ));
+                }
             }
         }
 
@@ -7311,6 +7301,241 @@ type = "mouth"
         assert_eq!(j[0].yaw_stiffness, 111.0);
         assert_eq!(j[1].bone, 0, "第二条是 root(0)");
         assert_eq!(j[1].yaw_stiffness, 222.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：stiffness/damping 钳到 `[0, 1000]`（实测 `jig35`/`jig36`）。
+    ///
+    /// 官方 `FUN_004542d0` 把 `is_flexible` 的 6 个 `*_stiffness`/`*_damping`
+    /// 与 `has_base_spring` 的 `stiffness`/`damping` 钳位；实测
+    /// `yaw_stiffness 5000 → 1000`、`yaw_damping -5 → 0`、
+    /// `pitch_stiffness 1000.5 → 1000`、`along_stiffness -100 → 0`、
+    /// base 的 `stiffness 5000 → 1000`、`damping -3 → 0`。
+    ///
+    /// ⚠️ `*_friction`/`*_bounce` **不钳位**（见下一个测试）。
+    #[test]
+    fn jiggle_stiffness_is_clamped_to_0_1000() {
+        let d = tmpdir("jigclamp");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.is_flexible]\n\
+             yaw_stiffness = 5000.0\nyaw_damping = -5.0\n\
+             pitch_stiffness = 1000.5\nalong_stiffness = -100.0\n\
+             along_damping = 999.5\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.yaw_stiffness, 1000.0, "5000 → 1000");
+        assert_eq!(j.yaw_damping, 0.0, "-5 → 0");
+        assert_eq!(j.pitch_stiffness, 1000.0, "1000.5 → 1000");
+        assert_eq!(j.along_stiffness, 0.0, "-100 → 0");
+        assert_eq!(j.along_damping, 999.5, "界内值不动");
+
+        // has_base_spring 的 stiffness/damping 同样钳位（jig36）。
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.has_base_spring]\n\
+             base_stiffness = 5000.0\nbase_damping = -3.0\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.base_stiffness, 1000.0, "base stiffness 5000 → 1000");
+        assert_eq!(j.base_damping, 0.0, "base damping -3 → 0");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：`*_friction`/`*_bounce` **不钳位**（实测 `jig41`/`jig42`）。
+    ///
+    /// `yaw_friction 5000`、`yaw_bounce 6000`、`pitch_friction -7` 全部原值透传。
+    #[test]
+    fn jiggle_friction_and_bounce_are_not_clamped() {
+        let d = tmpdir("jignoclamp");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.is_flexible]\n\
+             yaw_friction = 5000.0\nyaw_bounce = 6000.0\npitch_friction = -7.0\n\
+             pitch_bounce = 8.0\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.yaw_friction, 5000.0, "不钳位（jig42）");
+        assert_eq!(j.yaw_bounce, 6000.0, "不钳位（jig42）");
+        assert_eq!(j.pitch_friction, -7.0, "负值也不钳位（jig42）");
+        assert_eq!(j.pitch_bounce, 8.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：`left/up/forward_constraint` **不是角度**、不转弧度。
+    ///
+    /// 实测 `jig38`：QC 的 `left_constraint -0.5 0.5` → 盘上
+    /// `baseMinLeft = -0.5`（原值）。修复前 QC 侧对这些键也做了 `to_radians`。
+    #[test]
+    fn jiggle_base_spring_constraints_are_not_angles() {
+        let d = tmpdir("jigbaseang");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.has_base_spring]\n\
+             base_left = [-0.5, 0.5]\nbase_up = [-0.75, 2.0]\n\
+             base_forward = [-0.25, 0.25]\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.base_min_left, -0.5, "原值，不乘 π/180（jig38）");
+        assert_eq!(j.base_max_left, 0.5);
+        assert_eq!(j.base_min_up, -0.75);
+        assert_eq!(j.base_max_up, 2.0);
+        assert_eq!(j.base_min_forward, -0.25);
+        assert_eq!(j.base_max_forward, 0.25);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：`is_rigid` 现在也置 `YAW`/`PITCH` 约束位（实测 `jig43` = `0x2e`）。
+    ///
+    /// 修复前 `JiggleRigid` 只有 3 个字段，这 6 个键全部丢失，`flags` 停在 `0x22`。
+    #[test]
+    fn jiggle_is_rigid_sets_yaw_pitch_flags() {
+        let d = tmpdir("jigrigid");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.is_rigid]\n\
+             yaw_constraint = [-30.0, 40.0]\nyaw_friction = 7.0\n\
+             pitch_constraint = [-20.0, 50.0]\npitch_bounce = 8.0\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.flags, 0x2e, "RIGID|YAW|PITCH|LENGTH（无 ANGLE，因为没写）");
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(near(j.min_yaw, -30.0f32.to_radians()), "-30° → 弧度（jig43）");
+        assert!(near(j.max_yaw, 40.0f32.to_radians()));
+        assert!(near(j.min_pitch, -20.0f32.to_radians()));
+        assert!(near(j.max_pitch, 50.0f32.to_radians()));
+        assert_eq!(j.yaw_friction, 7.0);
+        assert_eq!(j.pitch_bounce, 8.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：跨块共享键按**书写顺序**后写覆盖。
+    ///
+    /// 官方是扁平记录，`length` 被两个块写时**后写的赢**（实测 `jig39` →
+    /// `length=20`、`jig40` → `length=5`、`jig50` → `length=20 tip_mass=9`）。
+    ///
+    /// TOML 侧把三个块展开成固定顺序（`is_flexible` → `is_rigid` →
+    /// `has_base_spring`），所以这里 `is_rigid` 的 `length` 覆盖
+    /// `is_flexible` 的。⚠️ **QC 路径不展开**，它保真 token 顺序
+    /// （见 `qc::parse::tests::jiggle_writes_keep_token_order`），
+    /// 两条路径共用 `resolve_jiggle_bones` 里**同一个**循环。
+    ///
+    /// ⚠️ TOML 的 `has_base_spring` **只有 9 个 `base_*` 字段**（官方裸键
+    /// `length`/`tip_mass`/… 在 TOML 侧不存在），所以跨块覆盖只能用
+    /// `is_flexible` ↔ `is_rigid` 这一对来测；`has_base_spring` 里的共享键
+    /// 是 QC 独有的写法，由 `writes` 承载（见往返测试）。
+    #[test]
+    fn jiggle_shared_keys_are_last_write_wins() {
+        let d = tmpdir("jiglww");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.is_flexible]\nlength = 5.0\n\
+             [jiggle_bones.is_rigid]\nlength = 20.0\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        assert_eq!(
+            c.resolved_jiggle_bones[0].length, 20.0,
+            "is_rigid 后写 ⟹ 覆盖 is_flexible 的 5（jig39/jig40 同机制）"
+        );
+        assert_eq!(
+            c.resolved_jiggle_bones[0].flags, 0x23,
+            "FLEXIBLE|RIGID|LENGTH（两块都在）"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **回归**：QC → TOML → 编译 必须**逐字保真** `$jigglebone`。
+    ///
+    /// `qc2toml` 会把 `writes` 顺序日志序列化进 TOML；重读后
+    /// `effective_writes()` 必须原样返回它（而不是退化成「展开三个块」），
+    /// 否则 `has_base_spring` 里的共享键（`tip_mass`/`length`/`angle_constraint`）
+    /// 就会在往返中丢掉 —— 官方 `jig41` 正是这种写法。
+    #[test]
+    fn jiggle_qc_toml_roundtrip_preserves_writes() {
+        let d = tmpdir("jigrt");
+        write(&d, "myprop-ref.smd", SMD);
+        // `has_base_spring` 里写共享键 `tip_mass`/`length`（官方 jig41 形态）——
+        // TOML 的 `JiggleBaseSpring` 没有这两个字段，只能靠 `writes` 承载。
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"myprop-ref.smd\"
+$jigglebone \"tip\" {
+\thas_base_spring {
+\t\ttip_mass 3
+\t\tlength 20
+\t\tstiffness 800
+\t}
+}
+$sequence \"idle\" \"myprop-ref.smd\" fps 30
+";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
+        let toml = desc.to_toml().expect("应能序列化成 TOML");
+        let back = ModelDesc::from_toml(&toml).expect("应能读回 TOML");
+        assert_eq!(
+            desc.jiggle_bones[0].writes, back.jiggle_bones[0].writes,
+            "`writes` 必须往返保真"
+        );
+        let c = compile(&back, &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.flags, 0x40, "只有 HAS_BASE_SPRING");
+        assert_eq!(j.tip_mass, 3.0, "共享键 tip_mass 穿过往返（jig41）");
+        assert_eq!(j.length, 20.0, "共享键 length 穿过往返（jig41）");
+        assert_eq!(j.base_stiffness, 800.0);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `effective_writes` 把 TOML 的 `base_*` 字段名映射回官方裸键。
+    ///
+    /// 这层映射是 TOML 与 QC 收敛到**同一条应用路径**的关键：QC 记的是
+    /// 官方裸键（`stiffness`/`left_constraint`），TOML 用的是 `base_*`，
+    /// 两者必须在 `resolve_jiggle_bones` 里被同一个 `match` 认出来。
+    #[test]
+    fn jiggle_toml_base_fields_map_to_official_keys() {
+        let d = tmpdir("jigmap");
+        write(&d, "myprop-ref.smd", SMD);
+        let t = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[jiggle_bones.has_base_spring]\n\
+             base_mass = 5.0\nbase_stiffness = 800.0\nbase_damping = 10.0\n\
+             base_left = [-0.5, 0.5]\nbase_left_friction = 10.0\n\
+             base_up = [-0.75, 2.0]\nbase_up_friction = 11.0\n\
+             base_forward = [-0.25, 0.25]\nbase_forward_friction = 12.0\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let desc = ModelDesc::from_toml(&t).unwrap();
+        let writes = desc.jiggle_bones[0].effective_writes();
+        let keys: Vec<&str> = writes.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "has_base_spring",
+                "base_mass",
+                "stiffness",
+                "damping",
+                "left_constraint",
+                "left_friction",
+                "up_constraint",
+                "up_friction",
+                "forward_constraint",
+                "forward_friction"
+            ],
+            "`base_*` 必须映射成官方裸键"
+        );
+        let c = compile(&desc, &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.flags, 0x40, "只有 HAS_BASE_SPRING");
+        assert_eq!(j.base_stiffness, 800.0);
+        assert_eq!(j.base_min_left, -0.5);
+        assert_eq!(j.base_forward_friction, 12.0);
         std::fs::remove_dir_all(&d).ok();
     }
 

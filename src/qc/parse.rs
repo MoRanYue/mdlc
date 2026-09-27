@@ -147,8 +147,6 @@ pub struct Parser<'a> {
     pending_lods: Vec<LodModel>,
     /// `$model` 块里 `flexfile` 设的当前 `.vta`（官方是**粘性变量**）。
     pending_vta: Option<String>,
-    /// `$jigglebone` 子块的当前块名。
-    last_block_name: Option<String>,
     /// **顶层** `$sectionframes <每段帧数> <阈值>` 的全局值。
     ///
     /// 官方是全局变量；mdlc 的 IR 是逐序列字段，所以在 `finish()` 里
@@ -232,7 +230,6 @@ impl<'a> Parser<'a> {
             joint_surface_props: Vec::new(),
             pending_lods: Vec::new(),
             pending_vta: None,
-            last_block_name: None,
             global_section_frames: None,
         }
     }
@@ -2416,6 +2413,17 @@ impl<'a> Parser<'a> {
     }
 
     /// `$jigglebone "<骨骼>" { is_flexible { ... } ... }`。
+    ///
+    /// # 只记录「按 token 顺序的写入日志」（`JiggleBone::writes`）
+    ///
+    /// 官方解析器**没有**三个独立子结构 —— 它只有一个扁平记录，每个键
+    /// 按 QC 里出现的先后顺序直接写进去，**后写覆盖先写**。两个只有块顺序
+    /// 不同的夹具结果不同（`jig47` → `-30°/40°`，`jig48` → `-10°/20°`），
+    /// 所以这里**必须**保真 token 顺序，单位换算与钳位留到
+    /// `compile::resolve_jiggle_bones` 里做一次。
+    ///
+    /// 未知键一律报错（官方是 `$jigglebone: invalid syntax '%s'` +
+    /// `Aborted Processing`，**不是**静默忽略）。
     fn cmd_jigglebone(&mut self) -> Result<(), QcError> {
         let bone = self.tok(false)?.text;
         let mut jb = JiggleBone {
@@ -2423,6 +2431,7 @@ impl<'a> Parser<'a> {
             is_flexible: None,
             is_rigid: None,
             has_base_spring: None,
+            writes: Vec::new(),
         };
         // 找 `{`。
         loop {
@@ -2436,145 +2445,113 @@ impl<'a> Parser<'a> {
             }
         }
         let mut depth = 1i32;
+        // 当前所在的子块名（`None` = 顶层，官方在顶层没有任何键可写）。
+        let mut block: Option<String> = None;
         while depth > 0 {
             let Some(t) = self.lex.next_token(true)? else {
                 break;
             };
             if t.text == "{" {
                 depth += 1;
-                let low = self.last_block_name.clone().unwrap_or_default();
-                self.parse_jiggle_sub(&low, &mut jb, &mut depth)?;
+                if depth != 2 {
+                    // 块里的嵌套 `{`：官方块解析器的键表里没有 `{`，
+                    // 连共享子解析器也不认 ⟹ `invalid syntax '{'` + abort。
+                    return Err(QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        format!(
+                            "$jigglebone {:?}: 块内出现嵌套的 `{{` —— 官方会 abort\
+                             （`$jigglebone: invalid syntax '{{'`）",
+                            jb.bone
+                        ),
+                    ));
+                }
+                let Some(b) = block.as_deref() else {
+                    // 顶层直接 `{`（`$jigglebone "x" { { ... } }`）。
+                    return Err(QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        format!(
+                            "$jigglebone {:?}: 嵌套的 `{{` 之前没有块名 —— 官方会 abort\
+                             （`$jigglebone: invalid syntax`）",
+                            jb.bone
+                        ),
+                    ));
+                };
+                // 记一条「进入该块」的写入（它负责置 `flags`）；
+                // 块名保留到 `}` 返回 depth 1 为止，供块内的键查表用。
+                jb.writes.push(JiggleWrite {
+                    key: b.to_string(),
+                    values: Vec::new(),
+                });
                 continue;
             }
             if t.text == "}" {
                 depth -= 1;
-                continue;
-            }
-            self.last_block_name = Some(t.text.to_ascii_lowercase());
-        }
-        self.desc.jiggle_bones.push(jb);
-        Ok(())
-    }
-
-    /// 解析 `$jigglebone` 的一个子块。
-    fn parse_jiggle_sub(
-        &mut self,
-        block: &str,
-        jb: &mut JiggleBone,
-        depth: &mut i32,
-    ) -> Result<(), QcError> {
-        match block {
-            "is_flexible" => jb.is_flexible = Some(JiggleFlexible::default()),
-            "is_rigid" => jb.is_rigid = Some(JiggleRigid::default()),
-            "has_base_spring" => jb.has_base_spring = Some(JiggleBaseSpring::default()),
-            _ => {}
-        }
-        while *depth > 1 {
-            let Some(t) = self.lex.next_token(true)? else {
-                return Ok(());
-            };
-            if t.text == "{" {
-                *depth += 1;
-                continue;
-            }
-            if t.text == "}" {
-                *depth -= 1;
+                if depth > 0 {
+                    block = None;
+                }
                 continue;
             }
             let low = t.text.to_ascii_lowercase();
-            // 只消费数值 token，字段本身暂不填（jiggle 由 TOML 侧验收）。
-            match low.as_str() {
-                "length" | "tip_mass" | "yaw_stiffness" | "yaw_damping" | "pitch_stiffness"
-                | "pitch_damping" | "along_stiffness" | "along_damping" | "angle_constraint"
-                | "yaw_friction" | "yaw_bounce" | "pitch_friction" | "pitch_bounce"
-                | "base_mass" | "base_stiffness" | "base_damping" | "base_left_friction"
-                | "base_up_friction" | "base_forward_friction" => {
-                    let v = self.f()?;
-                    Self::set_jiggle_scalar(jb, &low, v);
+            if depth == 1 {
+                // `depth == 1` 的 token 只能是**块名**（它由随后那个 `{`
+                // 触发「进入该块」的写入）。顶层裸键官方一律 abort ——
+                // 实测 `jig5`/`jig31`（`tip_mass 7` 写在所有块之外）都报
+                // `$jigglebone: invalid syntax 'tip_mass'` 并中止。
+                if matches!(low.as_str(), "is_flexible" | "is_rigid" | "has_base_spring") {
+                    block = Some(low);
+                    continue;
                 }
-                "yaw_constraint" | "pitch_constraint" | "base_left" | "base_up"
-                | "base_forward" => {
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!(
+                        "$jigglebone {:?}: 键 {low:?} 写在任何块之外 —— 官方会 abort\
+                         （`$jigglebone: invalid syntax '{low}'`）",
+                        jb.bone
+                    ),
+                ));
+            }
+            let Some(b) = block.as_deref() else {
+                // 嵌套 `{` 之后又出现键（如 `is_flexible { { ... } }`）——
+                // 官方此时也没有可用的键表。
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!(
+                        "$jigglebone {:?}: 键 {low:?} 出现在无名的嵌套块里",
+                        jb.bone
+                    ),
+                ));
+            };
+            // 键是否属于当前块 —— 这是官方「每个块只认自己那组键」的硬规则。
+            if !jiggle_block_accepts(b, &low) {
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!(
+                        "$jigglebone {:?}: {b} 块不接受键 {low:?} —— 官方会 abort\
+                         （`$jigglebone: invalid syntax '{low}'`）",
+                        jb.bone
+                    ),
+                ));
+            }
+            // 按键的元数消费数值，原样记录（不转单位、不钳位）。
+            let values = match low.as_str() {
+                "allow_length_flex" => Vec::new(),
+                "yaw_constraint" | "pitch_constraint" | "left_constraint" | "up_constraint"
+                | "forward_constraint" => {
                     let a = self.f()?;
                     let b = self.f()?;
-                    Self::set_jiggle_pair(jb, &low, [a, b]);
+                    vec![a, b]
                 }
-                "allow_length_flex" => {
-                    if let Some(f) = jb.is_flexible.as_mut() {
-                        f.allow_length_flex = true;
-                    }
-                }
-                _ => {}
-            }
+                _ => vec![self.f()?],
+            };
+            jb.writes.push(JiggleWrite { key: low, values });
         }
+        self.desc.jiggle_bones.push(jb);
         Ok(())
-    }
-
-    fn set_jiggle_scalar(jb: &mut JiggleBone, key: &str, v: f32) {
-        let to_rad = |x: f32| x.to_radians();
-        match key {
-            "angle_constraint" => {
-                if let Some(f) = jb.is_flexible.as_mut() {
-                    f.angle_constraint = Some(to_rad(v));
-                } else if let Some(r) = jb.is_rigid.as_mut() {
-                    r.angle_constraint = Some(to_rad(v));
-                }
-            }
-            _ => {
-                if let Some(f) = jb.is_flexible.as_mut() {
-                    match key {
-                        "length" => f.length = Some(v),
-                        "tip_mass" => f.tip_mass = Some(v),
-                        "yaw_stiffness" => f.yaw_stiffness = Some(v),
-                        "yaw_damping" => f.yaw_damping = Some(v),
-                        "pitch_stiffness" => f.pitch_stiffness = Some(v),
-                        "pitch_damping" => f.pitch_damping = Some(v),
-                        "along_stiffness" => f.along_stiffness = Some(v),
-                        "along_damping" => f.along_damping = Some(v),
-                        "yaw_friction" => f.yaw_friction = Some(v),
-                        "yaw_bounce" => f.yaw_bounce = Some(v),
-                        "pitch_friction" => f.pitch_friction = Some(v),
-                        "pitch_bounce" => f.pitch_bounce = Some(v),
-                        _ => {}
-                    }
-                } else if let Some(r) = jb.is_rigid.as_mut() {
-                    match key {
-                        "length" => r.length = Some(v),
-                        "tip_mass" => r.tip_mass = Some(v),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if let Some(b) = jb.has_base_spring.as_mut() {
-            match key {
-                "base_mass" => b.base_mass = Some(v),
-                "base_stiffness" => b.base_stiffness = Some(v),
-                "base_damping" => b.base_damping = Some(v),
-                "base_left_friction" => b.base_left_friction = Some(v),
-                "base_up_friction" => b.base_up_friction = Some(v),
-                "base_forward_friction" => b.base_forward_friction = Some(v),
-                _ => {}
-            }
-        }
-    }
-
-    fn set_jiggle_pair(jb: &mut JiggleBone, key: &str, v: [f32; 2]) {
-        let to_rad = |x: f32| x.to_radians();
-        if let Some(f) = jb.is_flexible.as_mut() {
-            match key {
-                "yaw_constraint" => f.yaw_constraint = Some([to_rad(v[0]), to_rad(v[1])]),
-                "pitch_constraint" => f.pitch_constraint = Some([to_rad(v[0]), to_rad(v[1])]),
-                _ => {}
-            }
-        }
-        if let Some(b) = jb.has_base_spring.as_mut() {
-            match key {
-                "base_left" => b.base_left = Some([to_rad(v[0]), to_rad(v[1])]),
-                "base_up" => b.base_up = Some([to_rad(v[0]), to_rad(v[1])]),
-                "base_forward" => b.base_forward = Some([to_rad(v[0]), to_rad(v[1])]),
-                _ => {}
-            }
-        }
     }
 
     /// `$proceduralbones "<vrd>"` —— 读 `.vrd` 生成 quatinterp 骨骼。
@@ -3584,6 +3561,71 @@ fn parse_f32(s: &str) -> Option<f32> {
     t[..end].parse::<f32>().ok()
 }
 
+/// `$jigglebone` 的 `block` 块是否接受键 `key`。
+///
+/// # 权威来源：反编译 + 27 个受控夹具
+///
+/// 三个块解析器（`FUN_00454800` = `is_flexible`、`FUN_004549d0` = `is_rigid`、
+/// `FUN_00454cc0` = `has_base_spring`）**不是**同一套键表：
+///
+/// * `is_flexible` 与 `has_base_spring` 在自己的独有键之外，还会把
+///   不匹配的 token 交给**共享子解析器** `FUN_004545b0`（被两者调用的
+///   那 9 个「通用键」）。
+/// * `is_rigid` **不调用**共享子解析器，而是把全部键**内联**在自己体内 ——
+///   所以它接受那 9 个通用键，但**不接受** `allow_length_flex`
+///   （实测 `jig45` 官方 abort）。
+///
+/// `key` 与 `block` 都必须是**小写**（调用方已 `to_ascii_lowercase`）。
+///
+/// 官方对任何不接受的键走 `_ => abort`：
+/// `$jigglebone: invalid syntax '%s'` + `Aborted Processing on '<mdl>'`。
+fn jiggle_block_accepts(block: &str, key: &str) -> bool {
+    /// 三块共享的 9 个「通用键」（共享子解析器 `FUN_004545b0`）。
+    const SHARED: [&str; 9] = [
+        "tip_mass",
+        "length",
+        "angle_constraint",
+        "yaw_constraint",
+        "yaw_friction",
+        "yaw_bounce",
+        "pitch_constraint",
+        "pitch_friction",
+        "pitch_bounce",
+    ];
+    if SHARED.contains(&key) {
+        // 三块都接受它们。
+        return matches!(block, "is_flexible" | "is_rigid" | "has_base_spring");
+    }
+    match block {
+        "is_flexible" => matches!(
+            key,
+            "yaw_stiffness"
+                | "yaw_damping"
+                | "pitch_stiffness"
+                | "pitch_damping"
+                | "along_stiffness"
+                | "along_damping"
+                | "allow_length_flex"
+        ),
+        // ⚠️ 没有 `allow_length_flex`（实测 `jig45` abort）。
+        "is_rigid" => false,
+        "has_base_spring" => matches!(
+            key,
+            // 官方 QC 是**裸键**，没有 `base_` 前缀。
+            "stiffness"
+                | "damping"
+                | "base_mass"
+                | "left_constraint"
+                | "up_constraint"
+                | "forward_constraint"
+                | "left_friction"
+                | "up_friction"
+                | "forward_friction"
+        ),
+        _ => false,
+    }
+}
+
 /// 把字符串解析成 `i32`（官方 `verify_atoi` / `atoi`）。
 ///
 /// 官方 `verify_atoi` 用 `atoi` —— 它**只读前导数字**，
@@ -3968,6 +4010,269 @@ $sequence \"idle\" \"a.smd\" fps 30
         let at = &d.attachments[0];
         assert_eq!(at.position, Some([1.0, 2.0, 3.0]));
         assert_eq!(at.rotation, Some([0.0, 0.0, 0.0]), "没写 rotate 时旋转应为零");
+    }
+
+    // ---- `$jigglebone` ----
+    //
+    // 语义全部来自**受控实验 + 官方反编译**（见 `compile::resolve_jiggle_bones`
+    // 的文档）：官方是「一个扁平记录 + token 顺序后写覆盖」，所以解析器
+    // 只需保真顺序、不做单位换算（换算留给 resolve）。
+    // 夹具 `docs/_probe/smdl/jig{1..50}.qc`，验收 `docs/_probe/cmp_jiggle.js`。
+
+    /// 一段 `$jigglebone` QC 骨架，`{}` 处填块内容。
+    fn jig_qc(blocks: &str) -> String {
+        format!(
+            "$modelname \"t.mdl\"\n$body body \"a.smd\"\n\
+             $jigglebone \"tip\" {{\n{blocks}\n}}\n\
+             $sequence \"idle\" \"a.smd\" fps 30\n"
+        )
+    }
+
+    /// 解析后取第一条 jiggle 记录的写入日志（`(键, 值)` 序列）。
+    fn jig_writes(qc: &str, dir: &std::path::Path) -> Vec<(String, Vec<f32>)> {
+        let d = parse(qc, dir);
+        d.jiggle_bones[0]
+            .writes
+            .iter()
+            .map(|w| (w.key.clone(), w.values.clone()))
+            .collect()
+    }
+
+    /// **回归**：`writes` 必须**保真 QC 里的 token 顺序**。
+    ///
+    /// 官方是扁平记录 + 后写覆盖，`jig47`/`jig48` 只有块顺序不同、
+    /// 结果角度就不同 ⟹ 顺序一旦丢失，两个夹具不可能同时复现。
+    #[test]
+    fn jiggle_writes_keep_token_order() {
+        let dir = fixture("jig_order");
+        let qc = jig_qc(
+            "\tis_rigid {\n\t\tyaw_constraint -10 20\n\t}\n\
+             \thas_base_spring {\n\t\tyaw_constraint -30 40\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "is_rigid",
+                "yaw_constraint",
+                "has_base_spring",
+                "yaw_constraint"
+            ],
+            "块名也要进日志（它负责置 flags），且顺序不得重排"
+        );
+        assert_eq!(w[1].1, vec![-10.0, 20.0], "值必须原样保留（不转弧度）");
+        assert_eq!(w[3].1, vec![-30.0, 40.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 反向块顺序也必须保真（`jig48` 与 `jig47` 只差这一处）。
+    #[test]
+    fn jiggle_writes_keep_reversed_block_order() {
+        let dir = fixture("jig_order_rev");
+        let qc = jig_qc(
+            "\thas_base_spring {\n\t\tyaw_constraint -30 40\n\t}\n\
+             \tis_rigid {\n\t\tyaw_constraint -10 20\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "has_base_spring",
+                "yaw_constraint",
+                "is_rigid",
+                "yaw_constraint"
+            ]
+        );
+        assert_eq!(w[1].1, vec![-30.0, 40.0]);
+        assert_eq!(w[3].1, vec![-10.0, 20.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归**：官方 `is_rigid` **内联**接受全套 yaw/pitch 键（实测 `jig43`）。
+    ///
+    /// 修复前 `set_jiggle_scalar` 的 `is_rigid` 分支只有 `length`/`tip_mass`，
+    /// 这 6 个键**静默丢弃** —— 用户工程 `v_silenced_smg.qc` 的
+    /// `$jigglebone "ValveBiped.strap"` 正是这种写法。
+    #[test]
+    fn jiggle_is_rigid_accepts_yaw_pitch_keys() {
+        let dir = fixture("jig_rigid");
+        let qc = jig_qc(
+            "\tis_rigid {\n\t\tyaw_constraint -30 40\n\t\tyaw_friction 7\n\
+             \t\tyaw_bounce 1\n\t\tpitch_constraint -20 50\n\
+             \t\tpitch_friction 3\n\t\tpitch_bounce 8\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "is_rigid",
+                "yaw_constraint",
+                "yaw_friction",
+                "yaw_bounce",
+                "pitch_constraint",
+                "pitch_friction",
+                "pitch_bounce"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 官方 `has_base_spring` 的**裸键**（`stiffness`/`left_constraint`/…）。
+    ///
+    /// mdlc 的 TOML 侧叫 `base_stiffness`/`base_left`/…，但 **QC 侧必须
+    /// 认官方裸键** —— 语料 `jigglebones.qci:40-48` 与 `jig2.qc` 都这么写。
+    #[test]
+    fn jiggle_has_base_spring_accepts_bare_keys() {
+        let dir = fixture("jig_base");
+        let qc = jig_qc(
+            "\thas_base_spring {\n\t\tbase_mass 5\n\t\tstiffness 800\n\t\tdamping 10\n\
+             \t\tleft_constraint -0.5 0.5\n\t\tup_constraint -0.75 2.0\n\
+             \t\tforward_constraint -0.25 0.25\n\t\tleft_friction 10\n\
+             \t\tup_friction 11\n\t\tforward_friction 12\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "has_base_spring",
+                "base_mass",
+                "stiffness",
+                "damping",
+                "left_constraint",
+                "up_constraint",
+                "forward_constraint",
+                "left_friction",
+                "up_friction",
+                "forward_friction"
+            ]
+        );
+        // `left_constraint` 的负值必须原样（**不是**角度、不转弧度）。
+        assert_eq!(w[4].1, vec![-0.5, 0.5]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 三块共享的 9 个通用键：`is_flexible` 与 `has_base_spring` 都接受
+    /// （官方 `FUN_004545b0` 被这两个块调用；实测 `jig17`/`jig18`/`jig41`）。
+    #[test]
+    fn jiggle_shared_keys_work_in_both_blocks() {
+        let dir = fixture("jig_shared");
+        for (tag, block) in [("flex", "is_flexible"), ("base", "has_base_spring")] {
+            let qc = jig_qc(&format!(
+                "\t{block} {{\n\t\tlength 20\n\t\ttip_mass 3\n\t\tangle_constraint 60\n\
+                 \t\tyaw_constraint -30 40\n\t\tyaw_friction 2\n\t\tyaw_bounce 1\n\
+                 \t\tpitch_constraint -20 50\n\t\tpitch_friction 3\n\t\tpitch_bounce 4\n\t}}"
+            ));
+            let w = jig_writes(&qc, &dir);
+            let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys.len(), 10, "{tag}: 块名 + 9 个共享键");
+            assert_eq!(keys[0], block);
+            assert_eq!(keys[1], "length");
+            assert_eq!(keys[9], "pitch_bounce");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归**：未知键必须**报错**，不得静默忽略。
+    ///
+    /// 官方是 `$jigglebone: invalid syntax '%s'` + `Aborted Processing`
+    /// （实测 `jig9`–`jig16`、`jig19`、`jig20`、`jig45`、`jig46`）。
+    /// 修复前是 `_ => {}` 静默跳过。
+    #[test]
+    fn jiggle_unknown_key_is_an_error() {
+        let dir = fixture("jig_unknown");
+        // `base_stiffness` 是 mdlc 的 TOML 键名，官方 QC 里**不存在**（jig9）。
+        let qc = jig_qc("\tis_flexible {\n\t\tyaw_stiffness 100\n\t}");
+        assert!(
+            crate::qc::parse_qc_str(&qc, &dir).is_ok(),
+            "合法键不应报错"
+        );
+        let qc = jig_qc("\thas_base_spring {\n\t\tbase_stiffness 800\n\t}");
+        let errs = crate::qc::parse_qc_str(&qc, &dir).expect_err("base_stiffness 官方拒绝");
+        assert!(
+            errs.iter().any(|e| e.message.contains("base_stiffness")),
+            "报错应点名该键，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归**：`allow_length_flex` 是 `is_flexible` **独有**键。
+    ///
+    /// 实测 `jig45`（在 `is_rigid` 里）/ `jig46`（在 `has_base_spring` 里）
+    /// 官方都 abort；`jig4`（在 `is_flexible` 里）成功。
+    #[test]
+    fn jiggle_allow_length_flex_is_flexible_only() {
+        let dir = fixture("jig_alf");
+        let qc = jig_qc("\tis_flexible {\n\t\tyaw_stiffness 100\n\t\tallow_length_flex\n\t}");
+        assert!(crate::qc::parse_qc_str(&qc, &dir).is_ok(), "jig4 写法应成功");
+        for block in ["is_rigid", "has_base_spring"] {
+            let qc = jig_qc(&format!("\t{block} {{\n\t\tallow_length_flex\n\t}}"));
+            let errs = crate::qc::parse_qc_str(&qc, &dir)
+                .expect_err(&format!("{block} 里的 allow_length_flex 官方拒绝（jig45/jig46）"));
+            assert!(
+                errs.iter().any(|e| e.message.contains("allow_length_flex")),
+                "报错应点名该键，实际：{errs:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归**：顶层裸键（不在任何块里）官方 abort。
+    ///
+    /// 实测 `jig5`/`jig31`：`tip_mass 7` 写在块外 ⟹
+    /// `$jigglebone: invalid syntax 'tip_mass'`。
+    /// 修复前 mdlc 静默接受（`jig5` 的产物 3352 B 正常落盘）。
+    #[test]
+    fn jiggle_bare_top_level_key_is_an_error() {
+        let dir = fixture("jig_bare");
+        let qc = jig_qc("\ttip_mass 7\n\tlength 20");
+        let errs = crate::qc::parse_qc_str(&qc, &dir).expect_err("顶层裸键官方拒绝");
+        assert!(
+            errs.iter().any(|e| e.message.contains("tip_mass")),
+            "报错应点名第一个键，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `is_flexible` 独有键在别的块里也被拒（`jig20`：`is_rigid{yaw_stiffness}`）。
+    #[test]
+    fn jiggle_flexible_only_keys_rejected_elsewhere() {
+        let dir = fixture("jig_flexonly");
+        let qc = jig_qc("\tis_rigid {\n\t\tyaw_stiffness 100\n\t}");
+        let errs = crate::qc::parse_qc_str(&qc, &dir).expect_err("is_rigid 不接受 yaw_stiffness");
+        assert!(
+            errs.iter().any(|e| e.message.contains("yaw_stiffness")),
+            "实际：{errs:?}"
+        );
+        // `has_base_spring` 独有键在 is_flexible 里同样被拒（`jig19`）。
+        let qc = jig_qc("\tis_flexible {\n\t\tleft_constraint -0.5 0.5\n\t}");
+        let errs =
+            crate::qc::parse_qc_str(&qc, &dir).expect_err("is_flexible 不接受 left_constraint");
+        assert!(
+            errs.iter().any(|e| e.message.contains("left_constraint")),
+            "实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一块可以**重复出现**（实测 `jig26` 两个连续 `is_flexible` 成功）。
+    #[test]
+    fn jiggle_block_may_repeat() {
+        let dir = fixture("jig_repeat");
+        let qc = jig_qc(
+            "\tis_flexible {\n\t\tyaw_stiffness 100\n\t}\n\
+             \tis_flexible {\n\t\tpitch_stiffness 200\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["is_flexible", "yaw_stiffness", "is_flexible", "pitch_stiffness"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
