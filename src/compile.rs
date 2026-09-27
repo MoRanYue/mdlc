@@ -4566,6 +4566,76 @@ pub fn sequence_pose_bounds(
             .collect()
     };
 
+    // ---- 蒙皮计划：帧循环外建一次 ----
+    //
+    // 顶点遍历与帧无关，逐帧变的只有 `posetransform`。原实现把遍历放在
+    // 帧循环里，于是每帧都要重走 bodypart/model/mesh 三层、并追一次
+    // `Vertex.bones` 的堆指针。真实视角模型上这一步是 `write_mdl` 的
+    // 84%（`v_silenced_smg`：35.3 / 41.9 ms，×24 格 × 772 帧）。
+    //
+    // 拆成两条路径：
+    //
+    // - **单骨骼顶点**（真实模型 98%）：按骨骼分组，同组顶点在扁平数组里
+    //   连续，整组共用一份矩阵，不必每顶点再查一次表。
+    // - **多骨骼顶点**：保持原始遍历顺序 —— `pos[a] += w * t[a]` 的累加
+    //   顺序影响浮点结果，必须逐位保持。
+    //
+    // 包围盒的 min/max 与顺序无关（NaN 比较恒假，永远不会被写进去），
+    // 所以两条路径的先后不影响结果。
+    //
+    // `k >= n` 的骨骼在**建表时**就滤掉：原实现在循环里 `continue`，
+    // 效果相同（该骨骼不参与累加）。
+    let mut singles: Vec<(u32, [f32; 3], f32)> = Vec::new();
+    let mut multi: Vec<([f32; 3], Vec<[f32; 2]>)> = Vec::new();
+    let mut has_orphan = false;
+    for bp in &compiled.bodyparts {
+        for m in &bp.models {
+            for mesh in &m.meshes {
+                for v in &mesh.vertices {
+                    let nvalid = v.bones.iter().filter(|p| (p[0] as usize) < n).count();
+                    if nvalid == 0 {
+                        has_orphan = true;
+                    } else if nvalid == 1 {
+                        let p = v
+                            .bones
+                            .iter()
+                            .find(|p| (p[0] as usize) < n)
+                            .expect("nvalid == 1");
+                        singles.push((p[0] as u32, v.pos, p[1]));
+                    } else {
+                        let mut all = Vec::with_capacity(nvalid);
+                        for p in &v.bones {
+                            if (p[0] as usize) < n {
+                                all.push(*p);
+                            }
+                        }
+                        multi.push((v.pos, all));
+                    }
+                }
+            }
+        }
+    }
+    // 按骨骼排序 ⟹ 同组连续。`sort_unstable_by_key` 对同键元素不保序，
+    // 但组内顺序不影响结果：同组顶点各自独立地做一次「变换 + 权重 +
+    // 并入包围盒」，没有跨顶点累加。
+    singles.sort_unstable_by_key(|s| s.0);
+    let ng = singles.len();
+    let mut s_px: Vec<f32> = Vec::with_capacity(ng);
+    let mut s_py: Vec<f32> = Vec::with_capacity(ng);
+    let mut s_pz: Vec<f32> = Vec::with_capacity(ng);
+    let mut s_w: Vec<f32> = Vec::with_capacity(ng);
+    let mut groups: Vec<(u32, u32, u32)> = Vec::new(); // (骨骼号, lo, hi)
+    for (i, &(bone, p, wt)) in singles.iter().enumerate() {
+        if groups.last().is_none_or(|g| g.0 != bone) {
+            groups.push((bone, i as u32, i as u32));
+        }
+        groups.last_mut().expect("刚 push 过").2 = i as u32 + 1;
+        s_px.push(p[0]);
+        s_py.push(p[1]);
+        s_pz.push(p[2]);
+        s_w.push(wt);
+    }
+
     for frames in cell_frames {
         for frame in frames {
             // 1) 该帧的局部世界矩阵（官方 `CalcBoneTransforms`）。
@@ -4593,32 +4663,76 @@ pub fn sequence_pose_bounds(
             }
 
             // 4) 并入蒙皮后的顶点。
-            for bp in &compiled.bodyparts {
-                for m in &bp.models {
-                    for mesh in &m.meshes {
-                        for v in &mesh.vertices {
-                            let mut pos = [0.0f32; 3];
-                            for pair in &v.bones {
-                                let k = pair[0] as usize;
-                                if k >= n {
-                                    continue;
-                                }
-                                let t = transform_point(&posetransform[k], v.pos);
-                                for a in 0..3 {
-                                    pos[a] += pair[1] * t[a];
-                                }
-                            }
-                            for a in 0..3 {
-                                if pos[a] < bmin[a] {
-                                    bmin[a] = pos[a];
-                                }
-                                if pos[a] > bmax[a] {
-                                    bmax[a] = pos[a];
-                                }
-                            }
-                        }
+            //
+            // 单骨骼顶点按骨骼分组：同组共用一份矩阵，且顶点在扁平数组里
+            // 连续，循环体是纯逐元素算术 + min/max 归约，可以直接向量化。
+            //
+            // `0.0f32 +` 保留 `+0.0` 对 `-0.0` 的归一化（否则 bmin/bmax
+            // 可能存下 `-0.0`，与官方逐位不同）。
+            //
+            // 归约用 `f32::min/max`：它与 `if p < bmin` 在**本处**等价 ——
+            // bmin/bmax 初值是 ±INF、且只被非 NaN 值覆盖，所以永远不会是
+            // NaN，而 `f32::min` 忽略 NaN 的行为因此不可达。
+            for &(bone, lo, hi) in &groups {
+                let m = &posetransform[bone as usize];
+                let (m0, m1, m2, m3) = (m[0], m[1], m[2], m[3]);
+                let (m4, m5, m6, m7) = (m[4], m[5], m[6], m[7]);
+                let (m8, m9, m10, m11) = (m[8], m[9], m[10], m[11]);
+                let mut mn = [f32::INFINITY; 3];
+                let mut mx = [f32::NEG_INFINITY; 3];
+                for i in lo as usize..hi as usize {
+                    let (x, y, z, w) = (s_px[i], s_py[i], s_pz[i], s_w[i]);
+                    let px = 0.0f32 + w * (m0 * x + m1 * y + m2 * z + m3);
+                    let py = 0.0f32 + w * (m4 * x + m5 * y + m6 * z + m7);
+                    let pz = 0.0f32 + w * (m8 * x + m9 * y + m10 * z + m11);
+                    mn[0] = mn[0].min(px);
+                    mn[1] = mn[1].min(py);
+                    mn[2] = mn[2].min(pz);
+                    mx[0] = mx[0].max(px);
+                    mx[1] = mx[1].max(py);
+                    mx[2] = mx[2].max(pz);
+                }
+                for a in 0..3 {
+                    if mn[a] < bmin[a] {
+                        bmin[a] = mn[a];
+                    }
+                    if mx[a] > bmax[a] {
+                        bmax[a] = mx[a];
                     }
                 }
+            }
+
+            // 多骨骼顶点：保持原始累加顺序（浮点加法不结合）。
+            for (vp, bones) in &multi {
+                let mut pos = [0.0f32; 3];
+                for pair in bones {
+                    let k = pair[0] as usize;
+                    let t = transform_point(&posetransform[k], *vp);
+                    for a in 0..3 {
+                        pos[a] += pair[1] * t[a];
+                    }
+                }
+                for a in 0..3 {
+                    if pos[a] < bmin[a] {
+                        bmin[a] = pos[a];
+                    }
+                    if pos[a] > bmax[a] {
+                        bmax[a] = pos[a];
+                    }
+                }
+            }
+        }
+    }
+
+    // 全部骨骼都越界的顶点：`pos` 恒为 `[0,0,0]`，原实现照样并进包围盒。
+    // 常量只需并一次（min/max 幂等）。
+    if has_orphan {
+        for a in 0..3 {
+            if 0.0f32 < bmin[a] {
+                bmin[a] = 0.0;
+            }
+            if 0.0f32 > bmax[a] {
+                bmax[a] = 0.0;
             }
         }
     }
