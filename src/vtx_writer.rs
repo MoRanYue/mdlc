@@ -1389,8 +1389,13 @@ fn write_vtx_multi(
             put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
 
             // 顶点：`origMeshVertID` 用 `finalMeshVertID`（多 LOD 的关键）。
-            for (vi, &u) in p.verts.iter().enumerate() {
+            //
+            // ⚠️ `p.verts` 里存的是 **`it.verts` 的下标（槽位）**，不是统一顶点号
+            // —— `plan_strips` 的输入 `it.tris` 就是这个空间的。必须先经
+            // `it.verts[slot]` 翻回统一顶点号，才能查布局。
+            for (vi, &slot) in p.verts.iter().enumerate() {
                 let o = v_abs + (v_cur + vi) * VERTEX_SIZE;
+                let u = it.verts[slot as usize];
                 let v = &all[it.unified_mesh].vertices[u as usize];
                 let bone_count = v.bones.len().min(3) as u8;
                 buf[o] = 0;
@@ -2486,6 +2491,84 @@ switch_point = 30.0
         c
     }
 
+    /// 构造一个「LOD 1 只用部分顶点」的多 LOD 模型 —— 专门抓「槽位 ≠ 统一顶点号」。
+    ///
+    /// LOD 0 用满 4 个角（统一池 `0..4`）；LOD 1 只用其中 3 个角、**不含统一顶点 0**。
+    /// 于是 LOD 1 的 `Item::verts`（统一顶点号）是 `[1, 2, 3]`，而 `Item::tris`
+    /// 是槽位 `[0, 1, 2]` —— 两者**不相等**，`multi_lod()` 那个「两个 LOD 用同一份
+    /// 顶点」的夹具里 `used == 0..n` 的恒等掩盖就消失了。
+    fn multi_lod_missing_vertex() -> CompiledModelDesc {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mdlc-vtx-lodsub-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        // 四个角的 (pos, uv)。角 0 只在 LOD 0 出现。
+        let pos = [
+            [-8.0f32, -8.0, 0.0],
+            [8.0, -8.0, 0.0],
+            [8.0, 8.0, 0.0],
+            [-8.0, 8.0, 0.0],
+        ];
+        let uv = [[0.0f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        // 12 个 token：`parentBone pos3 nrm3 uv2 links bone weight`。
+        fn smd(mat: &str, tris: &[[usize; 3]], pos: &[[f32; 3]; 4], uv: &[[f32; 2]; 4]) -> String {
+            let mut s = format!(
+                "version 1\nnodes\n  0 \"root\" -1\nend\nskeleton\n  time 0\n    \
+                 0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\nend\ntriangles\n{mat}\n"
+            );
+            for tri in tris {
+                for &i in tri {
+                    let p = pos[i];
+                    let t = uv[i];
+                    s.push_str(&format!(
+                        "  0 {:.6} {:.6} {:.6} 0.000000 0.000000 1.000000 {:.6} {:.6} 1 0 1.000000\n",
+                        p[0], p[1], p[2], t[0], t[1]
+                    ));
+                }
+            }
+            s.push_str("end\n");
+            s
+        }
+        // LOD 0：两个三角形，用满 4 个角 ⟹ 统一池顺序 = 角 0,1,2,3。
+        std::fs::write(
+            d.join("lod0.smd"),
+            smd("tex_a", &[[0, 1, 2], [0, 2, 3]], &pos, &uv),
+        )
+        .unwrap();
+        // LOD 1：只剩一个三角形，**不含角 0** ⟹ 统一顶点号 = [1, 2, 3]。
+        std::fs::write(d.join("lod1.smd"), smd("tex_a", &[[1, 2, 3]], &pos, &uv)).unwrap();
+
+        let toml = r#"
+[model]
+name = "models/test/lodsub.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{ name = "models/test/tex_a" }]
+
+[[bones]]
+name = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "lod0.smd"
+
+[[bodyparts.models.lods]]
+smd = "lod1.smd"
+switch_point = 30.0
+"#;
+        let desc = ModelDesc::from_toml(toml).unwrap();
+        let c = compile(&desc, &d).expect("多 LOD 子集模型应能编译");
+        std::fs::remove_dir_all(&d).ok();
+        c
+    }
+
     #[test]
     fn multi_lod_compiles_with_two_lods() {
         let c = multi_lod();
@@ -2620,6 +2703,72 @@ switch_point = 30.0
         }
     }
 
+    /// ⭐ 多 LOD 的 `origMeshVertID` 必须由**统一顶点号**翻译而来。
+    ///
+    /// `plan_strips` 的 [`StripPlan::verts`] 存的是 `Item::verts` 的**槽位**，
+    /// 不是统一顶点号（见 [`Item`] 的字段文档）；发射顶点时必须先
+    /// `it.verts[slot]` 翻回去，再喂给 [`crate::lod::LodLayout::mesh_local_id`]。
+    ///
+    /// 夹具让两者**不相等**：LOD 1 只剩三角形 `[1,2,3]`（不含统一顶点 0），
+    /// 于是槽位 `[0,1,2]` ≠ 统一顶点 `[1,2,3]`。`multi_lod()` 那种「两个 LOD
+    /// 用同一份顶点」的夹具里 `used == 0..n`，恒等映射会把错位掩盖掉。
+    ///
+    /// 布局（由 [`crate::lod::build_lod_layout`] 的排序键决定）：LOD 1 独有
+    /// 位为 0 的顶点排在前 ⟹ 角 1,2,3 拿 `finalMeshVertID` 0,1,2，角 0 拿 3。
+    /// 因此正确的 LOD 1 `origMeshVertID` 是 `[0,1,2]`；把槽位当统一顶点号
+    /// 会得到 `[3,0,1]` —— 角 0 根本不在 LOD 1 里。
+    #[test]
+    fn multi_lod_translates_slots_back_to_unified_vertices() {
+        let c = multi_lod_missing_vertex();
+        let out = write_vtx(&c).unwrap();
+        check_invariants(&out, &c).expect("多 LOD 的 VTX 必须自洽");
+        let groups = strip_groups(&out);
+        assert_eq!(groups.len(), 2, "两个 LOD 各一个 strip group");
+
+        // LOD 0 用满 4 个角：槽位 == 统一顶点号，两种写法同值。
+        let (gv0, _, s0) = &groups[0];
+        assert_eq!(*gv0, 4, "LOD 0 用到 4 个统一顶点");
+        assert_eq!(s0.len(), 1);
+        assert_eq!(
+            s0[0].orig_ids,
+            vec![3, 0, 1, 2],
+            "LOD 0 的 origMeshVertID（角 0 因只属于 LOD 0 而排在最后）"
+        );
+
+        // ⭐ LOD 1：槽位 ≠ 统一顶点号，这里才能分辨对错。
+        let (gv1, _, s1) = &groups[1];
+        assert_eq!(*gv1, 3, "LOD 1 只用到 3 个统一顶点（不含角 0）");
+        assert_eq!(s1.len(), 1, "3 根骨骼远小于 53，不该拆 strip");
+        let s = &s1[0];
+        assert_eq!(s.num_verts, 3);
+        assert_eq!(
+            s.orig_ids,
+            vec![0, 1, 2],
+            "LOD 1 的 origMeshVertID 必须由统一顶点 [1,2,3] 翻译而来；\
+             写成槽位 [0,1,2] 会得到 [3,0,1]（multi-LOD 回归）"
+        );
+
+        // 交叉校验：每个 orig id 都必须是该 mesh 合法编号，且互不相同。
+        let mut all = Vec::new();
+        for bp in &c.bodyparts {
+            for m in &bp.models {
+                if let Some(l) = &m.lods {
+                    all.extend(l.meshes.iter().cloned());
+                }
+            }
+        }
+        let layout = crate::lod::build_lod_layout(&all);
+        let total = layout.meshes[0].total_vertexes;
+        assert_eq!(total, 4, "跨 LOD 合并后该 mesh 共 4 个顶点");
+        let mut seen: Vec<u16> = s.orig_ids.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2], "LOD 1 的 3 个顶点应各占一个编号");
+        assert!(
+            s.orig_ids.iter().all(|&id| (id as usize) < total),
+            "origMeshVertID 必须落在该 mesh 的顶点总数内"
+        );
+    }
+
     /// materialReplacementList 必须**每 LOD 一个**（单 LOD 时 1 个）。
     #[test]
     fn multi_lod_has_one_material_replacement_list_per_lod() {
@@ -2740,6 +2889,8 @@ smd = "myprop-ref.smd"
         max_hw: u8,
         /// 该 strip 的索引值（**组内绝对**顶点下标）。
         indices: Vec<u16>,
+        /// 该 strip 各顶点的 `origMeshVertID`（顺序 = 顶点数组顺序）。
+        orig_ids: Vec<u16>,
     }
 
     /// 读出 VTX 里每个 strip group 的 `(组顶点数, 组索引数, strips)`。
@@ -2785,6 +2936,12 @@ smd = "myprop-ref.smd"
                                     .map(|o| b[vbase + o])
                                     .max()
                                     .unwrap_or(0);
+                                let orig_ids: Vec<u16> = (0..nv)
+                                    .map(|v| {
+                                        let o = vbase + (v_off + v) * VERTEX_SIZE + 4;
+                                        u16::from_le_bytes([b[o], b[o + 1]])
+                                    })
+                                    .collect();
                                 strips.push(StripView {
                                     vert_off: v_off,
                                     num_verts: nv,
@@ -2793,6 +2950,7 @@ smd = "myprop-ref.smd"
                                     n_bsc: g(st_abs + 19) as usize,
                                     max_hw,
                                     indices,
+                                    orig_ids,
                                 });
                             }
                             groups.push((gv, gi, strips));
