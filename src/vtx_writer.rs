@@ -164,10 +164,12 @@ impl std::fmt::Display for VtxWriteError {
                  VTX 的 `Vertex_t.boneID[]` 是**有符号 char**（`optimize.h:51`），\
                  硬件槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误的骨骼。\n\
                  \n\
-                 这是**格式**上限，不是本实现的选择。官方把这种 mesh 拆成多个\
-                 strip（每个 ≤ `maxBonesPerStrip` = 53 根）；mdlc 目前每个\
-                 strip group 只写一个 strip，所以需要先把 mesh 按骨骼分组拆开。\n\
-                 最直接的办法是按材质/骨骼把 SMD 拆成多个 mesh。",
+                 这是**格式**上限，不是本实现的选择，正常情况下你不会看到这条：\
+                 写出器会按官方语义把调色板超标的 mesh 拆成**多条 strip**\
+                 （每条 ≤ `maxBonesPerStrip` = 53 根，见 [`plan_strips`]）。\n\
+                 看到它说明该 mesh 的**三角形下标越界**（输入已损坏）——\
+                 那种情况写出器会退回「整组一条 strip」的兜底路径，于是整组\
+                 骨骼都压进了一条 strip。请先修 SMD 里越界的顶点下标。",
                 MAX_STRIP_BONES
             ),
             Self::Internal(m) => write!(f, "内部错误（请报告）：{m}"),
@@ -418,9 +420,219 @@ fn build_strip_palette(vertices: &[&crate::model::Vertex]) -> StripPalette {
 /// （`optimize.h:20`）与 `maxBonesPerStrip = 53`（L4D2 实测值）两层约束，
 /// 但它们都**大于** `char` 能表达的范围 —— 真正卡住的是这个 127。
 ///
-/// 语料实测最大 `boneStateChangeCount` 是 **53**（`survey_vtx_bonestate.js`），
-/// 离上限很远；这里只做**格式**兜底。
+/// ⚠️ 这只是**格式**兜底。真正必须守住的是 [`MAX_BONES_PER_STRIP`]（53）——
+/// 调色板超标的 mesh 会被拆成多条 strip（见 `plan_strips`）。
 pub const MAX_STRIP_BONES: usize = 127;
+
+/// `FileHeader_t.maxBonesPerStrip` 的实测值，也是**拆分 strip 的阈值**。
+///
+/// 语料实测（`docs/_probe/vtx_bsclimit.js`，3302 个官方 `.dx90.vtx`）：
+///
+/// | 判据 | 结果 |
+/// |---|---|
+/// | 头部 `maxBonesPerStrip` 取值 | **53**（3302/3302，唯一取值） |
+/// | `numBoneStateChanges > maxBonesPerStrip` 的 strip | **0**（最大超出 0） |
+///
+/// 所以 53 不是「随手一个上限」，而是官方**写进文件头、并被
+/// `optimize.cpp:871 assert( newStrip.numBoneStateChanges <= maxBonesPerStrip )`
+/// 保证覆盖全部 strip** 的硬上界。写出一条超过它的 strip 就骗过了引擎 ——
+/// 调色板超标的 mesh 会被拆成多条 strip（见 `plan_strips`）。
+pub const MAX_BONES_PER_STRIP: usize = 53;
+
+/// 一条 strip 的写出计划（一个 strip group 内可能有**多条** strip）。
+///
+/// # 官方约定（语料实测，`docs/_probe/vtx_split_detail.js`）
+///
+/// 参考样本 `mods/models/!survivors/survivor_TeenAngst.dx90.vtx` 的
+/// `bp0/model0/lod0/mesh5/sg0` 被拆成 **53 + 8** 两条：
+///
+/// ```text
+/// group{verts=4065 idx=20178 numStrips=2}
+///   strip[0] nv=3817@0     ni=19065@0     nBSC=53  index∈[0,3816]    hw∈[0,52]
+///   strip[1] nv= 248@3817  ni= 1113@19065 nBSC= 8  index∈[3817,4064] hw∈[0,7]
+/// ```
+///
+/// 由此钉死三条语义：
+///
+/// - 同一 strip group 的**顶点数组与索引数组只有一份**，被各 strip
+///   **按连续子区间瓜分**：`strip[i].vertOffset` / `indexOffset` 是**组内**
+///   起点，逐条首尾相接（`strip[0]` 从 0 起，
+///   `strip[i+1].vertOffset == strip[i].vertOffset + strip[i].numVerts`）；
+/// - **索引值是「组内绝对顶点下标」**，不是相对本 strip 的局部下标 ——
+///   实测 `strip[1]` 的索引恰好落在 `[3817, 4064]`，正是它自己的顶点子区间；
+/// - **每条 strip 有自己独立的 `boneStateChange` 数组**，`boneID[]` 写的是
+///   **该 strip 内**的局部硬件槽位（`hw ≤ nBSC - 1`）。
+///
+/// 官方产物里两条 strip 的 `origMeshVertID` 区间是**重叠**的
+/// （`strip[0] ∈ [0,8386]`、`strip[1] ∈ [602,6452]`）⟹ 同一个 mesh 顶点被
+/// 两条 strip 各存一份是**官方行为**，不是异常。
+struct StripPlan {
+    /// 本 strip 的顶点在**组顶点数组**内的起点（组内局部下标）。
+    v_off: usize,
+    /// 本 strip 的索引在**组索引数组**内的起点（组内局部下标）。
+    i_off: usize,
+    /// 本 strip 的顶点：元素是「组顶点槽位」。
+    ///
+    /// 单 LOD 路径下槽位 == mesh 顶点下标；多 LOD 路径下槽位是
+    /// `Item::verts` 的下标。写出时由调用方翻译成 `origMeshVertID`。
+    verts: Vec<u32>,
+    /// 本 strip 的三角形，元素是**组内绝对顶点下标**（已加 `v_off`）。
+    tris: Vec<[u32; 3]>,
+    /// 本 strip 自己的骨骼调色板。
+    pal: StripPalette,
+}
+
+/// 把一个 strip group 拆成若干条 strip，使每条的骨骼调色板都不超过
+/// `max_bones`（= [`MAX_BONES_PER_STRIP`]，53）。
+///
+/// # 为什么必须拆
+///
+/// `FileHeader_t.maxBonesPerStrip` 是**文件头声明的硬上界**。官方语料
+/// 3302/3302 个 `.dx90.vtx` 零违规（`vtx_multistrip.js --validate`），
+/// 而拆出来的每条 strip 都不超过它。引擎的硬件蒙皮路径按这个声明分配
+/// 骨骼矩阵槽位 —— 写出 `numBoneStateChanges > 53` 的 strip
+/// （以及 `boneID[]` 里 > 52 的槽位）就越过了声明。
+///
+/// 实测（`vtx_strip_dump.js` + `vtx_multistrip.js --validate`）：本工程
+/// 的 `survivor_TeenAngst.dx90.vtx` 有 **1 条 strip 的 `nBSC = 55`、
+/// `maxHw = 54`**，是全语料唯一的违规者；而游戏里能正常加载的旧产物
+/// 在同一个 mesh 上拆成 53 + 8。症状是进图几秒后崩在
+/// `shaderapidx9` 的顶点拷贝里。
+///
+/// # 拆分方式
+///
+/// 官方是「以三角形为种子洪泛 + 硬件矩阵 LRU 分配」，槽位耗尽就 flush
+/// 一条（`optimize.cpp:814-886`）。本实现用**等价的贪心**：
+///
+/// - 按 mesh 的三角形**原序**遍历，维护「当前 strip 用到的全局骨骼集合」；
+/// - 若加入下一个三角形会让集合超过 `max_bones`，先 flush 当前 strip；
+/// - 单三角形的骨骼数 ≤ 3 顶点 × 3 骨 = 9 ⟹ 贪心**永远不会卡住**。
+///
+/// 每条 strip 的顶点列表 = 该 strip 的三角形引用到的顶点，按 mesh 顶点序
+/// 去重排列（确定性）；组顶点数组 = 各 strip 顶点列表首尾相接。
+///
+/// # 不需要拆分时
+///
+/// 整组唯一骨骼数 ≤ `max_bones` 时返回**恰好一条** strip，且顶点保持
+/// mesh 原序、`v_off`/`i_off` 都是 0、索引原样 —— 与拆分特性引入前的
+/// 产物**逐字节相同**（`single_lod_path_is_unchanged` 守着这一点）。
+///
+/// 三角形里出现越界下标时（已经坏掉的输入）同样退回单 strip 原样，
+/// 保持旧行为、不 panic。
+fn plan_strips(
+    vertices: &[&crate::model::Vertex],
+    triangles: &[[u32; 3]],
+    max_bones: usize,
+) -> Vec<StripPlan> {
+    let whole = build_strip_palette(vertices);
+    let out_of_range = triangles
+        .iter()
+        .any(|t| t.iter().any(|&v| v as usize >= vertices.len()));
+    if whole.bsc.len() <= max_bones || out_of_range {
+        return vec![StripPlan {
+            v_off: 0,
+            i_off: 0,
+            verts: (0..vertices.len() as u32).collect(),
+            tris: triangles.to_vec(),
+            pal: whole,
+        }];
+    }
+
+    let mut strips: Vec<StripPlan> = Vec::new();
+    let mut cur_bones: Vec<i32> = Vec::new();
+    let mut cur_tris: Vec<[u32; 3]> = Vec::new();
+
+    for tri in triangles {
+        // 该三角形引入的、当前 strip 还没有的骨骼。
+        let mut fresh: Vec<i32> = Vec::new();
+        for &vi in tri {
+            for b in vertices[vi as usize].bones.iter().take(3) {
+                let gb = b[0] as i32;
+                if !cur_bones.contains(&gb) && !fresh.contains(&gb) {
+                    fresh.push(gb);
+                }
+            }
+        }
+        if !cur_tris.is_empty() && cur_bones.len() + fresh.len() > max_bones {
+            strips.push(finish_strip(&mut cur_bones, &mut cur_tris, vertices));
+        }
+        cur_bones.extend(fresh);
+        cur_tris.push(*tri);
+    }
+    if !cur_tris.is_empty() || strips.is_empty() {
+        strips.push(finish_strip(&mut cur_bones, &mut cur_tris, vertices));
+    }
+
+    // 组内偏移：各 strip 的顶点/索引子区间首尾相接。
+    let mut v_off = 0usize;
+    let mut i_off = 0usize;
+    for s in &mut strips {
+        s.v_off = v_off;
+        s.i_off = i_off;
+        let base = v_off as u32;
+        for t in &mut s.tris {
+            t[0] += base;
+            t[1] += base;
+            t[2] += base;
+        }
+        v_off += s.verts.len();
+        i_off += s.tris.len() * 3;
+    }
+
+    // 自检：拆完之后**每条** strip 都必须落在头部声明的
+    // `maxBonesPerStrip`（53）以内。贪心本身保证这一点（单个三角形最多
+    // 引入 9 根骨骼，永远能单独成条），这里是**兜底断言** —— 一旦哪天
+    // 贪心被改坏，debug 构建与全部测试会立刻炸，而不是静默写出超限文件
+    // 让引擎在 `shaderapidx9` 里崩掉。
+    //
+    // 用 `debug_assert!` 而不是硬错误：`--release` 下这条断言会被编译掉，
+    // 正式产物不受影响；真正面向用户的兜底是 `MAX_STRIP_BONES`（127，
+    // 见两个写出函数里的 `TooManyStripBones`）。
+    debug_assert!(
+        strips.iter().all(|s| s.pal.bsc.len() <= max_bones),
+        "拆 strip 后仍有调色板超过 {max_bones} 的 strip —— plan_strips 的贪心有 bug"
+    );
+    strips
+}
+
+/// 收尾一条 strip：算出它的顶点列表（mesh 序、去重）、调色板与
+/// 「组内局部槽位」索引，并把 `cur_*` 清空以便复用。
+fn finish_strip(
+    cur_bones: &mut Vec<i32>,
+    cur_tris: &mut Vec<[u32; 3]>,
+    vertices: &[&crate::model::Vertex],
+) -> StripPlan {
+    let mut used: Vec<u32> = Vec::new();
+    for t in cur_tris.iter() {
+        for &vi in t {
+            if !used.contains(&vi) {
+                used.push(vi);
+            }
+        }
+    }
+    used.sort_unstable();
+    let refs: Vec<&crate::model::Vertex> = used.iter().map(|&vi| vertices[vi as usize]).collect();
+    let pal = build_strip_palette(&refs);
+    // 组顶点槽位 → 本 strip 内的局部下标。
+    let local: HashMap<u32, u32> = used
+        .iter()
+        .enumerate()
+        .map(|(i, &vi)| (vi, i as u32))
+        .collect();
+    let tris: Vec<[u32; 3]> = cur_tris
+        .iter()
+        .map(|t| [local[&t[0]], local[&t[1]], local[&t[2]]])
+        .collect();
+    cur_bones.clear();
+    cur_tris.clear();
+    StripPlan {
+        v_off: 0,
+        i_off: 0,
+        verts: used,
+        tris,
+        pal,
+    }
+}
 
 /// 把编译结果写成 VTX 字节（**默认选项** —— 不做缓存优化）。
 ///
@@ -461,10 +673,6 @@ fn write_vtx_single(
 ) -> Result<VtxWriteOutcome, VtxWriteError> {
     let desc = &compiled.desc;
     let checksum = desc.checksum();
-
-    // ---- 1. 先算各段偏移 ----
-    let bp_count = compiled.bodyparts.len();
-    let model_total: usize = compiled.bodyparts.iter().map(|bp| bp.models.len()).sum();
     let mesh_total: usize = compiled
         .bodyparts
         .iter()
@@ -472,25 +680,62 @@ fn write_vtx_single(
         .map(|m| m.meshes.len())
         .sum();
 
+    // ---- 0. 拆 strip：每个 mesh 可能不止一条 ----
+    //
+    // 官方约定见 [`plan_strips`]：同一 strip group 的顶点/索引数组被各 strip
+    // 按**连续子区间**瓜分，每条 strip 有自己的骨骼调色板。
+    let mut mesh_plans: Vec<Vec<StripPlan>> = Vec::with_capacity(mesh_total);
+    for bp in &compiled.bodyparts {
+        for m in &bp.models {
+            for mesh in &m.meshes {
+                let refs: Vec<&crate::model::Vertex> = mesh.vertices.iter().collect();
+                let plans = plan_strips(&refs, &mesh.triangles, MAX_BONES_PER_STRIP);
+                for p in &plans {
+                    if p.pal.bsc.len() > MAX_STRIP_BONES {
+                        return Err(VtxWriteError::TooManyStripBones {
+                            model: m.name.clone(),
+                            count: p.pal.bsc.len(),
+                        });
+                    }
+                }
+                mesh_plans.push(plans);
+            }
+        }
+    }
+    // 每个 mesh 的**第一条** strip 在 strip 表里的下标。
+    let mut mesh_strip_at = Vec::with_capacity(mesh_total);
+    let mut strip_cursor = 0usize;
+    for plans in &mesh_plans {
+        mesh_strip_at.push(strip_cursor);
+        strip_cursor += plans.len();
+    }
+    let strip_total = strip_cursor;
+
+    // ---- 1. 先算各段偏移 ----
+    let bp_count = compiled.bodyparts.len();
+    let model_total: usize = compiled.bodyparts.iter().map(|bp| bp.models.len()).sum();
+
     let bp_off = HEADER_SIZE;
     let model_off = bp_off + bp_count * BODY_PART_SIZE;
     let lod_off = model_off + model_total * MODEL_SIZE;
     let mesh_off = lod_off + model_total * MODEL_LOD_SIZE;
     let sg_off = mesh_off + mesh_total * MESH_SIZE;
-    // 每个 mesh 一个 strip group + 一个 strip。
+    // 每个 mesh 一个 strip group，但可能有**多条** strip。
     let strip_off = sg_off + mesh_total * STRIP_GROUP_SIZE;
-    let vertex_off = strip_off + mesh_total * STRIP_SIZE;
+    let vertex_off = strip_off + strip_total * STRIP_SIZE;
 
     // 顶点区之后依次是索引区、bone state change 区、material replacement 区。
     // 逐 mesh 累加，同时记录每个 mesh 的起点。
     let mut mesh_vertex_at = Vec::with_capacity(mesh_total);
     let mut mesh_index_at = Vec::with_capacity(mesh_total);
-    let mut mesh_bsc_at = Vec::with_capacity(mesh_total);
     let mut mesh_stats = Vec::with_capacity(mesh_total);
 
     let mut vcursor = vertex_off;
 
     // 第一遍：算顶点区大小。
+    //
+    // ⚠️ 组顶点数**不等于** mesh 顶点数 —— 拆 strip 后同一 mesh 顶点可能在
+    // 多条 strip 里各存一份（官方实测如此，见 [`StripPlan`]）。
     for bp in &compiled.bodyparts {
         for m in &bp.models {
             for mesh in &m.meshes {
@@ -506,11 +751,15 @@ fn write_vtx_single(
                     });
                 }
                 mesh_vertex_at.push(vcursor);
-                vcursor += n * VERTEX_SIZE;
+                vcursor += mesh_plans[mesh_vertex_at.len() - 1]
+                    .iter()
+                    .map(|p| p.verts.len())
+                    .sum::<usize>()
+                    * VERTEX_SIZE;
             }
         }
     }
-    // 索引区紧跟顶点区。
+    // 索引区紧跟顶点区。索引总数与 mesh 三角形数一致（拆分只重排/重编号）。
     let mut icursor = vcursor;
     for bp in &compiled.bodyparts {
         for m in &bp.models {
@@ -527,28 +776,15 @@ fn write_vtx_single(
             }
         }
     }
-    // bone state change 区紧跟索引区。**每个 strip 一个调色板**，
+    // bone state change 区紧跟索引区。**每条 strip 一个调色板**，
     // 大小 = 该 strip 用到的唯一全局骨骼数（语料实测 6677/6677 恒等，
     // 见 [`build_strip_palette`]）。
     let mut bsc_cursor = icursor;
-    let mut mesh_palette: Vec<StripPalette> = Vec::with_capacity(mesh_total);
-    for bp in &compiled.bodyparts {
-        for m in &bp.models {
-            for mesh in &m.meshes {
-                // 单 LOD 路径下每个 mesh 恰好一个 strip group / 一个 strip，
-                // 顶点次序就是 mesh 顶点原序（`origMeshVertID == i`）。
-                let refs: Vec<&crate::model::Vertex> = mesh.vertices.iter().collect();
-                let pal = build_strip_palette(&refs);
-                if pal.bsc.len() > MAX_STRIP_BONES {
-                    return Err(VtxWriteError::TooManyStripBones {
-                        model: m.name.clone(),
-                        count: pal.bsc.len(),
-                    });
-                }
-                mesh_bsc_at.push(bsc_cursor);
-                bsc_cursor += pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
-                mesh_palette.push(pal);
-            }
+    let mut strip_bsc_at: Vec<usize> = Vec::with_capacity(strip_total);
+    for plans in &mesh_plans {
+        for p in plans {
+            strip_bsc_at.push(bsc_cursor);
+            bsc_cursor += p.pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
         }
     }
     // mesh 统计按同一顺序收集。
@@ -632,21 +868,22 @@ fn write_vtx_single(
         for m in &bp.models {
             for mesh in &m.meshes {
                 let sg_abs = sg_off + mi * STRIP_GROUP_SIZE;
-                let st_abs = strip_off + mi * STRIP_SIZE;
                 let v_abs = mesh_vertex_at[mi];
                 let i_abs = mesh_index_at[mi];
-                let bsc_abs = mesh_bsc_at[mi];
 
-                let nv = mesh.vertices.len();
-                let ni = mesh.triangles.len() * 3;
-                let pal = &mesh_palette[mi];
+                let plans = &mesh_plans[mi];
+                let first_strip = mesh_strip_at[mi];
+                let st_abs = strip_off + first_strip * STRIP_SIZE;
+                // 组顶点/索引数组 = 各 strip 的子区间首尾相接（见 [`StripPlan`]）。
+                let nv: usize = plans.iter().map(|p| p.verts.len()).sum();
+                let ni: usize = plans.iter().map(|p| p.tris.len() * 3).sum();
 
                 // strip group
                 put_i32(&mut buf, sg_abs, nv as i32);
                 put_i32(&mut buf, sg_abs + 4, (v_abs - sg_abs) as i32);
                 put_i32(&mut buf, sg_abs + 8, ni as i32);
                 put_i32(&mut buf, sg_abs + 12, (i_abs - sg_abs) as i32);
-                put_i32(&mut buf, sg_abs + 16, 1); // numStrips
+                put_i32(&mut buf, sg_abs + 16, plans.len() as i32); // numStrips
                 put_i32(&mut buf, sg_abs + 20, (st_abs - sg_abs) as i32);
                 // `flags`：`optimize.cpp:968-981` 的 `ComputeStripGroupFlags`：
                 //
@@ -679,72 +916,87 @@ fn write_vtx_single(
                 };
                 put_u8(&mut buf, sg_abs + 24, sg_flags);
 
-                // strip（tri-list）
-                put_i32(&mut buf, st_abs, ni as i32); // indexCount
-                put_i32(&mut buf, st_abs + 4, 0); // indexOffset（组内起点）
-                put_i32(&mut buf, st_abs + 8, nv as i32); // vertexCount
-                put_i32(&mut buf, st_abs + 12, 0); // vertOffset（组内起点）
-                // `numBones` = **max(顶点 numBones)**，不是唯一骨骼数
-                // （`optimize.cpp:1484-1487` 的非 fixed-function 分支；
-                //  语料 6677/6677 成立）。
-                put_u16(&mut buf, st_abs + 16, pal.num_bones);
-                put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
-                put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
-                put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
+                // strip（tri-list）：一个 strip group 里可能有**多条** strip，
+                // 各占组顶点/索引数组的一段**连续子区间**（见 [`StripPlan`]）。
+                let mut v_cur = 0usize; // 组顶点数组写游标
+                let mut i_cur = 0usize; // 组索引数组写游标（单位：索引）
+                for (si, p) in plans.iter().enumerate() {
+                    let st_abs = strip_off + (first_strip + si) * STRIP_SIZE;
+                    let bsc_abs = strip_bsc_at[first_strip + si];
+                    let pal = &p.pal;
 
-                // 顶点：boneWeightIndex 指向该 VVD 顶点自己的权重数组槽位。
-                for (vi, v) in mesh.vertices.iter().enumerate() {
-                    let o = v_abs + vi * VERTEX_SIZE;
-                    let bone_count = v.bones.len().min(3) as u8;
-                    // 实测 studiomdl **恒写 [0, 1, 2]**（固定序列），不是
-                    // 「0..bone_count」。它表示「槽位 k 对应 VVD 顶点里
-                    // weight[k]/bone[k]」；写 0 填充会让引擎把槽位 1/2
-                    // 也指向 weight[0]。
-                    buf[o] = 0;
-                    buf[o + 1] = 1;
-                    buf[o + 2] = 2;
-                    buf[o + 3] = bone_count.max(1);
-                    put_u16(&mut buf, o + 4, vi as u16); // origMeshVertID
-                    // boneId：**硬件**下标（见 [`build_strip_palette`]）。
-                    // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
-                    buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
-                }
+                    put_i32(&mut buf, st_abs, (p.tris.len() * 3) as i32); // indexCount
+                    put_i32(&mut buf, st_abs + 4, i_cur as i32); // indexOffset（组内起点）
+                    put_i32(&mut buf, st_abs + 8, p.verts.len() as i32); // vertexCount
+                    put_i32(&mut buf, st_abs + 12, v_cur as i32); // vertOffset（组内起点）
+                    // `numBones` = **max(顶点 numBones)**，不是唯一骨骼数
+                    // （`optimize.cpp:1484-1487` 的非 fixed-function 分支；
+                    //  语料 6677/6677 成立）。
+                    put_u16(&mut buf, st_abs + 16, pal.num_bones);
+                    put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
+                    put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
+                    put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
 
-                // 索引：tri-list，每三角形三个 u16。
-                //
-                // `optimize_vtx` 打开时**逐 strip group** 做顶点缓存优化
-                // （每个 strip group 是一次独立 draw call，见
-                // [`optimize_group_indices`]）。默认关闭 ⇒ 这段是原序直写，
-                // 产物与本特性引入前**逐字节相同**。
-                if opts.optimize_vertex_cache {
-                    let src: Vec<[u16; 3]> = mesh
-                        .triangles
-                        .iter()
-                        .map(|t| [t[0] as u16, t[1] as u16, t[2] as u16])
-                        .collect();
-                    let opt = optimize_group_indices(&src, nv)?;
-                    for (ti, tri) in opt.iter().enumerate() {
-                        let o = i_abs + ti * 6;
-                        put_u16(&mut buf, o, tri[0]);
-                        put_u16(&mut buf, o + 2, tri[1]);
-                        put_u16(&mut buf, o + 4, tri[2]);
+                    // 顶点：boneWeightIndex 指向该 VVD 顶点自己的权重数组槽位。
+                    for (vi, &slot) in p.verts.iter().enumerate() {
+                        let o = v_abs + (v_cur + vi) * VERTEX_SIZE;
+                        let v = &mesh.vertices[slot as usize];
+                        let bone_count = v.bones.len().min(3) as u8;
+                        // 实测 studiomdl **恒写 [0, 1, 2]**（固定序列），不是
+                        // 「0..bone_count」。它表示「槽位 k 对应 VVD 顶点里
+                        // weight[k]/bone[k]」；写 0 填充会让引擎把槽位 1/2
+                        // 也指向 weight[0]。
+                        buf[o] = 0;
+                        buf[o + 1] = 1;
+                        buf[o + 2] = 2;
+                        buf[o + 3] = bone_count.max(1);
+                        put_u16(&mut buf, o + 4, slot as u16); // origMeshVertID
+                        // boneId：**硬件**下标（见 [`build_strip_palette`]）。
+                        // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
+                        buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
                     }
-                } else {
-                    for (ti, tri) in mesh.triangles.iter().enumerate() {
-                        let o = i_abs + ti * 6;
-                        put_u16(&mut buf, o, tri[0] as u16);
-                        put_u16(&mut buf, o + 2, tri[1] as u16);
-                        put_u16(&mut buf, o + 4, tri[2] as u16);
-                    }
-                }
 
-                // bone state change：`{hardwareID, newBoneID}`。
-                // `hardwareID` **恒等于条目下标**（`optimize.cpp:876`；
-                // 语料 6677/6677 实测），所以直接写 `i`。
-                for (k, &gb) in pal.bsc.iter().enumerate() {
-                    let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
-                    put_i32(&mut buf, q, k as i32);
-                    put_i32(&mut buf, q + 4, gb);
+                    // 索引：tri-list，每三角形三个 u16。
+                    // 索引值是**组内绝对顶点下标**（`p.tris` 已含 `v_off` 基址），
+                    // 与官方实测一致 —— 见 [`StripPlan`]。
+                    //
+                    // `optimize_vtx` 打开时**逐 strip** 做顶点缓存优化
+                    // （每条 strip 是组内一段连续子区间，跨 strip 重排会破坏
+                    // 子区间划分）。默认关闭 ⇒ 这段是原序直写，
+                    // 产物与本特性引入前**逐字节相同**。
+                    if opts.optimize_vertex_cache {
+                        let src: Vec<[u16; 3]> = p
+                            .tris
+                            .iter()
+                            .map(|t| [t[0] as u16, t[1] as u16, t[2] as u16])
+                            .collect();
+                        let opt = optimize_group_indices(&src, nv)?;
+                        for (ti, tri) in opt.iter().enumerate() {
+                            let o = i_abs + (i_cur + ti * 3) * 2;
+                            put_u16(&mut buf, o, tri[0]);
+                            put_u16(&mut buf, o + 2, tri[1]);
+                            put_u16(&mut buf, o + 4, tri[2]);
+                        }
+                    } else {
+                        for (ti, tri) in p.tris.iter().enumerate() {
+                            let o = i_abs + (i_cur + ti * 3) * 2;
+                            put_u16(&mut buf, o, tri[0] as u16);
+                            put_u16(&mut buf, o + 2, tri[1] as u16);
+                            put_u16(&mut buf, o + 4, tri[2] as u16);
+                        }
+                    }
+
+                    // bone state change：`{hardwareID, newBoneID}`。
+                    // `hardwareID` **恒等于条目下标**（`optimize.cpp:876`；
+                    // 语料 6677/6677 实测），所以直接写 `i`。
+                    for (k, &gb) in pal.bsc.iter().enumerate() {
+                        let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
+                        put_i32(&mut buf, q, k as i32);
+                        put_i32(&mut buf, q + 4, gb);
+                    }
+
+                    v_cur += p.verts.len();
+                    i_cur += p.tris.len() * 3;
                 }
 
                 mi += 1;
@@ -839,17 +1091,16 @@ fn write_vtx_multi(
         .flat_map(|bp| &bp.models)
         .map(|m| m.lods.as_ref().map_or(1, |l| l.num_lods))
         .sum();
-    // 每个 LOD 的每个 mesh 一个 strip group + 一个 strip。
+    // 每个 LOD 的每个 mesh 一个 strip group，但**可能有不止一条 strip** ——
+    // `strip_total` 要等拆完才知道（见下面的 `item_plans`），所以
+    // `strip_off` / `vertex_off` 在那一块之后才算。
     let sg_total = mesh_total * num_lods;
-    let strip_total = sg_total;
 
     let bp_off = HEADER_SIZE;
     let model_off = bp_off + bp_count * BODY_PART_SIZE;
     let lod_off = model_off + model_total * MODEL_SIZE;
     let mesh_off = lod_off + lod_header_total * MODEL_LOD_SIZE;
     let sg_off = mesh_off + sg_total * MESH_SIZE;
-    let strip_off = sg_off + sg_total * STRIP_GROUP_SIZE;
-    let vertex_off = strip_off + strip_total * STRIP_SIZE;
 
     // ---- 逐 (model, lod, mesh) 展开成写入项 ----
     struct Item {
@@ -944,14 +1195,47 @@ fn write_vtx_multi(
         }
     }
 
-    // ---- 预算各数据区 ----
+    // ---- 拆 strip + 预算各数据区 ----
+    //
+    // 官方约定见 [`plan_strips`]：同一 strip group 的顶点/索引数组被各 strip
+    // 按**连续子区间**瓜分，每条 strip 有自己的骨骼调色板。这里的 item 就是
+    // 「一个 (model, lod, mesh)」，与单 LOD 路径的 mesh 同义。
+    let mut item_plans: Vec<Vec<StripPlan>> = Vec::with_capacity(items.len());
+    for it in &items {
+        let refs: Vec<&crate::model::Vertex> = it
+            .verts
+            .iter()
+            .map(|&u| &all[it.unified_mesh].vertices[u as usize])
+            .collect();
+        let plans = plan_strips(&refs, &it.tris, MAX_BONES_PER_STRIP);
+        for p in &plans {
+            if p.pal.bsc.len() > MAX_STRIP_BONES {
+                return Err(VtxWriteError::TooManyStripBones {
+                    model: format!("mesh {}", it.unified_mesh),
+                    count: p.pal.bsc.len(),
+                });
+            }
+        }
+        item_plans.push(plans);
+    }
+    // 每个 item 的**第一条** strip 在 strip 表里的下标。
+    let mut item_strip_at = Vec::with_capacity(items.len());
+    let mut strip_cursor = 0usize;
+    for plans in &item_plans {
+        item_strip_at.push(strip_cursor);
+        strip_cursor += plans.len();
+    }
+    let strip_total = strip_cursor;
+    // strip 表在 strip group 表之后，顶点区在 strip 表之后。
+    let strip_off = sg_off + sg_total * STRIP_GROUP_SIZE;
+    let vertex_off = strip_off + strip_total * STRIP_SIZE;
+
     let mut item_vertex_at = Vec::with_capacity(items.len());
     let mut item_index_at = Vec::with_capacity(items.len());
-    let mut item_bsc_at = Vec::with_capacity(items.len());
     let mut vcursor = vertex_off;
-    for it in &items {
+    for plans in &item_plans {
         item_vertex_at.push(vcursor);
-        vcursor += it.verts.len() * VERTEX_SIZE;
+        vcursor += plans.iter().map(|p| p.verts.len()).sum::<usize>() * VERTEX_SIZE;
     }
     let mut icursor = vcursor;
     for it in &items {
@@ -959,23 +1243,12 @@ fn write_vtx_multi(
         icursor += it.tris.len() * 6;
     }
     let mut bsc_cursor = icursor;
-    let mut item_palette: Vec<StripPalette> = Vec::with_capacity(items.len());
-    for it in &items {
-        let refs: Vec<&crate::model::Vertex> = it
-            .verts
-            .iter()
-            .map(|&u| &all[it.unified_mesh].vertices[u as usize])
-            .collect();
-        let pal = build_strip_palette(&refs);
-        if pal.bsc.len() > MAX_STRIP_BONES {
-            return Err(VtxWriteError::TooManyStripBones {
-                model: format!("mesh {}", it.unified_mesh),
-                count: pal.bsc.len(),
-            });
+    let mut strip_bsc_at: Vec<usize> = Vec::with_capacity(strip_total);
+    for plans in &item_plans {
+        for p in plans {
+            strip_bsc_at.push(bsc_cursor);
+            bsc_cursor += p.pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
         }
-        item_bsc_at.push(bsc_cursor);
-        bsc_cursor += pal.bsc.len() * BONE_STATE_CHANGE_SIZE;
-        item_palette.push(pal);
     }
     // material replacement list：**每 LOD 一个**。
     let mat_repl_off = bsc_cursor;
@@ -1056,19 +1329,20 @@ fn write_vtx_multi(
     // ---- strip group + strip + 顶点 + 索引 + bsc ----
     for (ii, it) in items.iter().enumerate() {
         let sg_abs = sg_off + ii * STRIP_GROUP_SIZE;
-        let st_abs = strip_off + ii * STRIP_SIZE;
         let v_abs = item_vertex_at[ii];
         let i_abs = item_index_at[ii];
-        let bsc_abs = item_bsc_at[ii];
-        let nv = it.verts.len();
-        let ni = it.tris.len() * 3;
-        let pal = &item_palette[ii];
+        let plans = &item_plans[ii];
+        let first_strip = item_strip_at[ii];
+        let st_abs = strip_off + first_strip * STRIP_SIZE;
+        // 组顶点/索引数组 = 各 strip 的子区间首尾相接（见 [`StripPlan`]）。
+        let nv: usize = plans.iter().map(|p| p.verts.len()).sum();
+        let ni: usize = plans.iter().map(|p| p.tris.len() * 3).sum();
 
         put_i32(&mut buf, sg_abs, nv as i32);
         put_i32(&mut buf, sg_abs + 4, (v_abs - sg_abs) as i32);
         put_i32(&mut buf, sg_abs + 8, ni as i32);
         put_i32(&mut buf, sg_abs + 12, (i_abs - sg_abs) as i32);
-        put_i32(&mut buf, sg_abs + 16, 1); // numStrips
+        put_i32(&mut buf, sg_abs + 16, plans.len() as i32); // numStrips
         put_i32(&mut buf, sg_abs + 20, (st_abs - sg_abs) as i32);
         // `stripGroup.flags`（**结构体偏移 +24**，`StripGroupHeader_t` 的最后一个字段）。
         //
@@ -1095,73 +1369,87 @@ fn write_vtx_multi(
         };
         put_u8(&mut buf, sg_abs + 24, sg_flags);
 
-        put_i32(&mut buf, st_abs, ni as i32);
-        put_i32(&mut buf, st_abs + 4, 0);
-        put_i32(&mut buf, st_abs + 8, nv as i32);
-        put_i32(&mut buf, st_abs + 12, 0);
-        // `numBones` = max(顶点 numBones)（见 [`build_strip_palette`]）。
-        put_u16(&mut buf, st_abs + 16, pal.num_bones);
-        put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
-        put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
-        put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
+        // strip（tri-list）：一个 strip group 里可能有**多条** strip，
+        // 各占组顶点/索引数组的一段**连续子区间**（见 [`StripPlan`]）。
+        let mut v_cur = 0usize; // 组顶点数组写游标
+        let mut i_cur = 0usize; // 组索引数组写游标（单位：索引）
+        for (si, p) in plans.iter().enumerate() {
+            let st_abs = strip_off + (first_strip + si) * STRIP_SIZE;
+            let bsc_abs = strip_bsc_at[first_strip + si];
+            let pal = &p.pal;
 
-        // 顶点：`origMeshVertID` 用 `finalMeshVertID`（多 LOD 的关键）。
-        for (vi, &u) in it.verts.iter().enumerate() {
-            let o = v_abs + vi * VERTEX_SIZE;
-            let v = &all[it.unified_mesh].vertices[u as usize];
-            let bone_count = v.bones.len().min(3) as u8;
-            buf[o] = 0;
-            buf[o + 1] = 1;
-            buf[o + 2] = 2;
-            buf[o + 3] = bone_count.max(1);
-            let local = layout
-                .mesh_local_id(it.unified_mesh, u)
-                .ok_or_else(|| {
-                    VtxWriteError::Internal(format!(
-                        "mesh {} 的统一顶点 {u} 不在布局里（LOD {}）",
-                        it.unified_mesh, it.lod
-                    ))
-                })?;
-            if local > u16::MAX as u32 {
-                return Err(VtxWriteError::TooManyVertices {
-                    model: format!("mesh {}", it.unified_mesh),
-                    count: local as usize,
-                });
-            }
-            put_u16(&mut buf, o + 4, local as u16);
-            // `boneID[]`：**硬件**下标（见 [`build_strip_palette`]）。
-            // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
-            buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
-        }
+            put_i32(&mut buf, st_abs, (p.tris.len() * 3) as i32); // indexCount
+            put_i32(&mut buf, st_abs + 4, i_cur as i32); // indexOffset（组内起点）
+            put_i32(&mut buf, st_abs + 8, p.verts.len() as i32); // vertexCount
+            put_i32(&mut buf, st_abs + 12, v_cur as i32); // vertOffset（组内起点）
+            // `numBones` = max(顶点 numBones)（见 [`build_strip_palette`]）。
+            put_u16(&mut buf, st_abs + 16, pal.num_bones);
+            put_u8(&mut buf, st_abs + 18, STRIP_IS_TRILIST);
+            put_i32(&mut buf, st_abs + 19, pal.bsc.len() as i32); // boneStateChangeCount
+            put_i32(&mut buf, st_abs + 23, (bsc_abs - st_abs) as i32);
 
-        // 索引（逐 strip group 可选做缓存优化，见单 LOD 路径的说明）。
-        if opts.optimize_vertex_cache {
-            let src: Vec<[u16; 3]> = it
-                .tris
-                .iter()
-                .map(|t| [t[0] as u16, t[1] as u16, t[2] as u16])
-                .collect();
-            let opt = optimize_group_indices(&src, nv)?;
-            for (ti, tri) in opt.iter().enumerate() {
-                let o = i_abs + ti * 6;
-                put_u16(&mut buf, o, tri[0]);
-                put_u16(&mut buf, o + 2, tri[1]);
-                put_u16(&mut buf, o + 4, tri[2]);
+            // 顶点：`origMeshVertID` 用 `finalMeshVertID`（多 LOD 的关键）。
+            for (vi, &u) in p.verts.iter().enumerate() {
+                let o = v_abs + (v_cur + vi) * VERTEX_SIZE;
+                let v = &all[it.unified_mesh].vertices[u as usize];
+                let bone_count = v.bones.len().min(3) as u8;
+                buf[o] = 0;
+                buf[o + 1] = 1;
+                buf[o + 2] = 2;
+                buf[o + 3] = bone_count.max(1);
+                let local = layout
+                    .mesh_local_id(it.unified_mesh, u)
+                    .ok_or_else(|| {
+                        VtxWriteError::Internal(format!(
+                            "mesh {} 的统一顶点 {u} 不在布局里（LOD {}）",
+                            it.unified_mesh, it.lod
+                        ))
+                    })?;
+                if local > u16::MAX as u32 {
+                    return Err(VtxWriteError::TooManyVertices {
+                        model: format!("mesh {}", it.unified_mesh),
+                        count: local as usize,
+                    });
+                }
+                put_u16(&mut buf, o + 4, local as u16);
+                // `boneID[]`：**硬件**下标（见 [`build_strip_palette`]）。
+                // 写成全局下标会让引擎读越界的调色板项 ⟹ 顶点错乱。
+                buf[o + 6..o + 9].copy_from_slice(&pal.hw[vi]);
             }
-        } else {
-            for (ti, tri) in it.tris.iter().enumerate() {
-                let o = i_abs + ti * 6;
-                put_u16(&mut buf, o, tri[0] as u16);
-                put_u16(&mut buf, o + 2, tri[1] as u16);
-                put_u16(&mut buf, o + 4, tri[2] as u16);
-            }
-        }
 
-        // bone state change：`{hardwareID, newBoneID}`，`hardwareID` 恒为条目下标。
-        for (k, &gb) in pal.bsc.iter().enumerate() {
-            let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
-            put_i32(&mut buf, q, k as i32);
-            put_i32(&mut buf, q + 4, gb);
+            // 索引：值是**组内绝对顶点下标**（`p.tris` 已含 `v_off` 基址）。
+            // 逐 strip 可选做缓存优化（跨 strip 重排会破坏子区间划分）。
+            if opts.optimize_vertex_cache {
+                let src: Vec<[u16; 3]> = p
+                    .tris
+                    .iter()
+                    .map(|t| [t[0] as u16, t[1] as u16, t[2] as u16])
+                    .collect();
+                let opt = optimize_group_indices(&src, nv)?;
+                for (ti, tri) in opt.iter().enumerate() {
+                    let o = i_abs + (i_cur + ti * 3) * 2;
+                    put_u16(&mut buf, o, tri[0]);
+                    put_u16(&mut buf, o + 2, tri[1]);
+                    put_u16(&mut buf, o + 4, tri[2]);
+                }
+            } else {
+                for (ti, tri) in p.tris.iter().enumerate() {
+                    let o = i_abs + (i_cur + ti * 3) * 2;
+                    put_u16(&mut buf, o, tri[0] as u16);
+                    put_u16(&mut buf, o + 2, tri[1] as u16);
+                    put_u16(&mut buf, o + 4, tri[2] as u16);
+                }
+            }
+
+            // bone state change：`{hardwareID, newBoneID}`，`hardwareID` 恒为条目下标。
+            for (k, &gb) in pal.bsc.iter().enumerate() {
+                let q = bsc_abs + k * BONE_STATE_CHANGE_SIZE;
+                put_i32(&mut buf, q, k as i32);
+                put_i32(&mut buf, q + 4, gb);
+            }
+
+            v_cur += p.verts.len();
+            i_cur += p.tris.len() * 3;
         }
     }
 
@@ -2362,5 +2650,280 @@ switch_point = 30.0
             mr + MATERIAL_REPLACEMENT_LIST_SIZE,
             "单 LOD 的文件应在唯一的 materialReplacementList 之后结束"
         );
+    }
+
+    // ==== 拆 strip（`plan_strips`）====================================
+    //
+    // 官方约定见 [`StripPlan`]：同一 strip group 的顶点/索引数组被各 strip
+    // 按连续子区间瓜分，每条 strip 有自己的骨骼调色板且
+    // `numBoneStateChanges <= maxBonesPerStrip`（53）。
+    //
+    // 语料 3302/3302 个官方 `.dx90.vtx` 零违规
+    // （`vtx_multistrip.js --validate`），本工程曾因单 strip 写出 `nBSC = 55`
+    // 而进游戏崩溃 —— 下面这些测试守着这条不变量。
+
+    /// 造一个**骨骼数可控**的模型：`n` 根骨骼、`n` 个顶点，
+    /// 每个顶点独占一根骨骼，每个三角形吃掉 3 根**新**骨骼。
+    ///
+    /// 于是整组调色板 = `n` 根骨骼：`n > 53` 时必然要拆，`n <= 53` 时不该拆。
+    fn many_bones(n: usize) -> CompiledModelDesc {
+        assert!(n >= 6 && n.is_multiple_of(3), "骨骼数须是 ≥ 6 的 3 的倍数");
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mdlc-vtxwide-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        // SMD：链式骨架 + 每顶点独占一根骨骼。
+        let mut smd = String::from("version 1\nnodes\n  0 \"root\" -1\n");
+        for i in 1..n {
+            smd.push_str(&format!("  {i} \"b{i}\" {}\n", i - 1));
+        }
+        smd.push_str("end\nskeleton\n  time 0\n");
+        for i in 0..n {
+            // 每根骨骼沿 +X 排开，位移互不相同。
+            smd.push_str(&format!("    {i} {} 0 0 0 0 0\n", i as f32 * 2.0));
+        }
+        smd.push_str("end\ntriangles\nmyprop\n");
+        for t in 0..n / 3 {
+            for k in 0..3 {
+                let v = t * 3 + k;
+                // 12 token：`bone x y z nx ny nz u v links bone1 weight1`
+                smd.push_str(&format!("  {v} {} 0 0 0 0 1 0 0 1 {v} 1.0\n", v as f32));
+            }
+        }
+        smd.push_str("end\n");
+
+        std::fs::write(d.join("myprop-ref.smd"), &smd).unwrap();
+        let mut bones = String::from("[[bones]]\nname = \"root\"\n");
+        for i in 1..n {
+            let parent = if i == 1 {
+                "root".to_string()
+            } else {
+                format!("b{}", i - 1)
+            };
+            bones.push_str(&format!("\n[[bones]]\nname = \"b{i}\"\nparent = \"{parent}\"\n"));
+        }
+        let toml = format!(
+            r#"
+[model]
+name = "models/test/wide.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{{ name = "models/test/myprop" }}]
+
+{bones}
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "myprop-ref.smd"
+"#
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("多骨骼宽模型应能编译");
+        std::fs::remove_dir_all(&d).ok();
+        c
+    }
+
+    /// 一个 strip 的关键字段（拆 strip 的验证用）。
+    #[derive(Debug)]
+    struct StripView {
+        vert_off: usize,
+        num_verts: usize,
+        index_off: usize,
+        num_indices: usize,
+        n_bsc: usize,
+        max_hw: u8,
+        /// 该 strip 的索引值（**组内绝对**顶点下标）。
+        indices: Vec<u16>,
+    }
+
+    /// 读出 VTX 里每个 strip group 的 `(组顶点数, 组索引数, strips)`。
+    fn strip_groups(out: &VtxWriteOutcome) -> Vec<(usize, usize, Vec<StripView>)> {
+        let b = &out.bytes;
+        let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut groups = Vec::new();
+        let bp = g(0x20) as usize;
+        for i in 0..g(0x1c) as usize {
+            let bp_abs = bp + i * BODY_PART_SIZE;
+            let mo = bp_abs + g(bp_abs + 4) as usize;
+            for j in 0..g(bp_abs) as usize {
+                let mo_abs = mo + j * MODEL_SIZE;
+                let lo = mo_abs + g(mo_abs + 4) as usize;
+                for k in 0..g(mo_abs) as usize {
+                    let lo_abs = lo + k * MODEL_LOD_SIZE;
+                    let mh = lo_abs + g(lo_abs + 4) as usize;
+                    for m in 0..g(lo_abs) as usize {
+                        let mh_abs = mh + m * MESH_SIZE;
+                        let sg = mh_abs + g(mh_abs + 4) as usize;
+                        for s in 0..g(mh_abs) as usize {
+                            let sg_abs = sg + s * STRIP_GROUP_SIZE;
+                            let gv = g(sg_abs) as usize;
+                            let gi = g(sg_abs + 8) as usize;
+                            let vbase = sg_abs + g(sg_abs + 4) as usize;
+                            let ibase = sg_abs + g(sg_abs + 12) as usize;
+                            let st = sg_abs + g(sg_abs + 20) as usize;
+                            let mut strips = Vec::new();
+                            for t in 0..g(sg_abs + 16) as usize {
+                                let st_abs = st + t * STRIP_SIZE;
+                                let ni = g(st_abs) as usize;
+                                let i_off = g(st_abs + 4) as usize;
+                                let nv = g(st_abs + 8) as usize;
+                                let v_off = g(st_abs + 12) as usize;
+                                let indices: Vec<u16> = (0..ni)
+                                    .map(|q| {
+                                        let o = ibase + (i_off + q) * 2;
+                                        u16::from_le_bytes([b[o], b[o + 1]])
+                                    })
+                                    .collect();
+                                let max_hw = (0..nv)
+                                    .flat_map(|v| (0..3).map(move |k| v_off + v * VERTEX_SIZE + 6 + k))
+                                    .map(|o| b[vbase + o])
+                                    .max()
+                                    .unwrap_or(0);
+                                strips.push(StripView {
+                                    vert_off: v_off,
+                                    num_verts: nv,
+                                    index_off: i_off,
+                                    num_indices: ni,
+                                    n_bsc: g(st_abs + 19) as usize,
+                                    max_hw,
+                                    indices,
+                                });
+                            }
+                            groups.push((gv, gi, strips));
+                        }
+                    }
+                }
+            }
+        }
+        groups
+    }
+
+    /// 调色板 ≤ 53 时**不拆**：一条 strip、顶点/索引从 0 起、原序不变。
+    ///
+    /// 这是「不引入回归」的判据 —— 拆 strip 之前所有产物都是这个形状。
+    #[test]
+    fn palette_within_max_bones_stays_a_single_strip() {
+        let c = many_bones(30);
+        let out = write_vtx(&c).unwrap();
+        let groups = strip_groups(&out);
+        assert_eq!(groups.len(), 1, "夹具只有一个 mesh");
+        let (gv, gi, strips) = &groups[0];
+        assert_eq!(strips.len(), 1, "30 根骨骼 < 53，不该拆 strip");
+        let s = &strips[0];
+        assert_eq!(s.vert_off, 0, "单 strip 的顶点应从 0 起");
+        assert_eq!(s.index_off, 0, "单 strip 的索引应从 0 起");
+        assert_eq!(s.n_bsc, 30, "调色板 = 该 strip 用到的唯一骨骼数");
+        assert_eq!(s.num_verts, *gv, "单 strip 应覆盖整个组顶点数组");
+        assert_eq!(s.num_indices, *gi, "单 strip 应覆盖整个组索引数组");
+    }
+
+    /// `plan_strips` 在小调色板上必须**恒等**：一条 strip、顶点原序、索引原样。
+    #[test]
+    fn plan_strips_keeps_small_palettes_intact() {
+        let v: Vec<crate::model::Vertex> = (0..4)
+            .map(|i| crate::model::Vertex {
+                pos: [i as f32, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+                bones: vec![[i as f32, 1.0]],
+            })
+            .collect();
+        let refs: Vec<&crate::model::Vertex> = v.iter().collect();
+        let tris = vec![[0u32, 1, 2], [1, 2, 3]];
+        let plans = plan_strips(&refs, &tris, MAX_BONES_PER_STRIP);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].verts, vec![0, 1, 2, 3], "顶点必须保持原序");
+        assert_eq!(plans[0].tris, tris, "索引必须原样（含绕序）");
+        assert_eq!(plans[0].v_off, 0);
+        assert_eq!(plans[0].i_off, 0);
+    }
+
+    /// ⭐ 核心不变量：调色板超 53 根骨骼时**必须拆**，且每条都不越界。
+    ///
+    /// 语料 3302/3302 个官方 `.dx90.vtx` 全部满足；本工程曾因单 strip
+    /// 写出 `nBSC = 55`（`maxHw = 54`）而进游戏几秒后崩溃。
+    #[test]
+    fn oversized_palette_is_split_into_strips_within_max_bones() {
+        let c = many_bones(60);
+        let out = write_vtx(&c).unwrap();
+        let groups = strip_groups(&out);
+        assert_eq!(groups.len(), 1, "夹具只有一个 mesh");
+        let (gv, gi, strips) = &groups[0];
+        assert!(
+            strips.len() > 1,
+            "60 根骨骼应拆成多条 strip，实际只有 {} 条",
+            strips.len()
+        );
+
+        let mut v_cur = 0usize;
+        let mut i_cur = 0usize;
+        for (n, s) in strips.iter().enumerate() {
+            assert!(
+                s.n_bsc <= MAX_BONES_PER_STRIP,
+                "strip[{n}] 的 nBSC {} 超过头部声明的 {MAX_BONES_PER_STRIP}",
+                s.n_bsc
+            );
+            assert!(
+                (s.max_hw as usize) < MAX_BONES_PER_STRIP,
+                "strip[{n}] 的硬件槽位 {} 超过 {}",
+                s.max_hw,
+                MAX_BONES_PER_STRIP - 1
+            );
+            assert_eq!(s.vert_off, v_cur, "strip[{n}] 的顶点子区间必须首尾相接");
+            assert_eq!(s.index_off, i_cur, "strip[{n}] 的索引子区间必须首尾相接");
+            v_cur += s.num_verts;
+            i_cur += s.num_indices;
+        }
+        assert_eq!(v_cur, *gv, "各 strip 顶点数之和应等于组声明的顶点数");
+        assert_eq!(i_cur, *gi, "各 strip 索引数之和应等于组声明的索引数");
+    }
+
+    /// 索引值是**组内绝对**顶点下标，且必须落在**本 strip** 的顶点子区间内。
+    #[test]
+    fn strip_indices_stay_inside_their_own_subrange() {
+        let c = many_bones(60);
+        let out = write_vtx(&c).unwrap();
+        let (_, _, strips) = strip_groups(&out).pop().unwrap();
+        for (n, s) in strips.iter().enumerate() {
+            for &i in &s.indices {
+                let i = i as usize;
+                assert!(
+                    i >= s.vert_off && i < s.vert_off + s.num_verts,
+                    "strip[{n}] 的索引 {i} 不在自己的顶点子区间 [{}, {}) 内",
+                    s.vert_off,
+                    s.vert_off + s.num_verts
+                );
+            }
+        }
+    }
+
+    /// 每个三角形的三个顶点必须落在**同一条** strip 里 —— 否则该三角形
+    /// 跨了 draw call，渲染时半边缺失。
+    #[test]
+    fn every_triangle_lives_in_one_strip() {
+        let c = many_bones(60);
+        let out = write_vtx(&c).unwrap();
+        let (_, _, strips) = strip_groups(&out).pop().unwrap();
+        let owner = |i: u16| {
+            strips
+                .iter()
+                .position(|x| (i as usize) >= x.vert_off && (i as usize) < x.vert_off + x.num_verts)
+                .expect("索引应落在某条 strip 的顶点子区间内")
+        };
+        for (n, s) in strips.iter().enumerate() {
+            assert_eq!(s.num_indices % 3, 0, "TRILIST 的索引数应是 3 的倍数");
+            for t in s.indices.as_chunks::<3>().0 {
+                assert!(
+                    t.iter().all(|&i| owner(i) == n),
+                    "strip[{n}] 里的三角形 {t:?} 跨越了多条 strip"
+                );
+            }
+        }
     }
 }
