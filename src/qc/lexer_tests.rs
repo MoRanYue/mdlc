@@ -225,6 +225,81 @@ fn variable_is_not_expanded_inside_quotes() {
     );
 }
 
+/// **行为 4b（mdlc 的故意差异）：`$definevariable` 重复定义 ⟹ 覆盖。**
+///
+/// ⚠️ 官方**不是**这样：`g_definevariable.AddToTail( v )`
+/// （L4D2 `scriplib.cpp:211`）是**追加**，查找 `:361-370` 取**第一个**命中
+/// ⟹ **先到先得**。真 studiomdl 裁决
+/// （`docs/_probe/oracle_definevariable.js` 变体 B）：
+/// `$definevariable Name first` + `$definevariable Name second`
+/// ⟹ 产出 **`first.mdl`**。
+///
+/// mdlc 按用户要求实现**覆盖**语义（NekoMDL 生态靠它表达
+/// `$redefinevariable` 的意图，而官方**没有**那个命令 —— exe 串扫描 0 命中，
+/// 官方对它报 `bad command $redefinevariable`）。
+#[test]
+fn definevariable_overrides_an_existing_variable() {
+    // 官方会是 `first`；mdlc 取最后一次定义 `second`。
+    let toks = all("$definevariable Name first\n$definevariable Name second\n$contents $Name$\n");
+    assert_eq!(
+        toks,
+        vec!["$contents", "second"],
+        "mdlc 的 `$definevariable` 必须覆盖同名变量（官方是先到先得，这是**故意差异**）"
+    );
+
+    // 单次定义仍然正常。
+    let toks = all("$definevariable Name only\n$contents $Name$\n");
+    assert_eq!(toks, vec!["$contents", "only"], "单次定义不受影响");
+}
+
+/// **行为 4c：覆盖是大小写不敏感的。**
+///
+/// 官方查找用 `Q_strnicmp`（`scriplib.cpp:363`），本来就不区分大小写；
+/// 覆盖的「同名」判定必须与之一致，否则 `Scale` / `SCALE` 会变成两个变量。
+#[test]
+fn definevariable_override_is_case_insensitive() {
+    let toks = all("$definevariable Scale 0.9\n$definevariable SCALE 0.5\n$contents $scale$\n");
+    assert_eq!(
+        toks,
+        vec!["$contents", "0.5"],
+        "`Scale` 与 `SCALE` 是同一个变量 ⟹ 覆盖生效"
+    );
+}
+
+/// **行为 4d：覆盖必须**原地**替换，不能「删掉再追加」。**
+///
+/// ⚠️ 这是覆盖语义里唯一的实现陷阱。查找是按 `len - 2` 个字符的
+/// **前缀**比较（上游 bug，见 [`variable_match_compares_only_len_minus_2_chars`]），
+/// 命中顺序由**下标**决定：`len < 2` 的引用（如 `$b$`，n = 0）
+/// **总是命中下标 0 的那个变量**。
+///
+/// 若把覆盖实现成「remove + push_back」，被覆盖的变量会被挪到尾部，
+/// 于是 `$b$` 会改命中原本排第二的变量 ⟹ **静默改变产物**。
+#[test]
+fn definevariable_override_keeps_the_original_index() {
+    // `alpha` 在下标 0、`beta` 在下标 1。
+    // `$b$` 的名字长 1 ⟹ n = 0 ⟹ 不比较任何字符 ⟹ 命中下标 0 的 `alpha`。
+    let toks = all("$definevariable alpha AAA\n$definevariable beta BBB\n$contents $b$\n");
+    assert_eq!(
+        toks,
+        vec!["$contents", "AAA"],
+        "n = 0 的引用应命中下标 0 的变量（`alpha`）"
+    );
+
+    // 覆盖 `alpha`：值变了，但**下标必须仍是 0** ⟹ `$b$` 仍命中它。
+    // 「remove + push_back」会让 `beta` 顶到下标 0 ⟹ 这里会拿到 `BBB`。
+    let toks = all(
+        "$definevariable alpha AAA\n$definevariable beta BBB\n\
+         $definevariable alpha CCC\n$contents $b$\n",
+    );
+    assert_eq!(
+        toks,
+        vec!["$contents", "CCC"],
+        "覆盖后 `alpha` 必须仍在下标 0 ⟹ `$b$` 拿到覆盖后的新值；\
+         若拿到 `BBB` 说明实现成了 remove + push_back"
+    );
+}
+
 /// **行为 5：`\\`（两个反斜杠）不是通用续行符。**
 ///
 /// 它只被 `Option_Flexrule` 识别（`studiomdl.cpp:3936`）。

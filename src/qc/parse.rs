@@ -391,10 +391,18 @@ impl<'a> Parser<'a> {
             "$weightlist" => self.cmd_weightlist(),
             "$defaultweightlist" => self.cmd_defaultweightlist(),
             "$declaresequence" => self.cmd_declaresequence(),
-            "$definevariable" | "$redefinevariable" => {
+            "$definevariable" => {
                 // 词法层已消费（`scriplib.cpp` 在 `GetToken` 内部处理）。
                 // 走到这里说明它作为**普通 token** 出现了 —— 官方也一样
                 // （`GetToken` 只在词法阶段拦截；这里不会到达）。
+                //
+                // ⚠️ **故意不支持 `$redefinevariable`**：它是 NekoMDL 扩展，
+                // 官方没有（exe 串扫描 0 命中），且官方对它报
+                // `bad command $redefinevariable`
+                // （`docs/_probe/oracle_redefinevariable.js`）。它落到下面的
+                // `other` 分支报错，与官方一致；而它想表达的需求已由
+                // `$definevariable` 的**覆盖语义**满足
+                // （见 `crate::qc::lexer::Lexer::define_variable`）。
                 Ok(())
             }
             // ---- 已知但**故意不支持**的命令（见各分支注释）----
@@ -4601,6 +4609,90 @@ $sequence \"idle\" \"a.smd\" fps 30
         assert!(
             errs.iter().any(|e| e.message.contains("left_constraint")),
             "实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`$redefinevariable` 必须被拒（mdlc 的故意差异，但报错文案与官方一致）。**
+    ///
+    /// ⚠️ 它是 **NekoMDL 扩展**，官方**没有**这个命令：
+    /// - 官方 exe 串扫描 `redefinevariable` **0 命中**（`docs/_probe/str_scan.js`）；
+    /// - 真 studiomdl 裁决（`docs/_probe/oracle_redefinevariable.js`）报
+    ///   `ERROR: main.qc(2): - bad command $redefinevariable`。
+    ///
+    /// 用户明确要求「不要支持 `$redefinevariable`，只需让 `$definevariable`
+    /// 也能覆盖已经定义的变量即可」⟹ mdlc 也报「未知的 QC 命令」，
+    /// 而它想表达的**覆盖**意图由 [`crate::qc::lexer::Lexer::define_variable`]
+    /// 的覆盖语义满足。
+    ///
+    /// ⚠️ 反向判据：若有人把 `$redefinevariable` 加回命令表（历史形态是
+    /// `"$definevariable" | "$redefinevariable" => { Ok(()) }`），这条测试
+    /// 会立刻失败 —— 那种写法只吃掉命令名、**把值留在流里**，
+    /// 于是值（如 `.922246`）会被当成下一条命令 ⟹
+    /// `未知的 QC 命令 "scale"`（这正是 `incap_anim_fix` 最初的报错）。
+    #[test]
+    fn redefinevariable_is_rejected_like_official() {
+        let dir = fixture("redefinevar");
+        let qc = "\
+$modelname \"t.mdl\"
+$definevariable scale .922246
+$redefinevariable scale .922246
+$body body \"a.smd\"
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir)
+            .expect_err("`$redefinevariable` 是 NekoMDL 扩展，官方报 bad command ⟹ mdlc 也必须拒");
+        assert!(
+            errs.iter().any(|e| e.message.contains("redefinevariable")),
+            "报错应点名 `$redefinevariable`，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`$definevariable` 的覆盖语义要能被 QC 解析层看到。**
+    ///
+    /// 词法层测试（`qc::lexer::tests::definevariable_overrides_an_existing_variable`）
+    /// 已钉住覆盖本身；这里钉的是**跨 `$include` 的场景**（用户工程
+    /// `incap_anim_fix` 的真实形态：主 QC `:13` 先定义，`:18` 的
+    /// `$include` 里再定义一次）—— 变量表是**全局**的
+    /// （`scriplib.cpp:49-53` 的 `g_definevariable`），覆盖也必须跨文件生效。
+    ///
+    /// 真 studiomdl 裁决（`docs/_probe/oracle_definevariable.js`）：
+    /// - 变体 D `$include` 里定义、主文件用 ⟹ `fromsub.mdl`（**跨 include 可见**）
+    /// - 变体 F 主文件定义、`$include` 里使用 ⟹ `frommain.mdl`（**跨 include 可见**）
+    /// - 变体 E 主文件先定义、`$include` 里再定义 ⟹ `frommain.mdl`
+    ///   （官方**不覆盖** —— mdlc 这里是故意差异）
+    #[test]
+    fn definevariable_override_crosses_include() {
+        let dir = fixture("var_include");
+        std::fs::write(
+            dir.join("sub.qci"),
+            "$definevariable Name overridden\n$surfaceprop \"metal\"\n",
+        )
+        .expect("应能写 qci");
+        // ⚠️ 顺序必须与用户工程一致：`anim_fix.qc` 是
+        // `:1 $definevariable Name` → `:13 $definevariable scale` →
+        // `:18 $include` → `:24 $modelname survivors/anim_$Name$.mdl`
+        // ⟹ **先定义、再 include（覆盖）、最后才展开**。
+        //
+        // ⚠️ `$modelname` 必须用**裸 token**：变量只在裸 token 里展开，
+        // 引号里不展开（`qc::lexer::tests::variable_is_not_expanded_inside_quotes`）。
+        //
+        // `$Dir$` 由**主 QC** 定义、`sub.qci` 不再定义 —— 它钉住「变量表
+        // 跨 `$include` **保留**」这另一半（只测覆盖的话，一个
+        // 「`push_include` 时清空变量表」的实现也能骗过测试：清空后
+        // `sub.qci` 的 `Name overridden` 照样生效，产物名不变）。
+        let qc = "\
+$definevariable Dir var
+$definevariable Name original
+$include sub.qci
+$modelname models/$Dir$/$Name$.mdl
+$body body \"a.smd\"
+";
+        let d = parse(qc, &dir);
+        assert_eq!(
+            d.model.name, "models/var/overridden.mdl",
+            "`$include` 里的再定义必须覆盖主 QC 的定义（变量表是全局的），\
+             且主 QC 定义的其它变量必须**跨 include 保留**"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

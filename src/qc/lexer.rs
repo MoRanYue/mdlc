@@ -575,11 +575,41 @@ impl Lexer {
     }
 
     /// `DefineVariable`（L4D2 `scriplib.cpp:201`）。
+    ///
+    /// ⚠️ **这里故意偏离官方**：官方是
+    /// `g_definevariable.AddToTail( v )`（`scriplib.cpp:211`）—— **追加**，
+    /// 而查找是 `for (…) if (Q_strnicmp(…) == 0) break;`（`:361-370`）
+    /// —— 取**第一个**命中 ⟹ **「先到先得」，重复定义不覆盖**。
+    /// 真 studiomdl 裁决（`docs/_probe/oracle_definevariable.js` 变体 B）：
+    /// `$definevariable Name first` + `$definevariable Name second`
+    /// ⟹ 产出 `first.mdl`。
+    ///
+    /// 但 NekoMDL 生态把变量当「可重定义」用，并为此发明了扩展命令
+    /// `$redefinevariable` —— 官方**没有**该命令（exe 串扫描 0 命中，
+    /// 且官方对它报 `bad command $redefinevariable`，见
+    /// `docs/_probe/oracle_redefinevariable.js`）。
+    /// 用户明确要求：「不要支持 `$redefinevariable`，只需让
+    /// `$definevariable` 也能覆盖已经定义的变量即可」⟹ 此处按**覆盖**语义
+    /// 实现：同名（大小写不敏感）则**原地替换值**。
+    ///
+    /// ⚠️ 必须是**原地**替换，不能「删掉再追加」：查找是按 `len - 2` 个字符
+    /// 的**前缀**比较（上游 bug，见 [`super`] 的说明），下标决定谁先命中。
+    /// 例：`scale`(0) + `sca`(1) 时 `$sca$` 只比 1 个字符 `s` ⟹ 命中 `scale`；
+    /// 若把 `scale` 移到尾部，`$sca$` 就会改命中 `sca` ⟹ **静默改变产物**。
+    ///
+    /// 影响面：parity 语料 901 个 QC + 用户工程 14 个 QC 里同名重复定义
+    /// **0 处**（`docs/_probe/dup_vars.js`）⟹ 对既有产物零影响。
     fn define_variable(&mut self, name: &Token) -> Result<(), QcError> {
         let value = self.expect_token(false)?;
-        // 官方是 `AddToTail` —— **重复定义会追加**，查找取**第一个**命中。
-        // 实测 `anims_fix.qci` 先 `$redefinevariable scale` 再
-        // `$definevariable ...`，所以「先到先得」还是「后到先得」有区别。
+        let key = name.text.to_ascii_lowercase();
+        if let Some(v) = self
+            .variables
+            .iter_mut()
+            .find(|v| v.param.to_ascii_lowercase() == key)
+        {
+            v.value = value.text;
+            return Ok(());
+        }
         self.variables.push(Variable {
             param: name.text.clone(),
             value: value.text,
