@@ -72,6 +72,40 @@ const FLAG_MOSTLY_OPAQUE: i32 = 1 << 3;
 /// 头文件的值在这里先按「够用」处理，标注为未实测。
 const MAX_SEQUENCES: usize = 1524;
 
+/// 官方 `MAXSTUDIOCMDS`（`studiomdl.h:37`）—— 一张命令列表最多几条，
+/// 也是**一个动画**最多能挂几条（`ParseAnimationToken` 的 `cmdlist`
+/// 分支在拷贝时逐条检查，超了报 `Too many cmds in %s`）。
+const MAX_CMDS: usize = 64;
+
+/// `lookupControl`（`studiomdl.cpp:395-415`）。
+///
+/// 接受的 token（大小写不敏感）与位值：
+/// `X`=0x1 `Y`=0x2 `Z`=0x4 `XR`=0x8 `YR`=0x10 `ZR`=0x20
+/// `LX`=0x40 `LY`=0x80 `LZ`=0x100 `LXR`=0x200 `LYR`=0x400 `LZR`=0x800
+/// `LM`=0x1000（`STUDIO_LINEAR`）`LQ`=0x2000（`STUDIO_QUADRATIC_MOTION`）。
+///
+/// ⚠️ **没有 `RX`/`RY`/`RZ`** —— 官方表里只有 `XR`/`YR`/`ZR`。
+/// 认不出返回 `None`（官方返回 `-1`），调用方据此停止吃 token。
+fn lookup_control(text: &str) -> Option<i32> {
+    Some(match text.to_ascii_lowercase().as_str() {
+        "x" => 0x0001,
+        "y" => 0x0002,
+        "z" => 0x0004,
+        "xr" => 0x0008,
+        "yr" => 0x0010,
+        "zr" => 0x0020,
+        "lx" => 0x0040,
+        "ly" => 0x0080,
+        "lz" => 0x0100,
+        "lxr" => 0x0200,
+        "lyr" => 0x0400,
+        "lzr" => 0x0800,
+        "lm" => 0x1000,
+        "lq" => 0x2000,
+        _ => return None,
+    })
+}
+
 /// QC 解析器。
 pub struct Parser<'a> {
     /// 词法器。
@@ -122,6 +156,13 @@ pub struct Parser<'a> {
     /// 动画源 / `$lod` 的 `replacemodel` / `$collisionmodel` 的顶点权重一概不算
     /// （它们的 `isActiveModel` 都是默认的 `false`，见 `studiomdl.h:1127`）。
     mesh_sources: HashSet<String>,
+    /// 合成附着点（`$illumposition x y z <骨骼>`）在 QC 里的**源位置**。
+    ///
+    /// 按 push 顺序与 `desc.attachments` 里的 `synthetic` 项一一对应。
+    /// 存在的唯一理由：那条命令的骨骼是否有效**只能等到 `finish()`**
+    /// 才判定（要先读遍所有 SMD 的 `nodes`），而 `Attachment` 本身不带
+    /// 位置信息 —— 没有它，错误只能报在「主 QC 第 0 行」。
+    synthetic_att_locs: Vec<(String, usize)>,
     /// 解析出的错误（累积，最后一起报）。
     errors: Vec<QcError>,
     /// `$bonemerge` 的骨骼名（骨骼表建好后回填）。
@@ -177,6 +218,7 @@ impl<'a> Parser<'a> {
                     surface_prop: None,
                     eye_position: None,
                     illum_position: None,
+                    illum_position_from_bone: false,
                     max_eye_deflection: None,
                     hull_min: None,
                     hull_max: None,
@@ -213,6 +255,7 @@ impl<'a> Parser<'a> {
                 quat_interp_bones: Vec::new(),
                 include_models: Vec::new(),
                 weight_lists: Vec::new(),
+                cmd_lists: Vec::new(),
             },
             import_bones: Vec::new(),
             cddir: vec![String::new()],
@@ -230,6 +273,7 @@ impl<'a> Parser<'a> {
             weightlists: Vec::new(),
             referenced_files: Vec::new(),
             mesh_sources: HashSet::new(),
+            synthetic_att_locs: Vec::new(),
             errors: Vec::new(),
             bonemerge_names: Vec::new(),
             unlock_define_bones: false,
@@ -322,6 +366,38 @@ impl<'a> Parser<'a> {
             "$illumposition" => {
                 let v = self.v3()?;
                 self.desc.model.illum_position = Some(v);
+                // 可选的**第 4 个 token**（必须同一行）是骨骼名 —— 官方
+                // `Cmd_Illumposition` 的 `GetToken(false)`。三处已由真 exe 钉死：
+                //
+                // ① 它让官方新建一个名为 `__illumPosition` 的**合成附着点**
+                //    （绑该骨骼、零旋转、平移 = 这三个坐标、`type` 带 `IS_RIGID`），
+                //    并让 `studiohdr2.illumpositionattachmentindex`（`+0x08`）指向它
+                //    （**1 起**下标）—— `oracle_illumposition3/4.js`；
+                // ② 此时 `illumposition`（`0x5C`）落盘**原样 `[x,y,z]`、不做轴变换**，
+                //    而 3 参数形式落盘 `[-y,x,z]` —— `oracle_illumposition6.js`；
+                // ③ 不判 `$`：`$illumposition 0 0 0 $attachment ...` 会把
+                //    `$attachment` 当骨骼名吃掉 —— `oracle_illumposition9.js`。
+                if self.avail() {
+                    let bone = self.tok(false)?.text;
+                    self.desc.model.illum_position_from_bone = true;
+                    self.synthetic_att_locs.push((t.file.clone(), t.line));
+                    self.desc.attachments.push(Attachment {
+                        name: "__illumPosition".to_string(),
+                        bone,
+                        position: Some(v),
+                        rotation: None,
+                        absolute: false,
+                        absolute_rotation: None,
+                        // 保活语义 = `rigid`（`oracle_illumposition10.js` 证实
+                        // 合成附着点与 `rigid` 附着点对骨骼表的效应逐字节一致）。
+                        rigid: true,
+                        flags: Some(0),
+                        synthetic: true,
+                        // 由 `finish()` 的「2b」段在骨骼表建好之后回填 ——
+                        // 那时才知道它绑的骨骼有没有被收骨判据丢掉。
+                        resolved: None,
+                    });
+                }
                 Ok(())
             }
             "$maxeyedeflection" => {
@@ -391,6 +467,8 @@ impl<'a> Parser<'a> {
             "$weightlist" => self.cmd_weightlist(),
             "$defaultweightlist" => self.cmd_defaultweightlist(),
             "$declaresequence" => self.cmd_declaresequence(),
+            "$cmdlist" => self.cmd_cmdlist(),
+            "$continue" => self.cmd_continue(),
             "$definevariable" => {
                 // 词法层已消费（`scriplib.cpp` 在 `GetToken` 内部处理）。
                 // 走到这里说明它作为**普通 token** 出现了 —— 官方也一样
@@ -1372,6 +1450,10 @@ impl<'a> Parser<'a> {
             forward_declared: true,
             no_auto_ik: false,
             ik_rules: Vec::new(),
+            cmds: Vec::new(),
+            scale: None,
+            adjust: None,
+            rotation: None,
             iklocks: Vec::new(),
             blends: Vec::new(),
             blend_width: None,
@@ -1418,6 +1500,10 @@ impl<'a> Parser<'a> {
             forward_declared: false,
             no_auto_ik: false,
             ik_rules: Vec::new(),
+            cmds: Vec::new(),
+            scale: None,
+            adjust: None,
+            rotation: None,
             iklocks: Vec::new(),
             blends: Vec::new(),
             blend_width: None,
@@ -1436,9 +1522,71 @@ impl<'a> Parser<'a> {
             num_frames: None,
         };
 
+        self.parse_sequence_body(&mut seq, &name_t, false)?;
+        self.desc.sequences.push(seq);
+        Ok(())
+    }
+
+    /// `ParseSequence` 的**主体**（`studiomdl.cpp:2650-2999`）——
+    /// `$sequence` 块与 `$continue <序列名>` 共用。
+    ///
+    /// `is_append` 对应官方的同名形参。`$continue` 命中序列池时官方调
+    /// `ParseSequence( pseq, true )`（`studiomdl.cpp:3175`），与
+    /// `$sequence` 的差别**只有三处**：
+    ///
+    /// 1. `:2944` 的动画级门是 `(numblends || isAppend)` —— append 时
+    ///    **无条件**先试 `ParseAnimationToken( animations[0] )`（mdlc 本来
+    ///    就无条件先试，见 `_ =>` 兜底）；
+    /// 2. `:2948-2972` 的「查 `$animation` 池 / `Cmd_ImpliedAnimation`」
+    ///    分支被 `!isAppend` 挡住，落到 `:2973` 的
+    ///    `TokenError( "unknown command \"%s\"\n" )`；
+    /// 3. `:2984 if (isAppend) return 0;` —— 直接返回，**不做**
+    ///    `no animations found` 检查，也不推导 `groupsize`。
+    ///
+    /// ⚠️ 官方 `ParseAnimation` 的 `isAppend` 形参（`:2442`）**完全没用**：
+    /// 函数体只有那个 `while (1)` 循环，不认识就
+    /// `Unknown animation option'%s'`。所以 `$continue <动画名>` 与
+    /// `$animation` 体是同一套解析，mdlc 的 `cmd_continue` 动画路径照抄。
+    ///
+    /// ⚠️ 提取这个函数的原因：修复前 `cmd_continue` 的序列路径**只**调
+    /// `parse_animation_token`，于是 `ACT_*`/`fps`/`fadein`/`fadeout`/
+    /// `addlayer`/`hidden`/`numframes`/`ikrule` 这些**序列级**选项全部报
+    /// `未知的命令`。实测 `anims_fix.qci:212`
+    /// `$DebiddoChargerLoop Idle_Fall_From_Charger ACT_TERROR_IDLE_FALL_FROM_CHARGERHIT -1`
+    /// 就死在这里。
+    fn parse_sequence_body(
+        &mut self,
+        seq: &mut Sequence,
+        name_t: &Token,
+        is_append: bool,
+    ) -> Result<(), QcError> {
+        let name = seq.name.clone();
         let mut depth = 0i32;
         // 本序列引用的动画名（blend 网格，行主序）。
         let mut blend_names: Vec<String> = Vec::new();
+        // 兜底委派 `ParseAnimationToken` 时的落点（官方落在
+        // `pseq->panim[0][0]` 上；mdlc 解析期还不知道第一格是哪个动画，
+        // 所以先记在 `holder` 里，块尾并回 `seq`）。
+        let mut holder = Animation {
+            name: name.clone(),
+            smd: String::new(),
+            fps: None,
+            looping: false,
+            frames: None,
+            subtract: None,
+            subtract_frame: None,
+            ik_rules: Vec::new(),
+            no_auto_ik: false,
+            weight_list: None,
+            cmds: Vec::new(),
+            // ⚠️ 从 `seq` **播种**（而不是 `None`）：`$continue <序列名>`
+            // 是「在已有序列上追加」，官方 `panim->scale` 会保留到被显式
+            // 覆写为止。`$sequence` 走到这里时 `seq.scale` 必为 `None`
+            // （上面那个字面量），所以对 `$sequence` 是无操作。
+            scale: seq.scale,
+            adjust: seq.adjust,
+            rotation: seq.rotation,
+        };
         loop {
             let t = if depth > 0 {
                 match self.lex.next_token(true)? {
@@ -1764,6 +1912,44 @@ impl<'a> Parser<'a> {
                     };
                 }
                 _ => {
+                    // ⭐ 官方 `ParseSequence` 的**三段**尾部分派
+                    // （`studiomdl.cpp:2944-2976`）：
+                    //
+                    // ```c
+                    // else if ((numblends || isAppend) && ParseAnimationToken( animations[0] )) { }
+                    // else if (!isAppend) { /* 查 $animation 池，否则 Cmd_ImpliedAnimation */ }
+                    // else { TokenError( "unknown command \"%s\"\n", token ); }
+                    // ```
+                    //
+                    // ⚠️ **修复前这里漏掉了整段 `ParseAnimationToken` 委派**，
+                    // 于是 `frame`（单数）/`origin`/`rotate`/`angles`/`scale`/
+                    // `fixuploop`/`noanimation`/`align`/`alignto`/`walkframe`/
+                    // `walkalignto`/`cmdlist` 以及运动控制位 `X Y Z LX LY`
+                    // **全部静默漏进 `blend_names`**，变成假 blend 格
+                    // （实测 `anims_fix.qci:165` 的 `align Death X Y 100 0`
+                    // 产生 6 个假格 ⟹ `compile.rs` 报「blend 格数 6 不是
+                    // 完全平方数」）。
+                    //
+                    // 官方那个 `(numblends || isAppend)` 门在 mdlc 里没法
+                    // 照抄（`blend_names` 此刻可能还空着，但**第一格动画**
+                    // 尚未确定）。这里选择**无条件先试**：动画级选项不认识
+                    // 就返回 `Ok(false)`，此时才退回下面的回退逻辑。
+                    if self.parse_animation_token(&mut holder, &t)? {
+                        // 认出了 —— 选项已写进 `holder`（`$sequence` 级的
+                        // `scale`/`adjust`/`rotation`/`cmds` 在块尾并回 `seq`）。
+                        continue;
+                    }
+                    if is_append {
+                        // 官方 `studiomdl.cpp:2973-2976`：
+                        // `else { TokenError( "unknown command \"%s\"\n", token ); }`
+                        // —— `$continue` 的序列路径**不**做「查 `$animation`
+                        // 池 / 建隐含动画」那一步（它被 `!isAppend` 挡住了）。
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("未知的命令 {:?}（官方是 unknown command {:?}）", t.text, t.text),
+                        ));
+                    }
                     if t.text.ends_with(".smd") || t.text.ends_with(".SMD") {
                         if blend_names.is_empty() && seq.smd.is_empty() {
                             seq.smd = self.resolve_src(&t.text);
@@ -1771,12 +1957,67 @@ impl<'a> Parser<'a> {
                         } else {
                             blend_names.push(t.text.clone());
                         }
-                    } else {
-                        // 假定是动画名（官方先查 `$animation` 池，查不到建隐含动画）。
+                    } else if self
+                        .animation_names
+                        .contains(t.text.to_ascii_lowercase().as_str())
+                    {
+                        // 官方 `studiomdl.cpp:2952-2959`：**先按名查 `g_panimation`
+                        // 池**，命中就原样引用那条动画（名字是**动画名**，不是路径）。
                         blend_names.push(t.text.clone());
+                    } else {
+                        // 池里没有 ⟹ 建**隐含动画**（`Cmd_ImpliedAnimation`，
+                        // `studiomdl.cpp:2506-2547`），它调
+                        // `Load_Source( panim->filename, "" )` —— 而 `Load_Source`
+                        // 是用 `cddir[numdirs]` 拼路径的（`%s%s.smd`，
+                        // `studiomdl.cpp:1603-1638`），即 **`$pushd` 的前缀是官方
+                        // 自动加的**。
+                        //
+                        // ⚠️ 早先这里原样 push 裸名，于是 `$pushd anims` 之下的
+                        // 隐含动画全被当成「工程根目录下的文件」—— 实测用户工程
+                        // `incap_anim_fix` 报 22 条
+                        // `sequences[N].smd: 读不到 .\NamVet_*.smd`。
+                        // 解析出的名字**不带扩展名**，由编译期的
+                        // [`crate::compile::resolve_smd_path`] 补 `.smd`
+                        // （官方同一条 `Load_Source` 试探链）。
+                        blend_names.push(self.resolve_src(&t.text));
                     }
                 }
             }
+        }
+
+        // 兜底委派的成果并回序列（官方直接写在 `pseq->panim[0][0]` 上；
+        // mdlc 记在 `holder` 里，编译期由 `compile.rs` 挂到第一格 ——
+        // 与 `ik_rules` 同一套路）。
+        //
+        // 只有走 `_ =>` 兜底的关键字才可能落在 `holder` 上：`fps`/`loop`/
+        // `delta`/`subtract`/`numframes`/`weightlist`/`ikrule`/标志位都被
+        // 上面的专有 arm 提前接住了。所以实际会并的只有
+        // `scale`/`adjust`/`rotation`/`cmds` 与 `fudgeloop`/`startloop`。
+        if holder.looping {
+            seq.looping = true;
+        }
+        seq.cmds.extend(holder.cmds);
+        // ⚠️ **无条件赋值**（不是 `if seq.scale.is_none()`）：`holder` 是从
+        // `seq` **播种**的（见上面 `holder` 字面量），所以未改动时两者相等、
+        // 赋值是无操作；而 `$continue` 在已有序列上追加 `scale 0.5` 时，
+        // `seq.scale` 早已是 `Some(旧值)`，条件赋值会把新值丢掉。
+        seq.scale = holder.scale;
+        seq.adjust = holder.adjust;
+        seq.rotation = holder.rotation;
+        // ⚠️ `holder.frames`（`frame a b` 选帧区间）**故意不并**：
+        // `Sequence::num_frames` 的语义是 `CMD_NUMFRAMES`（强制帧数、
+        // 靠复制末帧补齐，见 `compile.rs` 的 `numframes` 处理），
+        // 与「从源 SMD 里选 `a..=b` 帧」不是一回事。mdlc 的 `Sequence`
+        // 没有选帧区间的字段；`$animation` 侧由 `Animation::frames`
+        // 承担（`compile.rs` 的 `if let Some([lo, hi]) = a.frames`）。
+        // `holder.fps`/`delta`/`no_auto_ik`/`weight_list`/`subtract`/
+        // `ik_rules` 同理 —— 它们都有专有 arm 提前接住，永远到不了这里。
+
+        // 官方 `studiomdl.cpp:2984 if (isAppend) return 0;` —— `$continue`
+        // 的序列路径到这里就结束：**不做** `no animations found` 检查，
+        // 也不推导 `groupsize`（那是新序列才需要的）。
+        if is_append {
+            return Ok(());
         }
 
         if blend_names.is_empty() {
@@ -1810,7 +2051,8 @@ impl<'a> Parser<'a> {
             }
             seq.blends = blend_names;
         }
-        self.desc.sequences.push(seq);
+        // ⚠️ **不 push** —— 调用方负责（`$sequence` 新建后 push，
+        // `$continue` 则写回 `self.desc.sequences[si]`）。
         Ok(())
     }
 
@@ -1956,6 +2198,10 @@ impl<'a> Parser<'a> {
             ik_rules: Vec::new(),
             no_auto_ik: false,
             weight_list: None,
+            cmds: Vec::new(),
+            scale: None,
+            adjust: None,
+            rotation: None,
         };
         let mut depth = 0i32;
         loop {
@@ -1981,32 +2227,72 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            self.parse_animation_token(&mut anim, &t)?;
+            if !self.parse_animation_token(&mut anim, &t)? {
+                // 官方 `ParseAnimation` 的 `:2489`：
+                // `TokenError( "Unknown animation option'%s'\n", token );`
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!(
+                        "未知的动画选项 {:?}（官方是 Unknown animation option'{:?}'）",
+                        t.text, t.text
+                    ),
+                ));
+            }
         }
         self.desc.animations.push(anim);
         Ok(())
     }
 
-    /// `ParseAnimationToken`（`studiomdl.cpp:2185`）。
-    fn parse_animation_token(&mut self, anim: &mut Animation, t: &Token) -> Result<(), QcError> {
+    /// `ParseAnimationToken`（`studiomdl.cpp:2157-2308`）。
+    ///
+    /// 返回 `Ok(true)` = 认出了并消费了 `t`；`Ok(false)` = 不认识
+    /// （官方 `return false`）。**调用方决定**不认识时是报错还是继续：
+    /// `$animation` 体报 `Unknown animation option '%s'`，`$sequence`
+    /// 兜底则退化成「动画名」。
+    ///
+    /// # ⚠️ 分支顺序即语义
+    ///
+    /// 官方是一条 `if/else if` 长链，顺序不能动。mdlc 有两处**故意的**
+    /// 偏离，都是把官方走 `ParseCmdlistToken` 的关键字**提前**用专有字段
+    /// 接住 —— 否则编译期消费端（`compile.rs` 的 subtract 循环 /
+    /// `resolve_weight_lists` / `ik_rules` 挂第一格）会收不到：
+    ///
+    /// | 关键字 | 官方落点 | mdlc 落点 |
+    /// |---|---|---|
+    /// | `subtract` | `AnimCmd::Subtract` | `anim.subtract` + `subtract_frame` |
+    /// | `weightlist` | `AnimCmd::Weights` | `anim.weight_list` |
+    /// | `ikrule` | `AnimCmd::IkRule` | `anim.ik_rules` |
+    ///
+    /// 其余关键字（`fixuploop`/`alignto`/`align`/`walkframe`/…）走
+    /// [`Self::parse_cmdlist_token`] 委派，与官方 `:2273` 一致。
+    fn parse_animation_token(&mut self, anim: &mut Animation, t: &Token) -> Result<bool, QcError> {
         match t.text.to_ascii_lowercase().as_str() {
             "fps" => anim.fps = Some(self.f()?),
-            "origin" => {
-                let _ = self.v3()?;
+            // 官方 `panim->adjust.x/.y/.z`（`studiomdl.cpp:2193-2203`）。
+            "origin" => anim.adjust = Some(self.v3()?),
+            // 官方只写 `rotation.z`（`:2204-2209`），x/y 保持**默认 0**；
+            // 而 `panim->rotation` 的初值是 `g_defaultrotation =
+            // RadianEuler(0, 0, π/2)`（`:6883`）—— 所以「只给 rotate」
+            // 时 z 从 `DEG2RAD(90)` 起算，`rotate 0` 恰好还原默认值。
+            "rotate" => {
+                let v = self.f()?;
+                let mut r = anim
+                    .rotation
+                    .unwrap_or([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+                r[2] = (v + 90.0).to_radians();
+                anim.rotation = Some(r);
             }
-            "rotate" | "angles" => {
-                let n = if t.text.eq_ignore_ascii_case("rotate") {
-                    1
-                } else {
-                    3
-                };
-                for _ in 0..n {
-                    let _ = self.f()?;
-                }
+            // 官方三个分量都写（`:2210-2218`），z 同样 `+90`。
+            "angles" => {
+                let a = self.v3()?;
+                anim.rotation = Some([
+                    a[0].to_radians(),
+                    a[1].to_radians(),
+                    (a[2] + 90.0).to_radians(),
+                ]);
             }
-            "scale" => {
-                let _ = self.f()?;
-            }
+            "scale" => anim.scale = Some(self.f()?),
             "frame" | "frames" => {
                 let a = self.i()?;
                 let b = self.i()?;
@@ -2037,30 +2323,490 @@ impl<'a> Parser<'a> {
                 anim.ik_rules.push(r);
             }
             other => {
+                // 官方 `:2224-2271` 的前缀匹配组 —— 顺序即语义
+                // （`strnicmp("loop", token, 4)` 在前，`startloop` 不冲突）。
                 if other.starts_with("loop") {
+                    anim.looping = true;
+                } else if other.starts_with("startloop") {
+                    // 官方 `strnicmp("startloop", token, 5)`（`:2228-2233`）
+                    // 读一个 `looprestart`；mdlc 的 `Animation` 无该字段。
+                    let _ = self.i()?;
+                    anim.looping = true;
+                } else if other == "fudgeloop" {
                     anim.looping = true;
                 } else if other.starts_with("snap") {
                     // animdesc 的 SNAP 位；mdlc 的 Animation 无独立字段。
-                } else if other.starts_with("startloop") || other == "fudgeloop" {
-                    anim.looping = true;
-                    if other.starts_with("startloop") {
-                        let _ = self.i()?;
-                    }
                 } else if other == "post" || other == "realtime" {
                     // 无独立字段
+                } else if self.parse_cmdlist_token(t, &mut anim.cmds)? {
+                    // 官方 `:2273` 的 `ParseCmdlistToken` 委派 —— 整套 25 个
+                    // 关键字在 `$animation` 体内同样合法。
+                } else if other == "cmdlist" {
+                    // 官方 `:2277-2300`：按名找 `$cmdlist`，逐条**拷贝**到
+                    // 本动画的 `cmds[]`（不是引用），超 `MAXSTUDIOCMDS` 报
+                    // `Too many cmds in %s`。
+                    self.append_cmdlist(t, &mut anim.cmds)?;
+                } else if lookup_control(&t.text).is_some() {
+                    // 官方 `:2301-2304` 的 `lookupControl( token ) != -1` ——
+                    // 运动控制位。`Animation` 无 `motiontype` 字段（它只在
+                    // `AnimCmd::Motion`/`RefMotion` 里带），所以这里**只消费
+                    // token、不落盘** —— 与官方把位或进 `panim->motiontype`
+                    // 后再由 `walkframe` 类命令读取的行为等价：
+                    // 裸控制位单独出现时不产生任何效果。
                 } else if let Some(v) = parse_i32(&t.text) {
                     // 官方把裸数字当 `cmdlist` 下标 —— 语料 0 次。
                     let _ = v;
                 } else {
-                    return Err(QcError::new(
-                        t.file.clone(),
-                        t.line,
-                        format!("未知的动画选项 {other:?}"),
-                    ));
+                    // 官方 `return false` —— 由调用方决定报错还是继续
+                    // （`$animation` 体报 `Unknown animation option '%s'`，
+                    // `$sequence` 兜底退化成「动画名」）。
+                    return Ok(false);
                 }
             }
         }
+        Ok(true)
+    }
+
+    /// `cmdlist "<名>"` 的**引用**展开（官方 `ParseAnimationToken` 的
+    /// `cmdlist` 分支，`studiomdl.cpp:2277-2300`）—— 三处共用。
+    ///
+    /// 官方按名线性扫 `g_cmdlist[]`（`stricmp`），未命中报
+    /// `unknown cmdlist %s`；命中则逐条**拷贝**（`panim->cmds[numcmds++] =
+    /// g_cmdlist[i].cmds[j]`），每次拷贝前检查 `numcmds >= MAXSTUDIOCMDS`
+    /// 报 `Too many cmds in %s`。
+    ///
+    /// ⚠️ 官方**不拷贝名字**，只拷贝命令 —— `$cmdlist` 定义之后被修改
+    /// 不影响已展开的引用。
+    fn append_cmdlist(&mut self, t: &Token, out: &mut Vec<AnimCmd>) -> Result<(), QcError> {
+        let n = self.tok(false)?.text;
+        let Some(cl) = self
+            .desc
+            .cmd_lists
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&n))
+        else {
+            return Err(QcError::new(
+                t.file.clone(),
+                t.line,
+                format!("未知的 cmdlist {n:?}（官方是 unknown cmdlist {n}）"),
+            ));
+        };
+        let copied = cl.cmds.clone();
+        for c in copied {
+            if out.len() >= MAX_CMDS {
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!("命令过多：超过官方上限 {MAX_CMDS} 条（官方是 Too many cmds in）"),
+                ));
+            }
+            out.push(c);
+        }
         Ok(())
+    }
+
+    /// `$cmdlist <名> { ... }`（`Cmd_Cmdlist`，`studiomdl.cpp:2317-2378`）。
+    ///
+    /// 容器本身很薄：读名字，然后跑一个与 `cmd_sequence` **同构**的 depth
+    /// 循环，每个 token 交给 [`Self::parse_cmdlist_token`]。认不出来就是
+    /// `unknown command: %s`（官方原文）。
+    ///
+    /// ⚠️ 官方**不检查** `depth == 0` 就退出 —— 只有 `endofscript` 时
+    /// 才检查 `depth != 0`（报 `missing }\n`）。照抄。
+    fn cmd_cmdlist(&mut self) -> Result<(), QcError> {
+        let name_t = self.tok(false)?;
+        let mut cmds: Vec<AnimCmd> = Vec::new();
+        let mut depth = 0i32;
+        loop {
+            let t = if depth > 0 {
+                match self.lex.next_token(true)? {
+                    Some(t) => t,
+                    None => break,
+                }
+            } else {
+                if !self.avail() {
+                    break;
+                }
+                self.tok(false)?
+            };
+            if t.text == "{" {
+                depth += 1;
+                continue;
+            }
+            if t.text == "}" {
+                depth -= 1;
+                continue;
+            }
+            if !self.parse_cmdlist_token(&t, &mut cmds)? {
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!("$cmdlist 里未知的命令 {:?}（官方是 unknown command: {})", t.text, t.text),
+                ));
+            }
+        }
+        self.desc.cmd_lists.push(CmdList {
+            name: name_t.text,
+            cmds,
+        });
+        Ok(())
+    }
+
+    /// `$continue <名> <选项...>`（`Cmd_Continue`，`studiomdl.cpp:3170-3198`）。
+    ///
+    /// 官方按名字找一个**已存在**的序列或动画（`LookupSequence` 先，
+    /// `LookupAnimation` 后 —— 后者内部还会回退查序列池），然后以
+    /// `isAppend = true` 重入 `ParseSequence` / `ParseAnimation`：
+    /// 把本行剩下的选项**追加**到那个实体上，**不新建**。
+    ///
+    /// ⚠️ 官方在解析前先 `GetToken(true); UnGetToken();` 再检查
+    /// `token[0] != '$'` —— 这是**宏展开守卫**。`anims_fix.qci:137` 的
+    /// `$continue $FileName$` 在宏展开后 `$FileName$` 已变成真实序列名，
+    /// 所以会真的执行；但若展开结果为空（或下一个 token 仍是 `$...`），
+    /// 官方**什么都不做**而不是报错。照抄。
+    fn cmd_continue(&mut self) -> Result<(), QcError> {
+        let name_t = self.tok(false)?;
+        let name = name_t.text.clone();
+        // 官方 `Cmd_Continue`（`studiomdl.cpp:3170-3198`）：
+        //
+        // ```c
+        // GetToken(false);
+        // s_sequence_t *pseq = LookupSequence( token );
+        // if (pseq) { GetToken(true); UnGetToken(); if (token[0] != '$') ParseSequence( pseq, true ); return; }
+        // else { s_animation_t *panim = LookupAnimation( token );
+        //     if (panim) { GetToken(true); UnGetToken(); if (token[0] != '$') ParseAnimation( panim, true ); return; } }
+        // TokenError( "unknown continue animation %s\n", token );
+        // ```
+        //
+        // ⚠️ **`LookupSequence` 优先**。`LookupAnimation` 内部虽然也会回退查
+        // 序列池（`studiomdl.cpp:2381-2397` 的 `return pseq->panim[0][0]`），
+        // 但那条路只有在名字**不是**序列时才会走到 —— 所以这里直接写成
+        // 「先序列、后动画」，与官方等价。
+        let si = self
+            .desc
+            .sequences
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&name));
+        let ai = self
+            .desc
+            .animations
+            .iter()
+            .position(|a| a.name.eq_ignore_ascii_case(&name));
+        if si.is_none() && ai.is_none() {
+            return Err(QcError::new(
+                name_t.file.clone(),
+                name_t.line,
+                format!("$continue 找不到序列或动画 {name:?}（官方是 unknown continue animation {name}）"),
+            ));
+        }
+
+        // 宏展开守卫（官方 `GetToken(true); UnGetToken(); if (token[0] != '$')`）。
+        //
+        // ⚠️ **必须跨帧**：官方 `GetToken(true)` 在宏体耗尽时走
+        // `EndOfScript` 弹掉宏帧、继续读**外层**脚本
+        // （`scriplib.cpp:435-457` 的 `script--; return GetToken(crossline);`）。
+        //
+        // ⚠️ **修复前这里写的是 `if !self.avail() { return Ok(()); }`** ——
+        // `token_available()` 只看**当前帧**（`lexer.rs` 的
+        // `self.stack.last()`），宏体末行之后没有 token 就返回 `false`，
+        // 于是 `$continue` 提前返回、宏帧**没被弹出**；随后 `run()` 的
+        // `next_token(true)` 才跨帧，外层那行剩下的 token 就落到
+        // **顶层 `dispatch`** 的 `other =>` 兜底。实测
+        // `anims_fix.qci:212`
+        // `$DebiddoChargerLoop Idle_Fall_From_Charger ACT_TERROR_IDLE_FALL_FROM_CHARGERHIT -1`
+        // 报 `未知的 QC 命令 "act_terror_idle_fall_from_chargerhit"`。
+        let peek = match self.lex.next_token(true)? {
+            Some(t) => t,
+            // 真正的脚本结尾：官方 `GetToken(true)` 返回 false 后 `token`
+            // 保持旧值，随后 `ParseSequence` 的 `TokenAvailable()` 也是
+            // false ⟹ 什么都不做。照抄。
+            None => return Ok(()),
+        };
+        if peek.text.starts_with('$') {
+            self.lex.unget(peek);
+            return Ok(());
+        }
+        self.lex.unget(peek);
+
+        // 序列优先（官方 `LookupSequence` 先查）。`ParseSequence( pseq, true )`
+        // 的序列级选项链与 `$sequence` **完全相同** —— 复用
+        // `parse_sequence_body`，只把 `is_append` 置真。
+        //
+        // ⚠️ 修复前这里写的是「先看第一格名字能不能命中 `$animation`，
+        // 命中就改走动画路径」，于是 `ACT_*`/`fps`/`fadein`/`fadeout`/
+        // `addlayer`/`hidden`/`numframes`/`ikrule` 这些**序列级**选项全部报
+        // `未知的命令`。官方没有这条捷径：命中序列池就一定走
+        // `ParseSequence(pseq, true)`。
+        if let Some(si) = si {
+            let mut seq = self.desc.sequences[si].clone();
+            self.parse_sequence_body(&mut seq, &name_t, true)?;
+            self.desc.sequences[si] = seq;
+            return Ok(());
+        }
+
+        let ai = ai.expect("已判非 None");
+        // `ParseAnimation( panim, true )` —— 官方那个 `isAppend` 形参
+        // **完全没用**（`:2442-2499` 的函数体只有 `while (1)` 循环），
+        // 所以这里与 `$animation` 体同一套解析。
+        let mut anim = self.desc.animations[ai].clone();
+        let mut depth = 0i32;
+        loop {
+            let t = if depth > 0 {
+                match self.lex.next_token(true)? {
+                    Some(t) => t,
+                    None => break,
+                }
+            } else {
+                if !self.avail() {
+                    break;
+                }
+                self.tok(false)?
+            };
+            if t.text == "{" {
+                depth += 1;
+                continue;
+            }
+            if t.text == "}" {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+                continue;
+            }
+            if !self.parse_animation_token(&mut anim, &t)? {
+                // 官方 `ParseAnimation` 的 `:2489`。
+                return Err(QcError::new(
+                    t.file.clone(),
+                    t.line,
+                    format!(
+                        "未知的动画选项 {:?}（官方是 Unknown animation option'{:?}'）",
+                        t.text, t.text
+                    ),
+                ));
+            }
+        }
+        self.desc.animations[ai] = anim;
+        Ok(())
+    }
+
+    /// `ParseCmdlistToken`（`studiomdl.cpp:1698-2150`）—— **一套 25 个关键字**，
+    /// 三处共用：`$cmdlist` 块、`$animation` 体、`$sequence` 块。
+    ///
+    /// 返回 `Ok(true)` = 认出了并消费了 `t`（官方 `return true`）；
+    /// `Ok(false)` = 不认识（官方 `return false`，由调用方决定报错还是继续）。
+    ///
+    /// ⚠️ 官方开头是 `if (numcmds >= MAXSTUDIOCMDS) return false;` —— 满了
+    /// 就**当不认识**，于是调用方报 `unknown command` / `Unknown animation
+    /// option`。照抄。
+    ///
+    /// ⚠️ 参考动画名一律**不在这里解析**：官方用 `LookupAnimation` 立刻查，
+    /// mdlc 与 `subtract`/`weightlist` 同一套做法 —— 留到 `compile.rs`
+    /// （`LookupAnimation` 先查动画池再回退序列池，解析期也看不到后面才
+    /// 声明的动画）。
+    fn parse_cmdlist_token(&mut self, t: &Token, out: &mut Vec<AnimCmd>) -> Result<bool, QcError> {
+        if out.len() >= MAX_CMDS {
+            return Ok(false);
+        }
+        let low = t.text.to_ascii_lowercase();
+        // `weightlist` 官方是 `strnicmp(token,"weightlist",6)` ——
+        // **6 字符前缀**（`weight`），不是全词比较。
+        let cmd = if low.starts_with("weight") {
+            AnimCmd::Weights {
+                weight_list: self.tok(false)?.text,
+            }
+        } else {
+            match low.as_str() {
+                "fixuploop" => {
+                    let start = self.i()?;
+                    let end = self.i()?;
+                    AnimCmd::FixupLoop { start, end }
+                }
+                "subtract" | "presubtract" => AnimCmd::Subtract {
+                    reference: self.tok(false)?.text,
+                    frame: self.i()?,
+                    // `subtract` 置 `STUDIO_POST`，`presubtract` 不置
+                    // （`studiomdl.cpp:1750`）。
+                    post: low == "subtract",
+                },
+                "alignto" => AnimCmd::Align {
+                    reference: self.tok(false)?.text,
+                    // `STUDIO_X | STUDIO_Y`。
+                    motion_type: 0x0001 | 0x0002,
+                    src_frame: 0,
+                    dest_frame: 0,
+                    bone: None,
+                },
+                "align" => {
+                    let reference = self.tok(false)?.text;
+                    let (motion_type, src_frame) = self.parse_control_run(t, "align")?;
+                    let dest_frame = self.i()?;
+                    AnimCmd::Align {
+                        reference,
+                        motion_type,
+                        src_frame,
+                        dest_frame,
+                        bone: None,
+                    }
+                }
+                "alignboneto" => {
+                    let bone = self.tok(false)?.text;
+                    AnimCmd::Align {
+                        reference: self.tok(false)?.text,
+                        motion_type: 0x0001 | 0x0002,
+                        src_frame: 0,
+                        dest_frame: 0,
+                        bone: Some(bone),
+                    }
+                }
+                "match" => AnimCmd::Match {
+                    reference: self.tok(false)?.text,
+                },
+                "matchblend" => AnimCmd::MatchBlend {
+                    reference: self.tok(false)?.text,
+                    src_frame: self.i()?,
+                    dest_frame: self.i()?,
+                    dest_pre: self.i()?,
+                    dest_post: self.i()?,
+                },
+                "worldspaceblend" => AnimCmd::WorldSpaceBlend {
+                    reference: self.tok(false)?.text,
+                    start_frame: 0,
+                    loops: false,
+                },
+                "worldspaceblendloop" => {
+                    let reference = self.tok(false)?.text;
+                    // ⚠️ 官方这里用的是 `atoi`（不是 `verify_atoi`）——
+                    // 非法输入静默变 0。
+                    let start_frame = self
+                        .tok(false)
+                        .ok()
+                        .and_then(|t| parse_i32(&t.text))
+                        .unwrap_or(0);
+                    AnimCmd::WorldSpaceBlend {
+                        reference,
+                        start_frame,
+                        loops: true,
+                    }
+                }
+                "rotateto" => AnimCmd::Angle {
+                    angle: self.f()?,
+                },
+                "ikrule" => AnimCmd::IkRule {
+                    rule: self.option_ikrule()?,
+                },
+                "ikfixup" => AnimCmd::IkFixup {
+                    rule: self.option_ikrule()?,
+                },
+                "walkframe" => {
+                    let end_frame = self.i()?;
+                    // 官方的控制位循环**带 `UnGetToken`**（`:1965`）——
+                    // 遇到第一个非控制 token 就吐回。
+                    let motion_type = self.parse_control_peek()?;
+                    AnimCmd::Motion {
+                        motion_type,
+                        end_frame,
+                    }
+                }
+                "walkalignto" => {
+                    let end_frame = self.i()?;
+                    let reference = self.tok(false)?.text;
+                    let motion_type = self.parse_control_peek()?;
+                    AnimCmd::RefMotion {
+                        motion_type,
+                        end_frame,
+                        // 官方 `iSrcFrame = iEndFrame`（`:1988`）。
+                        src_frame: end_frame,
+                        reference,
+                        ref_frame: 0,
+                    }
+                }
+                "walkalign" => {
+                    let end_frame = self.i()?;
+                    let reference = self.tok(false)?.text;
+                    let (motion_type, ref_frame) = self.parse_control_run(t, "walkalign")?;
+                    let src_frame = self.i()?;
+                    AnimCmd::RefMotion {
+                        motion_type,
+                        end_frame,
+                        src_frame,
+                        reference,
+                        ref_frame,
+                    }
+                }
+                "derivative" => AnimCmd::Derivative { scale: self.f()? },
+                // 官方**不读任何 token**（`:2081-2084`）。
+                "noanimation" => AnimCmd::NoAnimation,
+                "lineardelta" => AnimCmd::LinearDelta { flags: 0x0010 },
+                // ⚠️ `splinedelta` 产生的仍是 `CMD_LINEARDELTA`
+                // （`CMD_SPLINEDELTA` 是死常量）。
+                "splinedelta" => AnimCmd::LinearDelta {
+                    flags: 0x0010 | 0x0040,
+                },
+                "compress" => AnimCmd::Compress { frames: self.i()? },
+                "numframes" => AnimCmd::NumFrames { frames: self.i()? },
+                "counterrotate" => AnimCmd::CounterRotate {
+                    bone: self.tok(false)?.text,
+                    target_angle: None,
+                },
+                "counterrotateto" => {
+                    // 官方顺序：先三个角度（pitch/yaw/roll），**再**骨骼名。
+                    let a = self.v3()?;
+                    AnimCmd::CounterRotate {
+                        bone: self.tok(false)?.text,
+                        target_angle: Some(a),
+                    }
+                }
+                _ => return Ok(false),
+            }
+        };
+        out.push(cmd);
+        Ok(true)
+    }
+
+    /// `align` / `walkalign` 共用的控制位循环 —— 官方这两处的循环
+    /// **不带 `UnGetToken`**：循环退出时 `token` 里留着那个非控制 token，
+    /// 紧接着被 `verify_atoi` 当帧号用掉。
+    ///
+    /// 返回 `(控制位掩码, 帧号)`。
+    fn parse_control_run(&mut self, t: &Token, what: &str) -> Result<(i32, i32), QcError> {
+        let mut motion_type = 0i32;
+        let mut cur = self.tok(false)?;
+        while let Some(c) = lookup_control(&cur.text) {
+            motion_type |= c;
+            cur = self.tok(false)?;
+        }
+        if motion_type == 0 {
+            return Err(QcError::new(
+                t.file.clone(),
+                t.line,
+                format!("{what} 缺少控制位（官方是 missing controls on {what}）"),
+            ));
+        }
+        let frame = parse_i32(&cur.text).ok_or_else(|| {
+            QcError::new(
+                cur.file.clone(),
+                cur.line,
+                format!("期望整数，得到 {:?}", cur.text),
+            )
+        })?;
+        Ok((motion_type, frame))
+    }
+
+    /// `walkframe` / `walkalignto` 共用的控制位循环 —— 官方这两处**带
+    /// `UnGetToken`**：遇到第一个非控制 token 就吐回，不消费它。
+    fn parse_control_peek(&mut self) -> Result<i32, QcError> {
+        let mut motion_type = 0i32;
+        while self.avail() {
+            let t = self.tok(false)?;
+            match lookup_control(&t.text) {
+                Some(c) => motion_type |= c,
+                None => {
+                    self.lex.unget(t);
+                    break;
+                }
+            }
+        }
+        Ok(motion_type)
     }
 
     /// `$definebone <名> <父> <x> <y> <z> <pitch> <yaw> <roll> [<rx> <ry> <rz> <rp> <ry2> <rr>]`。
@@ -2235,6 +2981,8 @@ impl<'a> Parser<'a> {
             absolute_rotation,
             rigid,
             flags: Some(flags),
+            synthetic: false,
+            resolved: None,
         });
         Ok(())
     }
@@ -3021,11 +3769,19 @@ impl<'a> Parser<'a> {
             if smd_cache.contains_key(f) {
                 continue;
             }
-            let p = if Path::new(f).is_absolute() {
-                PathBuf::from(f)
-            } else {
-                self.qdir.join(f)
-            };
+            // ⚠️ 用 `compile::resolve_smd_path` 而不是手工 `join`：
+            // 它会**补上缺失的 `.smd` 扩展名**（官方 `Load_Source` 在
+            // `xext[0] == '\0'` 时依次试 `.vrm`/`.smd`/… 的语义，
+            // `studiomdl.cpp:1603-1638`），与编译期读帧时的路径**必须一致**。
+            //
+            // 实测：`incap_anim_fix` 的宏体写的是
+            // `$animation a_$FileName$_neutral $FileName$ frame 7 7`
+            // —— 第二列没有扩展名。手工 `join` 会拼出不存在的路径，
+            // 于是这里报「读不到 SMD」，而那几份 SMD 恰恰是
+            // `$illumposition 0 0 0 $Bone$Spine` 里 `ValveBiped.Bip01_Spine`
+            // 的**唯一**来源 ⟹ 连带把合成附着点也误报成
+            // `unknown attachment link`。
+            let p = crate::compile::resolve_smd_path(&self.qdir, f);
             // ⚠️ **不要静默吞掉读失败** —— 那正是本项目反复踩到的
             // 「静默吃数据」：SMD 读不到时骨骼表会变空，
             // 最后只报一句「至少需要一根骨骼」，指向不了真因。
@@ -3063,6 +3819,35 @@ impl<'a> Parser<'a> {
                             .filter(|&b| b < s.nodes.len())
                             .collect(),
                         parents: s.nodes.iter().map(|n| n.parent).collect(),
+                        // 第 0 帧（`Smd::reference_frame`）的**局部**姿态。
+                        // 帧里没提到的骨骼留零 —— 官方 `Grab_Animation`
+                        // （`studiomdl.cpp:1065-1135`）用 `kalloc` 零填充。
+                        rest_positions: {
+                            let mut v = vec![[0.0f32; 3]; s.nodes.len()];
+                            if let Some(f0) = s.reference_frame() {
+                                for p in &f0.poses {
+                                    if let Ok(b) = usize::try_from(p.bone)
+                                        && b < v.len()
+                                    {
+                                        v[b] = p.position;
+                                    }
+                                }
+                            }
+                            v
+                        },
+                        rest_rotations: {
+                            let mut v = vec![[0.0f32; 3]; s.nodes.len()];
+                            if let Some(f0) = s.reference_frame() {
+                                for p in &f0.poses {
+                                    if let Ok(b) = usize::try_from(p.bone)
+                                        && b < v.len()
+                                    {
+                                        v[b] = p.rotation;
+                                    }
+                                }
+                            }
+                            v
+                        },
                     }),
                 },
             };
@@ -3359,6 +4144,155 @@ impl<'a> Parser<'a> {
         // `$jointsurfaceprop` 的回填会作用在排序前的下标上（虽然它们是
         // 按名字找的，但排序会换掉 Vec 的顺序，容易读错）。
         self.desc.bones = sort_parents_first(bones);
+
+        // ---- 2b. 合成附着点的骨骼解析（`LinkAttachments()` 的阶段 1 / 2） ----
+        //
+        // `$illumposition x y z <骨骼>` 会合成一个绑该骨骼的附着点（见
+        // `dispatch` 里那条分支）。官方 `LinkAttachments()`
+        // （`simplify.cpp:5313-5401`）分两阶段定它的骨骼与 `local`，
+        // 全部由真 exe 钉死（`docs/_probe/oracle_illumposition3..10.js`
+        // + `docs/_probe/diff_illumposition.js`）：
+        //
+        //   - 骨骼名**从未**在任何 SMD 的 `nodes` 段里出现 ⟹ 阶段 2 的
+        //     `if (!found)` 报 `MdlError( "unknown attachment link '%s'\n" )`
+        //     （`:5375`）⟹ **硬报错、中止**
+        //     （`oracle_illumposition7.js` 的 `illum4 bad bone`）。
+        //   - 骨骼**直命中全局骨骼表**（阶段 1，`:5324-5339`）⟹ `local` 原样落盘
+        //     —— `:5385` 左乘的 `boneToPose` 与 `:5388` 左乘的 `poseToBone`
+        //     互为逆（`:5334-5335` 就是同一个矩阵求逆）。
+        //   - 骨骼**被收骨判据丢掉**（零顶点引用且无 `$definebone`）⟹ 阶段 2
+        //     （`:5341-5376`）沿父链上溯到第一根直命中的祖先，`bone` 取**祖先**
+        //     的全局下标，`local` 被重算成
+        //     `inverse(source 第 0 帧 world[祖先]) ∘ source 第 0 帧 world[原始] ∘ local`。
+        //     整条链都没直命中 ⟹ `MdlError( "unable to find valid bone for attachment %s:%s\n" )`
+        //     （`:5360-5362`）。
+        //
+        // ⚠️ 判据是「名字是否出现在某个 SMD 的 nodes 里」，**不是**
+        // 「是否在 `desc.bones` 里」—— 被丢掉的骨骼同样不在 `desc.bones` 里，
+        // 用后者会把官方**静默**的那一类误报成错误（那正是 `illum b2`）。
+        //
+        // ⚠️ 阶段 2 用的 `boneToPose` 是 `g_source[j]->boneToPose[k]`
+        // （**该 source** 第 0 帧沿父链累积的姿态，`Build_Reference()`
+        // `studiomdl.cpp:728-762`），**不是**全局骨骼表的
+        // `g_bonetable[k].boneToPose` —— 所以修正矩阵只能在解析期算。
+        {
+            // 全局骨骼表按名字查下标 —— 官方 `findGlobalBone` 是 `stricmp`，
+            // 这里统一小写。
+            let global_index: HashMap<String, usize> = self
+                .desc
+                .bones
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.name.to_ascii_lowercase(), i))
+                .collect();
+            let all_nodes: HashSet<String> = files
+                .iter()
+                .filter_map(|f| smd_cache.get(f).and_then(|x| x.as_ref()))
+                .flat_map(|info| info.nodes.iter())
+                .map(|n| n.to_ascii_lowercase())
+                .collect();
+            // 阶段 2 按 `g_source[]` 的顺序扫（官方 `for (j = 0; ...)`）。
+            let sources: Vec<&SmdInfo> = files
+                .iter()
+                .filter_map(|f| smd_cache.get(f).and_then(|x| x.as_ref()))
+                .collect();
+            // `synthetic_att_locs` 按 push 顺序记录，与 `desc.attachments`
+            // 里的 `synthetic` 项一一对应（普通附着点不占位）。
+            let mut loc = self.synthetic_att_locs.iter();
+            let mut out: Vec<Option<(usize, [f32; 12])>> = Vec::new();
+            let mut errs: Vec<QcError> = Vec::new();
+            for at in &self.desc.attachments {
+                if !at.synthetic {
+                    continue;
+                }
+                let (file, line) = loc
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| (self.main_path.display().to_string(), 0));
+                let want = at.bone.to_ascii_lowercase();
+                if !all_nodes.contains(&want) {
+                    errs.push(QcError::new(
+                        file,
+                        line,
+                        format!(
+                            "unknown attachment link {:?} —— `$illumposition` 的第 4 个参数必须是某根 SMD 骨骼（官方 `simplify.cpp:5375`）",
+                            at.bone
+                        ),
+                    ));
+                    out.push(None);
+                    continue;
+                }
+                // 阶段 1：直命中 ⟹ `local` 原样落盘（修正矩阵 = 单位阵）。
+                //
+                // ⚠️ 这里**必须**由本函数给出下标，不能让写出器自己查
+                // `bone_index` —— 官方 `findGlobalBone` 用的是 `stricmp`
+                // （大小写不敏感），而 `ModelDesc::bone_index` 是精确匹配。
+                if let Some(&gi) = global_index.get(&want) {
+                    out.push(Some((gi, crate::bone_math::identity())));
+                    continue;
+                }
+                // 阶段 2：找第一个含该骨骼的 source。
+                let Some((info, k0)) = sources.iter().find_map(|info| {
+                    let k0 = info
+                        .nodes
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(&at.bone))?;
+                    Some((*info, k0))
+                }) else {
+                    errs.push(QcError::new(
+                        file,
+                        line,
+                        format!("unknown attachment link {:?}", at.bone),
+                    ));
+                    out.push(None);
+                    continue;
+                };
+                // 沿父链上溯到第一根直命中全局骨骼表的祖先。
+                let mut k = k0 as i32;
+                while k != -1 {
+                    let ki = k as usize;
+                    if ki >= info.nodes.len() {
+                        break;
+                    }
+                    if global_index.contains_key(&info.nodes[ki].to_ascii_lowercase()) {
+                        break;
+                    }
+                    k = info.parents.get(ki).copied().unwrap_or(-1);
+                }
+                if k == -1 {
+                    errs.push(QcError::new(
+                        file,
+                        line,
+                        format!(
+                            "unable to find valid bone for attachment __illumPosition:{}（官方 `simplify.cpp:5360`）",
+                            at.bone
+                        ),
+                    ));
+                    out.push(None);
+                    continue;
+                }
+                let ka = k as usize;
+                // `boneToPose` = 该 source **第 0 帧**沿父链累积的姿态。
+                let world = crate::bone_math::compute_world(
+                    &info.rest_positions,
+                    &info.rest_rotations,
+                    &info.parents,
+                );
+                let gi = global_index[&info.nodes[ka].to_ascii_lowercase()];
+                let corr = crate::bone_math::concat(
+                    &crate::bone_math::invert(&world[ka]),
+                    &world[k0],
+                );
+                out.push(Some((gi, corr)));
+            }
+            self.errors.extend(errs);
+            let mut it = out.into_iter();
+            for at in &mut self.desc.attachments {
+                if at.synthetic {
+                    at.resolved = it.next().flatten();
+                }
+            }
+        }
 
         // ---- 3. 材质表 ----
         //
@@ -3760,6 +4694,20 @@ struct SmdInfo {
     /// （`simplify.cpp:3478-3484`），以及 `UpdateBonerefRecursive`
     /// 的父链上传（`simplify.cpp:3404-3418`）。
     parents: Vec<i32>,
+    /// 第 0 帧（`Smd::reference_frame`）里每根骨骼的**局部**位置。
+    ///
+    /// 官方 `Build_Reference()` 拿第 0 帧的 `rawanim[0][i]` 沿父链累积出
+    /// `psource->boneToPose[]`（`studiomdl.cpp:728-762`），而 `LinkAttachments()`
+    /// 的阶段 2 要用**这个**矩阵（不是全局骨骼表的 `g_bonetable[k].boneToPose`）
+    /// 重算附着点的 `local`：`simplify.cpp:5350` 取它、`:5365` 对它求逆、
+    /// `:5385` 用它左乘。
+    ///
+    /// 第 0 帧没提到的骨骼按 `[0,0,0]` 算 —— 官方 `Grab_Animation`
+    /// （`studiomdl.cpp:1065-1135`）用 `kalloc` 零填充并逐骨骼拷贝上一帧，
+    /// 首帧缺失的骨骼就是零。
+    rest_positions: Vec<[f32; 3]>,
+    /// 同上，**弧度**（`SmdPose::rotation` 就是弧度）。
+    rest_rotations: Vec<[f32; 3]>,
 }
 /// 把字符串解析成 `f32`（官方 `verify_atof`）。
 ///
@@ -5100,6 +6048,489 @@ $sequence \"idle3\" \"c.smd\" fps 30
             names,
             vec!["root", "bone1"],
             "三份 SMD 的 nodes 完全相同 ⟹ 骨骼表里每根只应出现一次"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // `$illumposition` 的可选第 4 个 token（骨骼名）
+    // ---------------------------------------------------------------
+    //
+    // 官方 `Cmd_Illumposition` 的 `GetToken(false)` 读一个**可选**骨骼名，
+    // 并新建一个名为 `__illumPosition` 的合成附着点。全部语义由真
+    // studiomdl 裁决（`docs/_probe/oracle_illumposition3..10.js`）：
+    //
+    // | 形式 | `0x5C` 落盘 | 合成附着点 | `studiohdr2+0x08` |
+    // |---|---|---|---|
+    // | `$illumposition x y z` | `[-y, x, z]` | 无 | 0 |
+    // | `$illumposition x y z <骨骼>` | **原样 `[x,y,z]`** | 有 | **1 起**下标 |
+    //
+    // 且合成附着点的 `type` 带 `IS_RIGID`（`oracle10` 证实它与 `rigid`
+    // 附着点对骨骼表的效应逐字节一致）。
+
+    /// 4 参数形式：合成附着点的字段逐个钉死。
+    #[test]
+    fn illumposition_with_bone_creates_synthetic_attachment() {
+        let dir = fixture("illum_synth");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 5 6 7 bone1
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.model.illum_position, Some([5.0, 6.0, 7.0]));
+        assert!(
+            d.model.illum_position_from_bone,
+            "4 参数形式 ⟹ 写出时**不做**轴变换（`oracle_illumposition6.js`）"
+        );
+        let syn: Vec<_> = d.attachments.iter().filter(|a| a.synthetic).collect();
+        assert_eq!(syn.len(), 1, "应恰好合成一个附着点");
+        assert_eq!(syn[0].name, "__illumPosition");
+        assert_eq!(syn[0].bone, "bone1");
+        assert_eq!(
+            syn[0].position,
+            Some([5.0, 6.0, 7.0]),
+            "三个坐标进 `local` 的平移列（`oracle5` 的 `illum_nonzero`）"
+        );
+        assert_eq!(syn[0].rotation, None, "零旋转 ⟹ `local` 的旋转块是单位矩阵");
+        assert!(
+            syn[0].rigid,
+            "保活语义 = `IS_RIGID`（`oracle_illumposition10.js`）—— 缺了它，\
+             绑一根零引用骨骼时该骨骼会**被留下**，与官方不符"
+        );
+        assert_eq!(syn[0].flags, Some(0), "`flags` 落盘 0");
+    }
+
+    /// 3 参数形式**不**合成附着点，且仍走轴变换。
+    #[test]
+    fn illumposition_without_bone_makes_no_attachment() {
+        let dir = fixture("illum_three");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 5 6 7
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.model.illum_position, Some([5.0, 6.0, 7.0]));
+        assert!(
+            !d.model.illum_position_from_bone,
+            "3 参数形式落盘 `[-y,x,z]`（`oracle_illumposition6.js` 的 `illum3`）"
+        );
+        assert!(
+            d.attachments.iter().all(|a| !a.synthetic),
+            "没有第 4 个 token ⟹ 不合成附着点（`oracle6` 的 `illum3`：num=0 attIdx=0）"
+        );
+    }
+
+    /// ⭐ 骨骼名**从未出现在任何 SMD 的 `nodes` 里** ⟹ 硬报错。
+    ///
+    /// 官方 `LinkAttachments()` 的 `MdlError( "unknown attachment link '%s'\n" )`
+    /// （`simplify.cpp:5375`），真 exe 裁决见 `oracle_illumposition7.js`
+    /// 的 `illum4 bad bone`。
+    #[test]
+    fn illumposition_with_unknown_bone_is_an_error() {
+        let dir = fixture("illum_bad");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 0 0 0 nosuchbone
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未知骨骼必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown attachment link")
+                && e.message.contains("nosuchbone")),
+            "应报官方同款 `unknown attachment link`，实际：{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.line == 2),
+            "错误应指向 `$illumposition` 那一行（第 2 行），实际：{errs:?}"
+        );
+    }
+
+    /// ⭐ 骨骼名**出现过但被收骨判据丢掉** ⟹ **静默**，不报错。
+    ///
+    /// 这是与上一条的关键区分：官方 `MapSourcesToGlobalBonetable()` 把它
+    /// 静默重映射到根骨骼 0（`simplify.cpp:4180` 的 `k = 0;`），真 exe
+    /// 裁决见 `oracle_illumposition8.js` 的 `illum_b2` 与
+    /// `oracle_illumposition10.js` 的 `illum b2`。
+    /// 若用「是否在 `desc.bones` 里」当判据，就会把这一类**误报**成错误。
+    #[test]
+    fn illumposition_with_dropped_bone_is_silent() {
+        let dir = fixture("illum_dropped");
+        // `anim_only` 只在 `nodes` 里、零顶点引用 ⟹ 收骨判据丢弃它。
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "bone1", 0), (2, "anim_only", 1)],
+                &[0, 1, 1],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 0 0 0 anim_only
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d.bones.iter().any(|b| b.name == "anim_only"),
+            "前提：`anim_only` 必须已被收骨判据丢掉"
+        );
+        let syn = d
+            .attachments
+            .iter()
+            .find(|a| a.synthetic)
+            .expect("合成附着点仍应存在");
+        assert_eq!(
+            syn.bone, "anim_only",
+            "名字原样保留；写出时由 `mdl_writer` 回退到根骨骼 0"
+        );
+    }
+
+    /// ⭐ 阶段 2：被丢掉的骨骼 ⟹ `bone` 取**存活祖先**的下标，
+    /// 且 `local` 必须乘上修正矩阵 `inverse(world[祖先]) ∘ world[原始]`。
+    ///
+    /// 官方 `simplify.cpp:5341-5376`：`k` 沿父链上溯到第一根直命中全局骨骼表
+    /// 的祖先，`bone` 取**祖先**的全局下标，而 `boneToPose` 仍是**原始**骨骼的
+    /// ⟹ 非 absolute 时 `local' = poseToBone(祖先) ∘ boneToPose(原始) ∘ local`
+    /// （`simplify.cpp:5385`/`:5388`）。
+    ///
+    /// 真 exe 裁决：`docs/_probe/diff_illumposition.js` 的 `illum_drop`
+    /// （夹具父链 `i-1`，`b2` 的父是存活的 `b1`）⟹
+    /// `bone=1 local=[1,0,0,0,0,1,0,0,0,0,1,20]`，即 30 − 10 = 20。
+    #[test]
+    fn illumposition_stage2_recomputes_local_from_reference_pose() {
+        let dir = fixture("illum_stage2");
+        // `dropped` 零顶点引用 ⟹ 被收骨判据丢弃；它的父 `b1` 存活。
+        //
+        // 第 0 帧必须给两者**不同**的平移，否则修正矩阵退化成单位阵 ——
+        // `Some(单位阵)` 与 `None` 虽然仍可区分，但「按参考姿态重算」这件事
+        // 就没被钉住。
+        let mut smd = smd_with(
+            &[(0, "root", -1), (1, "b1", 0), (2, "dropped", 1)],
+            &[0, 1, 1],
+        );
+        for (bone, z) in [(1, 10.0f32), (2, 20.0f32)] {
+            let from = format!("{bone} 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n");
+            let to = format!("{bone} 0.000000 0.000000 {z:.6} 0.000000 0.000000 0.000000\n");
+            assert!(
+                smd.contains(&from),
+                "夹具格式变了：找不到骨骼 {bone} 的第 0 帧行"
+            );
+            smd = smd.replace(&from, &to);
+        }
+        std::fs::write(dir.join("a.smd"), smd).expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 0 0 0 dropped
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["root", "b1"],
+            "前提：`dropped` 必须已被收骨判据丢掉，而 `b1` 存活"
+        );
+        let syn = d
+            .attachments
+            .iter()
+            .find(|a| a.synthetic)
+            .expect("合成附着点仍应存在");
+        let (gi, corr) = syn
+            .resolved
+            .expect("阶段 2 必须给出 (骨骼下标, 修正矩阵)，不能留 `None`");
+        assert_eq!(gi, 1, "取的是**存活祖先** `b1` 的全局下标（不是 `dropped`）");
+        assert_eq!(
+            corr,
+            [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 20.0
+            ],
+            "修正矩阵 = inverse(world[b1]) ∘ world[dropped]：\
+             world[b1] 的 z=10、world[dropped] 的 z=30 ⟹ 平移差 20"
+        );
+    }
+
+    /// 合成附着点**豁免**「名字重复」与「找不到骨骼」两条校验。
+    ///
+    /// 官方对同一个 `$illumposition x y z <骨骼>` 写两次会产出**两个**同名
+    /// `__illumPosition` 附着点（`oracle_illumposition5.js` 的 `illum_twice`、
+    /// `oracle_illumposition10.js` 的 `illum b2 twice`）⟹ mdlc 不能因为
+    /// 重名而拒绝。而「找不到骨骼」那条也被豁免，因为被丢掉的骨骼同样
+    /// 不在 `desc.bones` 里（见上一条测试）。
+    #[test]
+    fn synthetic_attachment_is_exempt_from_validate() {
+        let dir = fixture("illum_twice");
+        // 必须让 `anim_only` 真的出现在 `a.smd` 的 nodes 里 —— 否则它属于
+        // 「从未出现过」那一类，应当**硬报错**（上一条测试的语义）。
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "root", -1), (1, "bone1", 0), (2, "anim_only", 1)],
+                &[0, 1, 1],
+            ),
+        )
+        .expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$illumposition 1 2 3 anim_only
+$illumposition 4 5 6 anim_only
+$body body \"a.smd\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.attachments.iter().filter(|a| a.synthetic).count(),
+            2,
+            "写两次 ⟹ 两个合成附着点（官方不去重）"
+        );
+        assert!(
+            d.validate().is_ok(),
+            "合成附着点应豁免校验（重名 + 被丢骨骼），实际：{:?}",
+            d.validate().unwrap_err()
+        );
+    }
+
+    /// ⚠️ **回归（R33）**：`$cmdlist <名> { … }` 收集命令，`cmdlist <名>` 引用它。
+    ///
+    /// 官方 `Cmd_Cmdlist`（`studiomdl.cpp:2317-2378`）把块内命令存进
+    /// `g_cmdlist[]`（`MAXSTUDIOCMDS = 64`）；引用侧是
+    /// `ParseAnimationToken` 的 `cmdlist` 分支（`:2277-2300`），
+    /// 逐条**拷贝**进 `panim->cmds[]`，名字未命中报
+    /// `unknown cmdlist %s`。
+    ///
+    /// 实测来源：用户工程 `incap_anim_fix\includes\anims_fix.qci:67-71`
+    /// 是全工程唯一的 `$cmdlist Release_IK { … }`（5 条 `ikrule … release`），
+    /// 被 24 处 `cmdlist Release_IK` 引用 —— 修前这些引用全部报
+    /// `未知的 QC 命令 "cmdlist"`。
+    #[test]
+    fn cmdlist_block_is_collected_and_referenced() {
+        let dir = fixture("cmdlist_ref");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$cmdlist Release_IK {
+    ikrule rfoot release
+    ikrule lfoot release
+}
+$animation \"a_idle\" \"a.smd\" fps 30 cmdlist Release_IK
+$sequence \"seq_idle\" \"a_idle\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.cmd_lists.len(), 1, "应收集到 1 个 cmdlist");
+        assert_eq!(d.cmd_lists[0].name, "Release_IK");
+        assert_eq!(d.cmd_lists[0].cmds.len(), 2, "块内应有 2 条命令");
+        let anim = &d.animations[0];
+        assert_eq!(
+            anim.cmds.len(),
+            2,
+            "`cmdlist Release_IK` 应把两条命令**拷进**动画，实际：{:?}",
+            anim.cmds
+        );
+        for cmd in &anim.cmds {
+            match cmd {
+                crate::model::AnimCmd::IkRule { rule } => {
+                    assert_eq!(
+                        rule.kind,
+                        crate::model::IkRuleType::Release,
+                        "类型应是 release"
+                    );
+                }
+                other => panic!("应是 IkRule，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// `cmdlist` 引用一个不存在的名字要报错（官方 `unknown cmdlist %s`）。
+    #[test]
+    fn cmdlist_unknown_name_is_an_error() {
+        let dir = fixture("cmdlist_unknown");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30 cmdlist NoSuchList
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未定义的 cmdlist 名必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("NoSuchList")),
+            "报错应点名缺失的 cmdlist，实际：{errs:?}"
+        );
+    }
+
+    /// ⚠️ **回归（R34）**：`$continue <序列名> <选项…>` 走**序列级**选项链。
+    ///
+    /// 官方 `Cmd_Continue`（`studiomdl.cpp:3170-3198`）**先** `LookupSequence`
+    /// —— 命中就以 `isAppend = true` 重入 `ParseSequence`（完整的序列级
+    /// 选项链），只有名字不是序列时才退回 `ParseAnimation`。
+    ///
+    /// 修前 mdlc 是「先试动画池」，且序列路径只调 `parse_animation_token`
+    /// ⟹ `fadeout`/`ACT_*`/`addlayer`/`hidden` 等**序列级**关键字全报
+    /// `未知的命令`。实测来源：`incap_anim_fix\includes\anims_fix.qci:212`
+    /// 的 `$DebiddoChargerLoop Idle_Fall_From_Charger ACT_… -1`。
+    #[test]
+    fn continue_appends_sequence_level_options() {
+        let dir = fixture("continue_seq");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$sequence \"seq_idle\" \"a_idle\"
+$continue \"seq_idle\" fadeout 0.5 hidden ACT_VM_IDLE 2
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.sequences.len(), 1, "`$continue` **不新建**序列");
+        let s = &d.sequences[0];
+        assert_eq!(s.fade_out, 0.5, "序列级 `fadeout` 应被追加");
+        assert_eq!(
+            s.extra_flags.map(|f| f & 0x0400),
+            Some(0x0400),
+            "序列级 `hidden` 应置位"
+        );
+        assert_eq!(s.activity.as_deref(), Some("ACT_VM_IDLE"));
+        assert_eq!(s.activity_weight, 2);
+    }
+
+    /// `$continue <动画名>` 走**动画级**选项链（官方 `ParseAnimation`）。
+    ///
+    /// ⚠️ 官方 `ParseAnimation` 的 `isAppend` 形参**在函数体里完全没用**
+    /// （`studiomdl.cpp:2442-2499`）⟹ 与 `$animation` 体是同一套解析。
+    #[test]
+    fn continue_updates_an_animation() {
+        let dir = fixture("continue_anim");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$continue \"a_idle\" fps 60 loop
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.sequences.len(), 0, "不该多出序列");
+        let a = &d.animations[0];
+        assert_eq!(a.fps, Some(60.0), "动画级 `fps` 应被追加");
+        assert!(a.looping, "动画级 `loop` 应被追加");
+    }
+
+    /// ⚠️ **回归（R35）**：`$sequence` 兜底必须委派 `ParseAnimationToken`。
+    ///
+    /// 官方 `ParseSequence` 有**三段**尾部分派（`studiomdl.cpp:2944-2976`），
+    /// 第一段就是 `ParseAnimationToken( animations[0] )`。mdlc 修前只有两段
+    /// ⟹ `frame`（单数）/`fudgeloop`/`noanimation`/`align`/`alignto`/
+    /// `walkframe`/`walkalignto`/`cmdlist`/控制位 `X Y Z LX LY` 全被静默
+    /// 压进 `blend_names` 当假 blend 格，编译时报
+    /// 「blend 格数 N 不是完全平方数」（`compile.rs:937`）。
+    ///
+    /// 实测来源：`anims_fix.qci:165` 的 `align Death X Y 100 0` 产生 6 个假格。
+    #[test]
+    fn sequence_catchall_delegates_to_parse_animation_token() {
+        let dir = fixture("seq_delegate");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$animation \"a_idle\" \"a.smd\" fps 30
+$sequence \"seq_idle\" \"a_idle\" frame 0 1 fudgeloop noanimation
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert!(
+            s.blends.is_empty(),
+            "`frame`/`fudgeloop`/`noanimation` 都是命令，不该变成 blend 格，实际：{:?}",
+            s.blends
+        );
+        assert!(s.looping, "`fudgeloop` 应经 holder 并回 `looping`");
+        assert_eq!(
+            s.cmds.len(),
+            1,
+            "`noanimation` 应变成一条 AnimCmd，实际：{:?}",
+            s.cmds
+        );
+        assert!(matches!(
+            s.cmds[0],
+            crate::model::AnimCmd::NoAnimation
+        ));
+    }
+
+    /// ⚠️ **回归（R36）**：`$sequence` 的**隐含动画**裸名要补 `$pushd` 前缀。
+    ///
+    /// 官方 `Cmd_ImpliedAnimation`（`studiomdl.cpp:2506-2547`）调
+    /// `Load_Source( panim->filename, "" )`，而 `Load_Source` 用
+    /// `cddir[numdirs]` 拼路径（`%s%s.smd`，`studiomdl.cpp:1603-1638`）
+    /// ⟹ **`$pushd` 的前缀是官方自动加的**。
+    ///
+    /// 修前 mdlc 原样 push 裸名，于是 `$pushd anims` 之下的隐含动画全被
+    /// 当成工程根目录下的文件 —— 实测用户工程报 22 条
+    /// `sequences[N].smd: 读不到 .\NamVet_*.smd`。
+    ///
+    /// ⚠️ 夹具里的动画名**不能**叫 `x`/`y`/`z`/`lx`/`ly` ——
+    /// `lookup_control` 会把它当**运动控制位**消费掉
+    /// （官方 `ParseAnimationToken` 的 `lookupControl( token ) != -1`
+    /// 分支，`studiomdl.cpp:2301-2304`），根本走不到「隐含动画」那一支。
+    #[test]
+    fn implied_animation_name_gets_cddir_prefix() {
+        let dir = fixture("implied_pushd");
+        std::fs::create_dir_all(dir.join("anims")).expect("应能建 anims 子目录");
+        std::fs::write(dir.join("anims").join("sway.smd"), MIN_SMD).expect("应能写 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$pushd anims
+$sequence \"seq_idle\" \"sway\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.sequences[0].smd, "anims/sway",
+            "隐含动画名必须带上 `$pushd` 前缀（官方 `Load_Source` 自动加）"
+        );
+    }
+
+    /// **纯动画工程（无 `$body`/`$model`）是合法输入。**
+    ///
+    /// 官方没有「至少需要一个 body part」这条检查：
+    /// 真 exe 裁决（`docs/_probe/oracle_no_body.js`）去掉 `$body` 后
+    /// `exit=0`、MDL 1048 B、`numbodyparts=0`（且**不产出** `.vvd`/`.dx90.vtx`
+    /// —— `write.cpp:2203-2204` 的 `if (phdr->numbodyparts == 0) return;`）。
+    ///
+    /// 实测来源：用户工程 `incap_anim_fix` 是纯动画工程（只有 `$modelname`
+    /// + 22 条 `$sequence`），修前卡在这条过严的校验上。
+    ///
+    /// ⚠️ 夹具**必须带 `$definebone`**：没有 `$body` ⟹ 没有
+    /// `isActiveModel` 的源 ⟹ 收骨判据（`78b9e77`）会把所有骨骼丢掉，
+    /// 于是撞上另一条 mdlc 独有的 `bones.is_empty()` 检查
+    /// （`model.rs:5306-5311`）。真实的纯动画工程也总是靠 `$definebone`
+    /// 撑起骨骼表 —— 用户工程的 72 根正是来自 `includes/definebones.qci`。
+    #[test]
+    fn animation_only_project_has_no_bodyparts_and_validates() {
+        let dir = fixture("anim_only_project");
+        let qc = "\
+$modelname \"survivors/anim_test.mdl\"
+$definebone \"root\" \"\" 0 0 0 0 0 0 0 0 0 0 0 0
+$animation \"a_idle\" \"a.smd\" fps 30
+$sequence \"seq_idle\" \"a_idle\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(d.bodyparts.is_empty(), "纯动画工程不该有 bodypart");
+        assert_eq!(d.bones.len(), 1, "`$definebone` 应无条件入表");
+        assert!(
+            d.validate().is_ok(),
+            "纯动画工程必须通过校验（官方无此检查），实际：{:?}",
+            d.validate().unwrap_err()
         );
     }
 }

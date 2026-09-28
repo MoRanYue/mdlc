@@ -303,11 +303,16 @@ fn definevariable_override_keeps_the_original_index() {
 /// **行为 5：`\\`（两个反斜杠）不是通用续行符。**
 ///
 /// 它只被 `Option_Flexrule` 识别（`studiomdl.cpp:3936`）。
-/// 实测语料：`survivors_facerules.qci` 的 `\\` 是真续行，
-/// 而 `anims_fix.qci` 的 59 处 `\\` **全在注释里**（画表格装饰）。
+/// 实测语料：`survivors_facerules.qci` 的 `\\` 是真续行。
 ///
-/// 词法层必须把 `\\` 当**普通 token** 交出去（由 flexrule 解析器处理），
-/// 而不是自己拼接行。
+/// ⚠️ **订正**：早先这里写着「`anims_fix.qci` 的 59 处 `\\` 全在注释里」——
+/// 那是**错的**。实测那 59 处里 **50 处在代码里**，是 `IncapAimMacro`
+/// （`anims_fix.qci:98-137`）与 `DebiddoChargerLoop`（`:144-153`）两个
+/// **宏体**的续行符，由 `DefineMacro` 消费（见下一条测试）。
+/// 注释里那 9 处（`:1-9` 画表格的）才是装饰。
+///
+/// 词法层必须把 `\\` 当**普通 token** 交出去（由 `define_macro` 与
+/// flexrule 解析器各自处理），而不是自己拼接行。
 #[test]
 fn double_backslash_is_a_plain_token_not_a_continuation() {
     let toks = all("%mouth = %A * 0.5 \\\\\n+ %B * 0.35\n");
@@ -315,6 +320,75 @@ fn double_backslash_is_a_plain_token_not_a_continuation() {
         toks,
         vec!["%mouth", "=", "%A", "*", "0.5", "\\\\", "+", "%B", "*", "0.35"],
         "`\\\\` 必须是普通 token（只有 flexrule 解析器赋予它续行语义）"
+    );
+}
+
+/// ⚠️ **回归（R32）**：`$definemacro` 的宏体**跨 `\\` 续行**。
+///
+/// 官方 `DefineMacro`（`hl2sdk-l4d2\utils\common\scriplib.cpp:147-198`）：
+///
+/// ```c
+/// char *cp = script->script_p;
+/// while (*cp && *cp != '\n') {
+///     if (*cp == '\\' && *(cp+1) == '\\') {
+///         while (*cp && *cp != '\n') { *cp = ' '; cp++; }   // 到行尾改空格
+///         if (*cp) { cp++; }                                 // 跨过换行
+///     } else { cp++; }
+/// }
+/// int size = (cp - script->script_p);
+/// ```
+///
+/// 修复前 mdlc **只取「本行剩余」**，于是
+/// `$definemacro IncapAimMacro FileName \\` 的体变**空** ⟹
+/// `anims_fix.qci:173`/`:174` 两次调用展开成空 ⟹
+/// **26 条 `$animation` + 2 个 `$sequence` 静默消失**，
+/// 随后 `anim_fix.qc:35` 的 `$continue` 指向不存在的序列。
+///
+/// 语义细节：宏体从**最后一个形参之后**开始；`\\` 与它所在行的**剩余部分**
+/// 都被换成空格（所以体里不会出现 `\\` token）；第一个**没有** `\\`
+/// 的换行结束宏体且**不属于**体。
+#[test]
+fn definemacro_body_continues_across_double_backslash() {
+    // 体有三行：`$body $A$ x` 与 `$tail`，中间靠 `\\` 连接；
+    // 末尾 `$tail` 后面是**普通**换行 ⟹ 体到此为止。
+    let toks = all("$definemacro M A \\\\\n$body $A$ x \\\\\n$tail\n$M val\n");
+    assert_eq!(
+        toks,
+        vec!["$body", "val", "x", "$tail"],
+        "宏体必须跨 `\\\\` 续行（`$A$` 展开成实参 `val`），且不得吃掉体外的 `$M val`"
+    );
+}
+
+/// `\\` 只终止**宏体**，不影响宏之后的普通行。
+///
+/// 若把 `\\` 做成**通用**续行符，宏定义之后的第一行代码会被吞进宏体。
+#[test]
+fn definemacro_stops_at_a_plain_newline() {
+    let toks = all("$definemacro M \\\\\n$in_macro\n$out_of_macro\n");
+    assert_eq!(
+        toks,
+        vec!["$out_of_macro"],
+        "宏体到普通换行为止；宏定义本身不产出 token"
+    );
+}
+
+/// 宏体里被 `\\` 吃掉的换行**必须计入行号**（`anims_fix.qci` 的宏有 39 行）。
+///
+/// ⚠️ 这是 mdlc 的**故意偏离**：官方那段手工扫描**不更新** `script->line`，
+/// 所以多行宏之后的官方行号是偏的。mdlc 选择修正它 —— 报错定位才有意义。
+#[test]
+fn definemacro_counts_lines_across_continuations() {
+    let mut l = lex("$definemacro M \\\\\n$a \\\\\n$b \\\\\n$c\n$surfaceprop \"metal\"\n");
+    let t = match l.next_token(true) {
+        Ok(Some(t)) => t,
+        Ok(None) => panic!("应有 token"),
+        Err(e) => panic!("词法错误: {e}"),
+    };
+    assert_eq!(t.text, "$surfaceprop");
+    assert_eq!(
+        t.line, 5,
+        "跨过 3 个 `\\\\` 续行 ⟹ 下一个 token 在第 5 行（实际 {}）",
+        t.line
     );
 }
 

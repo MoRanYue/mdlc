@@ -42,11 +42,19 @@
 //!    `ExpandVariableToken` 用的是 `Q_strnicmp(param, tp, len - 2)`，
 //!    其中 `len` 是 `$...$` 之间名字的长度。所以 `$Bone$` 实际只比
 //!    `"Bo"`。这是上游的 bug，但它**决定**了实际行为，所以照抄。
-//! 5. **`\\`（两个反斜杠）不是通用续行符。** 它只被
-//!    `Option_Flexrule`（`studiomdl.cpp:3936`）识别，用于 flexrule 表达式。
-//!    实测语料：`survivors_facerules.qci` 的 `\\` 是真续行，
-//!    而 `anims_fix.qci` 里的 59 处 `\\` **全在注释里**（画表格的装饰）。
-//!    把它做成通用预处理会**破坏注释**。
+//! 5. **`\\`（两个反斜杠）是 `$definemacro` 宏体的续行符，不是通用续行符。**
+//!    它被两处识别：`DefineMacro`（`scriplib.cpp:147`/`:168`）用于宏体跨行，
+//!    `Option_Flexrule`（`studiomdl.cpp:3936`）用于 flexrule 表达式。
+//!    两者机制不同，**都不能推广**成通用预处理 —— 那会破坏注释
+//!    （`\\` 后面跟着的注释文字会被吃掉）。
+//!
+//!    ⚠️ **订正**：本文件早先声称「`anims_fix.qci` 里的 59 处 `\\`
+//!    **全在注释里**（画表格的装饰）」—— **该声称是错的**。实测那 59 处里
+//!    **50 处在代码里**，是 `$definemacro IncapAimMacro`（`:98-137`）与
+//!    `$definemacro DebiddoChargerLoop`（`:144-153`）两个宏体的续行符。
+//!    把它当成纯装饰 ⟹ 宏体只剩第一行 ⟹ **26 条 `$animation` + 2 个
+//!    `$sequence` 静默消失**（见 `lexer::Lexer::define_macro` 的说明）。
+//!    这个误判的代价是「静默吃数据」—— 正是下面第 6 条要防的那一类。
 //! 6. **`$include` 找不到文件时官方静默跳过。** `LoadFile` 失败返回
 //!    `buffer = NULL, size = 0`，于是 `script_p >= end_p` 立刻成立，
 //!    `EndOfScript` 弹栈继续。mdlc **故意不照抄这条** —— 改为报错，

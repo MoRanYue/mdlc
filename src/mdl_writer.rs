@@ -2155,7 +2155,15 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 剩余偏差大的都是写死了 `$illumposition` 的（见
     // `docs/_probe/verify_illum_fallback.js`）。多数模型不写 `$bbox`，
     // 此时 auto 与 hull 相同，两种写法等价。
+    // `$illumposition` 有**两种**形式，落盘语义不同（`oracle_illumposition6.js`）：
+    //
+    // * `$illumposition x y z` ⟹ 落盘 `[-y, x, z]`（做轴变换）；
+    // * `$illumposition x y z <骨骼>` ⟹ 落盘**原样 `[x, y, z]`**、**不做**轴变换。
+    //
+    // 判据是 `ModelMeta::illum_position_from_bone`（QC 前端在吃到第 4 个 token
+    // 时置位）。TOML 表达不了 4 参数形式，所以 TOML 侧恒走轴变换分支。
     let illum = match desc.model.illum_position {
+        Some(v) if desc.model.illum_position_from_bone => v,
         Some(v) => qc_axis_to_model(v),
         None if !compiled.sequences.is_empty() => [
             (auto_min[0] + auto_max[0]) * 0.5,
@@ -2700,7 +2708,22 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // `sznameindex`（`+0x14`）实测 0% 模型有 —— studiomdl 不写它。
     put_i32(&mut buf, studiohdr2_off, 0);
     put_i32(&mut buf, studiohdr2_off + 0x04, 0);
-    put_i32(&mut buf, studiohdr2_off + 0x08, 0);
+    // `illumpositionattachmentindex`（`+0x08`）—— `$illumposition x y z <骨骼>`
+    // 合成的那个 `__illumPosition` 附着点在附着点表里的 **1 起**下标；
+    // 没写过 4 参数形式就是 **0**。
+    //
+    // 官方在解析到该命令时把它写成「当时的附着点数」，所以写多次时**最后一次胜出**
+    // —— 等价于「**最后一个**合成附着点的 1 起下标」（`oracle_illumposition5.js`
+    // 的 `illum_twice`：两个附着点、`attIdx == 2`）。
+    //
+    // 顺序敏感：`att_then_illum` 得 2、`illum_then_att` 得 1
+    // （`oracle_illumposition4.js`、`oracle_illumposition7.js` 的 `A illum B` 得 2）。
+    let illum_att_index = desc
+        .attachments
+        .iter()
+        .rposition(|at| at.synthetic)
+        .map_or(0, |i| i as i32 + 1);
+    put_i32(&mut buf, studiohdr2_off + 0x08, illum_att_index);
     // `flMaxEyeDeflection`（`+0x0C`）—— `$maxeyedeflection`。
     //
     // 官方（反汇编 `0x00450270`）落盘 `cos(deg2rad(输入))`，
@@ -3382,11 +3405,43 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 .map_err(|_| WriteError::Internal("附着点名相对偏移超出 i32".into()))?,
         );
         put_i32(&mut buf, base + at_off::FLAGS, at.flags.unwrap_or(0));
-        let bone = *bone_index
-            .get(at.bone.as_str())
-            .ok_or_else(|| {
-                WriteError::Internal(format!("附着点骨骼 {:?} 未通过校验", at.bone))
-            })?;
+        // ⚠️ 合成附着点（`$illumposition x y z <骨骼>`）绑的骨骼**可能被收骨判据
+        // 丢掉** —— 它的保活语义是 `rigid`，官方 `TagUsedBones()` 沿父链上溯找
+        // 第一根有顶点权重的骨骼（`simplify.cpp:3472-3484`），上溯无果就什么都不标。
+        // 该骨骼随后被丢，`LinkAttachments()` 的阶段 2（`simplify.cpp:5341-5376`）
+        // 沿父链上溯到第一根**直命中全局骨骼表**的祖先，附着点落那根祖先的
+        // 全局下标，`local` 被重算成
+        // `inverse(source 第 0 帧 world[祖先]) ∘ source 第 0 帧 world[原始] ∘ local`。
+        //
+        // 这两个值由 `qc::parse` 的 `finish()` 在**骨骼表建好之后**算出来
+        // （修正矩阵依赖某个 source 第 0 帧的姿态，只有解析期拿得到 ——
+        // 官方用的是 `g_source[j]->boneToPose[k]`，**不是**全局骨骼表的
+        // `g_bonetable[k].boneToPose`，见 `simplify.cpp:5350`），存在
+        // [`crate::model::Attachment::resolved`] 里。
+        //
+        // 实测 `docs/_probe/oracle_illumposition8.js` / `oracle_illumposition10.js`：
+        // `$illumposition 0 0 0 b2`（b2 零引用、父是 b0）⟹ 附着点 `→bone 0`；
+        // `docs/_probe/diff_illumposition.js` 的 `illum_drop`（夹具父链 `i-1`，
+        // b2 的父是存活的 b1）⟹ `bone=1 local=[1,0,0,0,0,1,0,0,0,0,1,20]`。
+        //
+        // 普通附着点不需要这条：非 rigid 的会保活自身，rigid 的会保活祖先，
+        // 两者都一定在骨骼表里（`validate()` 也会挡）。
+        let (bone, corr) = match &at.resolved {
+            Some((gi, corr)) => (*gi, Some(*corr)),
+            None => (
+                match bone_index.get(at.bone.as_str()) {
+                    Some(b) => *b,
+                    None if at.synthetic => 0,
+                    None => {
+                        return Err(WriteError::Internal(format!(
+                            "附着点骨骼 {:?} 未通过校验",
+                            at.bone
+                        )));
+                    }
+                },
+                None,
+            ),
+        };
         put_i32(&mut buf, base + at_off::LOCAL_BONE, bone as i32);
         // `local` 是 matrix3x4_t。
         //
@@ -3397,6 +3452,15 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         // 也没有 `LinkAttachments()` 的 `poseToBone` 左乘 —— 实测官方
         // 用户的 `eyes` 附着点偏差高达 **61.57**（`docs/_probe/att_abs_check.js`）。
         let m = crate::compile::attachment_local_matrix(desc, at, &ptb, bone);
+        // 阶段 2 的修正矩阵放在**最外层**：官方 `:5385` 是
+        // `ConcatTransforms( boneToPose, g_attachment[i].local, world )`，
+        // 而 `g_attachment[i].local` 此刻已经被 `:5388` 的
+        // `ConcatTransforms( poseToBone, world, g_attachment[i].local )` 覆写过，
+        // 也就是修正先作用于 `local`、再参与外层的 `boneToPose`。
+        let m = match &corr {
+            Some(c) => crate::bone_math::concat(c, &m),
+            None => m,
+        };
         for (k, v) in m.iter().enumerate() {
             put_f32(&mut buf, base + at_off::LOCAL + k * 4, *v);
         }
@@ -4992,6 +5056,8 @@ end
             absolute_rotation: None,
             rigid: false,
             flags: None,
+            synthetic: false,
+            resolved: None,
         });
         d.desc.bones[0].bonemerge = true;
         let out = write_mdl(&d).unwrap();

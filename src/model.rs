@@ -165,6 +165,168 @@ pub struct ModelDesc {
     /// 序列按名字引用它。
     #[serde(default)]
     pub weight_lists: Vec<WeightList>,
+    /// 命令列表（QC 的 `$cmdlist "<名>" { ... }`）。
+    ///
+    /// # 语义
+    ///
+    /// 官方 `Cmd_Cmdlist`（`studiomdl.cpp:2317-2378`）在**解析期**把
+    /// `{ }` 里的命令逐条解析进 `g_cmdlist[].cmds[]`（`MAXSTUDIOCMDS` = 64）；
+    /// 之后动画里的 `cmdlist "<名>"` 只是把这些命令**按值拷贝**过去
+    /// （`ParseAnimationToken` `:2282-2298`）。
+    ///
+    /// ⚠️ **没有重名检查**（同名取**先定义**的那个），也**没有上限检查**
+    /// —— 官方数组是 `g_cmdlist[MAXSTUDIOANIMS]`（2000）。
+    #[serde(default)]
+    pub cmd_lists: Vec<CmdList>,
+}
+
+/// 一张具名命令列表（QC 的 `$cmdlist "<名>" { ... }`）。
+///
+/// 见 [`ModelDesc::cmd_lists`]。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CmdList {
+    /// 列表名。动画里用 `cmdlist "<名>"` 引用（`stricmp`，大小写不敏感）。
+    pub name: String,
+    /// 命令序列，**按 QC 源码顺序**。
+    ///
+    /// 顺序是有意义的：官方 `processAnimations()`（`simplify.cpp:154-289`）
+    /// 就是**按这个顺序**逐条执行的，没有按种类排序。
+    #[serde(default)]
+    pub cmds: Vec<AnimCmd>,
+}
+
+/// 一条动画命令 —— 官方 `s_animcmd_t`（`studiomdl.h:361-453`）的 Rust 表示。
+///
+/// # 为什么不用官方那种 `int cmd` + `union` 的写法
+///
+/// 官方的 `union u` 里有**三处成员写错**（`ikfixup` 写 `u.ikrule.pRule`、
+/// `numframes` 写 `u.compress.frames`），靠 union 同址才「碰巧能用」。
+/// 用带载荷的 enum 表达同样语义，且不会把这类笔误当成语义。
+///
+/// 判别值见 `studiomdl.h:325-344` 的 `CMD_*` 宏。⚠️ `CMD_SPLINEDELTA`(14)
+/// 与 `CMD_SETBONE`(18) 官方**从未赋值**（`splinedelta` 关键字产生的是
+/// `CMD_LINEARDELTA` + `STUDIO_AL_SPLINE`），故这里没有对应变体。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AnimCmd {
+    /// `weightlist <名>` —— 官方 `CMD_WEIGHTS`。名字必须命中
+    /// `g_weightlist[1..]`（下标 0 是 `$defaultweightlist`，**不可按名选中**）。
+    Weights {
+        /// 权重表名（QC 里 `$weightlist` 的键）。
+        weight_list: String,
+    },
+    /// `subtract <动画> <帧>` / `presubtract <动画> <帧>` —— 官方 `CMD_SUBTRACT`。
+    ///
+    /// 两者**只有 `post` 一位不同**：`subtract` 置 `STUDIO_POST`，
+    /// `presubtract` 不置（`studiomdl.cpp:1750`）。
+    Subtract {
+        /// 参考动画名。
+        reference: String,
+        /// 参考动画的第几帧。
+        frame: i32,
+        /// 是否置 `STUDIO_POST`（`subtract` = true，`presubtract` = false）。
+        #[serde(default)]
+        post: bool,
+    },
+    /// `alignto` / `align` / `alignboneto` —— 官方 `CMD_AO`。
+    Align {
+        /// 参考动画名。
+        reference: String,
+        /// 控制位掩码（`STUDIO_X|STUDIO_Y` 等）。
+        motion_type: i32,
+        src_frame: i32,
+        dest_frame: i32,
+        /// 只有 `alignboneto` 写它；`alignto`/`align` 官方置 `NULL`（= 根骨骼）。
+        #[serde(default)]
+        bone: Option<String>,
+    },
+    /// `match <动画>` —— 官方 `CMD_MATCH`。
+    Match {
+        /// 参考动画名。
+        reference: String,
+    },
+    /// `fixuploop <起> <止>` —— 官方 `CMD_FIXUP`。
+    FixupLoop { start: i32, end: i32 },
+    /// `rotateto <角度>` —— 官方 `CMD_ANGLE`。
+    Angle { angle: f32 },
+    /// `ikfixup <链> <类型> ...` —— 官方 `CMD_IKFIXUP`。
+    ///
+    /// 与 [`Self::IkRule`] 的区别：官方对它是**栈拷贝**后直接
+    /// `fixupIKErrors`，**不进** `panim->ikrule[]` 数组。
+    IkFixup {
+        /// IK 规则载荷。
+        rule: IkRule,
+    },
+    /// `ikrule <链> <类型> ...` —— 官方 `CMD_IKRULE`。
+    ///
+    /// `processAnimations()` 里是**显式 no-op**（注释 `// processed later`），
+    /// 真正收集在 `ProcessIKRules()`（`simplify.cpp:5819-5841`）——
+    /// 它把规则拷进 `panim->ikrule[]`，与 `$sequence` 块里内联写的
+    /// `ikrule` **完全等价**。
+    IkRule {
+        /// IK 规则载荷。
+        rule: IkRule,
+    },
+    /// `walkframe <末帧> <控制位...>` —— 官方 `CMD_MOTION`。
+    ///
+    /// ⚠️ 官方 `s_motion_t.iStartFrame` **从未被解析路径写过** ——
+    /// 它来自 `processAnimations()` 里那个滚动游标 `startframe`。
+    Motion {
+        motion_type: i32,
+        end_frame: i32,
+    },
+    /// `walkalignto` / `walkalign` —— 官方 `CMD_REFMOTION`。
+    RefMotion {
+        motion_type: i32,
+        end_frame: i32,
+        src_frame: i32,
+        /// 参考动画名。
+        reference: String,
+        ref_frame: i32,
+    },
+    /// `derivative <缩放>` —— 官方 `CMD_DERIVATIVE`。
+    Derivative { scale: f32 },
+    /// `noanimation` —— 官方 `CMD_NOANIMATION`（不读任何 token）。
+    NoAnimation,
+    /// `lineardelta` / `splinedelta` —— 官方 `CMD_LINEARDELTA`。
+    ///
+    /// `lineardelta` 置 `STUDIO_AL_POST`(0x10)；`splinedelta` 再或上
+    /// `STUDIO_AL_SPLINE`(0x40)。⚠️ 两者都是 `CMD_LINEARDELTA`，
+    /// `CMD_SPLINEDELTA` 是死常量。
+    LinearDelta { flags: i32 },
+    /// `compress <帧数>` —— 官方 `CMD_COMPRESS`。
+    Compress { frames: i32 },
+    /// `numframes <帧数>` —— 官方 `CMD_NUMFRAMES`。
+    ///
+    /// ⚠️ 官方写的是 `u.compress.frames`（union 成员笔误，同址无害）；
+    /// 这里按语义存。
+    NumFrames { frames: i32 },
+    /// `counterrotate <骨骼>` / `counterrotateto <pitch> <yaw> <roll> <骨骼>`。
+    CounterRotate {
+        /// 骨骼名。
+        bone: String,
+        /// `counterrotateto` 的目标角；`counterrotate` 为 `None`。
+        #[serde(default)]
+        target_angle: Option<[f32; 3]>,
+    },
+    /// `worldspaceblend` / `worldspaceblendloop` —— 官方 `CMD_WORLDSPACEBLEND`。
+    WorldSpaceBlend {
+        /// 参考动画名。
+        reference: String,
+        start_frame: i32,
+        /// `worldspaceblendloop` = true。
+        loops: bool,
+    },
+    /// `matchblend <动画> <src> <dest> <pre> <post>` —— 官方 `CMD_MATCHBLEND`。
+    MatchBlend {
+        /// 参考动画名。
+        reference: String,
+        src_frame: i32,
+        dest_frame: i32,
+        dest_pre: i32,
+        dest_post: i32,
+    },
 }
 
 /// 一张具名权重表（QC 的 `$weightlist "<名>" { <骨骼> <权重> ... }`）。
@@ -1466,6 +1628,29 @@ pub struct Sequence {
     /// （`ProcessIKRules` 先拷贝 `cmds[]`，`simplify.cpp:6262-6281` 再追加）。
     #[serde(default)]
     pub ik_rules: Vec<IkRule>,
+    /// 序列级命令（QC `$sequence` 块内的 `cmdlist "<名>"` 展开）。
+    ///
+    /// # 为什么在序列上而不是在动画上
+    ///
+    /// 官方**没有**「序列级命令」这个概念：`s_sequence_t` 里根本没有
+    /// `cmds` 字段（`studiomdl.h:610-668`）。序列块里的 `cmdlist` 走的是
+    /// `ParseSequence` 的动画级分派（`studiomdl.cpp:2944`），
+    /// 落在 `pseq->panim[0][0]` —— **第一格动画**上。
+    ///
+    /// mdlc 在解析期还不知道第一格是哪个动画（`blends` 只是名字，
+    /// 编译期才解析），所以和 [`Self::ik_rules`] 一样先记在序列上，
+    /// 编译期再挂到第一格（`compile.rs` 的 `first_cell`）。
+    #[serde(default)]
+    pub cmds: Vec<AnimCmd>,
+    /// 缩放（QC `scale <f>`）。见 [`Animation::scale`]。
+    #[serde(default)]
+    pub scale: Option<f32>,
+    /// 位移（QC `origin <x> <y> <z>`）。见 [`Animation::adjust`]。
+    #[serde(default)]
+    pub adjust: Option<[f32; 3]>,
+    /// 旋转（QC `rotate` / `angles`，**弧度**）。见 [`Animation::rotation`]。
+    #[serde(default)]
+    pub rotation: Option<[f32; 3]>,
     /// **序列级** IK 锁（QC `$sequence` 块内的 `iklock <链名> <posW> <localQW>`）。
     ///
     /// # 与 `[[ik_autoplay_locks]]` 的区别（**两个不同的东西**）
@@ -1967,10 +2152,23 @@ pub struct ModelMeta {
     #[serde(default)]
     pub eye_position: Option<[f32; 3]>,
     /// `$illumposition`。
+    ///
+    /// 官方有**两种**形式，落盘语义不同（`oracle_illumposition6.js`）：
+    ///
+    /// * `$illumposition x y z` ⟹ 落盘 `[-y, x, z]`（做轴变换）；
+    /// * `$illumposition x y z <骨骼>` ⟹ 落盘**原样 `[x, y, z]`**，并新建合成
+    ///   附着点（见 [`Attachment::synthetic`]）。判据是
+    ///   [`Self::illum_position_from_bone`]。
+    ///
+    /// TOML 表达不了第 4 个 token，所以 TOML 侧永远走 3 参数的轴变换语义。
     #[serde(default)]
     pub illum_position: Option<[f32; 3]>,
-    /// `$maxeyedeflection <度>` —— 眼球最大偏转角的**余弦**，落盘进
-    /// `studiohdr2.flMaxEyeDeflection`（`+0x0C`）。
+    /// [`Self::illum_position`] 是否来自 **4 参数**形式（第 4 个 token 是骨骼名）。
+    ///
+    /// 为真时 [`Self::illum_position`] 落盘**不做轴变换**。该标志由 QC 前端设置，
+    /// TOML 表达不了（`#[serde(skip)]`）。
+    #[serde(skip)]
+    pub illum_position_from_bone: bool,
     ///
     /// # 语义（反汇编 `0x00450270` 确证）
     ///
@@ -3394,6 +3592,70 @@ pub struct Attachment {
     /// 官方对 `absolute`/`rigid` 都写 `0x0`，只有 `world_align` 写 `0x10000`。
     #[serde(default)]
     pub flags: Option<i32>,
+    /// 是否是 `$illumposition x y z <骨骼>` **合成**出来的那个附着点。
+    ///
+    /// 官方在 4 参数形式下新建一个名为 `__illumPosition` 的附着点：绑该骨骼、
+    /// 零旋转、平移就是那三个坐标、`type` 带 `IS_RIGID`，并让
+    /// `studiohdr2.illumpositionattachmentindex`（`+0x08`）指向它（**1 起**下标）。
+    /// 实测见 `docs/_probe/oracle_illumposition3.js` … `oracle_illumposition10.js`。
+    ///
+    /// 与普通附着点的三处不同：
+    ///
+    /// ① 官方**允许重名** —— 写两次 `$illumposition` 就有两个 `__illumPosition`
+    ///    （`oracle_illumposition5.js` 的 `illum_twice`），所以它不参与
+    ///    [`ModelDesc::validate`] 的重名检查；
+    /// ② 它绑的骨骼**可能被收骨判据丢掉** —— `IS_RIGID` 让 `TagUsedBones()` 沿父链
+    ///    上溯找第一根有顶点权重的骨骼（`simplify.cpp:3472-3484`），上溯无果就
+    ///    什么都不标，该骨骼随后被丢、再由 `MapSourcesToGlobalBonetable()` 静默
+    ///    重映射到骨骼 0（`simplify.cpp:4180`）。实测 `oracle_illumposition8/10.js`：
+    ///    `$illumposition 0 0 0 b2`（b2 零引用）⟹ `numbones` 少一根、附着点落 bone 0。
+    ///    写出侧靠 [`Attachment::resolved`] 承载这个结果；
+    /// ③ 它是 `#[serde(skip)]` 的 —— TOML 表达不了 4 参数形式，所以 TOML 侧
+    ///    永远走 3 参数的轴变换语义（见 [`crate::mdl_writer`] 的 illum 分支）。
+    #[serde(skip)]
+    pub synthetic: bool,
+    /// `LinkAttachments()` **阶段 2** 的写出侧覆盖值：`(全局骨骼下标, matrix3x4_t)`。
+    ///
+    /// 官方 `LinkAttachments()`（`simplify.cpp:5313-5401`）分两阶段解析附着点的骨骼：
+    ///
+    /// - **阶段 1**（`:5324-5339`）：骨骼**直命中**全局骨骼表 ⟹ `bone = k`，而
+    ///   `:5385` 左乘的 `boneToPose` 与 `:5388` 左乘的 `poseToBone` 恰好互为逆
+    ///   （`:5334-5335` 就是同一个矩阵求逆），`local` **原样落盘**。
+    /// - **阶段 2**（`:5341-5376`）：没直命中 ⟹ 到每个 source 的 `localBone[]` 里按
+    ///   `stricmp` 找，找到后**沿父链上溯**到第一根直命中全局骨骼表的祖先：
+    ///   `while (k != -1 && g_source[j]->boneGlobalToLocal[g_source[j]->boneLocalToGlobal[k]] != k) k = g_source[j]->localBone[k].parent;`
+    ///   （判据的来历：`MapSourcesToGlobalBonetable()` 只在**直命中**时置
+    ///   `boneGlobalToLocal`，被丢的骨骼保持 `-1` ⟹ 判据恒真，`simplify.cpp:4186-4215`）。
+    ///   然后 `bone = boneLocalToGlobal[上溯后]`，并把 `local` 重算成
+    ///   `poseToBone(上溯后)⁻¹ ∘ boneToPose(原始) ∘ local` —— 注意 `:5365` 求逆用的是
+    ///   **上溯后**的 `boneToPose`，而 `:5385` 左乘用的仍是**原始**骨骼的 `boneToPose`
+    ///   （局部变量 `k` 被改了，`boneToPose` 没有）。
+    ///
+    /// 上溯到 `k == -1`（整条链都没直命中）⟹
+    /// `MdlError( "unable to find valid bone for attachment %s:%s\n" )`（`:5360-5362`），
+    /// 由 [`crate::qc::parse`] 的 `finish` 在解析期报出。
+    ///
+    /// `boneToPose` 是**该 source 第 0 帧**的局部姿态沿父链累积
+    /// （`Build_Reference()`，`studiomdl.cpp:728-762`）—— 注意 `simplify.cpp:5350`
+    /// 取的是 `g_source[j]->boneToPose[k]` 而**不是**全局骨骼表的
+    /// `g_bonetable[k].boneToPose`，所以这个值只能在解析期算好。
+    ///
+    /// # 本字段的存法
+    ///
+    /// 存 `(上溯后的全局骨骼下标, 修正矩阵)`，其中
+    /// `修正 = inverse(source 第 0 帧 world[上溯后]) ∘ source 第 0 帧 world[原始]`。
+    /// 写出侧把它左乘到 `crate::compile::attachment_local_matrix` 的结果上
+    /// （那条路径已经处理了 `$staticprop` 的 `ConcatTransforms`，所以修正放在外面）。
+    ///
+    /// 实测 `docs/_probe/diff_illumposition.js` 的 `illum_drop` 变体（夹具父链 `i-1`，
+    /// b2 零引用被丢）：官方 `bone=1 local=[1,0,0,0,0,1,0,0,0,0,1,20]` —— 上溯到 b1、
+    /// 平移 30−10 = 20。`oracle_illumposition8/10.js` 的夹具里非根骨骼的父都是 b0，
+    /// 所以那里落 `bone=0`、平移 20−0 = 20，**同一条规则**。
+    ///
+    /// `None` ⟹ 阶段 1（骨骼直命中全局骨骼表）或普通附着点，走
+    /// `crate::compile::attachment_local_matrix` 原样落盘。
+    #[serde(skip)]
+    pub resolved: Option<(usize, [f32; 12])>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3914,6 +4176,34 @@ pub struct Animation {
     /// `setAnimationWeight(panim, index)` 作用在动画上。
     #[serde(default)]
     pub weight_list: Option<String>,
+    /// 本动画的命令序列（QC 的 `cmdlist "<名>"` 展开 + 内联命令）。
+    ///
+    /// 见 [`Sequence::cmds`]。官方把命令挂在 `s_animation_t.cmds[]` 上
+    /// （**序列本身没有 `cmds` 字段** —— `studiomdl.h:610-668`），
+    /// 所以序列级的 `cmdlist` 其实写在它的第一格动画上。
+    #[serde(default)]
+    pub cmds: Vec<AnimCmd>,
+    /// 缩放（QC `scale <f>`，`studiomdl.cpp:2219-2223`）。
+    ///
+    /// 官方 `panim->scale` 初值 **1.0**（`Cmd_Animation` `:2428`），
+    /// 只在 [`crate::compile`] 的源姿态换算里被消费
+    /// （`ConvertAnimation` → `BuildRawTransforms`）。
+    #[serde(default)]
+    pub scale: Option<f32>,
+    /// 位移（QC `origin <x> <y> <z>`，`studiomdl.cpp:2193-2203`）。
+    ///
+    /// 官方 `panim->adjust` 初值 **`(0,0,0)`**（`g_defaultadjust`）。
+    #[serde(default)]
+    pub adjust: Option<[f32; 3]>,
+    /// 旋转（QC `rotate <z>` / `angles <x> <y> <z>`，
+    /// `studiomdl.cpp:2204-2218`）。**弧度**，按 `RadianEuler` 的 `(x,y,z)`。
+    ///
+    /// ⚠️ 官方初值是 `g_defaultrotation = RadianEuler(0, 0, π/2)`
+    /// （`studiomdl.cpp:6883`）—— 缺省时 `rotation.z` 是 **90°**，
+    /// 不是 0。`rotate` 与 `angles` 都把 `z` 写成
+    /// `DEG2RAD(值 + 90)`，即**补上那 90°**；`x`/`y` 直接写。
+    #[serde(default)]
+    pub rotation: Option<[f32; 3]>,
 }
 
 /// 一个**已编译的动画**（animdesc 的载荷）。
@@ -5064,12 +5354,23 @@ impl ModelDesc {
         }
 
         // ---- body part / model / mesh ----
-        if self.bodyparts.is_empty() {
-            errs.push(DescError {
-                path: "bodyparts".into(),
-                message: "至少需要一个 body part".into(),
-            });
-        }
+        //
+        // ⚠️ **故意不检查 `bodyparts` 为空** —— 官方没有这个检查，而且
+        // **纯动画工程**（只有 `$modelname` + `$sequence`/`$animation`，
+        // 没有任何 `$body`/`$model`/`$bodygroup`）是**合法输入**。
+        //
+        // 官方证据（`docs/_probe/oracle_no_body.js`，真 `studiomdl.exe` 实测）：
+        //   * 同一份 QC **去掉** `$body` 那行 ⟹ `exit=0`、产出 MDL 1048 B、
+        //     `numbodyparts=0`、**不产出 `.vvd`/`.dx90.vtx`**；
+        //   * **加回** `$body` ⟹ `exit=0`、MDL 2200 B、`numbodyparts=1`、VVD+VTX 都有。
+        //   * 源码侧：`write.cpp:2203-2204` `if (phdr->numbodyparts == 0) return;`
+        //     —— **优雅早退**（跳过 `WriteVertices`），不是报错；
+        //     `write.cpp:1462` `phdr->numbodyparts = IsChar( g_numbodyparts );`
+        //     直接写 0；`studiomdl.cpp:995`/`:1040`/`:4238` 的
+        //     `if (g_numbodyparts == 0)` 是 `base = 1` 的**初始化**，不是校验。
+        //
+        // 实测用户工程 `incap_anim_fix`（`$modelname survivors/anim_zoey_float_fix.mdl`
+        // + 22 条 `$sequence`，零 `$body`）原本就卡在这条过严的校验上。
         for (bi, bp) in self.bodyparts.iter().enumerate() {
             let bpath = format!("bodyparts[{bi}]");
             if bp.name.trim().is_empty() {
@@ -5199,13 +5500,17 @@ impl ModelDesc {
                     message: "不能为空".into(),
                 });
             }
-            if at_names.insert(at.name.as_str(), i).is_some() {
+            // 合成附着点（`$illumposition x y z <骨骼>`）两条都豁免：
+            // 官方允许重名（`oracle_illumposition5.js` 的 `illum_twice`），
+            // 且它绑的骨骼可能被收骨判据丢掉后重映射到骨骼 0
+            // （`oracle_illumposition8/10.js`）。详见 [`Attachment::synthetic`]。
+            if !at.synthetic && at_names.insert(at.name.as_str(), i).is_some() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     message: format!("附着点名重复：{:?}", at.name),
                 });
             }
-            if !seen.contains_key(at.bone.as_str()) {
+            if !at.synthetic && !seen.contains_key(at.bone.as_str()) {
                 errs.push(DescError {
                     path: format!("{path}.bone"),
                     message: format!("找不到骨骼 {:?}", at.bone),

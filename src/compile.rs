@@ -331,10 +331,37 @@ pub fn static_prop_rotate(v: [f32; 3]) -> [f32; 3] {
 }
 
 /// 解析 SMD 路径：相对路径以 `base_dir` 为基准。
+///
+/// ⚠️ **没有扩展名时补 `.smd`** —— 官方 `Load_Source( name, "" )`
+/// 在 `xext[0] == '\0'` 时依次试 `.vrm` / `.smd` / `.sma` / `.phys` /
+/// `.vta` / `.obj`，第一个能读到的胜出（`studiomdl.cpp:1603-1638`）。
+/// 三条路径都传空扩展名：
+///
+/// * `$animation` 的源 —— `panim->source = Load_Source( panim->filename, "" )`
+///   （`:2422`）；
+/// * `$sequence` 的隐含动画 —— `Cmd_ImpliedAnimation( pseq, token )`
+///   （`:2506`）；
+/// * `$model`/`$body` 的网格源 —— `Load_Source( pmodel->filename, "", false, true )`
+///   （`:963`）。
+///
+/// 所以 QC 里写**不带扩展名**的名字是合法的。实测用户工程
+/// `incap_anim_fix\includes\anims_fix.qci` 的宏体就是
+/// `$animation a_$FileName$_neutral $FileName$ frame 7 7`
+/// （第二列 `$FileName$` = `NamVet_AimMatrix_Pistol_Incap`，无扩展名），
+/// 官方照编不误；mdlc 修复前会拼出 `anims/NamVet_AimMatrix_Pistol_Incap`
+/// 然后报「读不到 SMD」。
+///
+/// mdlc 只实现 SMD，所以直接补 `.smd`（官方那个 `.vrm` 优先的分支
+/// 在这里永远不会赢：`cddir` 下没有同名 `.vrm`）。
 pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> PathBuf {
     let p = Path::new(smd);
-    if p.is_absolute() {
+    let p = if p.extension().is_none() {
+        p.with_extension("smd")
+    } else {
         p.to_path_buf()
+    };
+    if p.is_absolute() {
+        p
     } else {
         base_dir.join(p)
     }
@@ -2765,7 +2792,53 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 // 命中序列时取它的 `panim[0][0]`。这里 `sequences` 里已经有
                 // 前面处理过的序列（本序列自己还没 push）—— 与官方「流式解析，
                 // 只能看到写在前面、且已进 `g_sequence` 的序列」同序。
-                match resolve_lookup_animation(ref_name, &anims, &anim_index, &sequences) {
+                //
+                // ⚠️⚠️ **但「自己」必须显式认下**（R31）。官方 `Cmd_Sequence`
+                // 在解析体**之前**就把序列 `AddToTail` 进 `g_sequence`
+                // （`studiomdl.cpp:2623-2627`）：
+                //
+                // ```c
+                // s_sequence_t *pseq = &g_sequence[ g_sequence.AddToTail() ];  // ← 先入表
+                // memset( pseq, 0, sizeof( s_sequence_t ) );
+                // strcpyn( pseq->name, token );
+                // ...
+                // ParseSequence( pseq, false );                               // ← 再解析体
+                // ```
+                //
+                // 所以 `$sequence X ... subtract X 0` 里的
+                // `LookupAnimation("X")` 能在**序列池**找到本序列，返回
+                // `pseq->panim[0][0]` —— 而那一格此刻**已经建好**（体里第一个
+                // 非关键字 token 就走 `Cmd_ImpliedAnimation`
+                // 或命中 `g_panimation`，随后 `if (numblends == 1)
+                // pseq->panim[0][0] = animations[0];`，`studiomdl.cpp:2964-2967`）。
+                //
+                // mdlc 的 `sequences` 要到本循环末尾才 push 本序列
+                // ⟹ 查不到自己，必须在这里补上。语义上「自引用帧 0」等价于
+                // 「把整条动画变成相对第 0 帧的增量」，与官方一致
+                // （`subtractBaseAnimations` 先把 `psrc->sanim[srcframe]`
+                // 快照进局部 `s_bone_t src[]`，`psrc == pdest` 也安全，
+                // `simplify.cpp:1071-1082`）。
+                //
+                // 实测触发点：用户工程
+                // `incap_anim_fix\includes\anims_fix.qci:161`
+                // ```text
+                // $sequence IncapIdlenoise NamVet_Idle_Standing_01 X Y Z fixuploop -15 15
+                //   loop weightlist INJUREDIDLENOISE subtract IncapIdlenoise 0 delta hidden
+                // ```
+                // （修前报 `sequences[1].subtract: 找不到参考动画 "IncapIdlenoise"`。）
+                //
+                // 顺序仍与官方一致：`resolve_lookup_animation` 先查动画池
+                // （若真有同名动画，它赢），只有没命中时才认自引用 ——
+                // 本序列此刻确实**不在** `sequences` 里。
+                let target = resolve_lookup_animation(ref_name, &anims, &anim_index, &sequences)
+                    .or_else(|| {
+                        if ref_name.eq_ignore_ascii_case(&s.name) {
+                            Some(anim_ix)
+                        } else {
+                            None
+                        }
+                    });
+                match target {
                     Some(j) => {
                         let src = anims[j].frames.clone();
                         let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
@@ -7132,6 +7205,129 @@ subtract_frame = 0
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// ⚠️ **回归（R31）**：序列级 `subtract` **引用它自己**必须能解析。
+    ///
+    /// 官方 `Cmd_Sequence` 在解析体**之前**就把序列 `AddToTail` 进
+    /// `g_sequence`（`studiomdl.cpp:2623-2627`）：
+    ///
+    /// ```c
+    /// s_sequence_t *pseq = &g_sequence[ g_sequence.AddToTail() ];  // ← 先入表
+    /// memset( pseq, 0, sizeof( s_sequence_t ) );
+    /// strcpyn( pseq->name, token );
+    /// ParseSequence( pseq, false );                               // ← 再解析体
+    /// ```
+    ///
+    /// 于是 `$sequence X ... subtract X 0` 里的 `LookupAnimation("X")` 能在
+    /// **序列池**找到本序列，返回 `pseq->panim[0][0]` —— 那一格此刻已建好。
+    /// mdlc 的 `sequences` 要到循环末尾才 push 本序列 ⟹ 必须显式认下自引用。
+    ///
+    /// 自引用的语义 = 「整条动画变成相对第 0 帧的增量」：
+    /// `subtractBaseAnimations` 先把 `psrc->sanim[srcframe]` 快照进局部
+    /// `s_bone_t src[]`（`simplify.cpp:1071-1082`），所以 `psrc == pdest`
+    /// 也安全。
+    ///
+    /// 实测触发点：用户工程 `incap_anim_fix\includes\anims_fix.qci:161`
+    /// ```text
+    /// $sequence IncapIdlenoise NamVet_Idle_Standing_01 X Y Z fixuploop -15 15
+    ///   loop weightlist INJUREDIDLENOISE subtract IncapIdlenoise 0 delta hidden
+    /// ```
+    /// 修前报 `sequences[1].subtract: 找不到参考动画 "IncapIdlenoise"` 并中止。
+    #[test]
+    fn subtract_can_reference_itself() {
+        let d = tmpdir("subtract-self");
+        // two.smd：2 帧；tip 的 Z 第 0 帧 20°（0.349066）、第 1 帧 35°（0.610865）
+        let two = r#"version 1
+nodes
+  0 "root" -1
+  1 "mid" 0
+  2 "tip" 1
+end
+skeleton
+  time 0
+    0 0 0 0 0 0 0
+    1 0 0 4 0 0 0
+    2 0 0 8 0 0 0.349066
+  time 1
+    0 0 0 0 0 0 0
+    1 0 0 4 0 0 0
+    2 0 0 8 0 0 0.610865
+end
+triangles
+myprop
+  2 -8 -8 8 0 0 1 0 0 1 2 1
+  2 8 -8 8 0 0 1 1 0 1 2 1
+  2 0 8 8 0 0 1 0.5 1 1 2 1
+end
+"#;
+        write(&d, "two.smd", two);
+        let toml = r#"
+[model]
+name = "models/test/selfsub.mdl"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{ name = "models/test/myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "mid"
+parent = "root"
+
+[[bones]]
+name = "tip"
+parent = "mid"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "two.smd"
+
+[[sequences]]
+name = "selfsub"
+smd = "two.smd"
+subtract = "selfsub"
+subtract_frame = 0
+"#;
+        let desc: ModelDesc = toml::from_str(toml).expect("TOML 解析");
+        let c = compile(&desc, &d).expect(
+            "序列级 `subtract` 引用**自己**必须能编译（官方 `Cmd_Sequence` \
+             在解析体之前就把序列放进 `g_sequence`）",
+        );
+        let seq = c
+            .sequences
+            .iter()
+            .find(|s| s.name == "selfsub")
+            .expect("产物里应有 selfsub 序列");
+        // ⚠️ `subtract` 只置 **animdesc** 的 DELTA，**不置 seqdesc** 的
+        // （见上面 `seq_is_delta` 处的 R11 表：`CMD_SUBTRACT` 落 `panim->flags`，
+        // `delta` 关键字才落 `pseq->flags`）。所以这里断言的是动画。
+        let anim = c
+            .animations
+            .iter()
+            .find(|a| a.name == "@selfsub")
+            .expect("产物里应有隐含动画 @selfsub");
+        assert!(anim.delta, "subtract ⇒ animdesc 的 DELTA");
+        assert!(
+            !seq.delta,
+            "只有 `subtract`、没有 `delta` 关键字 ⟹ seqdesc **不该**有 DELTA"
+        );
+        assert_eq!(seq.frames.len(), 2, "两帧都应保留");
+        let f0 = seq.frames[0][2].rotation[2].to_degrees();
+        let f1 = seq.frames[1][2].rotation[2].to_degrees();
+        assert!(
+            f0.abs() < 0.01,
+            "第 0 帧减去自己 ⟹ 恒等，实际 {f0}°（自引用没解析到？）"
+        );
+        assert!(
+            (f1 - 15.0).abs() < 0.01,
+            "第 1 帧应为 35° − 20° = 15°，实际 {f1}°"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// `subtract` 出来的动画在**写出阶段**只保留真正变化的骨骼。
     ///
     /// 这是 miku `look_*` 的核心判据：官方 `look_down` 只有 **1** 条轨道
@@ -10042,6 +10238,10 @@ weight = 0.5
             forward_declared: false,
             no_auto_ik: false,
             ik_rules: Vec::new(),
+            cmds: Vec::new(),
+            scale: None,
+            adjust: None,
+            rotation: None,
             iklocks: Vec::new(),
             blends: Vec::new(),
             blend_width: None,

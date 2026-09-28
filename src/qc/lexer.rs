@@ -535,41 +535,93 @@ impl Lexer {
         Ok(())
     }
 
-    /// `DefineMacro`（`scriplib.cpp:107`）。
+    /// `DefineMacro`（`scriplib.cpp:132-198`）。
+    ///
+    /// ⚠️ **`\\` 是宏体的续行符。** 它不是通用续行符 —— 只在这一个函数里
+    /// 生效（`Option_Flexrule` 的 `\\` 是另一套机制，见模块文档）。
+    ///
+    /// 官方流程（逐字对照）：
+    ///
+    /// ```c
+    /// char *cp = script->script_p;
+    /// while (TokenAvailable()) {
+    ///     GetToken(false);
+    ///     if (token[0] == '\\' && token[1] == '\\') break;
+    ///     cp = script->script_p;          // ← 只在**非** `\\` 时前进
+    ///     pmacro->macroparam[...] = ...;
+    /// }
+    /// script->script_p = cp;              // ← 回退到 `\\` 之前
+    /// while (*cp && *cp != '\n') {
+    ///     if (*cp == '\\' && *(cp+1) == '\\') {
+    ///         while (*cp && *cp != '\n') { *cp = ' '; cp++; }  // 原地改空格
+    ///         if (*cp) { cp++; }                                // 跨过换行
+    ///     } else { cp++; }
+    /// }
+    /// ```
+    ///
+    /// 语义：宏体从**最后一个形参之后**开始；遇到 `\\` 就把「`\\` 到行尾」
+    /// 全替换成**空格**并**跨过**换行继续，直到第一个**没有** `\\` 的换行。
+    /// 那个换行本身**保留在体内**（`size = cp - script->script_p` 已含它）。
+    ///
+    /// ⚠️ **修复前 mdlc 只取「本行剩余」**（`:552-558` 的注释还声称两者
+    /// 等价 —— 该声称**不成立**）。于是
+    /// `$definemacro IncapAimMacro FileName \\` 的体为空 ⟹
+    /// `anims_fix.qci:173`/`:174` 两次调用展开成空 ⟹ **26 条
+    /// `$animation` 与 2 个 `$sequence` 静默消失**，随后 `anim_fix.qc:35`
+    /// 的 `$continue` 指向不存在的序列（报 `unknown continue animation`）。
+    ///
+    /// ⚠️ 注意行首的 `+` 会被 Markdown 当成列表标记（clippy 的
+    /// `doc_lazy_continuation`），所以这里把它写成「与」。
+    ///
+    /// ⚠️ 一处**故意偏离**：官方的手工扫描**不更新** `script->line`，所以
+    /// 多行宏之后的官方行号是偏的。mdlc 把跨过的换行计入 `f.line`。
     fn define_macro(&mut self, name: &Token) -> Result<(), QcError> {
         let mut params = Vec::new();
+        // 官方 `cp` 的对应物：**最后一次成功取到形参之后**的位置
+        // （即 `\\` 之前）。取不到任何形参时它停在名字之后。
+        let f0 = self.frame_mut();
+        let mut body_start = f0.pos;
+        let def_line = f0.line;
         loop {
             if !self.token_available() {
                 break;
             }
             let t = self.expect_token(false)?;
-            // `\\` 终止形参表（`scriplib.cpp:122`）。
+            // `\\` 终止形参表，且**不**推进 `body_start`（`scriplib.cpp:122`）。
             if t.text == "\\\\" {
                 break;
             }
             params.push(t.text);
+            body_start = self.frame_mut().pos;
         }
-        // 宏体 = 从当前位置到行尾（官方 `while (*cp && *cp != '\n') cp++;`）。
-        //
-        // ⚠️ 官方的 `cp` 是**回退过的** `script_p`（`DefineMacro` 里
-        // `script->script_p = cp`，`cp` 是最后一次成功取 token 之后的位置）。
-        // 上面的形参循环里 `next_token` 已经把 pos 推到了行尾之后，
-        // 所以这里直接取到行尾即可 —— 两者在「形参循环因 TokenAvailable()
-        // 为假而退出」时等价。
         let f = self.frame_mut();
-        let start = f.pos;
-        let mut end = start;
-        while end < f.buffer.len().saturating_sub(1) && f.buffer[end] != b'\n' {
-            end += 1;
+        f.pos = body_start;
+        let len = f.buffer.len();
+        let mut cp = body_start;
+        let mut newlines = 0usize;
+        while cp < len && f.buffer[cp] != 0 && f.buffer[cp] != b'\n' {
+            if f.buffer[cp] == b'\\' && f.buffer.get(cp + 1) == Some(&b'\\') {
+                // 「`\\` 到行尾」原地改空格（官方 `*cp = ' '`）。
+                while cp < len && f.buffer[cp] != 0 && f.buffer[cp] != b'\n' {
+                    f.buffer[cp] = b' ';
+                    cp += 1;
+                }
+                if cp < len && f.buffer[cp] == b'\n' {
+                    cp += 1;
+                    newlines += 1;
+                }
+            } else {
+                cp += 1;
+            }
         }
-        let body = f.buffer[start..end].to_vec();
-        f.pos = end;
-        let line = f.line;
+        let body = f.buffer[body_start..cp].to_vec();
+        f.pos = cp;
+        f.line += newlines;
         self.macros.push(Macro {
             name: name.text.clone(),
             body,
             params,
-            line,
+            line: def_line,
         });
         Ok(())
     }
