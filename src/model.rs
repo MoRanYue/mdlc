@@ -4633,7 +4633,7 @@ pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格�
 #   [model].eye_position     <- $eyeposition
 #   [model].illum_position   <- $illumposition
 #   [model].contents         <- $contents
-#   [model].mass             <- $mass
+#   [physics].mass           <- $mass（在 $collisionmodel / $collisionjoints 块内）
 #   [materials].search_paths <- $cdmaterials
 #   [[bones]]                <- $definebone
 #   [[bodyparts]]            <- $bodygroup + $body
@@ -4663,9 +4663,10 @@ name = "models/mymod/myprop.mdl"
 # checksum = 12345
 static_prop = true
 surface_prop = "metal"
-# 可省略，默认 1.0（与 studiomdl 一致；写 0 会让物理质量为零）。
-# mass = 1.0
-# 可省略，默认 0。$contents 的 "solid" = 1，会写进头部与每根骨骼。
+# ⚠️ 质量**不在** [model] 里 —— 它在 [physics] 的 `mass`（对应
+#    $collisionmodel / $collisionjoints 块内的 `$mass`）。在 [model] 下写
+#    `mass = 1.0` 会因为 deny_unknown_fields 直接解析失败。
+# 可省略，默认 1（CONTENTS_SOLID）。$contents 的 "solid" = 1，会写进头部与每根骨骼。
 # contents = 1
 # 可省略；省略时由 SMD 顶点自动计算包围盒。
 # hull_min = [-8.0, -8.0, 0.0]
@@ -4703,7 +4704,11 @@ textures = [
 name = "root"
 # position = [0.0, 0.0, 0.0]
 # rotation = [0.0, 0.0, 0.0]
-# 可省略，默认 0x500（BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_HITBOX）。
+# 可省略；省略时按**用途**逐根计算（被顶点使用 / 被 hitbox 使用 /
+# 被 attachment 使用 / 被 ikchain 使用 / bonemerge）并沿父链向上传播，
+# 与官方逐位一致。**不是**无条件的 0x500 —— 0x500
+# （BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_HITBOX）只是「该骨骼确实
+# 被顶点与 hitbox 使用」时的结果，一律写它会把未被顶点使用的骨骼误标。
 # flags = 1280
 # 可省略；省略时继承 [model].surface_prop。
 # surface_prop = "metal"
@@ -4932,7 +4937,7 @@ impl ModelDesc {
         toml::from_str(text).map_err(|e| format!("TOML 解析失败：{e}"))
     }
 
-    /// 序列化为 TOML 文本（用于 `mdlc init` 从参考模型导出模板）。
+    /// 序列化为 TOML 文本（`mdlc qc2toml` 靠它把 QC 落成描述文件）。
     pub fn to_toml(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("TOML 序列化失败：{e}"))
     }
