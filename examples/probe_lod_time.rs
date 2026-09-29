@@ -52,7 +52,7 @@ fn main() {
         && let Some(m) = bp.models.first()
     {
         n_lods = m.lods.len() + 1;
-        let p = mdlc::compile::resolve_smd_path(&base, &m.smd);
+        let p = mdlc::compile::resolve_smd_path(&base, &m.smd).expect("夹具写全扩展名");
         if let Ok(t) = std::fs::read_to_string(&p)
             && let Ok(s) = mdlc::smd::parse_smd(&t)
         {

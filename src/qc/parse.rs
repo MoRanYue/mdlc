@@ -2203,9 +2203,11 @@ impl<'a> Parser<'a> {
                         // 隐含动画全被当成「工程根目录下的文件」—— 实测用户工程
                         // `incap_anim_fix` 报 22 条
                         // `sequences[N].smd: 读不到 .\NamVet_*.smd`。
-                        // 解析出的名字**不带扩展名**，由编译期的
-                        // [`crate::compile::resolve_smd_path`] 补 `.smd`
-                        // （官方同一条 `Load_Source` 试探链）。
+                        // 解析出的名字**不带扩展名** —— mdlc 要求写完整文件名，
+                        // 所以这种裸名会在编译期被
+                        // [`crate::compile::resolve_smd_path`] 拒绝并报
+                        // 「资产引用没有扩展名」（官方则会按 `Load_Source`
+                        // 的试探链找文件）。
                         blend_names.push(self.resolve_src(&t.text));
                     }
                 }
@@ -3371,12 +3373,13 @@ impl<'a> Parser<'a> {
                     // （必须是**已加载过**的源，否则 `Unknown replace model`）
                     // —— 也印证第 1 个是「源」。
                     //
-                    // 官方还会剥掉扩展名，再按 `cddir` 拼 `.smd`
-                    // （`Load_Source(name, "SMD")`），所以 `"ipf"` → `ipf.smd`。
+                    // ⚠️ mdlc **不**补扩展名 —— 这里要求写完整文件名
+                    // （`"ipf-lod1.smd"`）。官方会剥掉扩展名再按 `cddir`
+                    // 拼 `.smd`（`Load_Source(name, "SMD")`），mdlc 有意
+                    // 不做这种猜测（见 `compile::resolve_smd_path` 文档）。
                     let from = self.tok(false)?.text;
                     let to = self.tok(false)?.text;
                     let _ = from; // 源名只用于校验/匹配，落盘用第 2 个
-                    let to = ensure_smd_ext(&to);
                     lod.smd = Some(self.resolve_src(&to));
                     self.referenced_files.push(lod.smd.clone().unwrap());
                     // `reverse`（可选）：官方 `SetReverse`。
@@ -3996,19 +3999,20 @@ impl<'a> Parser<'a> {
             if smd_cache.contains_key(f) {
                 continue;
             }
-            // ⚠️ 用 `compile::resolve_smd_path` 而不是手工 `join`：
-            // 它会**补上缺失的 `.smd` 扩展名**（官方 `Load_Source` 在
-            // `xext[0] == '\0'` 时依次试 `.vrm`/`.smd`/… 的语义，
-            // `studiomdl.cpp:1603-1638`），与编译期读帧时的路径**必须一致**。
+            // ⚠️ 用 `compile::resolve_smd_path` 而不是手工 `join`：相对路径
+            // 必须以 `qdir` 为基准，且与编译期读帧时的路径**必须一致**。
             //
-            // 实测：`incap_anim_fix` 的宏体写的是
-            // `$animation a_$FileName$_neutral $FileName$ frame 7 7`
-            // —— 第二列没有扩展名。手工 `join` 会拼出不存在的路径，
-            // 于是这里报「读不到 SMD」，而那几份 SMD 恰恰是
-            // `$illumposition 0 0 0 $Bone$Spine` 里 `ValveBiped.Bip01_Spine`
-            // 的**唯一**来源 ⟹ 连带把合成附着点也误报成
-            // `unknown attachment link`。
-            let p = crate::compile::resolve_smd_path(&self.qdir, f);
+            // ⚠️ 它**不再补扩展名** —— 引用没写扩展名时报错（官方
+            // `Load_Source` 会按 `.vrm`/`.smd`/… 依次试探，
+            // `studiomdl.cpp:1603-1638`，mdlc 有意不实现这套猜测）。
+            // 所以 `referenced_files` 里的每一条都应当是完整文件名。
+            let p = match crate::compile::resolve_smd_path(&self.qdir, f) {
+                Ok(p) => p,
+                Err(msg) => {
+                    self.errors.push(QcError::new(f.clone(), 0, msg));
+                    continue;
+                }
+            };
             // ⚠️ **不要静默吞掉读失败** —— 那正是本项目反复踩到的
             // 「静默吃数据」：SMD 读不到时骨骼表会变空，
             // 最后只报一句「至少需要一根骨骼」，指向不了真因。
@@ -4811,20 +4815,6 @@ struct FlexOpts {
     split: f32,
     /// `decay <f>` —— 每条 vertanim 的 `speed` 通道。
     decay: f32,
-}
-
-/// 给没有扩展名的文件名补 `.smd`（官方 `Load_Source(name, "SMD")`）。
-///
-/// 官方 `Load_Source`（`studiomdl.cpp:1522`）无条件拼 `"%s%s.%s"` ——
-/// 所以 `"ipf"` 变成 `"ipf.smd"`，而 `"ipf.smd"` 会变成 `"ipf.smd.smd"`
-/// （官方先 `Q_StripExtension` 才拼，所以不会重复）。
-fn ensure_smd_ext(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".smd") || lower.ends_with(".dmx") || lower.ends_with(".vrm") {
-        name.to_string()
-    } else {
-        format!("{name}.smd")
-    }
 }
 
 /// 把骨骼表排成「父骨骼必定在子骨骼之前」的顺序。

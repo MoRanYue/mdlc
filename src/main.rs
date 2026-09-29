@@ -409,7 +409,13 @@ fn compile_and_write(
     let collision_smd: Option<mdlc::smd::Smd> = match desc.physics.smd.as_deref() {
         None => None,
         Some(rel_smd) => {
-            let p = mdlc::compile::resolve_smd_path(base, rel_smd);
+            let p = match mdlc::compile::resolve_smd_path(base, rel_smd) {
+                Ok(p) => p,
+                Err(msg) => {
+                    diagln!("错误：{msg}");
+                    return ExitCode::from(2);
+                }
+            };
             let text = match std::fs::read_to_string(&p) {
                 Ok(t) => t,
                 Err(e) => {

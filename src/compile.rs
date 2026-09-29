@@ -330,41 +330,40 @@ pub fn static_prop_rotate(v: [f32; 3]) -> [f32; 3] {
     [-v[1], v[0], v[2]]
 }
 
-/// 解析 SMD 路径：相对路径以 `base_dir` 为基准。
+/// 解析资产路径（SMD / `.vta` 等）：相对路径以 `base_dir` 为基准。
 ///
-/// ⚠️ **没有扩展名时补 `.smd`** —— 官方 `Load_Source( name, "" )`
-/// 在 `xext[0] == '\0'` 时依次试 `.vrm` / `.smd` / `.sma` / `.phys` /
-/// `.vta` / `.obj`，第一个能读到的胜出（`studiomdl.cpp:1603-1638`）。
-/// 三条路径都传空扩展名：
+/// ⚠️ **不补扩展名** —— 引用必须写完整文件名（含扩展名），否则报错。
 ///
-/// * `$animation` 的源 —— `panim->source = Load_Source( panim->filename, "" )`
-///   （`:2422`）；
-/// * `$sequence` 的隐含动画 —— `Cmd_ImpliedAnimation( pseq, token )`
-///   （`:2506`）；
-/// * `$model`/`$body` 的网格源 —— `Load_Source( pmodel->filename, "", false, true )`
-///   （`:963`）。
+/// 官方 `Load_Source( name, ext )` 在 `xext[0] == '\0'`（引用没写扩展名）
+/// 时，会按传入的 `ext` 或者一条固定顺序的试探链去找文件
+/// （`studiomdl.cpp:1603-1638` 依次试 `.vrm` / `.smd` / `.sma` / `.phys` /
+/// `.vta` / `.obj`，第一个能读到的胜出）；`flexfile`/`eyelid` 那条路径
+/// 更是直接传 `ext = "vta"`，于是**只**试 `.vta`（`:3636` / `:3722`）。
 ///
-/// 所以 QC 里写**不带扩展名**的名字是合法的。实测用户工程
-/// `incap_anim_fix\includes\anims_fix.qci` 的宏体就是
-/// `$animation a_$FileName$_neutral $FileName$ frame 7 7`
-/// （第二列 `$FileName$` = `NamVet_AimMatrix_Pistol_Incap`，无扩展名），
-/// 官方照编不误；mdlc 修复前会拼出 `anims/NamVet_AimMatrix_Pistol_Incap`
-/// 然后报「读不到 SMD」。
+/// mdlc 有意**不实现**这套试探链：
 ///
-/// mdlc 只实现 SMD，所以直接补 `.smd`（官方那个 `.vrm` 优先的分支
-/// 在这里永远不会赢：`cddir` 下没有同名 `.vrm`）。
-pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> PathBuf {
+/// * 同一个 token 在不同上下文里会解析到**不同的文件** ——
+///   `"main"` 在 `$model` 里是 `main.smd`（或 `main.vrm`！），在
+///   `flexfile` 里是 `main.vta`。让「写没写扩展名」隐式决定读哪个文件，
+///   是把歧义留给读者；
+/// * 试探链的失败信息是「六个候选都读不到」，而真正的原因通常是
+///   「用户少写了一个扩展名」。直接报错更准确。
+///
+/// 所以这里在缺扩展名时返回错误，由调用方带上自己的定位信息上报。
+pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> Result<PathBuf, String> {
     let p = Path::new(smd);
-    let p = if p.extension().is_none() {
-        p.with_extension("smd")
-    } else {
+    if !p.extension().is_some_and(|ext| !ext.is_empty()) {
+        return Err(format!(
+            "资产引用 {smd:?} 没有扩展名：mdlc 要求写完整文件名（如 {smd:?}.smd）。\
+             官方会按 .vrm/.smd/.sma/.phys/.vta/.obj 依次试探（`Load_Source`），\
+             本实现不做这种猜测。"
+        ));
+    }
+    Ok(if p.is_absolute() {
         p.to_path_buf()
-    };
-    if p.is_absolute() {
-        p
     } else {
         base_dir.join(p)
-    }
+    })
 }
 
 /// 读取并解析一个 SMD 文件。
@@ -467,7 +466,13 @@ fn build_model_lods(
                 continue;
             };
 
-            let smd_path = resolve_smd_path(base_dir, lod_smd);
+            let smd_path = match resolve_smd_path(base_dir, lod_smd) {
+                Ok(p) => p,
+                Err(msg) => {
+                    errs.push(e(&lpath, msg));
+                    continue;
+                }
+            };
             let smd = match read_smd(&smd_path, &lpath) {
                 Ok(s) => s,
                 Err(err) => {
@@ -1908,7 +1913,13 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             let mut models = Vec::with_capacity(bp.models.len());
             for (mi, m) in bp.models.iter().enumerate() {
                 let at = format!("bodyparts[{bi}].models[{mi}]");
-                let smd_path = resolve_smd_path(base_dir, &m.smd);
+                let smd_path = match resolve_smd_path(base_dir, &m.smd) {
+                    Ok(p) => p,
+                    Err(msg) => {
+                        errors.push(e(format!("{at}.smd"), msg));
+                        continue;
+                    }
+                };
                 let text = match std::fs::read_to_string(&smd_path) {
                     Ok(t) => t,
                     Err(err) => {
@@ -2079,7 +2090,13 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             });
             continue;
         }
-        let p = resolve_smd_path(base_dir, &a.smd);
+        let p = match resolve_smd_path(base_dir, &a.smd) {
+            Ok(p) => p,
+            Err(msg) => {
+                seq_errors.push(e(format!("{at}.smd"), msg));
+                continue;
+            }
+        };
         let Some((mut frames, _smd)) = load_smd_frames(
             &p,
             desc,
@@ -2185,17 +2202,25 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             .unwrap_or(sq.smd.as_str());
                         match anim_index.get(cell) {
                             Some(&j) => Some(anims[j].frames.clone()),
-                            None => {
-                                let p = resolve_smd_path(base_dir, &sq.smd);
-                                load_smd_frames(
+                            None => match resolve_smd_path(base_dir, &sq.smd) {
+                                Ok(p) => load_smd_frames(
                                     &p,
                                     desc,
                                     &bone_index,
                                     &format!("animations[{i}].subtract（序列 {ref_name:?}）"),
                                     &mut seq_errors,
                                 )
-                                .map(|(frames, _smd)| frames)
-                            }
+                                .map(|(frames, _smd)| frames),
+                                Err(msg) => {
+                                    seq_errors.push(e(
+                                        format!(
+                                            "animations[{i}].subtract（序列 {ref_name:?}）"
+                                        ),
+                                        msg,
+                                    ));
+                                    None
+                                }
+                            },
                         }
                     }
                     None => None,
@@ -2580,12 +2605,22 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             // 找不到 `reload.smd`（池里没有这个名字），于是又建一个。
             // 早先本实现按**文件名**登记，于是这两条被错误地并成一条
             // （实测 `numlocalanim` 17 vs 官方 29）。
-            let smd_path = resolve_smd_path(base_dir, &s.smd);
+            // ⚠️ **路径解析必须留在 `None` 臂里** —— `s.smd` 既可能是
+            // 文件路径，也可能是**动画名**（`$sequence "base" "a_base"`，
+            // 见 `parity\blend1.toml`）。查池命中时根本不读文件，
+            // 而 `a_base` 这种动画名没有扩展名 ⟹ 提前解析会误报。
             let by_name = anim_index.get(s.smd.as_str()).copied();
             let reused = by_name.is_some();
             let (anim_ix, mut frames) = match by_name {
                 Some(i) => (i, anims[i].frames.clone()),
                 None => {
+                    let smd_path = match resolve_smd_path(base_dir, &s.smd) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            seq_errors.push(e(format!("{at}.smd"), msg));
+                            continue;
+                        }
+                    };
                     let Some((frames, _smd)) = load_smd_frames(
                         &smd_path,
                         desc,
@@ -2929,7 +2964,11 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             }
             sequences.push(crate::model::CompiledSequence {
                 name: s.name.clone(),
-                smd_path,
+                // 复用已声明动画时 `smd_path` 是那个动画的源；新建隐含动画时
+                // 就是刚解析出的路径 ⟹ 两者都取 `anims[anim_ix]` 的。
+                // （原先这里直接用局部 `smd_path`，但路径解析现在只在
+                // `None` 臂里发生 —— 见上面那段说明。）
+                smd_path: anims[anim_ix].smd_path.clone(),
                 fps: s.fps.unwrap_or(30.0),
                 looping: s.looping,
                 activity: -1,
@@ -5580,7 +5619,13 @@ fn resolve_vta_flexes(
 
             for (fi, f) in m.iter().enumerate() {
                 let fat = format!("{at}.flexes[{fi}]");
-                let vta_path = resolve_smd_path(base_dir, &f.vta);
+                let vta_path = match resolve_smd_path(base_dir, &f.vta) {
+                    Ok(p) => p,
+                    Err(msg) => {
+                        errs.push(e(&fat, msg));
+                        continue;
+                    }
+                };
                 let vta = match vta_cache.entry(vta_path.clone()) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                     std::collections::hash_map::Entry::Vacant(slot) => {
@@ -10121,6 +10166,94 @@ end
         let desc = ModelDesc::from_toml(&desc_toml("nope.smd")).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
         assert!(errs.iter().any(|x| x.message.contains("读不到")), "{errs:?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `resolve_smd_path` 的三种输入：相对 / 绝对 / **缺扩展名**。
+    ///
+    /// 用 `std::env::temp_dir()` 造绝对路径，避免依赖 Windows 盘符
+    /// （CI 也会在非 Windows 上跑）。
+    #[test]
+    fn resolve_smd_path_requires_an_extension() {
+        let base = Path::new("anims");
+        // 相对 + 带扩展名 ⟹ 拼到 `base` 下，扩展名**原样保留**。
+        assert_eq!(
+            resolve_smd_path(base, "a.smd").unwrap(),
+            base.join("a.smd")
+        );
+        // `.vta` 同样走这条路（`flexfile` / `eyelid`）。
+        assert_eq!(
+            resolve_smd_path(base, "main.vta").unwrap(),
+            base.join("main.vta")
+        );
+        // 绝对路径 ⟹ 原样返回，不拼 `base`。
+        let abs = std::env::temp_dir().join("mdlc-abs-check.vta");
+        assert_eq!(
+            resolve_smd_path(base, abs.to_str().unwrap()).unwrap(),
+            abs
+        );
+        // 缺扩展名 ⟹ 报错，错误串里既回显引用又点明原因。
+        let err = resolve_smd_path(base, "c").unwrap_err();
+        assert!(err.contains("\"c\""), "错误串应回显引用：{err}");
+        assert!(err.contains("没有扩展名"), "错误串应点明原因：{err}");
+        // ⚠️ 目录名里的点**不算**扩展名：`file_name()` 是 `c`，没有点。
+        assert!(
+            resolve_smd_path(base, "a.b/c").is_err(),
+            "目录名里的点不能被当成扩展名"
+        );
+    }
+
+    /// ⚠️ **缺扩展名的引用必须报错**，不能猜。
+    ///
+    /// 官方 `Load_Source( name, ext )` 在引用没写扩展名时按
+    /// `.vrm`/`.smd`/`.sma`/`.phys`/`.vta`/`.obj` 依次试探
+    /// （`studiomdl.cpp:1603-1638`），`flexfile`/`eyelid` 更是只试 `.vta`
+    /// （`:3636` / `:3722`）。mdlc 有意**不实现**这套猜测：同一个 token
+    /// 在不同上下文里会解析到**不同的文件**（`"main"` 在 `$model` 里是
+    /// `main.smd`，在 `flexfile` 里是 `main.vta`），让「写没写扩展名」
+    /// 隐式决定读哪个文件是把歧义留给读者。
+    ///
+    /// 本用例：TOML 写 `smd = "nope"` ⟹ 必须报「没有扩展名」，
+    /// 而**不是**退化成「读不到 nope.smd」（那说明仍然在猜）。
+    #[test]
+    fn rejects_smd_reference_without_extension() {
+        let d = tmpdir("noext");
+        let desc = ModelDesc::from_toml(&desc_toml("nope")).unwrap();
+        let errs = compile(&desc, &d).unwrap_err();
+        let joined = errs
+            .iter()
+            .map(|x| x.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("没有扩展名"),
+            "缺扩展名必须报「没有扩展名」，实际：{joined}"
+        );
+        assert!(
+            !joined.contains("读不到"),
+            "不该退化成「读不到」（那意味着仍然去猜了扩展名）：{joined}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ⚠️ **动画名引用不能被路径校验误伤**。
+    ///
+    /// `[[sequences]] smd` 既可能是 SMD 路径，也可能是 `[[animations]]`
+    /// 的名字（`parity\blend1.toml` 的 `smd = "a_base"`）。查动画池命中时
+    /// **根本不读文件** ⟹ 不能提前做「必须有扩展名」的校验，
+    /// 否则 `a_base` 会被误报。本用例钉住这个懒求值行为。
+    #[test]
+    fn sequence_referencing_an_animation_name_needs_no_extension() {
+        let d = tmpdir("animname");
+        write(&d, "a.smd", SMD);
+        let toml = format!(
+            "{}\n[[animations]]\nname = \"a_base\"\nsmd = \"a.smd\"\n\
+             \n[[sequences]]\nname = \"base\"\nsmd = \"a_base\"\n",
+            desc_toml("a.smd")
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("引用动画名必须编译成功");
+        assert_eq!(c.sequences.len(), 1);
         std::fs::remove_dir_all(&d).ok();
     }
 
