@@ -2264,7 +2264,21 @@ pub struct ModelMeta {
     /// 说明**两者都会重排**。所以打开本项是**更接近官方行为**的，
     /// 只是不会逐字节相同 —— meshopt 与 NvTriStrip 是两套不同算法。
     ///
-    /// 命令行 `--optimize-vtx` 可覆盖本项（见 `main.rs`）。
+    /// # 三个等价入口
+    ///
+    /// | 入口 | 形态 | 方向 |
+    /// |---|---|---|
+    /// | TOML | `[model] optimize_vtx = true` | 双向 |
+    /// | 命令行 | `--optimize-vtx`（见 `main.rs`） | **只能开** |
+    /// | QC | `$optimizevtx` | **只能开** |
+    ///
+    /// 后两者是 `||` 关系（`main.rs` 的
+    /// `desc.model.optimize_vtx || cli_optimize_vtx`），所以一旦在命令行
+    /// 或 QC 里打开就**没法关**（缺省本来就是关的，没有关的需求）。
+    ///
+    /// ⚠️ `$optimizevtx` 是 **mdlc 自己的扩展**，官方与 NekoMDL 都没有
+    /// 这个 QC 命令（官方是 `-nvtristrip` 命令行开关）——
+    /// 真 `studiomdl.exe` 对它报 `bad command`。
     #[serde(default)]
     pub optimize_vtx: bool,
     /// **顶点超限时自动拆分**（默认 **`true`**）。
@@ -2302,6 +2316,18 @@ pub struct ModelMeta {
     ///
     /// 关掉它（`split_oversized_meshes = false`）则遇到超限 mesh 时**直接报错**，
     /// 报错信息会给出两条可行路径。
+    ///
+    /// # 三个等价入口
+    ///
+    /// | 入口 | 形态 | 方向 |
+    /// |---|---|---|
+    /// | TOML | `[model] split_oversized_meshes = false` | 双向 |
+    /// | QC | `$nosplitoversizedmeshes` | **只能关** |
+    /// | QC | `$splitoversizedmeshes` | **只能开**（把 `$include` 关掉的再开回来） |
+    ///
+    /// 两个 QC 命令都是 **mdlc 自己的扩展** —— 官方与 NekoMDL 都没有
+    /// （NekoMDL 的 `$maxverts` 做的是另一件事：拆成**新 bodypart**）。
+    /// 真 `studiomdl.exe` 对它们报 `bad command`。
     #[serde(default = "default_true")]
     pub split_oversized_meshes: bool,
     /// `$keyvalues` 块的内容（**不含外层 `mdlkeyvalue` 包装**）。
@@ -4969,6 +4995,7 @@ surface_prop = "metal"
 # 顶点缓存优化：重排每个 strip group 的索引顺序，让 GPU 的后变换顶点缓存
 # 命中率更高。**只改索引顺序**，顶点池与三角形集合都不变（渲染结果相同）。
 # 可省略，默认 false（保持与既有产物逐字节相同）。
+# QC 侧等价命令：$optimizevtx（mdlc 扩展）；命令行：--optimize-vtx。
 # optimize_vtx = true
 #
 # 顶点超限自动拆分：VTX 的 origMeshVertID 是 uint16 ⟹ **一个 mesh（= 一个
@@ -4976,6 +5003,8 @@ surface_prop = "metal"
 # 顺序切成多个 mesh**，全部留在**同一个 model** 里、**共用原材质下标**，
 # 所以不改变 $bodygroup 语义，渲染结果与拆分前逐像素相同。
 # 可省略，**默认 true**。关掉它则遇到超限 mesh 直接报错。
+# QC 侧等价命令：$nosplitoversizedmeshes 关 / $splitoversizedmeshes 开
+# （都是 mdlc 扩展）。
 # split_oversized_meshes = false
 
 [materials]

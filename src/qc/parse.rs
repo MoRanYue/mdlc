@@ -226,8 +226,9 @@ impl<'a> Parser<'a> {
                     contents: None,
                     skip_bone_in_bbox: false,
                     optimize_vtx: false,
-                    // QC 没有对应的关键字（这是 mdlc 自己的扩展），
-                    // 走**与 TOML 同一个缺省函数**（避免两处各写一遍而漂移）。
+                    // 缺省走**与 TOML 同一个缺省函数**（避免两处各写一遍而漂移）。
+                    // 两者都能被 mdlc 扩展命令改写（`$optimizevtx` /
+                    // `$splitoversizedmeshes` / `$nosplitoversizedmeshes`）。
                     split_oversized_meshes: crate::model::default_true(),
                     key_values: None,
                     pose_parameters: Vec::new(),
@@ -429,6 +430,32 @@ impl<'a> Parser<'a> {
             }
             "$skipboneinbbox" => {
                 self.desc.model.skip_bone_in_bbox = true;
+                Ok(())
+            }
+            // ---- mdlc 扩展：两个「优化 / 兜底」开关 ----
+            //
+            // 官方 `studiomdl.exe` 的 105 条分发表里**没有**这两个功能的任何
+            // 关键字（`tmp-qcscan\dispatch_table.tsv` 对 `optimize` / `split` /
+            // `oversized` / `vcache` 全部 0 命中），第三方 NekoMDL 也没有
+            // —— 它把顶点缓存优化做成**命令行**开关 `-nvtristrip`，把超限拆分
+            // 做成 `$maxverts`（拆成新 bodypart，mdlc 故意不学）。
+            //
+            // 所以这两个命令名是 **mdlc 自己的自由扩展**，命名规则是
+            // 「TOML 字段名去掉下划线、前面加 `$`」，与官方风格一致。
+            // 真 studiomdl 对它们报 `bad command`（`oracle_qc_extensions.js` 钉死）。
+            "$optimizevtx" => {
+                self.desc.model.optimize_vtx = true;
+                Ok(())
+            }
+            // 默认已是 `true`，这条存在的唯一理由是**反向覆盖**：`$include`
+            // 进来的 `.qci` 里写了 `$nosplitoversizedmeshes` 之后，主 QC
+            // 还得能开回来（QC 自上而下、后写覆盖）。
+            "$splitoversizedmeshes" => {
+                self.desc.model.split_oversized_meshes = true;
+                Ok(())
+            }
+            "$nosplitoversizedmeshes" => {
+                self.desc.model.split_oversized_meshes = false;
                 Ok(())
             }
             "$animblocksize" => {
@@ -5643,6 +5670,179 @@ $body body \"a.smd\"
              且主 QC 定义的其它变量必须**跨 include 保留**"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`$optimizevtx`（mdlc 扩展）打开顶点缓存优化。**
+    ///
+    /// ⚠️ 官方**没有**这个命令：`studiomdl.exe` 的 105 条分发表里
+    /// `optimize` / `vcache` / `nvtristrip` 对 QC **全部 0 命中**
+    /// （官方把缓存优化做成 `-nvtristrip` **命令行**开关，
+    /// 见 `tmp-qcscan\dispatch_table.tsv` 与 `docs/_probe/str_scan.js`）。
+    /// 所以这条测试钉的是 **mdlc 自己的扩展**，不是官方兼容行为。
+    ///
+    /// 缺省是 `false`（`ModelMeta::optimize_vtx` 的 `#[serde(default)]`），
+    /// 这条命令是**唯一**能从 QC 打开它的途径。
+    #[test]
+    fn optimizevtx_extension_turns_the_switch_on() {
+        let dir = fixture("qc_ext_optimizevtx");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$optimizevtx
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            d.model.optimize_vtx,
+            "`$optimizevtx` 必须把 optimize_vtx 置为 true"
+        );
+    }
+
+    /// **不写 `$optimizevtx` 时缺省仍是 `false`。**
+    ///
+    /// 这是上一条的**反向判据** —— 否则「把缺省改成 `true`」也能骗过它。
+    /// 缺省必须保持 `false`：本项目的验收基准是真 `studiomdl.exe`，
+    /// 打开缓存优化会改变索引顺序（`src/model.rs:2250-2256`）。
+    #[test]
+    fn optimizevtx_defaults_to_off() {
+        let dir = fixture("qc_ext_optimizevtx_default");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d.model.optimize_vtx,
+            "QC 不写 `$optimizevtx` 时 optimize_vtx 必须是 false（保持与既有产物逐字节相同）"
+        );
+    }
+
+    /// **`$nosplitoversizedmeshes`（mdlc 扩展）关掉超限网格自动拆分。**
+    ///
+    /// ⚠️ 官方**没有**这个命令，第三方 NekoMDL 也没有 —— 它用 `$maxverts`
+    /// 做同一件事（拆成**新 bodypart**，mdlc 故意不学，理由见
+    /// `src/model.rs:2283-2295`）。
+    ///
+    /// 缺省是 **`true`**，所以这条命令是**唯一**能从 QC 关掉它的途径。
+    /// 关掉之后遇到超限 mesh 会直接报错（`src/compile.rs` 的
+    /// `split_oversized_meshes` 提前返回那条路径）。
+    #[test]
+    fn nosplitoversizedmeshes_extension_turns_the_switch_off() {
+        let dir = fixture("qc_ext_nosplit");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$nosplitoversizedmeshes
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d.model.split_oversized_meshes,
+            "`$nosplitoversizedmeshes` 必须把 split_oversized_meshes 置为 false"
+        );
+    }
+
+    /// **不写命令时缺省仍是 `true`**（与 TOML 侧同一个缺省函数）。
+    #[test]
+    fn splitoversizedmeshes_defaults_to_on() {
+        let dir = fixture("qc_ext_split_default");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            d.model.split_oversized_meshes,
+            "QC 不写命令时 split_oversized_meshes 必须是 true（与 TOML 的 default_true 一致）"
+        );
+    }
+
+    /// **两个命令成对，后写覆盖先写。**
+    ///
+    /// 这条钉的是「`$include` 进来的 `.qci` 关了它，主 QC 还得能开回来」——
+    /// QC 是自上而下解释的，后出现的命令必须赢。若实现里把
+    /// `$splitoversizedmeshes` 误写成「只在未设置时才置位」，这条会失败。
+    #[test]
+    fn split_extension_pair_later_write_wins() {
+        let dir = fixture("qc_ext_split_pair");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$nosplitoversizedmeshes
+$splitoversizedmeshes
+";
+        let d = parse(qc, &dir);
+        assert!(
+            d.model.split_oversized_meshes,
+            "后写的 `$splitoversizedmeshes` 必须把前一条 `$nosplitoversizedmeshes` 覆盖回来"
+        );
+
+        let qc_rev = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$splitoversizedmeshes
+$nosplitoversizedmeshes
+";
+        let d_rev = parse(qc_rev, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d_rev.model.split_oversized_meshes,
+            "反向顺序也必须以后写的 `$nosplitoversizedmeshes` 为准"
+        );
+    }
+
+    /// **三个扩展命令名大小写不敏感**（`dispatch` 先 `to_ascii_lowercase()`）。
+    ///
+    /// 官方取词器对命令名同样不分大小写，所以这是「与官方风格一致」的判据。
+    #[test]
+    fn qc_extensions_are_case_insensitive() {
+        let dir = fixture("qc_ext_case");
+        let qc = "\
+$ModelName \"t.mdl\"
+$Body body \"a.smd\"
+$OptimizeVTX
+$NoSplitOversizedMeshes
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(d.model.optimize_vtx, "`$OptimizeVTX` 大小写混写也必须生效");
+        assert!(
+            !d.model.split_oversized_meshes,
+            "`$NoSplitOversizedMeshes` 大小写混写也必须生效"
+        );
+    }
+
+    /// **三个扩展命令都是「裸标志位」，不能吃掉下一行的 token。**
+    ///
+    /// ⚠️ 这条防的是历史形态的缺陷（见
+    /// [`redefinevariable_is_rejected_like_official`]）：只吃掉命令名、
+    /// **把值留在流里**，于是下一个 token 被当成下一条命令。
+    /// 这里在三个命令后面各放一条 `$surfaceprop`，若命令多吃一个 token，
+    /// `$surfaceprop` 就会被吞掉（`surface_prop` 落空）或报未知命令。
+    ///
+    /// ⚠️ QC 里的 `;` 是**行注释**，所以夹具必须**每键一行**。
+    #[test]
+    fn qc_extensions_do_not_eat_the_next_token() {
+        let dir = fixture("qc_ext_bare");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$optimizevtx
+$surfaceprop \"metal\"
+$nosplitoversizedmeshes
+$surfaceprop \"metal\"
+$splitoversizedmeshes
+$surfaceprop \"metal\"
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.model.surface_prop.as_deref(),
+            Some("metal"),
+            "三个扩展命令都必须只消费自己那一个 token"
+        );
     }
 
     /// 同一块可以**重复出现**（实测 `jig26` 两个连续 `is_flexible` 成功）。

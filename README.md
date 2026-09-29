@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 660 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 695 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -167,8 +167,8 @@ QC 脚本  ──┘
 | `extra_flags` | int | `0` | 额外的 `STUDIOHDR_FLAGS_*` 位 |
 | `contents` | int | **`1`**（`CONTENTS_SOLID`） | `$contents`。官方 `s_nDefaultContents = CONTENTS_SOLID`，**不是 0** |
 | `skip_bone_in_bbox` | bool | `false` | `$skipboneinbbox` |
-| `optimize_vtx` | bool | **`false`** | 顶点缓存优化（`meshopt`）；只重排索引，不改几何 |
-| `split_oversized_meshes` | bool | **`true`** | 顶点超限自动拆分，见[下文](#顶点超限自动拆分) |
+| `optimize_vtx` | bool | **`false`** | 顶点缓存优化（`meshopt`）；只重排索引，不改几何。QC：`$optimizevtx`（**mdlc 扩展**） |
+| `split_oversized_meshes` | bool | **`true`** | 顶点超限自动拆分，见[下文](#顶点超限自动拆分)。QC：`$nosplitoversizedmeshes` / `$splitoversizedmeshes`（**mdlc 扩展**） |
 | `key_values` | string | — | `$keyvalues` 内容（不含外层 `mdlkeyvalue` 包装） |
 | `pose_parameters` | table array | `[]` | `$poseparameter` |
 | `realign_bones` | bool | `false` | `$realignbones` |
@@ -490,6 +490,42 @@ QC 前端（`src/qc/`）已实现完整的词法/语法分析、`$include`、`$d
 > 而且它们改的是**被引用的那个共享动画对象**。
 > 判据是「它由官方哪个函数处理」，不是「它写在哪个块里」。
 
+### mdlc 扩展的 QC 命令
+
+下面 3 条**不是官方命令**，是 mdlc 自己的扩展。命名规则与 TOML 字段一一对应
+（字段名去掉下划线、前面加 `$`）：
+
+| 命令 | 等价 TOML | 说明 |
+|---|---|---|
+| `$optimizevtx` | `optimize_vtx = true` | 打开顶点缓存优化，等价于命令行 `--optimize-vtx` |
+| `$nosplitoversizedmeshes` | `split_oversized_meshes = false` | 关掉[顶点超限自动拆分](#顶点超限自动拆分)，遇到超限 mesh 直接报错 |
+| `$splitoversizedmeshes` | `split_oversized_meshes = true` | 把上面那条**开回来**（缺省本来就是 `true`；它存在的意义是 `$include` 的 `.qci` 关掉后主 QC 还能改回来） |
+
+三条都是**裸标志位**（不带参数，只消费自己那一个 token），且**命令名大小写不敏感**
+（与官方取词器一致）。QC 自上而下解释，**后写的赢**。
+
+```qc
+$modelname "models/mymod/myprop.mdl"
+$body body "myprop.smd"
+$optimizevtx              ; 打开顶点缓存优化
+$nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报错）
+```
+
+> ⚠️ **为什么是 mdlc 扩展而不是官方命令名。** 官方 `studiomdl.exe` 的 QC
+> 分发表里**没有**这两个功能的任何关键字（`optimize` / `vcache` / `nvtristrip` /
+> `split` / `oversized` 全部 0 命中）——官方把顶点缓存优化做成**命令行**开关
+> `-nvtristrip`，超限网格则**直接拒绝**（`ERROR: too many indices in source`）。
+> 第三方 NekoMDL 也没有这两个 QC 命令（它的 `$maxverts` 做的是另一件事：
+> 把超限模型拆成**新 bodypart**，mdlc 故意不学，理由见
+> [顶点超限自动拆分](#顶点超限自动拆分)）。
+>
+> 所以真 `studiomdl.exe` 对这三条会报 `bad command`。**写了它们的 QC 不能
+> 直接拿去跑官方工具**；要跨工具通用请改用 TOML 侧的对应字段。
+
+> ⚠️ **`$optimizevtx` 没有反向命令。** `optimize_vtx` 缺省就是 `false`，
+> 一条「关掉」的命令没有实际用途（官方的裸标志位如 `$staticprop` 也都没有
+> 反向命令）。同理命令行 `--optimize-vtx` 也只能开、不能关。
+
 ---
 
 ## 命令行参考
@@ -522,6 +558,9 @@ mdlc template
 `--optimize-vtx` 用 `meshopt` 对每个 strip group 重排索引以提升 GPU 后变换顶点
 缓存命中率。它**只改索引顺序**，顶点池与三角形集合都不变（写出前有守门断言校验
 这两条），所以渲染结果相同。默认**关闭**，以保持与既有产物逐字节相同。
+
+它与 `[model].optimize_vtx` 是 `||` 关系（任一为真即生效），所以**只能开、不能关**；
+QC 侧等价命令是 `$optimizevtx`（见 [mdlc 扩展的 QC 命令](#mdlc-扩展的-qc-命令)）。
 
 ---
 
@@ -657,7 +696,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 660 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 695 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -686,21 +725,21 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 660 passed / 0 failed / 6 ignored
+cargo test --release          # 695 passed / 0 failed / 6 ignored
 ```
 
-**660 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 666 个单元测试 =
-660 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**695 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 701 个单元测试 =
+695 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
-| `compile` | 119 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
-| `qc` | 102 | QC 词法（`qc::lexer` 17）/ 语法（`qc::parse` 33）/ 规则表达式语义（`qc::flexrule` 52） |
+| `qc` | 130 | QC 词法（`qc::lexer` 23）/ 语法（`qc::parse` 55）/ 规则表达式语义（`qc::flexrule` 52） |
+| `compile` | 120 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
 | `mdl_writer` | 81 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
 | `phy` | 77 | 凸包、`$concave`、ragdoll、IVP 布局不变量 |
 | `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
-| `vtx_writer` | 25 | strip group 链、骨骼调色板、缓存优化守门 |
+| `vtx_writer` | 31 | strip group 链、骨骼调色板、缓存优化守门 |
 | `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
 | `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
