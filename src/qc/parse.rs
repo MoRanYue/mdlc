@@ -1128,7 +1128,15 @@ impl<'a> Parser<'a> {
                     self.skip_rest_of_line();
                 }
                 other => {
-                    if let Some(rest) = other.strip_prefix('%') {
+                    // ⚠️ 规则名必须取**原始大小写**的 `t.text`，**不能**用 `low`。
+                    //
+                    // 官方是 `Option_Flexrule( g_model[g_nummodels], &token[1] )`
+                    // （`studiomdl.cpp:4366`）—— `token` 保留原样，随后用 `stricmp`
+                    // 在 `g_flexdesc` 里查（`:3911`）。而 `low` 是全小写的：把
+                    // `%AU1R` 存成 `au1r` 之后，写出阶段的 `flexdesc_index`
+                    // （大小写敏感）就查不到 `AU1R` ⟹ 报
+                    // `flex "au1r" 在 [[flex_descriptors]] 里找不到`。
+                    if let Some(rest) = t.text.strip_prefix('%') {
                         // `%<flex> = <表达式>`
                         //
                         // ⚠️ 先把两张名字表**取出来**再调 —— `parse_flexrule`
@@ -1226,6 +1234,27 @@ impl<'a> Parser<'a> {
         opts: FlexOpts,
         pair: bool,
     ) -> Result<(), QcError> {
+        // ⭐ **解析期**就注册 desc —— 官方 `Option_Flex` 是当场调
+        // `Add_Flexdesc` 的（`studiomdl.cpp:3568-3580`），注册发生在读完
+        // `flexfile`/`flexpair <split>` 之后、读 `frame`/`position` 等选项
+        // **之前**。同一条 `flex` 内不会再插进别的 `Add_Flexdesc`，所以
+        // 放在这里（`flex_options` 之后）得到的 desc 顺序与官方**逐项相同**。
+        //
+        // ⚠️ 这条曾经缺失，后果是**解析期查不到 desc**：`%<名>` flexrule 走
+        // `flex_desc_names()`，而 mdlc 早期只在编译期
+        // （`compile::resolve_vta_flexes`）注册 ⟹ `survivors_facerules.qci`
+        // 的 `%AU1R` 直接报 `unknown flex AU1R`。
+        //
+        // 判据是 `pair`（= 官方 `pairsplit != 0`），**不是**「用了 `flexpair`
+        // 关键字」：`flexpair "X" 0` 官方走 else 分支，只注册 `X`。
+        if pair {
+            let (rn, ln) = crate::flex::pair_names(&name);
+            self.add_flexdesc(&rn);
+            self.add_flexdesc(&ln);
+        } else {
+            self.add_flexdesc(&name);
+        }
+
         let Some(vta) = self.pending_vta.clone() else {
             return Err(self.lex.error(format!(
                 "`flex \"{name}\"` 之前没有 `flexfile` —— 官方此处用的是\
@@ -1242,8 +1271,37 @@ impl<'a> Parser<'a> {
             split: opts.split,
             position: opts.position,
             decay: opts.decay,
+            targets: None,
+            from_eyelid: false,
         });
         Ok(())
+    }
+
+    /// 把一条 flex 规格推入 `model.flexes`，但**直接给定** `vta`/`targets`。
+    ///
+    /// 只给官方 `eyelid` 用（`Option_Eyelid` 自带 `vtafile` token，
+    /// 不依赖粘性的 `flexfile`，且三条 flexkey 的分段 targets 各不相同）。
+    #[allow(clippy::too_many_arguments)]
+    fn push_flex_explicit(
+        &mut self,
+        model: &mut BodyModel,
+        vta: String,
+        name: String,
+        frame: i32,
+        split: f32,
+        targets: [f32; 4],
+    ) {
+        model.flexes.push(Flex {
+            vta,
+            name,
+            frame,
+            pair: false,
+            split,
+            position: 1.0,
+            decay: 0.0,
+            targets: Some(targets),
+            from_eyelid: true,
+        });
     }
 
     /// 注册一个 flexdesc（官方 `Add_Flexdesc`）。
@@ -1310,13 +1368,18 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `eyeball <名> <骨骼> <x> <y> <z> "<材质>" <半径> <zangle> "<虹膜材质>" <pupil_scale>`。
+    /// `eyeball <名> <骨骼> <x> <y> <z> "<材质>" <直径> <zangle> "<虹膜材质>" <pupil_scale>`。
+    ///
+    /// ⚠️ 第 7 个 token 官方叫「radius」但语义是**直径** ——
+    /// `studiomdl.cpp:3411` 是 `eyeball->radius = verify_atof(token) / 2.0;`。
+    /// 这个 `/2` 同时也是 `eyelid` 范围检查（`fabs(target) > radius`）的基准，
+    /// 少除一次会让检查**放宽一倍**、产物里的 `radius` 字段**大一倍**。
     fn option_eyeball(&mut self, model: &mut BodyModel) -> Result<(), QcError> {
         let name = self.tok(false)?.text;
         let bone = self.tok(false)?.text;
         let org = self.v3()?;
         let material = self.tok(false)?.text;
-        let radius = self.f()?;
+        let radius = self.f()? / 2.0;
         let zangle = self.f()?;
         let iris_material = self.tok(false)?.text;
         let pupil_scale = self.f()?;
@@ -1341,63 +1404,200 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `eyelid <名> <lowerer> <l1> <neutral> <n1> <raiser> <r1> <眼>...`。
+    /// `eyelid <名> <vta> lowerer <帧> <目标> neutral <帧> <目标> raiser <帧> <目标>
+    ///  [split <距离>] [eyeball <眼球名>]` —— 官方的眼睑语法。
+    ///
+    /// # 官方（`Option_Eyelid`，`studiomdl.cpp:3645-3802`）
+    ///
+    /// 一条 `eyelid` 会**注册 4 个 flexdesc**（顺序 = 先 `<名>`，再按 token
+    /// 出现顺序的 `<名>_lowerer` / `<名>_neutral` / `<名>_raiser`），
+    /// 并推**三条 flexkey**（全部 `flexdesc = <名>`、`decay = 0.0`、共用同一个
+    /// `.vta`、共用同一个 `split`）：
+    ///
+    /// | # | frame | target0..3 |
+    /// |---|---|---|
+    /// | 0 | `lowerer` 的帧 | `-11, -10, lowerer, neutral` |
+    /// | 1 | `neutral` 的帧 | `lowerer, neutral, neutral, raiser` |
+    /// | 2 | `raiser` 的帧 | `neutral, raiser, 10, 11` |
+    ///
+    /// ⚠️ `neutral 0` 会让第 1 条落在 **frame 0** —— 官方那里是「载荷清零」的
+    /// 特殊帧（`simplify.cpp:2453-2457`），所以它**合法且必然产出空载荷**。
+    /// 这正是 [`Flex::from_eyelid`] 存在的唯一理由。
+    ///
+    /// ⚠️ `eyeball <名>` 可以省略；省略时官方把这条眼睑挂到该 model 的
+    /// **全部**眼球上（`studiomdl.cpp:3756-3765`）。上下眼睑由 **`type[0]`**
+    /// 决定（`switch(type[0])` 的 `case 'u'` / `case 'l'`），
+    /// **不是**靠 `contains("upper")`；首字母不是 `u`/`l` 时官方静默不挂载
+    /// （三条 flexkey 照样注册）。官方那两处比较**区分大小写**。
+    ///
+    /// # 与官方的两处有意偏离
+    ///
+    /// 1. [`Self::add_flexdesc`] 按名**去重**（官方 `Option_Eyelid` 直接
+    ///    `strcpyn(g_flexdesc[g_numflexdesc++])`，同一个 `type` 写两次会产生
+    ///    两条同名 desc）。去重是 mdlc 的既有约定（`resolve_vta_flexes` 的
+    ///    `register` 同样去重），重复的 `type` 只会让后续下标整体漂移。
+    /// 2. 写了 `eyeball <名>` 但该眼球不存在时**报错**（官方静默什么都不做）。
+    ///    静默会让「眼睑没生效」变成零诊断的哑谜 —— 与
+    ///    [`Self::option_ikrule`] 对未知链名的处理一致。
     fn option_eyelid(&mut self, model: &mut BodyModel) -> Result<(), QcError> {
-        let lid_name = self.tok(false)?.text;
-        let mut vals: Vec<(String, f32)> = Vec::new();
-        for _ in 0..3 {
-            let d = self.tok(false)?.text;
-            let v = self.f()?;
-            vals.push((d, v));
-        }
-        let mut eyes = Vec::new();
+        let type_name = self.tok(false)?.text;
+        let vta_name = self.tok(false)?.text;
+        let vta = self.resolve_src(&vta_name);
+
+        // 官方 `:3665-3666`：base desc **无条件先注册**（不查重、不看后续 token）。
+        self.add_flexdesc(&type_name);
+
+        // (desc 名, 帧, 目标值) —— desc 名按官方拼成 `<type>_<token>`，
+        // 其中 `<token>` 用**原样**大小写（官方 `strcat` 的就是它）。
+        let mut lowerer: Option<(String, i32, f32)> = None;
+        let mut neutral: Option<(String, i32, f32)> = None;
+        let mut raiser: Option<(String, i32, f32)> = None;
+        let mut split = 0.0f32;
+        let mut eyeball: Option<String> = None;
+
         while self.avail() {
-            eyes.push(self.tok(false)?.text);
+            let key = self.tok(false)?.text;
+            let lower = key.to_ascii_lowercase();
+            match lower.as_str() {
+                "lowerer" | "neutral" | "raiser" => {
+                    let frame = self.i()?;
+                    let target = self.f()?;
+                    let desc = format!("{type_name}_{key}");
+                    self.add_flexdesc(&desc);
+                    let slot = match lower.as_str() {
+                        "lowerer" => &mut lowerer,
+                        "neutral" => &mut neutral,
+                        _ => &mut raiser,
+                    };
+                    *slot = Some((desc, frame, target));
+                }
+                "split" => split = self.f()?,
+                "eyeball" => eyeball = Some(self.tok(false)?.text),
+                other => {
+                    return Err(self
+                        .lex
+                        .error(format!("eyelid 的未知选项 {other:?}（官方是 unknown option）")));
+                }
+            }
         }
-        // 把这条 eyelid 挂到它引用的每个 eyeball 上。
-        //
-        // ⚠️ 官方 `Option_Eyelid` 用 `LookupEyeball(name)` 找眼球；
-        // 找不到就报错。这里照做。
-        for e in &eyes {
-            let Some(eb) = model
-                .eyeballs
-                .iter_mut()
-                .find(|x| x.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(e)))
-            else {
-                return Err(self.lex.error(format!("eyelid 引用了不存在的眼球 {e:?}")));
-            };
+
+        let (Some(lowerer), Some(neutral), Some(raiser)) = (lowerer, neutral, raiser) else {
+            return Err(self.lex.error(format!(
+                "eyelid {type_name:?} 缺少 lowerer/neutral/raiser 之一 —— 官方三条 \
+                 flexkey 的帧号与目标值全部来自它们，缺一个就会读到未初始化的栈值"
+            )));
+        };
+        let (lowerer_desc, lowerer_frame, lowerer_target) = lowerer;
+        let (neutral_desc, neutral_frame, neutral_target) = neutral;
+        let (raiser_desc, raiser_frame, raiser_target) = raiser;
+
+        // 三条 flexkey 共用同一个 desc 名 ⟹ `resolve_vta_flexes` 的 `register`
+        // 会把它们收敛到同一下标，正是官方 `flexdesc = basedesc` 的语义。
+        self.push_flex_explicit(
+            model,
+            vta.clone(),
+            type_name.clone(),
+            lowerer_frame,
+            split,
+            [-11.0, -10.0, lowerer_target, neutral_target],
+        );
+        self.push_flex_explicit(
+            model,
+            vta.clone(),
+            type_name.clone(),
+            neutral_frame,
+            split,
+            [lowerer_target, neutral_target, neutral_target, raiser_target],
+        );
+        self.push_flex_explicit(
+            model,
+            vta,
+            type_name.clone(),
+            raiser_frame,
+            split,
+            [neutral_target, raiser_target, 10.0, 11.0],
+        );
+
+        // ---- 挂到眼球上（官方 `:3756-3801`）----
+        let targets = [
+            ("lowerer", lowerer_target),
+            ("neutral", neutral_target),
+            ("raiser", raiser_target),
+        ];
+        let mut matched = 0usize;
+        for eb in model.eyeballs.iter_mut() {
+            if let Some(want) = &eyeball
+                && !eb
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(want))
+            {
+                continue;
+            }
+            matched += 1;
+
+            // 官方 `:3767-3778` 的三条范围检查，逐条 `TokenError`。
+            for (what, t) in targets {
+                if t.abs() > eb.radius {
+                    return Err(self.lex.error(format!(
+                        "eyelid {type_name:?} {what} out of range (+-{:.1}): \
+                         目标值 {t} 的绝对值超过眼球 {:?} 的半径 {}",
+                        eb.radius,
+                        eb.name.as_deref().unwrap_or(""),
+                        eb.radius
+                    )));
+                }
+            }
+
             let lid = EyeballLid {
-                lid_flexdesc: lid_name.clone(),
+                lid_flexdesc: type_name.clone(),
                 lowerer: EyeballLidEntry {
-                    flexdesc: vals[0].0.clone(),
-                    target: vals[0].1,
+                    flexdesc: lowerer_desc.clone(),
+                    target: lowerer_target,
                 },
                 neutral: EyeballLidEntry {
-                    flexdesc: vals[1].0.clone(),
-                    target: vals[1].1,
+                    flexdesc: neutral_desc.clone(),
+                    target: neutral_target,
                 },
                 raiser: EyeballLidEntry {
-                    flexdesc: vals[2].0.clone(),
-                    target: vals[2].1,
+                    flexdesc: raiser_desc.clone(),
+                    target: raiser_target,
                 },
             };
-            // `upper`/`lower` 由名字区分（官方也是这么做的）。
-            if lid_name.to_ascii_lowercase().contains("upper") {
-                eb.upper_lid = Some(lid);
-            } else {
-                eb.lower_lid = Some(lid);
+            // 官方 `switch(type[0])`：`case 'u'` → upper、`case 'l'` → lower，
+            // 其余首字母**静默不挂载**（三条 flexkey 已经注册了）。
+            // 官方那两处比较区分大小写，这里照做。
+            match type_name.as_bytes().first() {
+                Some(b'u') => eb.upper_lid = Some(lid),
+                Some(b'l') => eb.lower_lid = Some(lid),
+                _ => {}
             }
+        }
+
+        if let Some(want) = &eyeball
+            && matched == 0
+        {
+            return Err(self.lex.error(format!(
+                "eyelid {type_name:?} 引用了不存在的眼球 {want:?}\
+                 （官方会静默跳过；mdlc 报错以免眼睑静默失效）"
+            )));
         }
         Ok(())
     }
 
     /// `mouth <index> "<名>" "<骨骼>" <fx> <fy> <fz>`。
+    ///
+    /// ⚠️ 第 2 个 token 是 **flexdesc 名**，官方 `Option_Mouth`（`:3818`）走的是
+    /// `g_mouth[index].flexdesc = Add_Flexdesc( token );` —— 也就是**顺带注册**
+    /// 一个 flexdesc（同样按 `stricmp` 去重）。这里照做：漏掉注册会让
+    /// `%mouth = …` 这类 flexrule 在 `[[flex_descriptors]]` 里找不到目标。
     fn option_mouth(&mut self, model: &mut BodyModel) -> Result<(), QcError> {
         let _ = model;
         let index = self.i()?;
         let flexdesc = self.tok(false)?.text;
         let bone = self.tok(false)?.text;
         let forward = self.v3()?;
+        self.add_flexdesc(&flexdesc);
         self.desc.mouths.push(Mouth {
             index,
             flexdesc,
@@ -6731,6 +6931,378 @@ $sequence \"seq_idle\" \"a_idle\"
             d.validate().is_ok(),
             "纯动画工程必须通过校验（官方无此检查），实际：{:?}",
             d.validate().unwrap_err()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 官方 `eyelid` 语法（`Option_Eyelid`，`studiomdl.cpp:3645-3802`）
+    // ---------------------------------------------------------------
+    //
+    // 官方形：
+    //
+    // ```text
+    // eyelid <名> <vta> lowerer <帧> <目标> neutral <帧> <目标> raiser <帧> <目标>
+    //        [split <距离>] [eyeball <眼球名>]
+    // ```
+    //
+    // 一条 `eyelid` 会注册 **4 个 flexdesc**（`<名>` + `<名>_lowerer` /
+    // `_neutral` / `_raiser`）并推 **3 条 flexkey**（全部 `flexdesc = <名>`、
+    // 共用同一个 `.vta` 与同一个 `split`）：
+    //
+    // | # | frame | target0..3 |
+    // |---|---|---|
+    // | 0 | lowerer 的帧 | `-11, -10, lowerer, neutral` |
+    // | 1 | neutral 的帧 | `lowerer, neutral, neutral, raiser` |
+    // | 2 | raiser 的帧 | `neutral, raiser, 10, 11` |
+    //
+    // ⚠️ `neutral 0` 会让第 1 条落在 **frame 0**（官方的「载荷清零」特殊帧，
+    // `simplify.cpp:2453-2457`）—— 它**合法**，正是 [`Flex::from_eyelid`]
+    // 存在的唯一理由。夹具故意用 `neutral 0` 把这个豁免也钉住。
+
+    /// 官方 `eyelid`：4 个 desc 的**注册顺序**、3 条 flexkey 的帧与 targets。
+    #[test]
+    fn official_eyelid_registers_four_descs_and_three_flexkeys() {
+        let dir = fixture("eyelid_official");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper_right \"face.vta\" lowerer 1 -0.41 neutral 0 0.5 raiser 2 0.5 split 0.1 eyeball righteye
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let names: Vec<&str> = d
+            .flex_descriptors
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "upper_right",
+                "upper_right_lowerer",
+                "upper_right_neutral",
+                "upper_right_raiser"
+            ],
+            "官方 `:3665-3666` 先无条件注册 base desc，再按 token 顺序各注册一个 \
+             `<名>_<token>`（`studiomdl.cpp:3683`/`:3692`/`:3701`）"
+        );
+
+        let flexes = &d.bodyparts[0].models[0].flexes;
+        assert_eq!(flexes.len(), 3, "官方 `:3722-3754` 一条 eyelid 推 3 条 flexkey");
+        let frames: Vec<i32> = flexes.iter().map(|f| f.frame).collect();
+        assert_eq!(frames, vec![1, 0, 2], "帧号来自 lowerer/neutral/raiser");
+        assert_eq!(
+            flexes[0].targets,
+            Some([-11.0, -10.0, -0.41, 0.5]),
+            "key0 = `[-11, -10, lowerer, neutral]`"
+        );
+        assert_eq!(
+            flexes[1].targets,
+            Some([-0.41, 0.5, 0.5, 0.5]),
+            "key1 = `[lowerer, neutral, neutral, raiser]`"
+        );
+        assert_eq!(
+            flexes[2].targets,
+            Some([0.5, 0.5, 10.0, 11.0]),
+            "key2 = `[neutral, raiser, 10, 11]`"
+        );
+        for (i, f) in flexes.iter().enumerate() {
+            assert_eq!(
+                f.name, "upper_right",
+                "3 条 flexkey 的 flexdesc **全部**是 base desc（官方 `flexdesc = basedesc`），\
+                 于是 `resolve_vta_flexes` 的 `register` 会把它们收敛到同一下标"
+            );
+            assert!(!f.pair, "eyelid 的 flexkey 从不设 flexpair（官方恒 0）");
+            assert!(f.from_eyelid, "flexes[{i}] 应标记为来自 eyelid");
+            assert_eq!(f.split, 0.1, "三条共用同一个 `split`");
+            assert_eq!(f.vta, "face.vta", "三条共用同一个 `.vta`");
+        }
+
+        let eb = &d.bodyparts[0].models[0].eyeballs[0];
+        let up = eb.upper_lid.as_ref().expect("`upper_right` 应挂成上眼睑");
+        assert_eq!(up.lid_flexdesc, "upper_right");
+        assert_eq!(up.lowerer.flexdesc, "upper_right_lowerer");
+        assert_eq!(up.lowerer.target, -0.41);
+        assert_eq!(up.neutral.flexdesc, "upper_right_neutral");
+        assert_eq!(up.neutral.target, 0.5);
+        assert_eq!(up.raiser.flexdesc, "upper_right_raiser");
+        assert_eq!(up.raiser.target, 0.5);
+        assert!(
+            eb.lower_lid.is_none(),
+            "`type[0] == 'u'` 只挂上眼睑，不该顺手把下眼睑也填上"
+        );
+    }
+
+    /// ⭐ 判别性：`eyeball` 关键字**省略**时作用于该 model 的**全部**眼球。
+    ///
+    /// 官方 `:3756-3765` 是 `if (szEyeball[0] != '\0') { … continue; }` ——
+    /// 空串时**不**过滤，于是循环把每个眼球都填一遍。
+    #[test]
+    fn official_eyelid_without_eyeball_keyword_applies_to_all_eyeballs() {
+        let dir = fixture("eyelid_all_eyes");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyeball \"lefteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.4 neutral 0 0.5 raiser 2 0.5
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let ebs = &d.bodyparts[0].models[0].eyeballs;
+        assert_eq!(ebs.len(), 2);
+        for eb in ebs {
+            assert!(
+                eb.upper_lid.is_some(),
+                "省略 `eyeball` 时**每个**眼球都该被挂上（官方 `:3761-3765`），\
+                 实际 {:?} 没有",
+                eb.name
+            );
+        }
+    }
+
+    /// `eyeball <名>` **只**作用于被点名的那一个（按 `stricmp` 比较）。
+    #[test]
+    fn official_eyelid_eyeball_keyword_selects_one() {
+        let dir = fixture("eyelid_one_eye");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyeball \"lefteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid lower_right \"face.vta\" lowerer 3 -0.26 neutral 0 -0.5 raiser 4 -0.5 eyeball righteye
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let ebs = &d.bodyparts[0].models[0].eyeballs;
+        assert!(
+            ebs[0].lower_lid.is_some(),
+            "`righteye` 被点名 ⟹ 应挂上下眼睑（`type[0] == 'l'`）"
+        );
+        assert!(
+            ebs[1].lower_lid.is_none(),
+            "`lefteye` 没被点名 ⟹ 不该被挂上"
+        );
+    }
+
+    /// ⭐ **`eyeball` 的半径是 QC 直径的一半** —— `eyelid` 的范围检查是判据。
+    ///
+    /// 官方 `:3411` 是 `eyeball->radius = verify_atof(token) / 2.0;`，而
+    /// `:3767-3778` 的范围检查是 `fabs(target) > peyeball->radius`。
+    /// 夹具用 `eyeball … 1.0 …`（直径 1.0 ⟹ 半径 0.5）配 `lowerer … -0.6`：
+    /// 少除一次 `/2` 会让半径变 1.0，`-0.6` 就**不再**越界 ⟹ 本测试失败。
+    #[test]
+    fn eyeball_diameter_is_halved_into_radius() {
+        let dir = fixture("eyelid_radius");
+        // 0.5 恰好落在半径上：`>` 不是 `>=`，所以必须**通过**。
+        let ok = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.5 neutral 0 0.5 raiser 2 0.5
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(ok, &dir);
+        assert_eq!(
+            d.bodyparts[0].models[0].eyeballs[0].radius, 0.5,
+            "QC 的 1.0 是**直径** ⟹ `radius` 必须是 0.5（官方 `studiomdl.cpp:3411`）"
+        );
+
+        // 0.6 > 0.5 ⟹ 官方 `TokenError( "Eyelid \"%s\" lowerer out of range (+-%.1f)\n" )`。
+        let bad = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.6 neutral 0 0.5 raiser 2 0.5
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let errs = crate::qc::parse_qc_str(bad, &dir).expect_err("超出半径必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("out of range")),
+            "应报官方同款 `out of range`，实际：{errs:?}"
+        );
+    }
+
+    /// `type[0]` 不是 `u`/`l` 时**静默不挂载**，但三条 flexkey 照样注册。
+    ///
+    /// 官方 `:3780-3800` 是 `switch(type[0])` 只带 `case 'u'` / `case 'l'`
+    /// —— 没有 `default`。判据是**首字母**，不是 `contains("upper")`。
+    #[test]
+    fn official_eyelid_switch_only_accepts_u_and_l_first_letter() {
+        let dir = fixture("eyelid_switch");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid brow \"face.vta\" lowerer 1 -0.4 neutral 0 0.4 raiser 2 0.4
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.bodyparts[0].models[0].flexes.len(),
+            3,
+            "首字母不认识 ⟹ 不挂载，但**三条 flexkey 已经注册**（官方也是先推 key 再挂）"
+        );
+        let eb = &d.bodyparts[0].models[0].eyeballs[0];
+        assert!(
+            eb.upper_lid.is_none() && eb.lower_lid.is_none(),
+            "`brow` 的首字母既不是 `u` 也不是 `l` ⟹ 官方静默不挂载"
+        );
+    }
+
+    /// `lowerer`/`neutral`/`raiser` 缺一个 ⟹ 报错（官方会读到未初始化的栈值）。
+    #[test]
+    fn official_eyelid_missing_raiser_is_an_error() {
+        let dir = fixture("eyelid_missing");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.4 neutral 0 0.4
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("缺 raiser 必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("缺少 lowerer/neutral/raiser")),
+            "应报缺项，实际：{errs:?}"
+        );
+    }
+
+    /// 写了 `eyeball <名>` 但该眼球不存在 ⟹ 报错（官方静默什么都不做）。
+    #[test]
+    fn official_eyelid_unknown_eyeball_is_an_error() {
+        let dir = fixture("eyelid_bad_eye");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.4 neutral 0 0.4 raiser 2 0.4 eyeball nosuch
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未知眼球必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("不存在的眼球")
+                && e.message.contains("nosuch")),
+            "应点名 `nosuch`，实际：{errs:?}"
+        );
+    }
+
+    /// 未知选项 ⟹ 报错（官方 `TokenError( "unknown option: %s" )`）。
+    #[test]
+    fn official_eyelid_unknown_option_is_an_error() {
+        let dir = fixture("eyelid_bad_opt");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    eyeball \"righteye\" \"bone1\" 0 0 0 \"eye_mat\" 1.0 0 \"iris_mat\" 1
+    eyelid upper \"face.vta\" lowerer 1 -0.4 neutral 0 0.4 raiser 2 0.4 wat
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未知选项必须报错");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            errs.iter().any(|e| e.message.contains("eyelid 的未知选项")),
+            "应报未知选项，实际：{errs:?}"
+        );
+    }
+
+    /// ⭐ `mouth` 的第 2 个 token 是 flexdesc 名，官方**顺带注册**它。
+    ///
+    /// `Option_Mouth`（`:3818`）走的是 `g_mouth[index].flexdesc =
+    /// Add_Flexdesc( token );`。漏掉注册会让 `%mouth = …` 这类 flexrule
+    /// 在 `[[flex_descriptors]]` 里找不到目标。
+    #[test]
+    fn mouth_registers_its_flexdesc() {
+        let dir = fixture("mouth_desc");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    mouth 0 \"mouth\" \"bone1\" 0 1 0
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let names: Vec<&str> = d
+            .flex_descriptors
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mouth"],
+            "`mouth <i> <名> <骨骼> <fx> <fy> <fz>` 的 `<名>` 必须进 flexdesc 表"
+        );
+        assert_eq!(d.mouths.len(), 1);
+        assert_eq!(d.mouths[0].flexdesc, "mouth");
+    }
+
+    /// ⭐⭐ `%<flex>` 规则名必须保留**原始大小写**。
+    ///
+    /// 官方 `Cmd_Model` 走 `Option_Flexrule( g_model[g_nummodels], &token[1] )`
+    /// （`studiomdl.cpp:4366`）—— `token` 保留原样，随后用 `stricmp` 查
+    /// `g_flexdesc`（`:3911`）。
+    ///
+    /// ⚠️ mdlc 的 `cmd_model` 块内循环用 `low = t.text.to_ascii_lowercase()`
+    /// 做分派，兜底臂里若误用 `low` 就会把 `%AU1R` 存成 `au1r`；而写出阶段的
+    /// `flexdesc_index`（`compile.rs:5737`）是**大小写敏感**的 ⟹ 报
+    /// `flex "au1r" 在 [[flex_descriptors]] 里找不到`。用户工程的
+    /// `survivors_facerules.qci` 里 62 条大写规则全部踩中这个坑。
+    #[test]
+    fn flexrule_target_keeps_its_original_case() {
+        let dir = fixture("flexrule_case");
+        let qc = "\
+$modelname \"t.mdl\"
+$model \"body\" \"a.smd\" {
+    flexcontroller eyes range -30 30 eyes_updown
+    flexfile \"a.vta\"
+    flex \"AU1R\" frame 1
+    flexpair \"AU2\" 1.0 frame 2
+    %AU1R = eyes_updown
+    %AU2R = eyes_updown
+}
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // `flex "AU1R"` 直接注册；`flexpair "AU2"` 注册 `AU2R`/`AU2L`（先 R 后 L）。
+        let names: Vec<&str> = d
+            .flex_descriptors
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["AU1R", "AU2R", "AU2L"],
+            "flex / flexpair 注册的 desc 名必须保留原始大小写"
+        );
+
+        let rule_names: Vec<&str> = d.flex_rules.iter().map(|r| r.flex.as_str()).collect();
+        assert_eq!(
+            rule_names,
+            vec!["AU1R", "AU2R"],
+            "`%<flex>` 的规则名必须保留原始大小写 —— 小写化之后写出阶段的 \
+             `flexdesc_index`（大小写敏感）会查不到，报 \
+             `flex \"au1r\" 在 [[flex_descriptors]] 里找不到`"
         );
     }
 }

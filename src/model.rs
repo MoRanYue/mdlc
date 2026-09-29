@@ -3419,6 +3419,21 @@ pub struct Flex {
     /// QC 缺省 `1.0`（`studiomdl.cpp:3591`）。
     #[serde(default = "default_flex_position")]
     pub decay: f32,
+    /// 显式的 `target0..3`（`mstudioflex_t` 的四个 `target`）。
+    ///
+    /// `None` ⟹ 用缺省的 `[0.0, position, 10.0, 11.0]`（普通 `flex`）。
+    /// `Some` ⟹ 用给定值 —— 官方 `Option_Eyelid` 生成的三条 flexkey
+    /// **各有各的分段 targets**，不是缺省那组。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<[f32; 4]>,
+    /// 该 flex 由官方 `eyelid` 生成（`Option_Eyelid`，`studiomdl.cpp:3645-3802`）。
+    ///
+    /// 唯一作用是**豁免 `frame 0` 的硬报错**：官方 eyelid 的
+    /// `neutral 0` 会注册一条 frame 0 的 flexkey，语义是「载荷清零」
+    /// （`simplify.cpp:2453-2457` 的 `if (g_flexkey[i].frame == 0) numsrcanims = 0;`），
+    /// **不是错误**。手写的 `flex "x" frame 0` 仍然报错 —— 那几乎总是笔误。
+    #[serde(skip)]
+    pub from_eyelid: bool,
 }
 
 /// `Flex::frame` 的缺省值 —— **1，不是 0**（见 [`Flex::frame`] 的说明）。

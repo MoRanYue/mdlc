@@ -5673,9 +5673,10 @@ fn resolve_vta_flexes(
 ///
 /// 1. **flexrule**：把 `flex`（flexdesc 名）与每个 op 的 `controller`/`flexdesc`
 ///    名解析成下标（`fetch1` → flexcontroller、`fetch2` → flexdesc）。
-/// 2. **flexcontrollerui**：每条 `[[flex_controllers]]` **自动**产生一条 ui
-///    （`szindex0` 指向该 fc 自身，单声道）；用户显式写的追加在后
-///    （stereo 对里 `szindex0` 指向**下标更大**那条）。
+/// 2. **flexcontrollerui**：按 fc 数组顺序扫描，**紧邻**的 `right_X` + `left_X`
+///    对（`X` 逐字节相同、大小写敏感、与 `type` 无关）合并成一条 **stereo** ui
+///    （`name = X`，`szindex0` 指向**下标更大**的 `left_X`）；其余每条 fc 各
+///    产一条单声道 ui（`name` = fc 名原样）。用户显式写的追加在后。
 /// 3. **mouth**：按显式 `index` 摆进数组（长度 = `max(index)+1`），
 ///    `bone`/`flexdesc` 解析成下标，空洞写全 0。
 /// 4. **eyeball**：`org` 经 [`internal_bone_world`] 的逆变换成骨骼空间，
@@ -5807,16 +5808,64 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
     compiled.resolved_flex_rules = rules;
 
     // ---- 2. flexcontrollerui（自动 + 显式）----
+    //
+    // 官方规则（真 exe 17 用例裁决，见 `docs/_probe/oracle_fcui.js` /
+    // `oracle_fcui2.js`）：按 **fc 数组顺序**扫描，若**紧邻**的一对满足
+    //
+    //     name[i] == "right_" + X   且   name[i+1] == "left_" + X
+    //
+    // （`X` **逐字节相同**、**大小写敏感**；**与 `type` 无关**；**与是否被
+    // flexrule 引用无关**）⟹ 合并成 **1 条 stereo ui**：`name = X`、
+    // `stereo = 1`、`szindex0` → `left_X`（**下标更大**那条）、`szindex1` →
+    // `right_X`，两条一起跳过。
+    //
+    // 否则当前条单独成 **1 条非 stereo ui**：`name` = fc 名**原样**、
+    // `stereo = 0`、`szindex0` → 自身、`szindex1 = 0`。
+    //
+    // 判别性反例（全部实测，别把它们当成「显然」）：
+    //   - `left_X right_X`（顺序反转）        ⟹ **不**合并
+    //   - `zzz_right zzz_left`（后缀式）      ⟹ **不**合并
+    //   - `Right_A` / `Left_A`（前缀大小写）  ⟹ **不**合并
+    //   - `right_a left_A`（剩余部分大小写）  ⟹ **不**合并
+    //   - `right_A mid left_A`（不相邻）      ⟹ **不**合并
+    //   - `eyelid right_A` + `nose left_A`    ⟹ **仍合并**（type 不参与判据）
+    //   - `right_a_b left_a_b`（剩余含下划线）⟹ 合并，`name = "a_b"`
+    //
+    // ⚠️ 曾经这里是「每条 fc 各产一条非 stereo ui」，对用户工程会得到
+    // 52 条；官方是 33 条（52 − 19 对）。
     let mut uis: Vec<crate::model::ResolvedFlexControllerUi> = Vec::new();
-    // 每条 flexcontroller 自动产一条（官方 `flexcontroller` 命令顺带生成，
-    // 实测 fx2：3 个 fc → 3 条 ui，szindex0 指向 fc 自身，stereo=0）。
-    for (i, fc) in desc.flex_controllers.iter().enumerate() {
-        uis.push(crate::model::ResolvedFlexControllerUi {
-            name: fc.name.clone(),
-            fc0: i as i32,
-            fc1: None,
-            stereo: false,
-        });
+    let mut i = 0usize;
+    while i < desc.flex_controllers.len() {
+        let pair_name = {
+            let cur = desc.flex_controllers[i].name.as_str();
+            cur.strip_prefix("right_").and_then(|x| {
+                desc.flex_controllers
+                    .get(i + 1)
+                    .and_then(|n| n.name.strip_prefix("left_"))
+                    .filter(|y| *y == x)
+                    .map(|_| x.to_string())
+            })
+        };
+        match pair_name {
+            Some(x) => {
+                uis.push(crate::model::ResolvedFlexControllerUi {
+                    name: x,
+                    fc0: (i + 1) as i32, // left（下标更大）
+                    fc1: Some(i as i32), // right（下标更小）
+                    stereo: true,
+                });
+                i += 2;
+            }
+            None => {
+                uis.push(crate::model::ResolvedFlexControllerUi {
+                    name: desc.flex_controllers[i].name.clone(),
+                    fc0: i as i32,
+                    fc1: None,
+                    stereo: false,
+                });
+                i += 1;
+            }
+        }
     }
     // 用户显式写的（DMX 形态 / stereo 对）。
     for (ui_i, u) in desc.flex_controller_ui.iter().enumerate() {
@@ -7756,6 +7805,221 @@ type = "mouth"
         assert_eq!(uis[1].fc0, 1);
         assert!(uis.iter().all(|u| !u.stereo && u.fc1.is_none()), "自动产的都是单声道");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 辅助：给一组 fc 名，返回编译后的 ui 列表（`(name, fc0, fc1, stereo)`）。
+    ///
+    /// 每个名字都是 `[[flex_controllers]]` 一条，`type` 固定 `"lid"`（除非
+    /// 显式传 `(name, type)`）。
+    fn fcui_of(names: &[&str]) -> Vec<(String, i32, Option<i32>, bool)> {
+        let d = tmpdir("fcuipair");
+        write(&d, "myprop-ref.smd", SMD);
+        let mut toml = desc_toml("myprop-ref.smd");
+        for n in names {
+            toml.push_str(&format!(
+                "\n[[flex_controllers]]\nname = {n:?}\ntype = \"lid\"\n"
+            ));
+        }
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("应能编译");
+        let out = c
+            .resolved_flex_controller_ui
+            .iter()
+            .map(|u| (u.name.clone(), u.fc0, u.fc1, u.stereo))
+            .collect();
+        std::fs::remove_dir_all(&d).ok();
+        out
+    }
+
+    /// ⭐ **`right_X` + `left_X` 紧邻一对合并成一条 stereo ui**。
+    ///
+    /// 真 exe 裁决（`docs/_probe/oracle_fcui.js` 的 `fc1`）：
+    /// `flexcontroller eyelid right_lid_raiser left_lid_raiser` ⟹
+    /// `nfc=2 nUI=1`，`ui[0] name="lid_raiser" stereo=1 s0->fc[1] s1->fc[0]`。
+    ///
+    /// ⚠️ `fc0` 指向 **`left_`**（下标更大那条），`fc1` 指向 `right_` ——
+    /// 与 `studio.h` 的 `pLeftController() = this + szindex0` 一致。
+    #[test]
+    fn adjacent_right_left_pair_merges_into_stereo_ui() {
+        let uis = fcui_of(&["right_lid_raiser", "left_lid_raiser"]);
+        assert_eq!(uis.len(), 1, "一对应合并成 1 条 ui，got {uis:?}");
+        assert_eq!(uis[0].0, "lid_raiser", "名字 = 去掉 right_/left_ 前缀");
+        assert_eq!(uis[0].1, 1, "szindex0 → left_（下标更大）");
+        assert_eq!(uis[0].2, Some(0), "szindex1 → right_（下标更小）");
+        assert!(uis[0].3, "stereo = true");
+    }
+
+    /// 非配对（既无 `right_` 也无相邻 `left_`）各成一条单声道 ui，名字原样。
+    ///
+    /// `oracle_fcui.js` 的 `fc2`/`fc8`：`half_closed` 单条、4 个无前后缀的名字
+    /// ⟹ 条数不变、`stereo=0`、名原样。
+    #[test]
+    fn unpaired_controllers_each_get_a_mono_ui_with_verbatim_name() {
+        let uis = fcui_of(&["half_closed", "bite", "presser", "tightener"]);
+        assert_eq!(uis.len(), 4, "4 个非配对 fc → 4 条 ui");
+        assert_eq!(uis[0].0, "half_closed");
+        assert_eq!(uis[3].0, "tightener");
+        for (i, u) in uis.iter().enumerate() {
+            assert_eq!(u.1, i as i32, "szindex0 → 自身");
+            assert_eq!(u.2, None, "szindex1 = 0");
+            assert!(!u.3, "stereo = 0");
+        }
+    }
+
+    /// ⚠️ **顺序敏感**：`left_X` 在前**不合并**。
+    ///
+    /// `oracle_fcui.js` 的 `fc4`（`left_lid_raiser right_lid_raiser`）⟹
+    /// `nfc=2 nUI=2`，两条**非 stereo**、名原样。
+    ///
+    /// 这条最容易写错成「按名字配对」—— 那样会得到 1 条 stereo ui。
+    #[test]
+    fn reversed_left_right_order_does_not_merge() {
+        let uis = fcui_of(&["left_lid_raiser", "right_lid_raiser"]);
+        assert_eq!(uis.len(), 2, "顺序反转不合并，got {uis:?}");
+        assert_eq!(uis[0].0, "left_lid_raiser", "名原样");
+        assert_eq!(uis[1].0, "right_lid_raiser");
+        assert!(uis.iter().all(|u| !u.3), "两条都是单声道");
+    }
+
+    /// ⚠️ **前缀敏感**：`zzz_right` / `zzz_left` 这种**后缀式**不合并。
+    ///
+    /// `oracle_fcui.js` 的 `fc7` ⟹ `nfc=2 nUI=2`，两条非 stereo。
+    #[test]
+    fn suffix_style_right_left_does_not_merge() {
+        let uis = fcui_of(&["zzz_right", "zzz_left"]);
+        assert_eq!(uis.len(), 2, "后缀式不合并，got {uis:?}");
+        assert_eq!(uis[0].0, "zzz_right");
+        assert_eq!(uis[1].0, "zzz_left");
+    }
+
+    /// ⚠️ **不相邻不合并**：`right_A mid left_A` ⟹ 3 条。
+    ///
+    /// `oracle_fcui2.js` 的 `g2`。判据是「**紧接着的下一条**」，不是「在数组
+    /// 里找配对」。
+    #[test]
+    fn non_adjacent_right_left_does_not_merge() {
+        let uis = fcui_of(&["right_A", "mid", "left_A"]);
+        assert_eq!(uis.len(), 3, "不相邻不合并，got {uis:?}");
+        assert_eq!(uis[0].0, "right_A");
+        assert_eq!(uis[2].0, "left_A");
+    }
+
+    /// ⚠️ **剩余部分必须逐字节相同（大小写敏感）**。
+    ///
+    /// `oracle_fcui2.js` 的 `g1`（`right_A left_B`）、`g3`（`Right_A`）、
+    /// `g4`（`Left_A`）、`g7`（`right_a left_A`）全部**不合并**。
+    ///
+    /// ⭐ `g3`/`g4` 同时证明**前缀本身也大小写敏感**。
+    #[test]
+    fn remainder_must_match_byte_for_byte() {
+        for names in [
+            ["right_A", "left_B"],  // 剩余不同
+            ["Right_A", "left_A"],  // 前缀大小写
+            ["right_A", "Left_A"],  // 前缀大小写
+            ["right_a", "left_A"],  // 剩余大小写
+        ] {
+            let uis = fcui_of(&names);
+            assert_eq!(uis.len(), 2, "{names:?} 不应合并，got {uis:?}");
+            assert!(uis.iter().all(|u| !u.3), "{names:?} 两条都应是单声道");
+        }
+    }
+
+    /// ⭐ **`type` 不参与判据**：`eyelid right_A` + `nose left_A` **仍合并**。
+    ///
+    /// `oracle_fcui2.js` 的 `g5` ⟹ `nfc=2 nUI=1`、`ui[0] name="A" stereo=1`。
+    ///
+    /// 这条推翻了「同 type 才配对」的直觉假设 —— 用户工程的
+    /// `right_/left_` 对恰好都同 type，光看语料分辨不出来。
+    #[test]
+    fn pairing_ignores_the_controller_type() {
+        let d = tmpdir("fcuitype");
+        write(&d, "myprop-ref.smd", SMD);
+        let mut toml = desc_toml("myprop-ref.smd");
+        toml.push_str("\n[[flex_controllers]]\nname = \"right_A\"\ntype = \"eyelid\"\n");
+        toml.push_str("\n[[flex_controllers]]\nname = \"left_A\"\ntype = \"nose\"\n");
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("应能编译");
+        let uis = &c.resolved_flex_controller_ui;
+        assert_eq!(uis.len(), 1, "type 不同也合并（g5 实测），got {uis:?}");
+        assert_eq!(uis[0].name, "A");
+        assert!(uis[0].stereo);
+        assert_eq!(uis[0].fc0, 1);
+        assert_eq!(uis[0].fc1, Some(0));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 连续两对：`right_A left_A right_B left_B` ⟹ 2 条 stereo ui。
+    ///
+    /// `oracle_fcui2.js` 的 `g6`。同时验证扫描指针**一次跳两条**（否则第二对
+    /// 会被 `left_A` 打乱）。
+    #[test]
+    fn consecutive_pairs_each_merge() {
+        let uis = fcui_of(&["right_A", "left_A", "right_B", "left_B"]);
+        assert_eq!(uis.len(), 2, "两对应得 2 条 ui，got {uis:?}");
+        assert_eq!((uis[0].0.as_str(), uis[0].1, uis[0].2), ("A", 1, Some(0)));
+        assert_eq!((uis[1].0.as_str(), uis[1].1, uis[1].2), ("B", 3, Some(2)));
+        assert!(uis.iter().all(|u| u.3));
+    }
+
+    /// 剩余部分**可以含下划线**：`right_a_b` + `left_a_b` ⟹ `name = "a_b"`。
+    ///
+    /// `oracle_fcui2.js` 的 `g9`。前缀只剥一次，不按 `_` 分词。
+    #[test]
+    fn remainder_may_contain_underscores() {
+        let uis = fcui_of(&["right_a_b", "left_a_b"]);
+        assert_eq!(uis.len(), 1, "got {uis:?}");
+        assert_eq!(uis[0].0, "a_b", "只剥 right_/left_ 前缀，不按 _ 分词");
+    }
+
+    /// ⭐ **用户工程实测**：`survivors_facerules.qci:2-30` 的 30 条
+    /// `flexcontroller` 声明 ⟹ **52 fc / 33 ui**，与官方产物
+    /// `docs/_probe/_oracle_official_flex.mdl` 的 `numflexcontrollerui=33`
+    /// 逐条同名同序。
+    ///
+    /// 这里只钉**配对计数**（19 对 + 14 条单声道 = 33），名字序列见
+    /// `docs/_probe/cmp_flex.js` 的端到端比对。
+    #[test]
+    fn user_project_controller_list_yields_33_uis() {
+        // 逐字抄自 `survivors_facerules.qci:2-30`（`range` 无关，略）。
+        let decls: [&[&str]; 29] = [
+            &["right_lid_raiser", "left_lid_raiser"],
+            &["right_lid_tightener", "left_lid_tightener"],
+            &["right_lid_droop", "left_lid_droop"],
+            &["right_lid_closer", "left_lid_closer"],
+            &["half_closed"],
+            &["blink"],
+            &["right_lid_squinter", "left_lid_squinter"],
+            &["right_inner_raiser", "left_inner_raiser"],
+            &["right_outer_raiser", "left_outer_raiser"],
+            &["right_lowerer", "left_lowerer"],
+            &["right_cheek_raiser", "left_cheek_raiser"],
+            &["right_wrinkler", "left_wrinkler", "dilator"],
+            &["right_upper_raiser", "left_upper_raiser"],
+            &["right_corner_puller", "left_corner_puller"],
+            &["right_corner_depressor", "left_corner_depressor"],
+            &["chin_raiser"],
+            &["right_part", "left_part"],
+            &["right_puckerer", "left_puckerer"],
+            &["right_funneler", "left_funneler"],
+            &["right_stretcher", "left_stretcher"],
+            &["bite", "presser", "tightener", "jaw_clencher"],
+            &["jaw_drop"],
+            &["right_mouth_drop", "left_mouth_drop"],
+            &["right_cheek_puffer", "left_cheek_puffer"],
+            &["mouth_sideways"],
+            &["jaw_sideways"],
+            &["lower_lip"],
+            // 下面两条来自 `survivors_bodyrules.qci:3-4`
+            // （`flexcontroller eyes range -30 30 eyes_updown` / `eyes_rightleft`）。
+            &["eyes_updown"],
+            &["eyes_rightleft"],
+        ];
+        let names: Vec<&str> = decls.iter().flat_map(|g| g.iter().copied()).collect();
+        assert_eq!(names.len(), 52, "官方产物 numflexcontrollers = 52");
+        let uis = fcui_of(&names);
+        assert_eq!(uis.len(), 33, "官方产物 numflexcontrollerui = 33");
+        assert_eq!(uis.iter().filter(|u| u.3).count(), 19, "19 对 stereo");
+        assert_eq!(uis.iter().filter(|u| !u.3).count(), 14, "14 条单声道");
     }
 
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----

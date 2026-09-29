@@ -404,9 +404,23 @@ pub fn resolve_flex_indexed(
 ) -> Result<Vec<MeshFlexes>, FlexError> {
     let at = format!("bodyparts[..].models[..].flexes[{spec_index}]");
 
+    let n_meshes = mesh_of_vertex
+        .iter()
+        .map(|(m, _)| m + 1)
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![MeshFlexes::default(); n_meshes];
+
     // ⛔ `frame 0` 恒空 —— 与其静默产出 0 载荷，不如显式报错。
     // 这正是 L4D2 那个坑的症状来源（见 HANDBOOK 38.4）。
+    //
+    // ⚠️ 例外：官方 `Option_Eyelid` 的 `neutral 0` 会**故意**注册一条
+    // frame 0 的 flexkey，语义就是「载荷清零」（`simplify.cpp:2453-2457`），
+    // 所以它合法且**必然**产出空载荷 —— 那条路径由 `from_eyelid` 标记。
     if flex.frame == 0 {
+        if flex.from_eyelid {
+            return Ok(out);
+        }
         return Err(ferr(format!(
             "{at}：frame = 0 是**特殊帧**，studiomdl 会强制把载荷清零\
              （`simplify.cpp:2453-2457`），产物里 `numflexes` 恒为 0。\
@@ -416,13 +430,6 @@ pub fn resolve_flex_indexed(
     if flex.frame < 0 {
         return Err(ferr(format!("{at}：frame 不能为负（{}）", flex.frame)));
     }
-
-    let n_meshes = mesh_of_vertex
-        .iter()
-        .map(|(m, _)| m + 1)
-        .max()
-        .unwrap_or(0);
-    let mut out = vec![MeshFlexes::default(); n_meshes];
 
     // ---- 相对帧号：TOML 的 frame 直接就是相对帧号 ----
     let rel = flex.frame;
@@ -578,7 +585,11 @@ pub fn resolve_flex_indexed(
         // `target0..3`（`studiomdl.cpp:3585-3588` + `write.cpp:1765-1769`）：
         // 缺省 [0, 1, 10, 11]；`position` 覆盖 target1。
         // 实测确认缺省就是 [0,1,10,11]，与 studio.h 的注释不符。
-        let targets = [0.0, flex.position, 10.0, 11.0];
+        //
+        // ⚠️ 官方 `Option_Eyelid` 的三条 flexkey **各有各的分段 targets**
+        // （`[-11,-10,a,b]` / `[a,b,c,d]` / `[c,d,10,11]`），由 `Flex::targets`
+        // 显式携带 —— 它绝不能走这条缺省。
+        let targets = flex.targets.unwrap_or([0.0, flex.position, 10.0, 11.0]);
 
         slot.flexes.push(ResolvedFlex {
             flexdesc: flexdesc.0,
@@ -699,6 +710,8 @@ end
             split: 0.0,
             position: 1.0,
             decay: 1.0,
+            targets: None,
+            from_eyelid: false,
         }
     }
 
