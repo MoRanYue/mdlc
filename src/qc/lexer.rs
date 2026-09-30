@@ -315,94 +315,117 @@ impl Lexer {
     /// 返回 `Ok(None)` 表示「本次没有产出 token，但也没错」——
     /// 即碰到了 `$include` / 宏 / 变量展开，调用方应继续循环。
     fn scan_token(&mut self, crossline: bool) -> Result<Option<Token>, QcError> {
-        // ---- skipspace（scriplib.cpp:385）----
+        // ⚠️ 官方用 `goto skipspace`（单行注释）与**递归调用**（块注释）
+        // 表达「跳过注释后重来」；本实现写成 `loop` + `continue`。
         //
-        // ⚠️ 只对 `'\n'` 递增行号；`'\r'` 是**普通空白**。
+        // # 为什么必须写成循环（R37）
+        //
+        // 曾写成 `return self.scan_token(crossline);` —— 那是**尾调用**，
+        // 但 Rust **不做尾调用消除**。debug 构建下每次递归压一个
+        // `0x11a0`（4512）字节的栈帧，1 MB 默认栈只够约 232 层
+        // ⟹ **连续 220 行注释就爆栈**（`c00000fd`，实测阈值恰好 220；
+        // 见 `docs/_probe/stack_threshold.js`）。
+        //
+        // 真实触发源：用户工程的 `lods.qci` 前 **259 行全是注释**
+        // （整个 `$lod 10 { … }` 块被注释掉）⟹ debug 下
+        // `mdlc qc2toml survivor_teenangst.qc` 3 秒即崩。
+        // release 的栈帧小得多，恰好躲过 —— 所以这个缺陷**只在 debug
+        // 二进制上显形**，release 冒烟测试发现不了它。
         loop {
-            if self.frame().at_end() {
-                return self.end_of_script_inner(crossline).map(|_| None);
-            }
-            let c = self.frame().cur();
-            if c > 32 {
-                break;
-            }
-            self.frame_mut().pos += 1;
-            if c == b'\n' {
-                if !crossline {
-                    return Err(self.error("行不完整（行尾缺少参数）"));
-                }
-                let f = self.frame_mut();
-                f.line += 1;
-            }
-        }
-
-        if self.frame().at_end() {
-            return self.end_of_script_inner(crossline).map(|_| None);
-        }
-
-        let (file, line) = self.location();
-
-        // ---- 单行注释（scriplib.cpp:408）----
-        //
-        // `;` `#` `//` 三者都起注释。注意 `#` 与 `/` **不**结束 token，
-        // 只有 `;` 会（见下面的常规 token 扫描条件）。
-        let c = self.frame().cur();
-        let is_comment = c == b';'
-            || c == b'#'
-            || (c == b'/' && self.frame().peek1() == b'/');
-        if is_comment {
-            if !crossline {
-                return Err(self.error("行不完整（行尾是注释）"));
-            }
-            // `while (*script->script_p++ != '\n')` —— 注意是**先取后判**，
-            // 所以 `\n` 本身也被消费掉。
-            loop {
-                let ch = self.frame().cur();
-                let at_end = self.frame().at_end();
-                self.frame_mut().pos += 1;
-                if ch == b'\n' {
-                    break;
-                }
-                if at_end {
-                    return self.end_of_script_inner(crossline).map(|_| None);
-                }
-            }
-            self.frame_mut().line += 1;
-            // `goto skipspace`
-            return self.scan_token(crossline);
-        }
-
-        // ---- 块注释（scriplib.cpp:425）----
-        //
-        // ⚠️ 官方这段的换行计数**写错了**：
-        // ```c
-        // if (*script->script_p++ != '\n')
-        //     scriptline = ++script->line;
-        // ```
-        // 是「**不是**换行时才递增行号」—— 与直觉相反。
-        // 这里**故意修正**为「是换行时递增」，因为：
-        // ① 它是上游 bug，官方自己的行号在块注释后就飘了；
-        // ② 行号只用于报错，不影响任何解析分支。
-        // 记在这里以免将来「对照源码时发现不一致」又被改回去。
-        if c == b'/' && self.frame().peek1() == b'*' {
-            self.frame_mut().pos += 2;
+            // ---- skipspace（scriplib.cpp:385）----
+            //
+            // ⚠️ 只对 `'\n'` 递增行号；`'\r'` 是**普通空白**。
             loop {
                 if self.frame().at_end() {
                     return self.end_of_script_inner(crossline).map(|_| None);
                 }
-                let a = self.frame().cur();
-                let b = self.frame().peek1();
-                if a == b'*' && b == b'/' {
-                    self.frame_mut().pos += 2;
+                let c = self.frame().cur();
+                if c > 32 {
                     break;
                 }
                 self.frame_mut().pos += 1;
-                if a == b'\n' {
-                    self.frame_mut().line += 1;
+                if c == b'\n' {
+                    if !crossline {
+                        return Err(self.error("行不完整（行尾缺少参数）"));
+                    }
+                    let f = self.frame_mut();
+                    f.line += 1;
                 }
             }
-            return self.scan_token(crossline);
+
+            if self.frame().at_end() {
+                return self.end_of_script_inner(crossline).map(|_| None);
+            }
+
+            // ---- 单行注释（scriplib.cpp:408）----
+            //
+            // `;` `#` `//` 三者都起注释。注意 `#` 与 `/` **不**结束 token，
+            // 只有 `;` 会（见下面的常规 token 扫描条件）。
+            let c = self.frame().cur();
+            let is_comment = c == b';'
+                || c == b'#'
+                || (c == b'/' && self.frame().peek1() == b'/');
+            if is_comment {
+                if !crossline {
+                    return Err(self.error("行不完整（行尾是注释）"));
+                }
+                // `while (*script->script_p++ != '\n')` —— 注意是**先取后判**，
+                // 所以 `\n` 本身也被消费掉。
+                loop {
+                    let ch = self.frame().cur();
+                    let at_end = self.frame().at_end();
+                    self.frame_mut().pos += 1;
+                    if ch == b'\n' {
+                        break;
+                    }
+                    if at_end {
+                        return self.end_of_script_inner(crossline).map(|_| None);
+                    }
+                }
+                self.frame_mut().line += 1;
+                // `goto skipspace`
+                continue;
+            }
+
+            // ---- 块注释（scriplib.cpp:425）----
+            //
+            // ⚠️ 官方这段的换行计数**写错了**：
+            // ```c
+            // if (*script->script_p++ != '\n')
+            //     scriptline = ++script->line;
+            // ```
+            // 是「**不是**换行时才递增行号」—— 与直觉相反。
+            // 这里**故意修正**为「是换行时递增」，因为：
+            // ① 它是上游 bug，官方自己的行号在块注释后就飘了；
+            // ② 行号只用于报错，不影响任何解析分支。
+            // 记在这里以免将来「对照源码时发现不一致」又被改回去。
+            if c == b'/' && self.frame().peek1() == b'*' {
+                self.frame_mut().pos += 2;
+                loop {
+                    if self.frame().at_end() {
+                        return self.end_of_script_inner(crossline).map(|_| None);
+                    }
+                    let a = self.frame().cur();
+                    let b = self.frame().peek1();
+                    if a == b'*' && b == b'/' {
+                        self.frame_mut().pos += 2;
+                        break;
+                    }
+                    self.frame_mut().pos += 1;
+                    if a == b'\n' {
+                        self.frame_mut().line += 1;
+                    }
+                }
+                continue;
+            }
+
+            break;
         }
+
+        // 位置在注释跳过后重算。与「原实现在注释处理**之前**取一次」对
+        // 真实 token 完全等价：注释分支原先直接递归返回，那份
+        // `(file, line)` 被丢弃；`filename` 在跳注释期间不会变。
+        let (file, line) = self.location();
 
         // ---- 拷贝 token（scriplib.cpp:543）----
         //

@@ -503,3 +503,43 @@ fn unget_returns_the_same_token() {
     let again = l.next_token(true).unwrap().unwrap();
     assert_eq!(t, again, "unget 后必须取到同一个 token");
 }
+
+/// ⭐⭐⭐ R37 回归：**连续注释不得消耗栈**。
+///
+/// `scan_token` 跳过注释后曾用 `return self.scan_token(crossline);` 重来。
+/// 那是**尾调用**，但 **Rust 不做尾调用消除** ⟹ debug 下每跳过一行注释
+/// 就多压一个 `0x11a0`（4512）字节的栈帧 ⟹ **连续 220 行注释即爆栈**
+/// （`0xc00000fd`，实测阈值见 `docs/_probe/stack_threshold.js`）。
+///
+/// 真实触发源是用户工程的 `lods.qci`：前 **259 行**全是被注释掉的
+/// `$lod 10 { … }` 块 ⟹ debug 二进制 3 秒即崩。
+/// ⚠️ **release 不崩**（栈帧小得多），所以这个缺陷只在 debug 下显形 ——
+/// 这正是它长期潜伏的原因，也是本测试存在的理由。
+///
+/// 用例取 **5000** 行：若退回递归，debug 下需要约 22 MB 栈，
+/// 远超任何测试线程的栈（默认 2 MiB，`RUST_MIN_STACK` 也只到 8 MiB）
+/// ⟹ **不存在「栈恰好够大所以侥幸通过」的可能**。
+#[test]
+fn long_comment_run_does_not_consume_stack() {
+    const N: usize = 5000;
+
+    let mut line_src = String::new();
+    let mut block_src = String::new();
+    for _ in 0..N {
+        line_src.push_str("// x\n");
+        block_src.push_str("/* x */\n");
+    }
+    line_src.push_str("$surfaceprop \"metal\"\n");
+    block_src.push_str("$surfaceprop \"metal\"\n");
+
+    for (label, src) in [("行注释", &line_src), ("块注释", &block_src)] {
+        let mut l = lex(src);
+        let t = l.next_token(true).unwrap().unwrap();
+        assert_eq!(
+            t.text, "$surfaceprop",
+            "{label}：连续 {N} 行注释之后必须仍能取到 token"
+        );
+        // 顺带钉住「位置改在跳注释之后取」这一重构不改变行号。
+        assert_eq!(t.line, N + 1, "{label}：注释跳过后行号必须仍然准确");
+    }
+}
