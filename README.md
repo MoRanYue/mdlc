@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 718 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 719 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -696,7 +696,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 718 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 719 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -725,15 +725,15 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 718 passed / 0 failed / 6 ignored
+cargo test --release          # 719 passed / 0 failed / 6 ignored
 ```
 
-**718 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 724 个单元测试 =
-718 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**719 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 725 个单元测试 =
+719 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
-| `qc` | 140 | QC 词法（`qc::lexer` 23）/ 语法（`qc::parse` 65）/ 规则表达式语义（`qc::flexrule` 52） |
+| `qc` | 141 | QC 词法（`qc::lexer` 24）/ 语法（`qc::parse` 65）/ 规则表达式语义（`qc::flexrule` 52） |
 | `compile` | 133 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
 | `mdl_writer` | 81 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
