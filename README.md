@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 695 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 718 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -696,7 +696,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 695 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 718 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -725,29 +725,29 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 695 passed / 0 failed / 6 ignored
+cargo test --release          # 718 passed / 0 failed / 6 ignored
 ```
 
-**695 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 701 个单元测试 =
-695 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**718 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 724 个单元测试 =
+718 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
-| `qc` | 130 | QC 词法（`qc::lexer` 23）/ 语法（`qc::parse` 55）/ 规则表达式语义（`qc::flexrule` 52） |
-| `compile` | 120 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
+| `qc` | 140 | QC 词法（`qc::lexer` 23）/ 语法（`qc::parse` 65）/ 规则表达式语义（`qc::flexrule` 52） |
+| `compile` | 133 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
 | `mdl_writer` | 81 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
 | `phy` | 77 | 凸包、`$concave`、ragdoll、IVP 布局不变量 |
+| `vtx_writer` | 30 | strip group 链、骨骼调色板、按 `maxBonesPerStrip` 拆 strip |
 | `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
-| `vtx_writer` | 31 | strip group 链、骨骼调色板、缓存优化守门 |
 | `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
-| `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
-| `bone_math` | 19 | 欧拉/四元数、矩阵约定 |
-| `ani_writer` | 16 | `.ani` 容器与块对齐 |
+| `smd` | 18 | SMD 解析（含 9/10 token 顶点行） |
+| `bone_math` | 17 | 欧拉/四元数、矩阵约定 |
 | `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
+| `ani_writer` | 16 | `.ani` 容器与块对齐 |
 | `vta` | 14 | `.vta` 解析 |
-| `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
+| `lib.rs` 的 `tests` | 10 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
 | `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
 | `layout` | 6 | 段偏移计算与单调性 |
 
