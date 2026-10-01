@@ -836,9 +836,13 @@ fn same_fbx_geometry_error(
          只产出 1 帧（实测 exit=0、无警告；本实现从同一个文件采到了 {n_frames} 帧，\
          两者分歧），mdlc 不产出这种结果。\
          改 QC 没有用 —— `$animation` 块、按名引用、重写 `$sequence` 都被实测证明仍是 1 帧\
-         （docs/_probe/oracle_samefile_fix.js 的 N2/N4/N5/N6）。唯一有效的做法是：\
-         ① 把动画拆到独立的 FBX 文件（唯一可行）；\
-         ② 若确实要 1 帧静态姿态，写 `numframes 1`。（SMD 没有这个限制，只有 .fbx 会。）",
+         （docs/_probe/oracle_samefile_fix.js 的 N2/N4/N5/N6）。两条出路：\
+         ① 把动画拆到独立的 FBX 文件（唯一通用做法）；\
+         ② 若确实只要 1 帧静态姿态，在 `$animation` 里写 `frames 0 0` \
+         （`$sequence` 没有帧区间语法，只能用①）。\
+         ⚠️ `numframes 1` **不管用** —— 它只**延长**（`simplify.cpp:1279-1293` 的\
+         `forceNumframes` 从 `panim->numframes` 起补帧），不会把 5 帧缩成 1 帧。\
+         （SMD 没有这个限制，只有 .fbx 会。）",
         path.display()
     ))
 }
@@ -2623,11 +2627,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let Some((mut frames, _smd)) = loaded else {
             continue;
         };
-        if let Some(msg) = same_fbx_geometry_error(&p, &fbx_geometry, frames.len()) {
-            seq_errors.push(e(format!("{at}.smd"), msg));
-            continue;
-        }
         // ---- 取帧区间（QC 的 `frames a b`，闭区间）----
+        //
+        // ⚠️ **必须在 `same_fbx_geometry_error` 之前**：那个判据看的是「最终采到
+        // 几帧」，而 `frames 0 0` 正是「我只要 1 帧」的合法表达。早先把检查放在
+        // 这里之前 ⟹ 错误信息里建议的 `frames 0 0` 自己也会被同一个错误拦下
+        // （实测：`$animation a1 "same.fbx" frames 0 0` 仍报同一个错）。
         if let Some([lo, hi]) = a.frames {
             let n = frames.len() as i32;
             // 官方把越界值**夹到**源范围（`studiomdl.cpp:2250-2254`），
@@ -2642,6 +2647,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 continue;
             }
             frames = frames[lo as usize..=hi as usize].to_vec();
+        }
+        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_error`。
+        // 判据要 `n_frames`，所以先读帧（并应用 `frames` 区间）再判。
+        if let Some(msg) = same_fbx_geometry_error(&p, &fbx_geometry, frames.len()) {
+            seq_errors.push(e(format!("{at}.smd"), msg));
+            continue;
         }
         pending_subtract.push(a.subtract.as_deref().map(|s| (s.to_owned(), a.subtract_frame.unwrap_or(0))));
         anim_index.insert(a.name.as_str(), anims.len());
@@ -7742,6 +7753,28 @@ smd = "{smd}"
         )
     }
 
+    /// 与 [`desc_toml`] 同形，但材质表里放的是 [`crate::fbx::FALLBACK_MATERIAL`]。
+    ///
+    /// [`MIN_FBX`] 里的网格**没有任何材质**，FBX 路径会合成兜底名
+    /// `debug/debugempty`（官方行为，见 `docs/fbx-support.md` §1.9），
+    /// 而 `desc_toml` 的材质表里只有 `myprop` ⟹ 报「材质名找不到」。
+    /// 要编过就必须把这个兜底名登记进材质表。
+    fn fbx_desc_toml() -> String {
+        let base = desc_toml("anim.fbx");
+        let needle = "textures = [{ name = \"models/test/myprop\" }]";
+        assert!(
+            base.contains(needle),
+            "desc_toml 的材质表变了，本辅助函数需要同步更新"
+        );
+        base.replace(
+            needle,
+            &format!(
+                "textures = [{{ name = \"{}\" }}]",
+                crate::fbx::FALLBACK_MATERIAL
+            ),
+        )
+    }
+
     /// 与 [`desc_toml`] 相同，但给 `tip` 注入一个**与 SMD 冲突**的参考姿态
     /// （等价于 QC 的 `$definebone "tip" "root" 0 0 20 0 0 0`）。
     ///
@@ -7822,6 +7855,116 @@ end
         [8.0, -8.0, 0.0],
         [0.0, 8.0, 0.0],
     ];
+
+    /// ⭐ **手写的最小 ASCII FBX**（2131 B）：1 个立方体网格 + 1 条动画栈（6 帧）。
+    ///
+    /// # 为什么要内联一份 FBX
+    ///
+    /// FBX 夹具的常规来源是 Blender（`_fbxresearch/samples/`），但那些**不能进
+    /// 仓库**（体量大、且是外部素材），而 FBX 又**以二进制为主**，没法像 SMD 那样
+    /// 直接把文本内联进测试。ASCII FBX 恰好两全：**ufbx 能读**（`ufbx.c` 有完整的
+    /// ASCII 解析路径），文本可以内联。
+    ///
+    /// # 它到底长什么样
+    ///
+    /// - 8 个控制点（立方体，边长 2，中心在原点）、6 个四边面（`PolygonVertexIndex`
+    ///   里每面最后一个下标按 FBX 约定**取反再减 1**，如 `-2` 表示面结束于下标 1）。
+    /// - 一个 `Model::box` 节点，`Lcl Translation/Rotation/Scaling` 全是单位值。
+    /// - 一条 `AnimStack::Take 001`，其 `T.X` 曲线有 **6 个关键帧**
+    ///   （`KeyTime` 从 0 到 230930790000 = 1 秒，FBX 的 KTime 单位是 1/46186158000 秒）
+    ///   ⟹ 采出 **6 帧**，正好能触发「同文件静默 1 帧」陷阱（判据要求 `> 1` 帧）。
+    ///
+    /// ⚠️ 网格节点**自身**是唯一骨骼（无蒙皮）—— 这正是官方骨骼过滤规则的
+    /// 「无蒙皮的网格节点自身算一根」（见 `docs/fbx-support.md` §1.4），所以
+    /// `desc_toml` 里那两根 `root`/`tip` 会被 SMD 侧忽略、这里只需一根。
+    ///
+    /// ⚠️ **不要**用 `Count:` 里的数字当真 —— ufbx 不校验它，但保持自洽省得
+    /// 以后有人以为是错的。
+    const MIN_FBX: &str = r#"; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+	}
+}
+Definitions:  {
+	Version: 100
+	Count: 6
+	ObjectType: "Model" { Count: 1 }
+	ObjectType: "Geometry" { Count: 1 }
+	ObjectType: "AnimationStack" { Count: 1 }
+	ObjectType: "AnimationLayer" { Count: 1 }
+	ObjectType: "AnimationCurveNode" { Count: 1 }
+	ObjectType: "AnimationCurve" { Count: 1 }
+}
+Objects:  {
+	Geometry: 100, "Geometry::box", "Mesh" {
+		Vertices: *24 {
+			a: -1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,-1,-1,1,1,-1,1,1,1,1,-1,1,1
+		}
+		PolygonVertexIndex: *24 {
+			a: 0,3,2,-2,4,5,6,-8,0,1,5,-5,3,7,6,-3,0,4,7,-4,1,2,6,-6
+		}
+		GeometryVersion: 124
+	}
+	Model: 200, "Model::box", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+		}
+		Shading: T
+		Culling: "CullingOff"
+	}
+	AnimationStack: 300, "AnimStack::Take 001", "" {
+		Properties70:  {
+			P: "LocalStart", "KTime", "Time", "",0
+			P: "LocalStop", "KTime", "Time", "",230930790000
+		}
+	}
+	AnimationLayer: 400, "AnimLayer::BaseLayer", "" {
+	}
+	AnimationCurveNode: 500, "AnimCurveNode::T", "" {
+		Properties70:  {
+			P: "d|X", "Number", "", "A",0
+			P: "d|Y", "Number", "", "A",0
+			P: "d|Z", "Number", "", "A",0
+		}
+	}
+	AnimationCurve: 600, "AnimCurve::T.X", "" {
+		Default: 0
+		KeyVer: 4009
+		KeyTime: *6 {
+			a: 0,46186158000,92372316000,138558474000,184744632000,230930790000
+		}
+		KeyValueFloat: *6 {
+			a: 0,1,2,3,4,5
+		}
+		KeyAttrFlags: *1 { a: 24836 }
+		KeyAttrDataFloat: *4 { a: 0,0,0,0 }
+		KeyAttrRefCount: *1 { a: 6 }
+	}
+}
+Connections:  {
+	C: "OO",100,200
+	C: "OO",300,0
+	C: "OO",400,300
+	C: "OO",500,400
+	C: "OP",600,500, "d|X"
+	C: "OP",500,200, "Lcl Translation"
+}
+"#;
 
     // ---- `$animation` 的 `subtract` ----
     //
@@ -11592,6 +11735,72 @@ end
         assert!(
             same_fbx_geometry_error(Path::new("a.smd"), &[PathBuf::from("a.smd")], 8).is_none(),
             "SMD 同文件正常（8 帧源出 8 帧），报错会误伤既有工程"
+        );
+        // ⑤ 文案里给出的**两条出路**都必须真的可用，且不能建议 `numframes 1`。
+        //    早先建议 `numframes 1`，但那条路**走不通**：`forceNumframes` 只延长
+        //    （`simplify.cpp:1279-1293` 从 `panim->numframes` 起补帧），不会把
+        //    5 帧缩成 1 帧；而且 `$body` 行上根本没有 `numframes` 这个选项
+        //    （实测 `未知的 studio 选项 "numframes"`）。
+        assert!(
+            msg.contains("frames 0 0"),
+            "必须给出真正可用的 1 帧写法（`frames 0 0`）：{msg}"
+        );
+        assert!(
+            !msg.contains("写 `numframes 1`"),
+            "不能再建议 `numframes 1` —— 它只延长、不缩短，且 `$body` 不接受它：{msg}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ⭐ **`frames 0 0` 必须真的能绕开同文件陷阱**（端到端，不是文案断言）。
+    ///
+    /// 早先 `same_fbx_geometry_error` 在应用 `frames` 区间**之前**跑 ⟹ 它看到的是
+    /// 源的 6 帧，于是把「我只要 1 帧」的合法表达也拦下了 —— 错误信息里建议的
+    /// 出路自己走不通。修法 = 把取帧区间提到检查之前（判据看的是**最终**帧数）。
+    ///
+    /// 夹具是 [`MIN_FBX`] —— 一份**手写的最小 ASCII FBX**（2131 B）。之所以不用
+    /// Blender 生成的样本：那些不能进仓库（体量大），而 FBX 是**二进制**为主、
+    /// 没法像 SMD 那样内联文本。ASCII FBX 恰好两全 —— ufbx 能读，文本可内联。
+    #[test]
+    fn frames_range_is_applied_before_the_same_file_guard() {
+        let d = tmpdir("framesorder");
+        write(&d, "anim.fbx", MIN_FBX);
+        // 同一份 FBX 既作网格源又作动画源 —— 正是那个陷阱的组合。
+        let toml = format!(
+            "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\nframes = [0, 0]\n\
+             \n[[sequences]]\nname = \"idle\"\nsmd = \"a1\"\n",
+            fbx_desc_toml()
+        );
+        let desc = ModelDesc::from_toml(&toml).expect("TOML 解析");
+        let c = compile(&desc, &d).expect("`frames 0 0` 必须能绕开同文件判据");
+        let a = c
+            .animations
+            .iter()
+            .find(|a| a.name == "a1")
+            .expect("a1 应存在");
+        assert_eq!(a.frames.len(), 1, "`frames 0 0` 之后应当只剩 1 帧");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ⭐ **反方向**：不写 `frames` 时同文件陷阱**必须仍然拒绝**。
+    ///
+    /// 与上一个测试配对 —— 单看「`frames 0 0` 能编过」不能证明判据还在
+    /// （把判据整个删掉也能过）。两条一起才钉住「判据看的是最终帧数」。
+    #[test]
+    fn same_file_fbx_is_still_rejected_without_a_frame_range() {
+        let d = tmpdir("framesnoguard");
+        write(&d, "anim.fbx", MIN_FBX);
+        let toml = format!(
+            "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\n\
+             \n[[sequences]]\nname = \"idle\"\nsmd = \"a1\"\n",
+            fbx_desc_toml()
+        );
+        let desc = ModelDesc::from_toml(&toml).expect("TOML 解析");
+        let errs = compile(&desc, &d).expect_err("不写 frames 时必须仍然拒绝");
+        let all = format!("{errs:?}");
+        assert!(
+            all.contains("网格源"),
+            "应当报同文件陷阱（6 帧会被官方丢掉）：{all}"
         );
         std::fs::remove_dir_all(&d).ok();
     }

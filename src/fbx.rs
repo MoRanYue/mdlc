@@ -709,11 +709,63 @@ fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node>
     }
     used.extend(extra);
 
-    (0..scene.nodes.len())
-        .map(|i| &scene.nodes[i])
-        .filter(|n| !n.is_root && used.contains(&n.element.element_id))
-        .collect()
+    // 排列顺序：官方是**深度优先先序**，而 `scene.nodes` 是逐层顺序（BFS）。
+    let ids: Vec<(u32, Option<u32>)> = (0..scene.nodes.len())
+        .map(|i| {
+            let n = &scene.nodes[i];
+            (
+                n.element.element_id,
+                n.parent.as_ref().map(|p| p.element.element_id),
+            )
+        })
+        .collect();
+    let order = dfs_preorder(&ids, &used);
+    order.into_iter().filter_map(|id| by_id.get(&id).copied()).collect()
 }
+
+/// 把**逐层顺序**（BFS，即 `ufbx::Scene::nodes` 的顺序）重排成官方骨骼表的
+/// **深度优先先序**（DFS pre-order）。
+///
+/// 输入 `nodes` 按源顺序给出 `(element_id, parent_element_id)`；`keep` 是已经过
+/// 过滤（见 [`kept_nodes`]）的 id 集合。输出只含 `keep` 里的 id。
+///
+/// ⚠️ **为什么必须重排**：`scene.nodes` 是 parents-first 的**层序**，官方骨骼表
+/// 却是 DFS 先序。两个判别样本（`docs/_probe/oracle_fbx_boneedge.js`）：
+///
+/// * `be1_two_roots.fbx`（两根平行骨架）—— ufbx 给 `RigA, RigB, A_root, B_root,
+///   A_tip, B_tip`，官方是 `RigA, A_root, A_tip, RigB, B_root, B_tip`；
+/// * `bo1_fork.fbx`（`R → A → A1` 与 `R → B → B1`，只 `A1` / `B1` 被加权）——
+///   ufbx 给 `Skeleton, R, A, B, A1, B1`，官方是 `Skeleton, R, A, A1, B, B1`。
+///
+/// ⚠️ **单链样本上两种顺序恰好重合**，所以只有「分叉」样本能把它分开 ——
+/// 早先按 `scene.nodes` 原样过滤，在 `rig.fbx` 等 7 个用例上全部通过，
+/// 直到 `be1` / `bo1` 才暴露。兄弟姐妹之间沿用输入里的相对顺序。
+fn dfs_preorder(nodes: &[(u32, Option<u32>)], keep: &std::collections::HashSet<u32>) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut roots: Vec<u32> = Vec::new();
+    for &(id, parent) in nodes {
+        if !keep.contains(&id) {
+            continue;
+        }
+        match parent {
+            Some(pid) if keep.contains(&pid) => children.entry(pid).or_default().push(id),
+            // 父节点不是保留节点（`is_root`、或（防御性地）不在集合里）⟹ 它是本棵树的根。
+            _ => roots.push(id),
+        }
+    }
+
+    let mut out: Vec<u32> = Vec::with_capacity(keep.len());
+    let mut stack: Vec<u32> = roots.iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if let Some(cs) = children.get(&id) {
+            // 反向压栈 ⟹ 出栈顺序 = 输入里的兄弟姐妹顺序。
+            stack.extend(cs.iter().rev().copied());
+        }
+    }
+    out
+}
+
 
 fn smd_nodes(kept: &[&ufbx::Node]) -> Vec<SmdNode> {
     let idx_of: HashMap<u32, i32> = kept
@@ -1288,5 +1340,81 @@ mod tests {
         assert_eq!(FbxGeometry::shape_key_frame(0), 1);
         assert_eq!(FbxGeometry::shape_key_frame(1), 2);
         assert_eq!(FbxGeometry::shape_key_frame(41), 42);
+    }
+
+    /// ⭐ **DFS 先序**（官方骨骼表顺序）：`be1_two_roots.fbx` 的判别用例。
+    ///
+    /// ufbx 的 `scene.nodes` 是层序 `RigA, RigB, A_root, B_root, A_tip, B_tip`，
+    /// 官方骨骼表是 `RigA, A_root, A_tip, RigB, B_root, B_tip`。
+    #[test]
+    fn dfs_preorder_matches_two_parallel_roots() {
+        // (id, parent)：0=RigA 1=RigB 2=A_root 3=B_root 4=A_tip 5=B_tip
+        let nodes = [
+            (0u32, None),
+            (1, None),
+            (2, Some(0)),
+            (3, Some(1)),
+            (4, Some(2)),
+            (5, Some(3)),
+        ];
+        let keep: std::collections::HashSet<u32> = (0..6).collect();
+        assert_eq!(dfs_preorder(&nodes, &keep), vec![0, 2, 4, 1, 3, 5]);
+    }
+
+    /// ⭐ **DFS 先序**：`bo1_fork.fbx` 的判别用例（兄弟姐妹顺序要保留）。
+    ///
+    /// ufbx 给 `Skeleton, R, A, B, A1, B1`；官方是 `Skeleton, R, A, A1, B, B1`。
+    /// 注意 `A2` 在源里排在 `B` 前面（层序），但**不在** `keep` 里。
+    #[test]
+    fn dfs_preorder_matches_forked_hierarchy() {
+        // 0=Skeleton 1=R 2=A 3=B 4=A1 5=A2 6=B1
+        let nodes = [
+            (0u32, None),
+            (1, Some(0)),
+            (2, Some(1)),
+            (3, Some(1)),
+            (4, Some(2)),
+            (5, Some(2)),
+            (6, Some(3)),
+        ];
+        let keep: std::collections::HashSet<u32> = [0, 1, 2, 3, 4, 6].into_iter().collect();
+        assert_eq!(dfs_preorder(&nodes, &keep), vec![0, 1, 2, 4, 3, 6]);
+    }
+
+    /// 单链上 DFS 与层序**恰好重合** —— 这正是这个 bug 能躲过 `rig.fbx` 等
+    /// 7 个用例的原因，也是本条测试存在的理由（守住「别以为单链绿了就没事」）。
+    #[test]
+    fn dfs_preorder_is_identity_on_a_single_chain() {
+        let nodes = [
+            (0u32, None),
+            (1, Some(0)),
+            (2, Some(1)),
+            (3, Some(2)),
+        ];
+        let keep: std::collections::HashSet<u32> = (0..4).collect();
+        assert_eq!(dfs_preorder(&nodes, &keep), vec![0, 1, 2, 3]);
+    }
+
+    /// 父节点**不在** `keep` 里时，子节点成为新树的根（`is_root` 被过滤后
+    /// 的常见形态）；多棵树按源顺序依次展开。
+    #[test]
+    fn dfs_preorder_starts_a_new_tree_when_the_parent_is_filtered() {
+        // 0=root(被丢) 1=A 2=A_child 3=B
+        let nodes = [
+            (0u32, None),
+            (1, Some(0)),
+            (2, Some(1)),
+            (3, Some(0)),
+        ];
+        let keep: std::collections::HashSet<u32> = [1, 2, 3].into_iter().collect();
+        assert_eq!(dfs_preorder(&nodes, &keep), vec![1, 2, 3]);
+    }
+
+    /// 空集合与「全部被过滤」都必须给出空结果（不 panic）。
+    #[test]
+    fn dfs_preorder_handles_empty_input() {
+        let empty: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        assert!(dfs_preorder(&[], &empty).is_empty());
+        assert!(dfs_preorder(&[(0, None)], &empty).is_empty());
     }
 }

@@ -99,6 +99,46 @@ numbones=4
 **成了第 5 根骨骼** —— 它在单 FBX 用例里是被丢掉的。⟹ **过滤规则依赖于该节点在当前模型里
 是否承载网格**，不是单纯看类型。
 
+#### 1.4b ✅ 边界已定案（6 个单变量样本，`oracle_fbx_boneedge.js`）
+
+上面那条「例外」其实是**主规则**。用 6 个专门造的样本（`_fbxresearch\gen_fbx_boneedge.py`
+→ `be1_two_roots.fbx` / `be2_nested_arm.fbx` / `be3_meshchild.fbx` / `be4_meshnode_anim.fbx` /
+`be5_unweighted.fbx` / `be6_deep_chain.fbx`）逐个裁决，**官方 6/6 exit=0**：
+
+| 样本 | 造的是什么 | 官方骨骼表 |
+|---|---|---|
+| BE1 | 两根**平行**骨架 | 6 根：`RigA(-1) A_root A_tip RigB(-1) B_root B_tip` ⟹ **两棵树并列，不合并** |
+| BE2 | 骨架里嵌 armature 对象（bone-parenting） | 6 根：`RigOuter O_root O_mid RigInner I_root I_tip` ⟹ **嵌套骨架照常展开** |
+| BE3 | 网格节点**有子骨骼** | 4 根：`mesh_root(-1) Skeleton S_root S_tip` ⟹ **网格节点算一根，其子骨骼跟着进来** |
+| BE4 | 网格节点**自身带动画**（无骨骼） | 1 根：`mesh_only`；动画帧数 `[1]` |
+| BE5 | 骨架**全部零权重**（只父子、无 Armature 修改器） | 2 根：`Skeleton(-1) body` ⟹ ⭐ **零权重时保留的是「网格节点 + 其祖先」，不是「骨架」** |
+| BE6 | 8 级深链**只最深被加权** | 9 根：`Skeleton C0..C7` ⟹ **祖先全保留** |
+
+⟹ ⭐ **主规则无例外**：
+
+1. **种子** = 被蒙皮权重引用的骨骼（`SkinCluster.num_weights > 0` 的簇的 `bone_node`）；
+   **没有蒙皮的网格节点，它自身**算一个种子（这就是 BE3/BE4/BE5 与 `box.fbx` 的机制 ——
+   不是「例外」，是主规则）。
+2. **沿父链上溯收集全部祖先**（BE6 的 8 级深链、BE5 的 `Skeleton` 都靠这条进来）。
+3. `is_root`（ufbx 合成的空名根）**丢弃**。
+4. 叶节点且零权重 ⟹ 丢弃（`helper_forward`；`twostack.fbx` 的 `Head1` 同理）。
+
+#### 1.4c ✅ 排列顺序 = **DFS 先序**（不是 ufbx 的层序）
+
+`be1_two_roots.fbx` 暴露了一条**独立于集合的**规则：骨骼表的**顺序**。
+
+| | `be1_two_roots.fbx` 的顺序 |
+|---|---|
+| ufbx `scene.nodes` | `RigA, RigB, A_root, B_root, A_tip, B_tip`（**BFS / 层序**） |
+| 官方产物 | `RigA, A_root, A_tip, RigB, B_root, B_tip`（**DFS 先序**） |
+
+又造了一个专门分辨两者的样本 `_fbxresearch\gen_fbx_boneorder.py` → `bo1_fork.fbx`：
+`Skeleton → R → (A → A1, A2)` 与 `R → B → B1`（只 `A1`/`B1` 加权；`aaa_mesh` 挂 A1、
+`zzz_mesh` 挂 B1，故意让网格名与骨骼名顺序**相反**）⟹ 官方 `Skeleton, R, A, A1, B, B1`。
+
+⚠️ **单链样本上 DFS 与层序恰好重合** —— 这就是这条 bug 躲过 `rig.fbx` 等 7 个原用例的原因，
+**只有「分叉」样本能分开**。mdlc 修前给的是层序（`Skeleton, R, A, B, A1, B1`）。
+
 ### 1.5 ⭐⭐ 官方把 FBX 动画**固定归一化到 30 fps**
 
 同一段 1 秒动画分别以 24 / 30 / 60 fps 场景导出（`_fbxresearch\gen_fbx_fps.py`）：
@@ -907,6 +947,25 @@ mdlc **拒绝**，并给出可操作的出路：
 > （还有 `checksum`、1 ULP 级的 `hull_min/hull_max`、`seqdesc.bbmin/bbmax`）。
 > 验收口径是**逐字段**（`docs/_probe/mdl_field_dump.js`）而非逐字节。
 
+#### 4.6b 不是偏离、但必须写明的两条「官方的坑」
+
+这两条**不是** mdlc 的选择，而是官方行为里两个会让人白费功夫的地方 ——
+mdlc 的做法与官方一致，但错误/提示信息必须把它们讲清楚：
+
+| # | 情形 | 官方行为 | mdlc 的处置 |
+|---|---|---|---|
+| A | 同一 FBX 既作网格源又作动画源，且它**真的有多帧** | 静默只出 1 帧 | **报错**（偏离 1），并给出**两条真正可用**的出路：① 拆到独立 FBX；② 在 `$animation` 里写 `frames 0 0` |
+| B | 想让多帧源缩成 1 帧而写 `numframes 1` | `forceNumframes` 只**延长**（`simplify.cpp:1279-1293` 从 `panim->numframes` 起补帧），不会缩短；且 `$body` 行根本不接受 `numframes` | 同上 —— 错误信息里**不再**建议 `numframes 1` |
+
+⚠️ 情形 A 的出路 ② 有个**实现顺序**要求：`frames` 区间必须在
+「同文件判据」**之前**应用。早先把判据放在前面 ⟹ 它看到的是源的原始帧数，
+于是把「我只要 1 帧」的合法表达也拦下了 —— **错误信息里建议的出路自己走不通**
+（实测：`$animation a1 "same.fbx" frames 0 0` 仍报同一个错）。
+判据看的是**最终**采到几帧，所以顺序是硬约束，已由
+`frames_range_is_applied_before_the_same_file_guard` +
+`same_file_fbx_is_still_rejected_without_a_frame_range` **成对**钉住
+（单看前者不能证明判据还在 —— 把判据整个删掉也能过）。
+
 > ⚠️ **跨工具兼容性**：偏离 1–4 意味着**用了新语法的 QC 不能直接跑官方工具**。
 > 这与既有扩展命令（`$optimizevtx` 等）的处理方式一致 ——
 > README 应明确写出这条，并指出「要跨工具通用请改用 TOML 侧字段」。
@@ -984,7 +1043,7 @@ src_stack = "run"
 | # | 事项 | 说明 | 状态 |
 |---|---|---|---|
 | 1 | **单位/缩放定案** | §1.7 的「骨骼 ×100、网格 ×1」需要一份**真实 Source 绑定 FBX** 复验；现有夹具是 Blender 默认导出（根节点带 m→cm 缩放）。⚠️ §1.7b 已证明**轴向**侧官方不做变换，单位侧大概率同理（都是「原样搬运根变换」），但仍需一份真实资产确认 | ⏳ 待复验（**骨骼位移口径已由 E 定案，10/10**） |
-| 2 | **骨骼过滤规则** | §1.4 的例外（`box.fbx` 的网格节点成了骨骼）需要更多样本确认边界（多根骨骼、多网格、嵌套骨架） | ⏳ 待复验（**「骨骼被过滤」的诊断因此未实现**，见 §4.4） |
+| 2 | **骨骼过滤规则** | §1.4 的例外（`box.fbx` 的网格节点成了骨骼）需要更多样本确认边界（多根骨骼、多网格、嵌套骨架） | ✅ **已定案**（§1.4b 的 6 个单变量样本：主规则无例外，`box.fbx` 不是例外；§1.4c 的**排列顺序 = DFS 先序**也已修）。⚠️ 「骨骼被过滤」的**诊断**仍未实现 —— 但它现在缺的是「怎么措辞」而非「规则不明」，见 §4.4 |
 | 3 | **flex 的 oracle 差分** | 用 `morph.fbx` 做「官方 FBX→flex」vs「mdlc FBX→flex」的逐字段对照；再复验「shape key 顺序 = 帧 1..N」这条映射 | ✅ **已完成**（`k4_flex_align.js`：desc/controller/rule/targets/vtype/speed/side/ndelta **全部逐字段一致**；载荷按 VVD 位置对齐 16/16） |
 | 4 | **动画采样率** | 官方固定 30 fps（§1.5）；`ufbx` 需显式设 `minimum_sample_rate` 才能复刻（§2.3） | ✅ **已可用**（`srcfps` 端到端实测：60 ⟹ 11 帧、30 ⟹ 6 帧） |
 | 5 | **`ufbx` 的依赖体积** | 纯 Rust 之外的 C 源码；需评估对 MSRV job（`rust-version = "1.89"`）与 CI 的影响 | ✅ **已通过**（CI 的 MSRV job 绿） |

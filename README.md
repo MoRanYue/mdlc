@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 751 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 762 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -787,7 +787,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 751 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 762 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -816,15 +816,15 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 751 passed / 0 failed / 6 ignored
+cargo test --release          # 762 passed / 0 failed / 6 ignored
 ```
 
-**751 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 757 个单元测试 =
-751 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**762 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 768 个单元测试 =
+762 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
-| `compile` | 148 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一、FBX shape key → flex、`src*` 选项 |
+| `compile` | 154 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一、FBX shape key → flex、`src*` 选项 |
 | `qc` | 145 | QC 词法（`qc::lexer` 24）/ 语法（`qc::parse` 69）/ 规则表达式语义（`qc::flexrule` 52） |
 | `mdl_writer` | 82 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
@@ -835,11 +835,11 @@ cargo test --release          # 751 passed / 0 failed / 6 ignored
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
 | `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
 | `bone_math` | 19 | 欧拉/四元数、矩阵约定 |
+| `fbx` | 17 | FBX 三条几何口径（R3/N3/E）、`src*` 选项矩阵、shape key 帧号、骨骼表 DFS 先序 |
 | `ani_writer` | 16 | `.ani` 容器与块对齐 |
 | `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
 | `vta` | 14 | `.vta` 解析 |
 | `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
-| `fbx` | 12 | FBX 三条几何口径（R3/N3/E）、`src*` 选项矩阵、shape key 帧号 |
 | `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
 | `layout` | 6 | 段偏移计算与单调性 |
 
