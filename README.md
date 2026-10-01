@@ -141,6 +141,18 @@ QC 脚本  ──┘
 [`docs/fbx-support.md`](docs/fbx-support.md)）。**格式由扩展名决定，所以必须写全**
 —— 这也是不自动补扩展名的原因之一（见 `## 已知未实现`）。
 
+> **FBX 可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
+> （合并所有网格、恒取第一条 NLA 栈、shape key 自动注册成 flex），
+> 而官方那些**静默失败**会被 mdlc 变成显式提示，每个隐式决定都有一个
+> 显式覆盖语法（九条 `src*`，见 [`### FBX 源选项`](#fbx-源选项src9-条)）。
+>
+> ```qc
+> $modelname "models/mymod/linnea.mdl"
+> $cdmaterials "models/mymod/"
+> $body body "linnea.fbx" srcpart "body"   // 只取 body 网格
+> // 表情不用写：shape key 自动注册
+> ```
+
 职责划分：
 
 | 内容 | 由谁承载 | 对应 QC |
@@ -951,7 +963,7 @@ src/
 
 ## 延伸文档
 
-仓库内的 `docs/` 收录了五份**实测反推**的规格报告（结论全部来自对真实产物的
+仓库内的 `docs/` 收录了六份**实测反推**的规格报告（结论全部来自对真实产物的
 逐字节分析，不是从 `studio.h` 推断的）：
 
 | 文档 | 内容 |
@@ -961,6 +973,7 @@ src/
 | [`docs/coordinate-systems.md`](docs/coordinate-systems.md) | 坐标系约定与 `$staticprop` 几何旋转 |
 | [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | 以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准的 QC 覆盖对照 |
 | [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
+| [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的可行性调研与 UX 方案（**82 个官方 oracle 用例**的实测结论 + 九条 `src*` 语法的设计理由 + 偏离表） |
 
 > ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
 > 带有明确的快照日期（当时的文件 SHA256 与测试数）。**它们描述的是历史状态**，
