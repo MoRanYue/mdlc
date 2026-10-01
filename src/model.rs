@@ -1923,6 +1923,25 @@ pub struct Sequence {
     /// 与 [`Self::section_frames`] 无关 —— 后者是「每段多少帧」。
     #[serde(default)]
     pub num_frames: Option<i32>,
+    /// `srcstack "walk"`：**按名字选动画栈**（仅对 FBX 源有意义）。
+    ///
+    /// `None` = 取第一条 —— 那是官方的行为，且 `$sequence` 的名字
+    /// **完全不参与**栈选择（`docs/fbx-support.md` §1.8：3 个样本 × 3 个
+    /// 序列名，全部取第一条栈）。
+    ///
+    /// ⚠️ 名字对不上时报错并列出全部可用栈名（不静默回落）——
+    /// 静默回落正是官方最让人困惑的地方。
+    #[serde(default)]
+    pub src_stack: Option<String>,
+    /// `srcfps 30`：FBX 动画的**重采样率**。`None` = `30`（官方固定值）。
+    ///
+    /// ⚠️ 与 [`Self::fps`] 不是一回事：那个是**动画的播放帧率**
+    /// （落进 `animdesc.fps`，**不改帧数**），这个是**从源文件采几帧**
+    /// （`ufbx::bake_anim` 的 `resample_rate`）。
+    /// 官方对 FBX 恒定 30 fps 采样，无论源文件写的是 24 / 30 / 60
+    /// （`docs/fbx-support.md` §1.5）。
+    #[serde(default)]
+    pub src_fps: Option<f32>,
 }
 
 /// blend 网格的**一格** —— 指向 [`ModelDesc::animations`] 里的一个动画。
@@ -3339,6 +3358,53 @@ pub struct BodyModel {
     /// `mstudioflex_t.flexdesc` 就是这个顺序里的下标。
     #[serde(default)]
     pub flexes: Vec<Flex>,
+    /// `srcpart "name"`：**只取这些名字的网格**（可重复）。
+    ///
+    /// 空 = 取源文件里全部网格并合并 —— 那是官方的行为
+    /// （`docs/fbx-support.md` §1.10：一个 FBX 里的多块网格被合并进同一个
+    /// `mstudiomodel_t`，部件边界丢失）。
+    ///
+    /// 名字是 **FBX 里 mesh 节点的名字**（`node.element.name`），不是
+    /// `$body` 给的名字。名字对不上时 `src\fbx.rs` 会报
+    /// 「{} 里没有任何三角形（网格）」并提示核对 `srcpart`。
+    #[serde(default)]
+    pub src_parts: Vec<String>,
+    /// `srcmaterial "name"`：网格**没有**材质时用这个名字。
+    ///
+    /// `None` = 官方的兜底 `debug/debugempty`（`src\fbx.rs` 的
+    /// [`crate::fbx::FALLBACK_MATERIAL`]）。
+    #[serde(default)]
+    pub src_material: Option<String>,
+    /// `srcscale <f>`：顶点与骨骼位移的缩放。`None` = `1.0`（官方不做单位换算）。
+    ///
+    /// ⚠️ 官方**不**按 FBX 的 `unit_meters` 换算 —— `rig.fbx` 的
+    /// `Skeleton` 局部缩放 `(100,100,100)` 被原样搬进骨骼表，而顶点位置
+    /// 仍按原值（`docs/fbx-support.md` §1.7）。`srcscale` 是给「源文件单位
+    /// 真的错了」准备的逃生门，不是常规选项。
+    #[serde(default)]
+    pub src_scale: Option<f32>,
+    /// `srcaxis "y"` / `"z"`：**强制**上轴。`None` = 不干预（官方原样透传）。
+    ///
+    /// ⚠️ 只在源文件自身轴向坏掉（根变换丢了）时才需要 —— 只要根节点变换与
+    /// 几何自洽，官方与 mdlc 的默认行为就已经正确，无论 Y-up 还是 Z-up
+    /// （`docs/fbx-support.md` §1.7b）。
+    #[serde(default)]
+    pub src_axis: Option<String>,
+    /// `srcshapekey "name"`：**只取这些名字的形变目标**（可重复）。
+    ///
+    /// 空 = 取全部，帧号 = 文件顺序 + 1（官方行为，`docs/fbx-support.md` §1.6b）。
+    /// 写了之后帧号按**本列表的顺序** 1..N。
+    #[serde(default)]
+    pub src_shape_keys: Vec<String>,
+    /// `srcshapekeyorder "a" "b"`：显式指定帧号顺序。
+    ///
+    /// 与 [`Self::src_shape_keys`] 的区别：那个是**过滤 + 定序**（列表之外的
+    /// 一律丢掉），这个是**只定序**（列表之外的按文件顺序排在其后）。
+    #[serde(default)]
+    pub src_shape_key_order: Vec<String>,
+    /// `srcshapekeyignore`：**完全忽略形变目标**（不产出任何 flex）。
+    #[serde(default)]
+    pub src_shape_key_ignore: bool,
 }
 
 /// 一条 VTA 形状绑定（QC 的 `flexfile "<vta>" flex "<名>" frame <n>`）。
@@ -4262,6 +4328,15 @@ pub struct Animation {
     /// `DEG2RAD(值 + 90)`，即**补上那 90°**；`x`/`y` 直接写。
     #[serde(default)]
     pub rotation: Option<[f32; 3]>,
+    /// `srcstack "walk"`：**按名字选动画栈**（仅对 FBX 源有意义）。
+    ///
+    /// 见 [`Sequence::src_stack`] —— `$animation` 引用 FBX 时同样支持，
+    /// 因为两者最终都走 `read_source_frames`。
+    #[serde(default)]
+    pub src_stack: Option<String>,
+    /// `srcfps 30`：FBX 动画的**重采样率**。见 [`Sequence::src_fps`]。
+    #[serde(default)]
+    pub src_fps: Option<f32>,
 }
 
 /// 一个**已编译的动画**（animdesc 的载荷）。
@@ -5775,6 +5850,101 @@ impl ModelDesc {
                         ),
                     });
                 }
+            }
+        }
+
+        // ---- FBX 源选项（`src*`）----
+        //
+        // 这些字段只在源是 FBX 时有意义，但**不按扩展名报错** ——
+        // 写了 `srcpart` 却把 `.fbx` 换成 `.smd` 时，报「SMD 不支持 srcpart」
+        // 比静默忽略更有用；而校验器看不到文件系统，只能做**值域**检查。
+        // 「选项是否被用上」由 `src\compile.rs` 在真读到源之后判定。
+        for (bi, bp) in self.bodyparts.iter().enumerate() {
+            for (mi, m) in bp.models.iter().enumerate() {
+                let path = format!("bodyparts[{bi}].models[{mi}]");
+                if let Some(s) = m.src_scale
+                    && (!s.is_finite() || s <= 0.0)
+                {
+                    errs.push(DescError {
+                        path: format!("{path}.src_scale"),
+                        message: format!("必须是正有限数，实际 {s}"),
+                    });
+                }
+                if let Some(a) = &m.src_axis
+                    && crate::fbx::ForcedAxis::parse(a).is_none()
+                {
+                    errs.push(DescError {
+                        path: format!("{path}.src_axis"),
+                        message: format!(
+                            "只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
+                             大小写不敏感），实际 {a:?}"
+                        ),
+                    });
+                }
+                if let Some(mat) = &m.src_material
+                    && mat.trim().is_empty()
+                {
+                    errs.push(DescError {
+                        path: format!("{path}.src_material"),
+                        message: "不能为空（省略这个字段就是官方的 debug/debugempty）".into(),
+                    });
+                }
+                for (k, p) in m.src_parts.iter().enumerate() {
+                    if p.trim().is_empty() {
+                        errs.push(DescError {
+                            path: format!("{path}.src_parts[{k}]"),
+                            message: "网格名不能为空".into(),
+                        });
+                    }
+                }
+                for (k, n) in m.src_shape_keys.iter().enumerate() {
+                    if n.trim().is_empty() {
+                        errs.push(DescError {
+                            path: format!("{path}.src_shape_keys[{k}]"),
+                            message: "形变目标名不能为空".into(),
+                        });
+                    }
+                }
+                for (k, n) in m.src_shape_key_order.iter().enumerate() {
+                    if n.trim().is_empty() {
+                        errs.push(DescError {
+                            path: format!("{path}.src_shape_key_order[{k}]"),
+                            message: "形变目标名不能为空".into(),
+                        });
+                    }
+                }
+                // `srcshapekeyignore` 与另外两个互斥：一个是「全都要」，
+                // 一个是「都不要」，同时给出会让「谁说了算」变成隐式规则。
+                if m.src_shape_key_ignore
+                    && (!m.src_shape_keys.is_empty() || !m.src_shape_key_order.is_empty())
+                {
+                    errs.push(DescError {
+                        path: format!("{path}.src_shape_key_ignore"),
+                        message: "与 `src_shape_keys` / `src_shape_key_order` 不能同时给出：\
+                                  前者是「一个形变目标都不要」，后两者是「按名单取」"
+                            .into(),
+                    });
+                }
+            }
+        }
+        for (i, s) in self.sequences.iter().enumerate() {
+            if let Some(f) = s.src_fps
+                && (!f.is_finite() || f <= 0.0)
+            {
+                errs.push(DescError {
+                    path: format!("sequences[{i}].src_fps"),
+                    message: format!("必须是正有限数，实际 {f}"),
+                });
+            }
+        }
+        for (i, a) in self.animations.iter().enumerate() {
+            if let Some(f) = a.src_fps
+                && (!f.is_finite() || f <= 0.0)
+            {
+                errs.push(DescError {
+                    path: format!("animations[{i}].src_fps"),
+                    message: format!("必须是正有限数，实际 {f}"),
+                });
             }
         }
 

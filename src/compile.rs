@@ -421,6 +421,159 @@ pub fn is_source_ref(text: &str) -> bool {
     SourceKind::of(Path::new(text)).is_ok()
 }
 
+/// 一次源读取的全部选项 —— `src*` 扩展语法落到读取层的**唯一**载体。
+///
+/// # 为什么要有这个结构
+///
+/// `srcpart` / `srcmaterial` / `srcscale` / `srcaxis` 属于**几何**侧，
+/// `srcstack` / `srcfps` 属于**动画**侧，但两者最终都只是
+/// [`crate::fbx::FbxOpts`] 加两个标量。QC 前端与 TOML 都填这个结构，
+/// 三个读取函数都吃它，于是「选项从哪来」与「选项怎么用」彻底解耦 ——
+/// 读取层完全不知道 QC 存在。
+///
+/// # 默认值 = 官方行为
+///
+/// [`Default`] 是 [`crate::fbx::FbxOpts::default()`]（不干预单位与轴向、
+/// 全部网格合并、无材质时合成 `debug/debugempty`）+ 第一条动画栈 +
+/// [`crate::fbx::DEFAULT_FPS`]，逐条对齐官方实测（`docs/fbx-support.md` §1）。
+///
+/// # 对 `.smd` 源完全无影响
+///
+/// SMD 路径不读这个结构（它没有网格名、没有材质兜底、没有动画栈），
+/// 所以给既有工程加 `src*` 字段不会改变任何产物字节。
+#[derive(Debug, Clone, Default)]
+pub struct SrcOpts {
+    /// FBX 的几何与变换选项。
+    pub fbx: crate::fbx::FbxOpts,
+    /// `srcstack`：按名字选动画栈。`None` = 第一条（官方行为）。
+    pub stack: Option<String>,
+    /// `srcfps`：FBX 动画的重采样率。`0.0` = [`crate::fbx::DEFAULT_FPS`]。
+    pub fps: f32,
+    /// `srcshapekey`：只取这些形变目标，**且按本列表的顺序定帧号**。
+    pub shape_keys: Vec<String>,
+    /// `srcshapekeyorder`：只定序（名单外的按文件顺序排在其后）。
+    pub shape_key_order: Vec<String>,
+    /// `srcshapekeyignore`：一个形变目标都不要。
+    pub shape_key_ignore: bool,
+}
+
+impl SrcOpts {
+    /// 从一条 `$body` / `$model` 的选项构造（几何侧）。
+    ///
+    /// `src_axis` 的值域错误在这里就报出来 —— [`crate::model::ModelDesc::validate`]
+    /// 也会查一遍，但编译路径不该依赖「调用方先校验过」。
+    pub fn of_model(m: &crate::model::BodyModel) -> Result<Self, String> {
+        let axis = match m.src_axis.as_deref() {
+            None => None,
+            Some(s) => Some(crate::fbx::ForcedAxis::parse(s).ok_or_else(|| {
+                format!(
+                    "src_axis 只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
+                     大小写不敏感），实际 {s:?}"
+                )
+            })?),
+        };
+        Ok(Self {
+            fbx: crate::fbx::FbxOpts {
+                parts: m.src_parts.clone(),
+                material: m.src_material.clone(),
+                scale: m.src_scale.unwrap_or(1.0),
+                axis,
+            },
+            stack: None,
+            fps: 0.0,
+            shape_keys: m.src_shape_keys.clone(),
+            shape_key_order: m.src_shape_key_order.clone(),
+            shape_key_ignore: m.src_shape_key_ignore,
+        })
+    }
+
+    /// 叠加动画侧的两个选项（`$animation` / `$sequence` 的 `srcstack` / `srcfps`）。
+    ///
+    /// `fps` 的 `None` 与 `0.0` 都表示「用官方默认 30」，所以这里只在
+    /// 给了**正数**时覆盖。
+    pub fn with_anim(&self, stack: Option<&str>, fps: Option<f32>) -> Self {
+        Self {
+            fbx: self.fbx.clone(),
+            stack: stack.map(str::to_string).or_else(|| self.stack.clone()),
+            fps: fps.filter(|f| *f > 0.0).unwrap_or(self.fps),
+            shape_keys: self.shape_keys.clone(),
+            shape_key_order: self.shape_key_order.clone(),
+            shape_key_ignore: self.shape_key_ignore,
+        }
+    }
+
+    /// 实际使用的重采样率。
+    pub fn fps_or_default(&self) -> f32 {
+        if self.fps > 0.0 {
+            self.fps
+        } else {
+            crate::fbx::DEFAULT_FPS
+        }
+    }
+
+    /// 按 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore` 处理一份
+    /// 形变目标表，返回**定好序**的结果（帧号 = 下标 + 1）。
+    ///
+    /// # 三条规则
+    ///
+    /// * `ignore` ⟹ 返回空（一个 flex 都不注册）
+    /// * `shape_keys` 非空 ⟹ **过滤 + 定序**：只留名单里的，按名单顺序；
+    ///   名单里有但源里没有的**报错**（静默丢掉是官方最坑的行为之一）
+    /// * `shape_key_order` 非空 ⟹ **只定序**：名单里的排前面（按名单顺序），
+    ///   其余的按源顺序跟在其后
+    ///
+    /// 两个名单都为空 ⟹ 原样返回（官方行为：文件顺序 + 1）。
+    pub fn order_shape_keys(
+        &self,
+        keys: &[crate::fbx::FbxShapeKey],
+    ) -> Result<Vec<crate::fbx::FbxShapeKey>, String> {
+        if self.shape_key_ignore {
+            return Ok(Vec::new());
+        }
+        if self.shape_keys.is_empty() && self.shape_key_order.is_empty() {
+            return Ok(keys.to_vec());
+        }
+        let find = |want: &str| -> Option<&crate::fbx::FbxShapeKey> {
+            keys.iter().find(|k| k.name.eq_ignore_ascii_case(want))
+        };
+        if !self.shape_keys.is_empty() {
+            let mut out = Vec::with_capacity(self.shape_keys.len());
+            let mut missing = Vec::new();
+            for want in &self.shape_keys {
+                match find(want) {
+                    Some(k) => out.push(k.clone()),
+                    None => missing.push(want.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                let have: Vec<&str> = keys.iter().map(|k| k.name.as_str()).collect();
+                return Err(format!(
+                    "srcshapekey 里的 {} 在源文件里不存在；现有的是 {have:?}",
+                    missing
+                        .iter()
+                        .map(|m| format!("{m:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ));
+            }
+            return Ok(out);
+        }
+        // 只定序：名单里的在前（按名单顺序），其余按源顺序。
+        let mut out: Vec<crate::fbx::FbxShapeKey> = Vec::with_capacity(keys.len());
+        for want in &self.shape_key_order {
+            if let Some(k) = find(want) {
+                out.push(k.clone());
+            }
+        }
+        for k in keys {
+            if !out.iter().any(|o| o.name == k.name) {
+                out.push(k.clone());
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// 读取一个源文件（`.smd` 或 `.fbx`），统一成中立的 [`Smd`]。
 ///
 /// # 这是**唯一**的格式分派点
@@ -433,14 +586,14 @@ pub fn is_source_ref(text: &str) -> bool {
 ///
 /// # 默认值全部与官方一致
 ///
-/// FBX 侧用的是 [`crate::fbx::FbxOpts::default()`]，即「不干预单位与轴向、
-/// 全部网格合并、无材质时合成 `debug/debugempty`」—— 逐条对齐官方实测
+/// FBX 侧用的是 [`SrcOpts::default()`]，即「不干预单位与轴向、全部网格合并、
+/// 无材质时合成 `debug/debugempty`」—— 逐条对齐官方实测
 /// （`docs/fbx-support.md` §1）。mdlc 扩展语法（`srcpart` / `srcscale` /
-/// `srcaxis` …）会在这里按需替换掉它。
-pub fn read_source(path: &Path, at: &str) -> Result<Smd, CompileError> {
+/// `srcaxis` …）由调用方填进 `opts`。
+pub fn read_source(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, CompileError> {
     match SourceKind::of(path).map_err(|msg| e(at, msg))? {
         SourceKind::Smd => read_smd(path, at),
-        SourceKind::Fbx => crate::fbx::read(path, at, &crate::fbx::FbxOpts::default())
+        SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
             .map(|g| g.smd)
             .map_err(|err| e(at, err.to_string())),
     }
@@ -462,13 +615,17 @@ pub struct SourceGeometry {
 /// 与 [`read_source`] 的唯一区别就是多带一份 [`SourceGeometry::shape_keys`]；
 /// 只有 `$body` / `$model` 的主网格需要它，LOD 与 QC 的文件存在性检查走
 /// [`read_source`] 就够（前者官方也不产出 flex，后者根本不看内容）。
-pub fn read_source_geometry(path: &Path, at: &str) -> Result<SourceGeometry, CompileError> {
+pub fn read_source_geometry(
+    path: &Path,
+    at: &str,
+    opts: &SrcOpts,
+) -> Result<SourceGeometry, CompileError> {
     match SourceKind::of(path).map_err(|msg| e(at, msg))? {
         SourceKind::Smd => read_smd(path, at).map(|smd| SourceGeometry {
             smd,
             shape_keys: Vec::new(),
         }),
-        SourceKind::Fbx => crate::fbx::read(path, at, &crate::fbx::FbxOpts::default())
+        SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
             .map(|g| SourceGeometry {
                 smd: g.smd,
                 shape_keys: g.shape_keys,
@@ -488,15 +645,15 @@ pub fn read_source_geometry(path: &Path, at: &str) -> Result<SourceGeometry, Com
 /// [`crate::fbx::DEFAULT_FPS`]；mdlc 的 `srcfps` 可以覆盖它。
 ///
 /// ⚠️ 返回的 [`Smd`] 的 `triangles` 是空的 —— 调用方只取 `frames`。
-pub fn read_source_frames(path: &Path, at: &str) -> Result<Smd, CompileError> {
+pub fn read_source_frames(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, CompileError> {
     match SourceKind::of(path).map_err(|msg| e(at, msg))? {
         SourceKind::Smd => read_smd(path, at),
         SourceKind::Fbx => crate::fbx::read_frames(
             path,
             at,
-            None,
-            crate::fbx::DEFAULT_FPS,
-            &crate::fbx::FbxOpts::default(),
+            opts.stack.as_deref(),
+            opts.fps_or_default(),
+            &opts.fbx,
         )
         .map_err(|err| e(at, err.to_string())),
     }
@@ -617,6 +774,7 @@ fn build_model_lods(
     desc: &ModelDesc,
     base_dir: &Path,
     at: &str,
+    opts: &SrcOpts,
 ) -> Result<ModelLods, Vec<CompileError>> {
     let mut errs: Vec<CompileError> = Vec::new();
     let num_lods = m.lods.len() + 1;
@@ -688,7 +846,7 @@ fn build_model_lods(
                     continue;
                 }
             };
-            let smd = match read_source(&smd_path, &lpath) {
+            let smd = match read_source(&smd_path, &lpath, opts) {
                 Ok(s) => s,
                 Err(err) => {
                     errs.push(err);
@@ -1300,6 +1458,7 @@ fn load_smd_frames(
     desc: &ModelDesc,
     desc_index: &std::collections::HashMap<&str, usize>,
     at: &str,
+    opts: &SrcOpts,
     errs: &mut Vec<CompileError>,
 ) -> Option<(Vec<Vec<crate::smd::SmdPose>>, Smd)> {
     let e = |msg: String| CompileError {
@@ -1307,7 +1466,7 @@ fn load_smd_frames(
         message: msg,
     };
     let bone_count = desc.bones.len();
-    let smd = match read_source_frames(smd_path, at) {
+    let smd = match read_source_frames(smd_path, at, opts) {
         Ok(s) => s,
         Err(err) => {
             errs.push(err);
@@ -2159,7 +2318,16 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
-                let geom = match read_source_geometry(&smd_path, &format!("{at}.smd")) {
+                // `srcpart` / `srcmaterial` / `srcscale` / `srcaxis` —— 几何侧
+                // 的 `src*` 选项。`.smd` 源不读它，所以既有工程产物逐字节不变。
+                let sopts = match SrcOpts::of_model(m) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        errors.push(e(&at, msg));
+                        continue;
+                    }
+                };
+                let geom = match read_source_geometry(&smd_path, &format!("{at}.smd"), &sopts) {
                     Ok(s) => s,
                     Err(err) => {
                         errors.push(err);
@@ -2167,6 +2335,16 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     }
                 };
                 let smd = geom.smd;
+                // `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`
+                // 在**读取层之外**应用：`read_source_geometry` 只管把源里
+                // 有什么读出来，取哪些、按什么顺序是 QC/TOML 层的决定。
+                let shape_keys = match sopts.order_shape_keys(&geom.shape_keys) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        errors.push(e(&at, msg));
+                        continue;
+                    }
+                };
 
                 // ⚠️ **不要**因为「网格源 SMD 里有 `[[bones]]` 没有的骨骼」而报错。
                 //
@@ -2194,7 +2372,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 let lods = if m.lods.is_empty() {
                     None
                 } else {
-                    match build_model_lods(m, &meshes, &smd, desc, base_dir, &at) {
+                    match build_model_lods(m, &meshes, &smd, desc, base_dir, &at, &sopts) {
                         Ok(v) => Some(v),
                         Err(errs) => {
                             errors.extend(errs);
@@ -2260,7 +2438,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     eyeballs: Vec::new(),
                     mesh_flexes: Vec::new(),
                     mesh_src_index,
-                    shape_keys: geom.shape_keys,
+                    shape_keys,
                 });
             }
             bodyparts.push(CompiledBodyPart {
@@ -2333,11 +2511,16 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_error`。
         // 判据要 `n_frames`，所以先读帧再判（读一个 FBX 两次的代价可接受：
         // 只有「同文件」这一种情形会走到第二次）。
+        //
+        // `srcstack` / `srcfps` 是**动画侧**的选项，所以基准是
+        // `SrcOpts::default()`（几何侧的 `srcpart` 之类对动画源无意义）。
+        let aopts = SrcOpts::default().with_anim(a.src_stack.as_deref(), a.src_fps);
         let loaded = load_smd_frames(
             &p,
             desc,
             &bone_index,
             &format!("{at}.smd"),
+            &aopts,
             &mut seq_errors,
         );
         let Some((mut frames, _smd)) = loaded else {
@@ -2441,6 +2624,8 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             .first()
                             .map(|n| n.as_str())
                             .unwrap_or(sq.smd.as_str());
+                        // 现场读的这条源属于**这个序列**，所以动画侧选项取它的。
+                        let sopts = SrcOpts::default().with_anim(sq.src_stack.as_deref(), sq.src_fps);
                         match anim_index.get(cell) {
                             Some(&j) => Some(anims[j].frames.clone()),
                             None => match resolve_smd_path(base_dir, &sq.smd) {
@@ -2449,6 +2634,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                                     desc,
                                     &bone_index,
                                     &format!("animations[{i}].subtract（序列 {ref_name:?}）"),
+                                    &sopts,
                                     &mut seq_errors,
                                 )
                                 .map(|(frames, _smd)| frames),
@@ -2862,11 +3048,15 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             continue;
                         }
                     };
+                    // 隐含动画的源就是**序列自己**的源，所以动画侧选项取序列的。
+                    let sopts =
+                        SrcOpts::default().with_anim(s.src_stack.as_deref(), s.src_fps);
                     let Some((frames, _smd)) = load_smd_frames(
                         &smd_path,
                         desc,
                         &bone_index,
                         &format!("{at}.smd"),
+                        &sopts,
                         &mut seq_errors,
                     ) else {
                         continue;
@@ -8844,6 +9034,153 @@ type = "mouth"
         );
     }
 
+    // ---- `SrcOpts`：`src*` 选项的解析与 `srcshapekey*` 三条规则 ----
+    //
+    // 全部是纯函数，直接构造结构体断言，不需要文件系统。
+    // 端到端（真 FBX 文件 + 官方产物对照）在 `target/fbxcheck/` 上做。
+
+    fn sk(name: &str) -> crate::fbx::FbxShapeKey {
+        crate::fbx::FbxShapeKey {
+            name: name.to_string(),
+            position_offsets: vec![[1.0, 0.0, 0.0]],
+            normal_offsets: vec![[0.0; 3]],
+            vertex_index: vec![0],
+        }
+    }
+
+    fn names_of(keys: &[crate::fbx::FbxShapeKey]) -> Vec<&str> {
+        keys.iter().map(|k| k.name.as_str()).collect()
+    }
+
+    /// 默认 `SrcOpts` = 官方行为：不选网格、不换材质、不缩放、不转轴向、
+    /// 第一条动画栈、30 fps、形变目标原样。
+    #[test]
+    fn default_src_opts_are_the_official_behaviour() {
+        let o = SrcOpts::default();
+        assert!(o.fbx.parts.is_empty(), "默认合并全部网格（官方行为）");
+        assert!(o.fbx.material.is_none(), "默认用 debug/debugempty");
+        assert!((o.fbx.scale - 1.0).abs() < f32::EPSILON);
+        assert!(o.fbx.axis.is_none(), "默认不干预轴向（官方只是原样搬运）");
+        assert!(o.stack.is_none(), "默认第一条动画栈");
+        assert_eq!(o.fps_or_default(), crate::fbx::DEFAULT_FPS);
+        assert!(!o.shape_key_ignore);
+        let keys = vec![sk("a"), sk("b")];
+        assert_eq!(names_of(&o.order_shape_keys(&keys).unwrap()), ["a", "b"]);
+    }
+
+    /// `srcshapekey` = **过滤 + 定序**，名单里源里没有的**必须报错**
+    /// （静默丢掉是官方最坑的行为之一，所以这里是有意比官方严格）。
+    #[test]
+    fn srcshapekey_filters_and_reorders() {
+        let mut o = SrcOpts {
+            shape_keys: vec!["b".into(), "a".into()],
+            ..Default::default()
+        };
+        let keys = vec![sk("a"), sk("b"), sk("c")];
+        assert_eq!(
+            names_of(&o.order_shape_keys(&keys).unwrap()),
+            ["b", "a"],
+            "按名单顺序，名单外的（c）丢掉"
+        );
+
+        o.shape_keys = vec!["b".into(), "nope".into()];
+        let err = o.order_shape_keys(&keys).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("现有的是"), "错误信息要列出源里有什么：{err}");
+    }
+
+    /// `srcshapekeyorder` = **只定序**：名单里的在前，其余按源顺序跟后。
+    #[test]
+    fn srcshapekeyorder_only_reorders() {
+        let mut o = SrcOpts {
+            shape_key_order: vec!["c".into(), "a".into()],
+            ..Default::default()
+        };
+        let keys = vec![sk("a"), sk("b"), sk("c")];
+        assert_eq!(
+            names_of(&o.order_shape_keys(&keys).unwrap()),
+            ["c", "a", "b"],
+            "名单序在前，剩下的按源顺序"
+        );
+
+        // 名单里有源里没有的名字 ⟹ **不报错**（只定序，语义上允许）。
+        o.shape_key_order = vec!["zzz".into(), "b".into()];
+        assert_eq!(names_of(&o.order_shape_keys(&keys).unwrap()), ["b", "a", "c"]);
+    }
+
+    /// `srcshapekeyignore` = 一个都不要（与另外两个互斥由 QC/`validate` 保证，
+    /// 这里只验证它自己的行为）。
+    #[test]
+    fn srcshapekeyignore_drops_everything() {
+        let o = SrcOpts {
+            shape_key_ignore: true,
+            shape_keys: vec!["a".into()],
+            ..Default::default()
+        };
+        let keys = vec![sk("a"), sk("b")];
+        assert!(o.order_shape_keys(&keys).unwrap().is_empty());
+    }
+
+    /// 名字匹配**大小写不敏感**（与 `node_selected` 的 `eq_ignore_ascii_case`
+    /// 同口径）—— FBX 里的节点名大小写不总是稳定的。
+    #[test]
+    fn srcshapekey_matches_case_insensitively() {
+        let o = SrcOpts {
+            shape_keys: vec!["WIDE".into()],
+            ..Default::default()
+        };
+        let keys = vec![sk("wide")];
+        assert_eq!(names_of(&o.order_shape_keys(&keys).unwrap()), ["wide"]);
+    }
+
+    /// `with_anim` 只覆盖**正数** fps；`None` 与 `0.0` 都表示「用默认」。
+    #[test]
+    fn with_anim_overrides_only_positive_fps() {
+        let base = SrcOpts::default();
+        assert_eq!(base.with_anim(None, None).fps_or_default(), 30.0);
+        assert_eq!(base.with_anim(None, Some(0.0)).fps_or_default(), 30.0);
+        assert_eq!(base.with_anim(None, Some(60.0)).fps_or_default(), 60.0);
+        assert_eq!(
+            base.with_anim(Some("walk"), None).stack.as_deref(),
+            Some("walk")
+        );
+        // 不传 stack 时保留原有的（`$sequence` 叠加在 `$body` 之上）。
+        let with = base.with_anim(Some("walk"), Some(60.0));
+        assert_eq!(with.with_anim(None, None).stack.as_deref(), Some("walk"));
+    }
+
+    /// `of_model` 把 `src*` 的 IR 字段搬进 `FbxOpts`，且 `src_axis` 的值域
+    /// 错误**在这里**就报（不依赖「调用方先 `validate` 过」）。
+    #[test]
+    fn of_model_maps_ir_fields_and_validates_axis() {
+        let mut m = crate::model::BodyModel {
+            smd: "x.fbx".into(),
+            name: None,
+            flip_triangles: true,
+            lods: Vec::new(),
+            eyeballs: Vec::new(),
+            flexes: Vec::new(),
+            src_parts: vec!["body".into()],
+            src_material: Some("face".into()),
+            src_scale: Some(0.01),
+            src_axis: Some("z-up".into()),
+            src_shape_keys: vec!["wide".into()],
+            src_shape_key_order: Vec::new(),
+            src_shape_key_ignore: false,
+        };
+        let o = SrcOpts::of_model(&m).unwrap();
+        assert_eq!(o.fbx.parts, ["body"]);
+        assert_eq!(o.fbx.material.as_deref(), Some("face"));
+        assert!((o.fbx.scale - 0.01).abs() < 1e-9);
+        assert_eq!(o.fbx.axis, Some(crate::fbx::ForcedAxis::Z));
+        assert_eq!(o.shape_keys, ["wide"]);
+
+        m.src_axis = Some("sideways".into());
+        let err = SrcOpts::of_model(&m).unwrap_err();
+        assert!(err.contains("sideways"), "{err}");
+        assert!(err.contains("src_axis"), "{err}");
+    }
+
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----
     //
     // 规则全部来自受控实验（`docs/_probe/smdl/jig{1,2,4,6,7,8}.qc` →
@@ -11494,6 +11831,8 @@ weight = 0.5
             subtract: None,
             subtract_frame: None,
             num_frames: None,
+            src_stack: None,
+            src_fps: None,
         });
         let errs = d.validate().unwrap_err();
         assert!(

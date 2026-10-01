@@ -978,6 +978,19 @@ impl<'a> Parser<'a> {
         // 「**不要**翻转」，不是「翻转」。
         let mut flip_triangles = true;
 
+        // ---- mdlc 扩展：`src*`（见 `docs/fbx-support.md` §4.3）----
+        //
+        // 只对 `.fbx` 源有意义，但**不在这里按扩展名报错**：文件名可能
+        // 还要过 `resolve_src`（`$pushd` 前缀），而且「源换成 SMD 了但
+        // 选项还留着」这种情况，交给 `compile()` 在真读到源之后判定更有用。
+        let mut src_parts: Vec<String> = Vec::new();
+        let mut src_material: Option<String> = None;
+        let mut src_scale: Option<f32> = None;
+        let mut src_axis: Option<String> = None;
+        let mut src_shape_keys: Vec<String> = Vec::new();
+        let mut src_shape_key_order: Vec<String> = Vec::new();
+        let mut src_shape_key_ignore = false;
+
         // 行内选项。
         while self.avail() {
             let o = self.tok(false)?;
@@ -989,6 +1002,61 @@ impl<'a> Parser<'a> {
                 "faces" | "bias" => {
                     let _ = self.tok(false)?;
                 }
+                "srcpart" => {
+                    // ⚠️ **每次只读一个 token**，可重复写。
+                    //
+                    // 读到行尾看起来更省事（`srcpart "body" "hair"`），但会
+                    // **吞掉后面的选项**：`srcpart "hat" srcaxis "y"` 里的
+                    // `srcaxis` 会变成第二个网格名（实测 T9 夹具）。
+                    // 网格名带空格由引号解决（`srcpart "my mesh"`），
+                    // 不需要靠「读整行」来支持。
+                    src_parts.push(self.tok(false)?.text);
+                }
+                "srcmaterial" => {
+                    src_material = Some(self.tok(false)?.text);
+                }
+                "srcscale" => {
+                    let t = self.tok(false)?;
+                    let v: f32 = t.text.parse().map_err(|_| {
+                        QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcscale 需要数字，实际 {:?}", t.text),
+                        )
+                    })?;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcscale 必须是正有限数，实际 {v}"),
+                        ));
+                    }
+                    src_scale = Some(v);
+                }
+                "srcaxis" => {
+                    let t = self.tok(false)?;
+                    if crate::fbx::ForcedAxis::parse(&t.text).is_none() {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!(
+                                "srcaxis 只认 \"y\" / \"z\"（也接受 yup / y-up / \
+                                 zup / z-up，大小写不敏感），实际 {:?}",
+                                t.text
+                            ),
+                        ));
+                    }
+                    src_axis = Some(t.text);
+                }
+                "srcshapekey" => {
+                    // ⚠️ 每次只读一个 token（理由同上面的 `srcpart`）：
+                    // 读到行尾会把后面的 `srcshapekeyignore` 之类当成形状名。
+                    src_shape_keys.push(self.tok(false)?.text);
+                }
+                "srcshapekeyorder" => {
+                    src_shape_key_order.push(self.tok(false)?.text);
+                }
+                "srcshapekeyignore" => src_shape_key_ignore = true,
                 "{" => {
                     self.lex.unget(o);
                     break;
@@ -1001,6 +1069,16 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
+        }
+
+        // `srcshapekeyignore` 与另外两个互斥（见 `ModelDesc::validate` 的同名检查）。
+        // 这里也报一次：`validate()` 报的是 TOML 的字段路径，对 QC 用户没意义。
+        if src_shape_key_ignore && (!src_shape_keys.is_empty() || !src_shape_key_order.is_empty())
+        {
+            return Err(self.lex.error(
+                "`srcshapekeyignore` 与 `srcshapekey` / `srcshapekeyorder` 不能同时给出：\
+                 前者是「一个形变目标都不要」，后两者是「按名单取」",
+            ));
         }
 
         let smd = self.resolve_src(&filename);
@@ -1019,6 +1097,13 @@ impl<'a> Parser<'a> {
             lods: Vec::new(),
             eyeballs: Vec::new(),
             flexes: Vec::new(),
+            src_parts,
+            src_material,
+            src_scale,
+            src_axis,
+            src_shape_keys,
+            src_shape_key_order,
+            src_shape_key_ignore,
         })
     }
 
@@ -1126,6 +1211,66 @@ impl<'a> Parser<'a> {
                 "flexcontroller" => self.option_flexcontroller()?,
                 "spherenormals" | "attachment" => {
                     self.skip_rest_of_line();
+                }
+                // ---- mdlc 扩展：`src*` 的**块内**形式 ----
+                //
+                // 与 `option_studio` 的行内分支同一套语义。两处都要有，因为
+                // `$model "n" "x.fbx" { srcpart "body" }` 是更自然的写法
+                // （官方 `$model` 本来就带块），而 `$body n x.fbx srcpart "body"`
+                // 走的是行内那条路。
+                "srcpart" => {
+                    while self.avail() {
+                        let t = self.tok(false)?;
+                        model.src_parts.push(t.text);
+                    }
+                }
+                "srcmaterial" => {
+                    model.src_material = Some(self.tok(false)?.text);
+                }
+                "srcscale" => {
+                    let t = self.tok(false)?;
+                    let v: f32 = t.text.parse().map_err(|_| {
+                        QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcscale 需要数字，实际 {:?}", t.text),
+                        )
+                    })?;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcscale 必须是正有限数，实际 {v}"),
+                        ));
+                    }
+                    model.src_scale = Some(v);
+                }
+                "srcaxis" => {
+                    let t = self.tok(false)?;
+                    if crate::fbx::ForcedAxis::parse(&t.text).is_none() {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!(
+                                "srcaxis 只认 \"y\" / \"z\"（也接受 yup / y-up / \
+                                 zup / z-up，大小写不敏感），实际 {:?}",
+                                t.text
+                            ),
+                        ));
+                    }
+                    model.src_axis = Some(t.text);
+                }
+                "srcshapekey" => {
+                    // ⚠️ 每次只读一个 token（理由同上面的 `srcpart`）。
+                    let t = self.tok(false)?;
+                    model.src_shape_keys.push(t.text);
+                }
+                "srcshapekeyorder" => {
+                    let t = self.tok(false)?;
+                    model.src_shape_key_order.push(t.text);
+                }
+                "srcshapekeyignore" => {
+                    model.src_shape_key_ignore = true;
                 }
                 other => {
                     // ⚠️ 规则名必须取**原始大小写**的 `t.text`，**不能**用 `low`。
@@ -1697,6 +1842,9 @@ impl<'a> Parser<'a> {
             subtract: None,
             subtract_frame: None,
             num_frames: None,
+            // `$declaresequence` 只声明名字，动画侧选项留空（默认 = 官方行为）。
+            src_stack: None,
+            src_fps: None,
         });
         Ok(())
     }
@@ -1747,6 +1895,8 @@ impl<'a> Parser<'a> {
             subtract: None,
             subtract_frame: None,
             num_frames: None,
+            src_stack: None,
+            src_fps: None,
         };
 
         self.parse_sequence_body(&mut seq, &name_t, false)?;
@@ -1813,6 +1963,9 @@ impl<'a> Parser<'a> {
             scale: seq.scale,
             adjust: seq.adjust,
             rotation: seq.rotation,
+            // 同上：`$continue` 是追加语义，动画侧选项也从 `seq` 播种。
+            src_stack: seq.src_stack.clone(),
+            src_fps: seq.src_fps,
         };
         loop {
             let t = if depth > 0 {
@@ -2108,6 +2261,28 @@ impl<'a> Parser<'a> {
                     // （`studiomdl.cpp:2104-2111`）：**强制**帧数
                     // （`simplify.cpp` 用它把动画重采样到指定帧数）。
                     seq.num_frames = Some(self.i()?);
+                }
+                // ---- mdlc 扩展：动画侧的两个 `src*` 选项 ----
+                "srcstack" => {
+                    seq.src_stack = Some(self.tok(false)?.text);
+                }
+                "srcfps" => {
+                    let t = self.tok(false)?;
+                    let v: f32 = t.text.parse().map_err(|_| {
+                        QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcfps 需要数字，实际 {:?}", t.text),
+                        )
+                    })?;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            format!("srcfps 必须是正有限数，实际 {v}"),
+                        ));
+                    }
+                    seq.src_fps = Some(v);
                 }
                 other if other.starts_with("act_") => {
                     // 官方 `strnicmp(token,"ACT_",4)==0` 时 `UnGetToken()`
@@ -2431,6 +2606,8 @@ impl<'a> Parser<'a> {
             scale: None,
             adjust: None,
             rotation: None,
+            src_stack: None,
+            src_fps: None,
         };
         let mut depth = 0i32;
         loop {
@@ -2550,6 +2727,31 @@ impl<'a> Parser<'a> {
             "ikrule" => {
                 let r = self.option_ikrule()?;
                 anim.ik_rules.push(r);
+            }
+            // ---- mdlc 扩展：动画侧的两个 `src*` 选项 ----
+            //
+            // ⚠️ 必须放在 `other =>` **之前**，否则会落到
+            // `parse_cmdlist_token` 里变成「未知的命令」。
+            "srcstack" => {
+                anim.src_stack = Some(self.tok(false)?.text);
+            }
+            "srcfps" => {
+                let t = self.tok(false)?;
+                let v: f32 = t.text.parse().map_err(|_| {
+                    QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        format!("srcfps 需要数字，实际 {:?}", t.text),
+                    )
+                })?;
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        format!("srcfps 必须是正有限数，实际 {v}"),
+                    ));
+                }
+                anim.src_fps = Some(v);
             }
             other => {
                 // 官方 `:2224-2271` 的前缀匹配组 —— 顺序即语义
@@ -3992,6 +4194,26 @@ impl<'a> Parser<'a> {
     /// 3. **事件 cycle**（`write.cpp:494`）：
     ///    `cycle = frame / (numframes - 1)` —— 需要该序列 SMD 的帧数。
     fn finish(&mut self) -> Result<ModelDesc, Vec<QcError>> {
+        // ---- 0. 网格源的 `src*` 选项 ----
+        //
+        // ⚠️ 这一趟读源**必须**用上 `srcmaterial`：它替换的是「源里没有材质
+        // 时合成的那个名字」（官方 `debug/debugempty`），而材质表是在这里
+        // 按「源里出现的材质名」登记的。用默认选项读，登记的就是
+        // `debug/debugempty`，而 `compile()` 那边按 `srcmaterial` 取到的是
+        // 用户写的名字 ⟹ 报「SMD 里的材质名 … 在 [materials].textures 里
+        // 找不到」（实测 S7 夹具）。所以两侧必须用**同一套**选项。
+        //
+        // `srcpart` / `srcscale` / `srcaxis` 不影响材质名，但一并带上没有坏处
+        // —— 少一处「哪些选项在这一趟生效」的心智负担。
+        let mut src_opts_of: HashMap<String, crate::compile::SrcOpts> = HashMap::new();
+        for bp in &self.desc.bodyparts {
+            for m in &bp.models {
+                if let Ok(o) = crate::compile::SrcOpts::of_model(m) {
+                    src_opts_of.insert(m.smd.clone(), o);
+                }
+            }
+        }
+
         // ---- 1. 读所有被引用的 SMD（缓存，避免重复读）----
         let mut smd_cache: HashMap<String, Option<SmdInfo>> = HashMap::new();
         let files: Vec<String> = self.referenced_files.clone();
@@ -4027,7 +4249,18 @@ impl<'a> Parser<'a> {
             // ⚠️ `CompileError` 没有行号字段，`.smd` 的解析行号在
             // `SmdError` 的 `Display` 里（`第 N 行：…`），已包含在 message
             // 中；`.fbx` 本来就没有行号概念。所以这里统一填 0。
-            let info = match crate::compile::read_source(&p, "QC 里引用了它") {
+            // ⚠️ 这里用**默认** [`crate::compile::SrcOpts`]，不读 `src*` 选项：
+            // 这一趟只做「文件读不读得到 + 节点名/材质名是什么」的存在性检查，
+            // 而 `src*` 改变的是**取哪些网格、怎么变换**，不改变「这个文件
+            // 是不是合法的源」。真正的几何读取在 `compile()` 里，
+            // 那边会用上 QC 填好的选项。
+            // ⚠️ 这里用该源的 `src*` 选项（见上面第 0 步的注释）——
+            // `srcmaterial` 决定的材质名必须与 `compile()` 那边一致。
+            // 拿不到选项（理论上不会，`referenced_files` 里的网格源都来自
+            // `option_studio`）就退回默认值。
+            let fallback = crate::compile::SrcOpts::default();
+            let opts = src_opts_of.get(f).unwrap_or(&fallback);
+            let info = match crate::compile::read_source(&p, "QC 里引用了它", opts) {
                 Err(err) => {
                     self.errors.push(QcError::new(
                         p.display().to_string(),
@@ -7300,6 +7533,109 @@ $sequence \"idle\" \"a.smd\" fps 30
             "`%<flex>` 的规则名必须保留原始大小写 —— 小写化之后写出阶段的 \
              `flexdesc_index`（大小写敏感）会查不到，报 \
              `flex \"au1r\" 在 [[flex_descriptors]] 里找不到`"
+        );
+    }
+
+    /// ⚠️ **回归**：`srcpart` 必须**每次只吃一个 token**。
+    ///
+    /// 首版实现读到行尾（`while self.avail()`），于是
+    /// `$body body "a.fbx" srcpart "hat" srcaxis "y"` 里的 `srcaxis`
+    /// 被当成**第二个网格名** —— 不报错（不存在的网格名会被静默过滤），
+    /// 只是 `srcaxis` 静默失效。实测夹具 T8/T9 的包围盒与不加 `srcaxis`
+    /// 时完全相同，才发现。
+    #[test]
+    fn srcpart_does_not_swallow_the_following_option() {
+        let dir = fixture("srcpart_swallow");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\" srcpart \"hat\" srcaxis \"y\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = &d.bodyparts[0].models[0];
+        assert_eq!(
+            m.src_parts,
+            vec!["hat"],
+            "`srcpart \"hat\"` 后面还有 `srcaxis \"y\"` —— 只应吃一个 token"
+        );
+        assert_eq!(
+            m.src_axis.as_deref(),
+            Some("y"),
+            "`srcaxis` 必须被当成选项解析，而不是第二个网格名"
+        );
+    }
+
+    /// 同一个坑的另外两个受害者：`srcshapekey` / `srcshapekeyorder`。
+    ///
+    /// ⚠️ 后面跟的选项**不能**是 `srcshapekeyignore` —— 它与
+    /// `srcshapekey` 互斥（`validate()` 会拒绝），那样测的就变成互斥检查了。
+    /// 这里用 `srcmaterial`，它和形状 key 名单毫无关系。
+    #[test]
+    fn srcshapekey_does_not_swallow_the_following_option() {
+        let dir = fixture("srcshapekey_swallow");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\" srcshapekey \"wide\" srcmaterial \"my/fallback\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = &d.bodyparts[0].models[0];
+        assert_eq!(
+            m.src_shape_keys,
+            vec!["wide"],
+            "`srcshapekey \"wide\"` 后面还有 `srcmaterial` —— 只应吃一个 token"
+        );
+        assert_eq!(
+            m.src_material.as_deref(),
+            Some("my/fallback"),
+            "`srcmaterial` 必须被当成选项解析，而不是第二个形状名"
+        );
+    }
+
+    /// `srcpart` 可重复写，效果是**累加**（等价于一次给多个名字）。
+    #[test]
+    fn srcpart_is_repeatable() {
+        let dir = fixture("srcpart_repeat");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\" srcpart \"body\" srcpart \"hair\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.bodyparts[0].models[0].src_parts,
+            vec!["body", "hair"],
+            "可重复写，顺序保留"
+        );
+    }
+
+    /// ⚠️ **回归**：`finish()` 读源必须带上该源的 `src*` 选项。
+    ///
+    /// 材质表是在 `finish()` 里按「源里出现的材质名」登记的，而
+    /// `compile()` 侧按 `srcmaterial` 取到的是用户写的名字。两边用不同的
+    /// 选项 ⟹ 报 `SMD 里的材质名 "my/fallback" 在 [materials].textures
+    /// 里找不到`（实测夹具 S7）。
+    #[test]
+    fn srcmaterial_reaches_the_texture_table() {
+        let dir = fixture("srcmaterial");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\" srcmaterial \"my/fallback\"
+$sequence \"idle\" \"a.smd\" fps 30
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        // `a.smd` 里的材质名是 `mat`，所以这条断言只证明「解析没报错」；
+        // 真正的端到端验证在 `target\srcoptcheck` 的 S7 夹具（那边用 FBX
+        // 源，`srcmaterial` 会替换掉 `debug/debugempty`）。
+        assert_eq!(d.bodyparts[0].models[0].src_material.as_deref(), Some("my/fallback"));
+        assert!(
+            d.materials.textures.iter().any(|t| t.name == "mat"),
+            "SMD 里出现的材质名仍须进材质表，实际：{:?}",
+            d.materials.textures.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
     }
 }

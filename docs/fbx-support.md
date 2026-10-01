@@ -696,7 +696,7 @@ glTF/GLB 的等价概念后，**九条全部是通用概念**（详见下表「g
 
 | QC | TOML | 作用 | 省略时 | glTF 对应物 |
 |---|---|---|---|---|
-| `srcpart "body"` | `src_parts = ["body"]` | 只取指定名字的网格；可重复 | 取全部并合并（官方） | mesh / primitive |
+| `srcpart "body"` | `src_parts = ["body"]` | 只取指定名字的网格；**可重复写**（`srcpart "a" srcpart "b"`） | 取全部并合并（官方） | mesh / primitive |
 | `srcmaterial "face"` | `src_material = "face"` | 网格**没有**材质时用它 | `debug/debugempty`（官方） | material |
 | `srcscale 1.0` | `src_scale = 1.0` | 顶点与骨骼位移的缩放 | `1.0`（官方） | 同 |
 | `srcaxis "z"` | `src_axis = "z"` | **强制**上轴（`y` / `z`）；见下 | **不干预**（官方，§1.7b） | Y-up 固定 |
@@ -705,6 +705,25 @@ glTF/GLB 的等价概念后，**九条全部是通用概念**（详见下表「g
 > **根节点变换与几何自洽**（正常导出器都保证这点），官方与 mdlc 的默认行为就已经正确 ——
 > 无论是 Y-up 还是 Z-up 导出。`srcaxis` 是给「根变换丢了 / 被清掉」的坏文件准备的逃生门，
 > **不是常规选项**。默认必须与官方一致（不干预）。
+
+> ⚠️ **多值选项的写法：一个选项一个值，靠重复来累加。**
+> `srcpart` / `srcshapekey` / `srcshapekeyorder` **都只吃紧随其后的一个 token**：
+>
+> ```qc
+> srcpart "body" srcpart "hair"      // ✅ 两个网格
+> srcpart "body" "hair"              // ❌ "hair" 不是选项名，会报未知选项
+> srcpart "hat" srcaxis "y"          // ✅ srcaxis 正常生效
+> ```
+>
+> 这与 `$attachment` / `$sequence` 那类「后面跟定长参数」的命令一致，
+> 也是**唯一**能保证选项之间不互相吞并的写法。名字里带空格用引号解决
+> （`srcpart "my mesh"`），不需要靠「读到行尾」来支持。
+>
+> 📌 首版实现曾把这三个选项写成「读到行尾」，结果是
+> `srcpart "hat" srcaxis "y"` 里的 `srcaxis` 被当成第二个网格名 ——
+> **不报错**（不存在的网格名会被静默过滤），只是 `srcaxis` 静默失效。
+> 回归测试：`srcpart_does_not_swallow_the_following_option` /
+> `srcshapekey_does_not_swallow_the_following_option` / `srcpart_is_repeatable`。
 
 **B. 动画侧（`$sequence` / `$animation` 的块内或行内选项）**
 
