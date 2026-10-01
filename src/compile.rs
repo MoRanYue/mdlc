@@ -608,6 +608,21 @@ pub struct SourceGeometry {
     /// 官方把 FBX 的 shape key 全自动注册成 flex，所以这份数据不能像
     /// [`read_source`] 那样丢掉 —— 丢了就是「模型能编译，但表情不见了」。
     pub shape_keys: Vec<crate::fbx::FbxShapeKey>,
+    /// FBX 里**没有材质**、被合成了兜底名的网格名（去重）。
+    ///
+    /// 官方静默合成 `debug/debugempty`（或用 `srcmaterial` 给的名字）；
+    /// mdlc 读出来只为发一条诊断（`docs/fbx-support.md` §4.4）。SMD 源恒为空。
+    pub untextured_meshes: Vec<String>,
+    /// 被**合并进同一个 model** 的网格名（去重）。
+    ///
+    /// 官方把 FBX 里的多块网格合并成一个 `mstudiomodel_t`（§1.10），部件
+    /// 边界丢失。只有多于一块时才有意义。SMD 源恒为空。
+    pub merged_meshes: Vec<String>,
+    /// FBX 里的**动画栈名**（按文件顺序）。
+    ///
+    /// 官方恒取第一条（§1.8）。多于一条时 mdlc 发诊断提醒用户
+    /// 用 `srcstack` 选。SMD 源恒为空。
+    pub anim_stacks: Vec<String>,
 }
 
 /// 读取一个**几何源**，保留 FBX 的 shape key。
@@ -624,13 +639,92 @@ pub fn read_source_geometry(
         SourceKind::Smd => read_smd(path, at).map(|smd| SourceGeometry {
             smd,
             shape_keys: Vec::new(),
+            untextured_meshes: Vec::new(),
+            merged_meshes: Vec::new(),
+            anim_stacks: Vec::new(),
         }),
         SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
             .map(|g| SourceGeometry {
                 smd: g.smd,
                 shape_keys: g.shape_keys,
+                untextured_meshes: g.untextured_meshes,
+                merged_meshes: g.merged_meshes,
+                anim_stacks: g.anim_stacks,
             })
             .map_err(|err| e(at, err.to_string())),
+    }
+}
+
+/// FBX 源的四条「官方 `exit=0` 但结果可疑」诊断（`docs/fbx-support.md` §4.4）。
+///
+/// 全部是**提示**，不是错误 —— 这些情形官方都静默通过，用户的模型也确实
+/// 能编译出来，只是结果可能不是他想要的。SMD 源三个字段恒为空，所以这个
+/// 函数对 `.smd` 工程返回空表（连一行输出都不产生）。
+///
+/// 参数里的 `shape_keys` 是**已经过 `srcshapekey*` 过滤/定序之后**的那一份：
+/// 诊断要说的是「这次编译实际注册了几个 flex」，用过滤前的那份会骗人。
+///
+/// ⚠️ 纯函数（返回文案而不是直接打印）—— 直接打印的话这条路径就没法测了
+/// （`diagln!` 走 stderr/stdout，测试里抓不到）。打印由
+/// [`emit_fbx_diagnostics`] 负责。
+fn fbx_diagnostics(
+    at: &str,
+    geom: &SourceGeometry,
+    shape_keys: &[crate::fbx::FbxShapeKey],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // ① 多块网格被合并进同一个 `mstudiomodel_t`（§1.10，部件边界丢失）。
+    //    只有多于一块时才提 —— 一块网格是绝大多数情况，不值得打扰。
+    if geom.merged_meshes.len() > 1 {
+        out.push(format!(
+            "提示：{at} 的 {} 块网格被合并进同一个部件：{:?}。官方同样合并（部件边界丢失）；要分开请用 `srcpart` 逐个选，或拆成多条 `$body` / `$model`。",
+            geom.merged_meshes.len(),
+            geom.merged_meshes
+        ));
+    }
+    // ② 网格没有材质 ⟹ 合成了兜底名。官方静默用 `debug/debugempty`。
+    if !geom.untextured_meshes.is_empty() {
+        out.push(format!(
+            "提示：{at} 的网格 {:?} 没有材质，已合成 {:?}。要改用别的名字写 `srcmaterial \"...\"`。",
+            geom.untextured_meshes,
+            crate::fbx::FALLBACK_MATERIAL
+        ));
+    }
+    // ③ 多动画栈：官方恒取第一条（§1.8），用户想用第二条只能靠 `srcstack`。
+    //    这是 FBX 路径下最容易踩的坑 —— 名字明明对得上却不生效。
+    if geom.anim_stacks.len() > 1 {
+        out.push(format!(
+            "提示：{at} 有 {} 条动画栈 {:?}；官方与 mdlc 默认都只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
+            geom.anim_stacks.len(),
+            geom.anim_stacks
+        ));
+    }
+    // ④ shape key 已自动注册成 flex（§1.6b）—— 列出来让用户知道帧号怎么来的。
+    if !shape_keys.is_empty() {
+        let list: Vec<String> = shape_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                format!(
+                    "{:?}(帧{})",
+                    k.name,
+                    crate::fbx::FbxGeometry::shape_key_frame(i)
+                )
+            })
+            .collect();
+        out.push(format!(
+            "提示：{at} 的 {} 个 shape key 已自动注册成 flex：{}。要控制取哪些 / 顺序 / 忽略，用 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`。",
+            shape_keys.len(),
+            list.join(" ")
+        ));
+    }
+    out
+}
+
+/// 把 [`fbx_diagnostics`] 的文案逐条打到诊断流上。
+fn emit_fbx_diagnostics(at: &str, geom: &SourceGeometry, shape_keys: &[crate::fbx::FbxShapeKey]) {
+    for line in fbx_diagnostics(at, geom, shape_keys) {
+        crate::diagln!("{line}");
     }
 }
 
@@ -2334,7 +2428,6 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
-                let smd = geom.smd;
                 // `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`
                 // 在**读取层之外**应用：`read_source_geometry` 只管把源里
                 // 有什么读出来，取哪些、按什么顺序是 QC/TOML 层的决定。
@@ -2345,6 +2438,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
+                // ⚠️ 必须在 `let smd = geom.smd;` **之前**调用 —— 那一步会把
+                // `geom` 部分移走，之后就没法再借它的诊断字段了。
+                emit_fbx_diagnostics(&at, &geom, &shape_keys);
+                let smd = geom.smd;
 
                 // ⚠️ **不要**因为「网格源 SMD 里有 `[[bones]]` 没有的骨骼」而报错。
                 //
@@ -9038,6 +9135,91 @@ type = "mouth"
     //
     // 全部是纯函数，直接构造结构体断言，不需要文件系统。
     // 端到端（真 FBX 文件 + 官方产物对照）在 `target/fbxcheck/` 上做。
+
+    /// 造一个只带诊断字段的 `SourceGeometry`（`smd` 用最小空壳）。
+    fn geom_with(
+        untextured: &[&str],
+        merged: &[&str],
+        stacks: &[&str],
+    ) -> SourceGeometry {
+        SourceGeometry {
+            smd: Smd {
+                version: 1,
+                nodes: Vec::new(),
+                frames: Vec::new(),
+                triangles: Vec::new(),
+            },
+            shape_keys: Vec::new(),
+            untextured_meshes: untextured.iter().map(|s| s.to_string()).collect(),
+            merged_meshes: merged.iter().map(|s| s.to_string()).collect(),
+            anim_stacks: stacks.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// `.smd` 源（三个诊断字段全空）必须**一条提示都不发** —— 否则既有
+    /// SMD 工程的输出会被无端污染。
+    #[test]
+    fn fbx_diagnostics_are_silent_for_smd_sources() {
+        let g = geom_with(&[], &[], &[]);
+        assert!(fbx_diagnostics("bp[0].m[0]", &g, &[]).is_empty());
+    }
+
+    /// 单块网格、单条栈、无 shape key ⟹ 静默（一块网格是绝大多数情况，
+    /// 提醒它「被合并了」只会制造噪声）。
+    #[test]
+    fn fbx_diagnostics_stay_quiet_on_the_ordinary_case() {
+        let g = geom_with(&[], &["body"], &["walk"]);
+        assert!(fbx_diagnostics("bp[0].m[0]", &g, &[]).is_empty());
+    }
+
+    /// 四条提示各自的触发条件与关键措辞。
+    #[test]
+    fn fbx_diagnostics_cover_the_four_hazards() {
+        // ① 多网格合并
+        let g = geom_with(&[], &["body", "hat"], &[]);
+        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("2 块网格被合并"), "{}", d[0]);
+        assert!(d[0].contains("srcpart"), "要指出出路：{}", d[0]);
+
+        // ② 无材质
+        let g = geom_with(&["box"], &["box"], &[]);
+        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("没有材质"), "{}", d[0]);
+        assert!(d[0].contains("debug/debugempty"), "{}", d[0]);
+        assert!(d[0].contains("srcmaterial"), "{}", d[0]);
+
+        // ③ 多动画栈
+        let g = geom_with(&[], &["box"], &["walk", "run"]);
+        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("2 条动画栈"), "{}", d[0]);
+        assert!(d[0].contains("srcstack"), "{}", d[0]);
+
+        // ④ shape key 自动注册（帧号 1 起，与 `shape_key_frame` 一致）
+        let g = geom_with(&[], &["body"], &[]);
+        let keys = vec![sk("wide"), sk("tall")];
+        let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].contains("2 个 shape key"), "{}", d[0]);
+        assert!(d[0].contains("\"wide\"(帧1)"), "{}", d[0]);
+        assert!(d[0].contains("\"tall\"(帧2)"), "{}", d[0]);
+        assert!(d[0].contains("srcshapekey"), "{}", d[0]);
+    }
+
+    /// 四条可以同时触发，顺序固定（多网格 → 无材质 → 多栈 → shape key）。
+    #[test]
+    fn fbx_diagnostics_can_fire_all_four_at_once() {
+        let g = geom_with(&["body"], &["body", "hat"], &["walk", "run"]);
+        let keys = vec![sk("wide")];
+        let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
+        assert_eq!(d.len(), 4, "{d:#?}");
+        assert!(d[0].contains("块网格被合并"), "{}", d[0]);
+        assert!(d[1].contains("没有材质"), "{}", d[1]);
+        assert!(d[2].contains("条动画栈"), "{}", d[2]);
+        assert!(d[3].contains("个 shape key"), "{}", d[3]);
+    }
 
     fn sk(name: &str) -> crate::fbx::FbxShapeKey {
         crate::fbx::FbxShapeKey {

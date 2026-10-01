@@ -311,7 +311,27 @@ pub fn read_frames(
         });
     }
     let stack_index = match stack {
-        None => 0,
+        None => {
+            // ⭐ 多栈而用户没点名时发一条提示（`docs/fbx-support.md` §1.8 的
+            // 最大障碍）：官方恒取第一条，且 `$sequence` 的名字**完全不参与**
+            // 栈选择（`oracle_fbx_order.js` 实测 `order_rw` 让 walk/run/idle
+            // 三个名字全部拿到 12 帧）。不提示的话用户会以为「名字对得上就该
+            // 生效」，然后对着一个不动的动画查半天。
+            if scene.anim_stacks.len() > 1 {
+                let names: Vec<String> = scene
+                    .anim_stacks
+                    .iter()
+                    .map(|s| s.element.name.to_string())
+                    .collect();
+                crate::diagln!(
+                    "提示：{} 有 {} 条动画栈 {:?}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
+                    path.display(),
+                    names.len(),
+                    names
+                );
+            }
+            0
+        }
         Some(want) => scene
             .anim_stacks
             .iter()
