@@ -801,23 +801,31 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// 「同一个 FBX 既作网格源又作动画源」的拒绝判据（见 [`fbx_geometry_sources`]）。
+/// 「同一个 FBX 既作网格源又作动画源」的**差异提示**（见 [`fbx_geometry_sources`]）。
 ///
-/// 返回 `Some(错误文案)` 表示应拒绝。
+/// 返回 `Some(提示文案)` 表示应当告知用户「这里与官方产物不一致」。
 ///
-/// # ⚠️ 只在**真的有动画可丢**时拒绝
+/// # ✅ 允许，不拒绝
 ///
-/// 官方陷阱的后果是「静默 1 帧」。如果源**本来就只有 1 帧**
+/// ⭐ **FBX 本来就是网格与动画合一的容器** —— 要求用户把网格和动画拆成两个
+/// 文件，等于让用户为了迁就官方的一个 bug 而改变自己的资产组织方式。
+/// 官方在这个组合下**静默地**只产出 1 帧（实测 exit=0、无警告），
+/// 而 mdlc 会正常采出全部帧 —— **分歧的方向是「mdlc 对、官方错」**，
+/// 所以这里**放行**，只提示。
+///
+/// # ⚠️ 只在**真的有分歧**时提示
+///
+/// 官方的退化后果是「静默 1 帧」。如果源**本来就只有 1 帧**
 /// （例如 `box.fbx` / `morph.fbx` 这类没有 `AnimStack` 的静态网格），
-/// 官方与 mdlc 都出 1 帧，**没有任何分歧** ⟹ 不该报错。
+/// 官方与 mdlc 都出 1 帧，**没有任何分歧** ⟹ 不该提示。
 ///
 /// 所以判据里带 `n_frames`：只有 mdlc 采出 **> 1 帧**（= 官方会丢掉的那些）
-/// 才拒绝。这让判据**自我校准** —— 不依赖「哪些 FBX 有动画」的静态判断，
+/// 才提示。这让判据**自我校准** —— 不依赖「哪些 FBX 有动画」的静态判断，
 /// 而是直接看「这次实际采到了几帧」。
 ///
 /// ⚠️ **只对 `.fbx` 生效** —— SMD 同文件完全正常（8 帧源出 8 帧），
-/// 对 SMD 报错会误伤大量既有工程。
-fn same_fbx_geometry_error(
+/// 没有任何分歧可言。
+fn same_fbx_geometry_note(
     path: &Path,
     geometry: &[PathBuf],
     n_frames: usize,
@@ -832,17 +840,12 @@ fn same_fbx_geometry_error(
         return None;
     }
     Some(format!(
-        "引用的 {} 已经被当作**网格源**加载。官方在这个组合下**静默地**\
-         只产出 1 帧（实测 exit=0、无警告；本实现从同一个文件采到了 {n_frames} 帧，\
-         两者分歧），mdlc 不产出这种结果。\
-         改 QC 没有用 —— `$animation` 块、按名引用、重写 `$sequence` 都被实测证明仍是 1 帧\
-         （docs/_probe/oracle_samefile_fix.js 的 N2/N4/N5/N6）。两条出路：\
-         ① 把动画拆到独立的 FBX 文件（唯一通用做法）；\
-         ② 若确实只要 1 帧静态姿态，在 `$animation` 里写 `frames 0 0` \
-         （`$sequence` 没有帧区间语法，只能用①）。\
-         ⚠️ `numframes 1` **不管用** —— 它只**延长**（`simplify.cpp:1279-1293` 的\
-         `forceNumframes` 从 `panim->numframes` 起补帧），不会把 5 帧缩成 1 帧。\
-         （SMD 没有这个限制，只有 .fbx 会。）",
+        "{} 同时用作网格源与动画源。FBX 可以同时包含网格与动画，mdlc 正常采出了 \
+         {n_frames} 帧 —— 但官方 studiomdl 在这个组合下会**静默地**只产出 1 帧\
+         （实测 exit=0、无警告，见 docs/fbx-support.md §4.4）。\
+         这是**有意的偏离**：mdlc 不复制这个退化行为。\
+         ⚠️ 若你在与官方产物对照，这里的帧数不一致是**预期**的。\
+         想让两边一致，把动画拆到独立的 FBX 文件（官方与 mdlc 都会正常）。",
         path.display()
     ))
 }
@@ -2609,7 +2612,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 continue;
             }
         };
-        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_error`。
+        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_note`。
         // 判据要 `n_frames`，所以先读帧再判（读一个 FBX 两次的代价可接受：
         // 只有「同文件」这一种情形会走到第二次）。
         //
@@ -2629,10 +2632,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         };
         // ---- 取帧区间（QC 的 `frames a b`，闭区间）----
         //
-        // ⚠️ **必须在 `same_fbx_geometry_error` 之前**：那个判据看的是「最终采到
-        // 几帧」，而 `frames 0 0` 正是「我只要 1 帧」的合法表达。早先把检查放在
-        // 这里之前 ⟹ 错误信息里建议的 `frames 0 0` 自己也会被同一个错误拦下
-        // （实测：`$animation a1 "same.fbx" frames 0 0` 仍报同一个错）。
+        // ⚠️ **必须在 `same_fbx_geometry_note` 之前**：那个提示看的是「最终采到
+        // 几帧」，而 `frames 0 0` 正是「我只要 1 帧」的合法表达 —— 放在之前会
+        // 把「只要 1 帧」误报成「有分歧」。
         if let Some([lo, hi]) = a.frames {
             let n = frames.len() as i32;
             // 官方把越界值**夹到**源范围（`studiomdl.cpp:2250-2254`），
@@ -2648,11 +2650,11 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             }
             frames = frames[lo as usize..=hi as usize].to_vec();
         }
-        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_error`。
+        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_note`。
         // 判据要 `n_frames`，所以先读帧（并应用 `frames` 区间）再判。
-        if let Some(msg) = same_fbx_geometry_error(&p, &fbx_geometry, frames.len()) {
-            seq_errors.push(e(format!("{at}.smd"), msg));
-            continue;
+        // ✅ **只提示、不拒绝**：FBX 本来就是网格与动画合一的容器。
+        if let Some(msg) = same_fbx_geometry_note(&p, &fbx_geometry, frames.len()) {
+            crate::diagln!("{msg}");
         }
         pending_subtract.push(a.subtract.as_deref().map(|s| (s.to_owned(), a.subtract_frame.unwrap_or(0))));
         anim_index.insert(a.name.as_str(), anims.len());
@@ -3170,12 +3172,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     };
                     // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱（SMD 不受影响）。
-                    // 判据带帧数：只有真的会丢帧（> 1 帧）才拒绝。
+                    // 判据带帧数：只有真的会丢帧（> 1 帧）才提示。
+                    // ✅ **只提示、不拒绝** —— 见 `same_fbx_geometry_note`。
                     if let Some(msg) =
-                        same_fbx_geometry_error(&smd_path, &fbx_geometry, frames.len())
+                        same_fbx_geometry_note(&smd_path, &fbx_geometry, frames.len())
                     {
-                        seq_errors.push(e(format!("{at}.smd"), msg));
-                        continue;
+                        crate::diagln!("{msg}");
                     }
                     let i = anims.len();
                     let name = format!("@{}", s.name);
@@ -7760,7 +7762,15 @@ smd = "{smd}"
     /// 而 `desc_toml` 的材质表里只有 `myprop` ⟹ 报「材质名找不到」。
     /// 要编过就必须把这个兜底名登记进材质表。
     fn fbx_desc_toml() -> String {
-        let base = desc_toml("anim.fbx");
+        fbx_desc_toml_with_body("anim.fbx")
+    }
+
+    /// 同 [`fbx_desc_toml`]，但 `[[bodyparts]]` 的几何源换成 `body`。
+    ///
+    /// 用于「同一个 FBX 既作网格源又作动画源」的对照测试 —— 两遍编译只有
+    /// `$body` 的源不同，其余完全一致。
+    fn fbx_desc_toml_with_body(body: &str) -> String {
+        let base = desc_toml(body);
         let needle = "textures = [{ name = \"models/test/myprop\" }]";
         assert!(
             base.contains(needle),
@@ -11696,83 +11706,76 @@ end
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// ⭐ **官方的 FBX「同文件静默 1 帧」陷阱必须被拒绝**，但**只在真的会丢帧时**。
+    /// ⭐ **同文件只发提示、不报错**，且**只在真的有分歧时**发。
     ///
-    /// 三条判据（缺一不可，见 [`same_fbx_geometry_error`]）：
+    /// 三条判据（缺一不可，见 [`same_fbx_geometry_note`]）：
     /// ① 源是 `.fbx`（**SMD 同文件完全正常**，8 帧源出 8 帧）；
     /// ② 该文件确实是几何源；
-    /// ③ 从它采出的帧数 **> 1**（只有 1 帧时官方与 mdlc 一致，无分歧 ⟹ 不报错）。
+    /// ③ 从它采出的帧数 **> 1**（只有 1 帧时官方与 mdlc 一致，无分歧 ⟹ 不提示）。
     ///
     /// ⚠️ 判据 ③ 是**自我校准**的关键：`box.fbx` / `morph.fbx` 这类没有
     /// `AnimStack` 的静态网格，「同文件」也不会丢任何东西
-    /// （`docs/_probe/oracle_samefile_smd.js` 的对照与 `fbxcheck` 的
-    /// K1/K3/K6 三个 Δ=0 用例都是这种情况），报错会误伤。
+    /// （`docs/_probe/oracle_samefile_static.js` 的 G1–G6 六个组合两边都是 1 帧），
+    /// 提示会变成噪声。
     #[test]
-    fn same_fbx_geometry_is_rejected_only_when_frames_would_be_lost() {
+    fn same_fbx_geometry_note_is_emitted_only_when_frames_would_differ() {
         let d = tmpdir("samefbx");
         let geom = vec![PathBuf::from("box.fbx")];
         let p = Path::new("box.fbx");
-        // ① 多帧 + 几何源 ⟹ 拒绝，且文案要点明「改 QC 没有用」。
-        let msg = same_fbx_geometry_error(p, &geom, 6).expect("多帧同文件必须拒绝");
-        assert!(msg.contains("网格源"), "{msg}");
+        // ① 多帧 + 几何源 ⟹ 提示，且文案要点明「这是有意的偏离」。
+        let msg = same_fbx_geometry_note(p, &geom, 6).expect("多帧同文件应当提示");
+        assert!(msg.contains("同时用作网格源与动画源"), "{msg}");
         assert!(
-            msg.contains("改 QC 没有用"),
-            "必须明确告诉用户 $animation 走不通：{msg}"
+            msg.contains("有意的偏离"),
+            "必须说明这是有意偏离官方行为：{msg}"
         );
-        assert!(msg.contains("独立的 FBX 文件"), "必须给出唯一可行出路：{msg}");
-        // ② 只有 1 帧 ⟹ 官方与 mdlc 一致，**不报错**。
         assert!(
-            same_fbx_geometry_error(p, &geom, 1).is_none(),
-            "1 帧时没有分歧，不该报错"
+            msg.contains("独立的 FBX 文件"),
+            "必须给出「想与官方一致时」的做法：{msg}"
         );
-        assert!(same_fbx_geometry_error(p, &geom, 0).is_none());
-        // ③ 不是几何源 ⟹ 不报错（FBX 只作动画源是合法的）。
         assert!(
-            same_fbx_geometry_error(Path::new("rig.fbx"), &geom, 6).is_none(),
-            "不是几何源就不该报错"
+            msg.contains("6 帧"),
+            "必须报出 mdlc 实际采到的帧数（用户才知道分歧有多大）：{msg}"
+        );
+        // ② 只有 1 帧 ⟹ 官方与 mdlc 一致，**不提示**。
+        assert!(
+            same_fbx_geometry_note(p, &geom, 1).is_none(),
+            "1 帧时没有分歧，不该提示"
+        );
+        assert!(same_fbx_geometry_note(p, &geom, 0).is_none());
+        // ③ 不是几何源 ⟹ 不提示（FBX 只作动画源是合法的）。
+        assert!(
+            same_fbx_geometry_note(Path::new("rig.fbx"), &geom, 6).is_none(),
+            "不是几何源就不该提示"
         );
         // ④ SMD 同文件**必须放行** —— 官方在 SMD 上没有这个陷阱。
         assert!(
-            same_fbx_geometry_error(Path::new("a.smd"), &[PathBuf::from("a.smd")], 8).is_none(),
-            "SMD 同文件正常（8 帧源出 8 帧），报错会误伤既有工程"
-        );
-        // ⑤ 文案里给出的**两条出路**都必须真的可用，且不能建议 `numframes 1`。
-        //    早先建议 `numframes 1`，但那条路**走不通**：`forceNumframes` 只延长
-        //    （`simplify.cpp:1279-1293` 从 `panim->numframes` 起补帧），不会把
-        //    5 帧缩成 1 帧；而且 `$body` 行上根本没有 `numframes` 这个选项
-        //    （实测 `未知的 studio 选项 "numframes"`）。
-        assert!(
-            msg.contains("frames 0 0"),
-            "必须给出真正可用的 1 帧写法（`frames 0 0`）：{msg}"
-        );
-        assert!(
-            !msg.contains("写 `numframes 1`"),
-            "不能再建议 `numframes 1` —— 它只延长、不缩短，且 `$body` 不接受它：{msg}"
+            same_fbx_geometry_note(Path::new("a.smd"), &[PathBuf::from("a.smd")], 8).is_none(),
+            "SMD 同文件正常（8 帧源出 8 帧），提示会变成噪声"
         );
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// ⭐ **`frames 0 0` 必须真的能绕开同文件陷阱**（端到端，不是文案断言）。
+    /// ⭐ **`frames 0 0` 能拿到 1 帧**（端到端）。
     ///
-    /// 早先 `same_fbx_geometry_error` 在应用 `frames` 区间**之前**跑 ⟹ 它看到的是
-    /// 源的 6 帧，于是把「我只要 1 帧」的合法表达也拦下了 —— 错误信息里建议的
-    /// 出路自己走不通。修法 = 把取帧区间提到检查之前（判据看的是**最终**帧数）。
+    /// 同文件现在是**允许**的，本用例因此不再测「绕开判据」，而是测
+    /// 「`frames` 区间照常生效」—— 它与同文件提示互不干扰。
     ///
     /// 夹具是 [`MIN_FBX`] —— 一份**手写的最小 ASCII FBX**（2131 B）。之所以不用
     /// Blender 生成的样本：那些不能进仓库（体量大），而 FBX 是**二进制**为主、
     /// 没法像 SMD 那样内联文本。ASCII FBX 恰好两全 —— ufbx 能读，文本可内联。
     #[test]
-    fn frames_range_is_applied_before_the_same_file_guard() {
+    fn frames_range_still_applies_on_a_same_file_fbx() {
         let d = tmpdir("framesorder");
         write(&d, "anim.fbx", MIN_FBX);
-        // 同一份 FBX 既作网格源又作动画源 —— 正是那个陷阱的组合。
+        // 同一份 FBX 既作网格源又作动画源 —— 现在是**允许**的组合。
         let toml = format!(
             "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\nframes = [0, 0]\n\
              \n[[sequences]]\nname = \"idle\"\nsmd = \"a1\"\n",
             fbx_desc_toml()
         );
         let desc = ModelDesc::from_toml(&toml).expect("TOML 解析");
-        let c = compile(&desc, &d).expect("`frames 0 0` 必须能绕开同文件判据");
+        let c = compile(&desc, &d).expect("同文件 + `frames 0 0` 必须能编过");
         let a = c
             .animations
             .iter()
@@ -11782,25 +11785,61 @@ end
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// ⭐ **反方向**：不写 `frames` 时同文件陷阱**必须仍然拒绝**。
+    /// ⭐ **反方向**：不写 `frames` 时拿到**与「仅作动画源」完全相同的帧数**
+    /// —— 不是官方的 1 帧。
     ///
-    /// 与上一个测试配对 —— 单看「`frames 0 0` 能编过」不能证明判据还在
-    /// （把判据整个删掉也能过）。两条一起才钉住「判据看的是最终帧数」。
+    /// 与上一个测试配对。⭐ 断言刻意**不写死帧数**（[`MIN_FBX`] 的 6 个关键帧
+    /// 跨 5 秒，30 fps 重采样后是 151 帧 —— 写死数字会让测试与夹具的时间轴
+    /// 耦合），而是**两次编译对比**：
+    ///
+    /// | 编译 | `$body` 源 | 帧数 |
+    /// |---|---|---|
+    /// | A | 另一个文件 | N（基准） |
+    /// | B | `anim.fbx` **自己** | **必须也是 N** |
+    ///
+    /// 这直接编码了「mdlc 不因同文件而退化」这条断言 —— 官方在这里会从 N
+    /// 掉到 1，任何退化都会让 A≠B。
     #[test]
-    fn same_file_fbx_is_still_rejected_without_a_frame_range() {
+    fn same_file_fbx_without_a_frame_range_yields_all_frames() {
         let d = tmpdir("framesnoguard");
         write(&d, "anim.fbx", MIN_FBX);
-        let toml = format!(
+        // 基准：`anim.fbx` 只作动画源（`$body` 用另一个文件）。
+        write(&d, "static.fbx", MIN_FBX);
+        let base_toml = format!(
             "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\n\
              \n[[sequences]]\nname = \"idle\"\nsmd = \"a1\"\n",
-            fbx_desc_toml()
+            fbx_desc_toml_with_body("static.fbx")
         );
-        let desc = ModelDesc::from_toml(&toml).expect("TOML 解析");
-        let errs = compile(&desc, &d).expect_err("不写 frames 时必须仍然拒绝");
-        let all = format!("{errs:?}");
-        assert!(
-            all.contains("网格源"),
-            "应当报同文件陷阱（6 帧会被官方丢掉）：{all}"
+        let base = compile(&ModelDesc::from_toml(&base_toml).unwrap(), &d)
+            .expect("异文件必须能编过");
+        let n_base = base
+            .animations
+            .iter()
+            .find(|a| a.name == "a1")
+            .expect("a1 应存在")
+            .frames
+            .len();
+        assert!(n_base > 1, "夹具必须有多帧（否则本测试空洞通过）：{n_base}");
+
+        // 对照：同一个 `anim.fbx` **既作网格源又作动画源**。
+        let same_toml = format!(
+            "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\n\
+             \n[[sequences]]\nname = \"idle\"\nsmd = \"a1\"\n",
+            fbx_desc_toml_with_body("anim.fbx")
+        );
+        let c = compile(&ModelDesc::from_toml(&same_toml).unwrap(), &d)
+            .expect("同文件必须**允许**（FBX 网格动画合一）");
+        let n_same = c
+            .animations
+            .iter()
+            .find(|a| a.name == "a1")
+            .expect("a1 应存在")
+            .frames
+            .len();
+        assert_eq!(
+            n_same, n_base,
+            "同文件时的帧数必须与「仅作动画源」一致 —— 官方会从 {n_base} 掉到 1，\
+             mdlc 不复制这个退化行为"
         );
         std::fs::remove_dir_all(&d).ok();
     }
@@ -11822,6 +11861,106 @@ end
         let c = compile(&desc, &d).expect("SMD 同文件必须编译成功（官方也是如此）");
         assert_eq!(c.sequences.len(), 1);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ⭐ **同文件是允许的**（`$body` / `$model` / `$bodygroup` 三种写法都不例外）。
+    ///
+    /// ⭐⭐ **这是有意的偏离**：FBX 本来就是网格与动画合一的容器，
+    /// 官方却在这个组合下**静默地**只产出 1 帧
+    /// （`docs/_probe/oracle_samefile_forms.js`，10 用例实测）：
+    ///
+    /// | 几何源 | 动画源 | 官方帧数 | mdlc |
+    /// |---|---|---|---|
+    /// | `$body body "x.fbx"` | `$sequence idle "x.fbx"` | **1** ❌ | **6** ✅ |
+    /// | `$model "body" "x.fbx" { }` | 同上 | **1** ❌ | **6** ✅ |
+    /// | `$bodygroup "bg" { studio "x.fbx" }` | 同上 | **1** ❌ | **6** ✅ |
+    /// | 同上三种 | `$animation a "x.fbx"` | **1** ❌ | **6** ✅ |
+    ///
+    /// mdlc **正常采出全部帧**，只发一条提示（`same_fbx_geometry_note`）。
+    /// 理由：要求用户把网格和动画拆成两个文件，等于让用户为了迁就官方的
+    /// 一个 bug 而改变自己的资产组织方式。
+    ///
+    /// ⚠️ 判据必须对三种几何声明形式**一视同仁** —— 少收一种写法就会漏提示。
+    #[test]
+    fn same_file_fbx_is_allowed_for_all_geometry_declaration_forms() {
+        // 三种几何声明形式，全部指向同一个有动画的 FBX。
+        let forms: [(&str, &str); 3] = [
+            ("$body body \"anim.fbx\"", "body"),
+            ("$model \"body\" \"anim.fbx\" {\n}", "model"),
+            (
+                "$bodygroup \"bg\"\n{\n\tstudio \"anim.fbx\"\n}",
+                "bodygroup",
+            ),
+        ];
+        for (geom, label) in forms {
+            // 两个方向都要：`$sequence` 直引 与 `$animation` 块。
+            let anims: [(&str, &str); 2] = [
+                ("$sequence idle \"anim.fbx\"", "sequence"),
+                (
+                    "$animation a1 \"anim.fbx\"\n$sequence idle { a1 }",
+                    "animation",
+                ),
+            ];
+            for (anim, anim_label) in anims {
+                let d = tmpdir(&format!("sameform_{label}_{anim_label}"));
+                write(&d, "anim.fbx", MIN_FBX);
+                let qc = format!(
+                    "$modelname \"mymod/t.mdl\"\n$surfaceprop \"default\"\n\
+                     $cdmaterials \"models/mymod\"\n{geom}\n{anim}\n"
+                );
+                let desc = crate::qc::parse_qc_str(&qc, &d)
+                    .unwrap_or_else(|e| panic!("{label}+{anim_label}: QC 应解析成功：{e:?}"));
+                let c = compile(&desc, &d).unwrap_or_else(|e| {
+                    panic!("{label}+{anim_label}: 同文件必须**允许**（FBX 网格动画合一）：{e:?}")
+                });
+                // 关键断言：帧数必须与「异文件基准」一致，**不是**官方退化的 1 帧。
+                // （`MIN_FBX` 的 6 个关键帧跨 5 秒，30 fps 下是 151 帧 ——
+                //   写死数字会让测试与夹具的时间轴耦合，所以只断言 > 1。）
+                let a = c
+                    .animations
+                    .iter()
+                    .find(|a| a.name == "a1" || a.name == "@idle")
+                    .unwrap_or_else(|| panic!("{label}+{anim_label}: 应产出动画"));
+                assert!(
+                    a.frames.len() > 1,
+                    "{label}+{anim_label}: 必须采出多帧（官方退化成 1 帧，mdlc 不复制）：得到 {} 帧",
+                    a.frames.len()
+                );
+                std::fs::remove_dir_all(&d).ok();
+            }
+        }
+    }
+
+    /// ⭐ **反方向**：几何源与动画源是**不同**文件时同样放行（6 帧）。
+    ///
+    /// 与上一个测试配对 —— 只测「同文件能过」不能证明判据没把异文件也
+    /// 误判成同文件（例如 `same_file` 用错了比较口径）。
+    #[test]
+    fn different_file_fbx_is_accepted_for_all_geometry_declaration_forms() {
+        let forms: [(&str, &str); 3] = [
+            ("$body body \"static.fbx\"", "body"),
+            ("$model \"body\" \"static.fbx\" {\n}", "model"),
+            (
+                "$bodygroup \"bg\"\n{\n\tstudio \"static.fbx\"\n}",
+                "bodygroup",
+            ),
+        ];
+        for (geom, label) in forms {
+            let d = tmpdir(&format!("diffform_{label}"));
+            // `static.fbx` 与 `anim.fbx` 内容相同但**路径不同** ⟹ 官方正常出 6 帧。
+            write(&d, "static.fbx", MIN_FBX);
+            write(&d, "anim.fbx", MIN_FBX);
+            let qc = format!(
+                "$modelname \"mymod/t.mdl\"\n$surfaceprop \"default\"\n\
+                 $cdmaterials \"models/mymod\"\n{geom}\n\
+                 $animation a1 \"anim.fbx\"\n$sequence idle {{ a1 }}\n"
+            );
+            let desc = crate::qc::parse_qc_str(&qc, &d)
+                .unwrap_or_else(|e| panic!("{label}: QC 应解析成功：{e:?}"));
+            compile(&desc, &d)
+                .unwrap_or_else(|e| panic!("{label}: 异文件必须放行（官方出 6 帧）：{e:?}"));
+            std::fs::remove_dir_all(&d).ok();
+        }
     }
 
     /// SMD 里有、`[[bones]]` 里没有的骨骼 ⟹ **沿父链上溯**，不是报错。

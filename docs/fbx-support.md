@@ -487,8 +487,9 @@ order_rw.fbx:
 | `M5_smd_same_5f` | `abi7.smd`（5 帧） | `abi7.smd`（**同**） | **5** ✅ 正常 |
 
 ⟹ **SMD 同文件完全正常（8 帧源出 8 帧、5 帧源出 5 帧），只有 FBX 退化成 1 帧。**
-因此 mdlc 的拒绝判据**必须按源格式分流** —— 对 SMD 同文件放行，
-否则会误伤大量既有工程（parity 语料里 `$body x.smd` + `$sequence y x.smd` 是常见写法）。
+因此 mdlc 的判据**必须按源格式分流** —— 对 SMD 同文件放行（否则会误伤大量既有工程：
+parity 语料里 `$body x.smd` + `$sequence y x.smd` 是常见写法），
+且**只对 `.fbx` 提示**（不报错，见 §4.4）。
 
 ⭐ **精确边界已单变量定案**（`oracle_fbx_samefile.js`，6 用例）：
 触发条件是**「同一个文件」**，**不是**「body 源本身带动画」：
@@ -505,6 +506,49 @@ order_rw.fbx:
 ⟹ S2/S3 证明**body 源带不带动画都无所谓**（只要文件不同就正常）；
 S1/S4 证明**只要文件相同就退化成 1 帧**（哪怕该文件有 6 帧动画）。
 （S6 是「同文件 + 都无动画」，1 帧属预期，不构成反例。）
+
+⭐⭐⭐ **触发条件对「几何声明的写法」不敏感**（`oracle_samefile_forms.js`，10 用例）：
+**网格源的三种声明形式 × 动画源的两种写法，6 个组合全部退化成 1 帧。**
+
+| 用例 | 网格源 | 动画源 | 官方帧数 |
+|---|---|---|---|
+| `F1_body_seq_same` | `$body body "rig_anim.fbx"` | `$sequence idle "rig_anim.fbx"` | **1** ❌ |
+| `F2_model_seq_same` | `$model "body" "rig_anim.fbx" { }` | 同上 | **1** ❌ |
+| `F3_bodygroup_seq_same` | `$bodygroup "bg" { studio "rig_anim.fbx" }` | 同上 | **1** ❌ |
+| `F4_body_anim_same` | `$body body "rig_anim.fbx"` | `$animation a "rig_anim.fbx"` | **1** ❌ |
+| `F5_model_anim_same` | `$model "body" "rig_anim.fbx" { }` | 同上 | **1** ❌ |
+| `F6_bodygroup_anim_same` | `$bodygroup "bg" { studio "rig_anim.fbx" }` | 同上 | **1** ❌ |
+| `F7_body_anim_diff` | `$body body "rig.fbx"` | `$animation a "rig_anim.fbx"` | 6 ✅ |
+| `F8_model_anim_diff` | `$model "body" "rig.fbx" { }` | 同上 | 6 ✅ |
+| `F9_bodygroup_anim_diff` | `$bodygroup "bg" { studio "rig.fbx" }` | 同上 | 6 ✅ |
+| `F10_bodygroup_seq_diff` | `$bodygroup "bg" { studio "rig.fbx" }` | `$sequence idle "rig_anim.fbx"` | 6 ✅ |
+
+⟹ **判据不需要区分 `$body` / `$model` / `$bodygroup`** —— 官方在**导入阶段**
+就按「这个源已经加载过了」退化，与 QC 里用哪个命令声明无关。
+mdlc 的 `fbx_geometry_sources()` 因此同时收 `bodypart.models[].smd` 与
+`lods[].smd`，对三种写法一视同仁（实测 6 个同文件组合**全部走提示路径**、
+4 个异文件组合**全部无提示**，且帧数与官方逐条一致）。
+
+⭐⭐ **静态 FBX（无动画栈）不提示**（`oracle_samefile_static.js`，6 用例）：
+`box.fbx` / `morph.fbx` 作网格源 + 动画源时，官方与 mdlc **都是 1 帧**，
+两边没有分歧 ⟹ 不提示。这正是判据带 `n_frames` 的理由（见 §4.4 陷阱 1 的
+「自我校准」说明）：`G1`..`G6` 六个组合在 mdlc 侧**全部 EXIT=0 且无提示**。
+
+⚠️ **`$bodygroup` 的 `}` 必须独占一行**：官方 `Option_Studio`
+（`studiomdl.cpp:917-968`）读完文件名后跑 `while (TokenAvailable())`（**读到行尾**），
+写成一行的 `{ studio "x.fbx" }` 会让 `}` 落进 `else` 分支 ⟹
+`MdlError("unknown command \"}\"")`（实测 exit=4294967295）。
+mdlc 同样报 `未知的 studio 选项 "}"` ⟹ **两边一致**。
+
+⚠️ `$lod` 的 `replacemodel` **第 1 个参数是「已加载的源名」，不是文件路径**：
+官方 `Cmd_ReplaceModel`（`studiomdl.cpp:5387-5406`）先 `strrchr(token, '.')` 剥掉扩展名，
+再 `FindCachedSource(token, "")` 查表 —— 而 `FindCachedSource`
+（`:1515-1556`）的扩展名试探链**只有 `.vrm` / `.smd`（`.vta` 被注释掉）**，
+**不含 `.fbx`** ⟹ FBX 源无法被 `replacemodel` 的 from 位引用
+（报 `Unknown replace model`）。把 FBX 放在 **to 位**（`replacemodel "rig" "rig_anim.fbx"`）
+可以编译，但同文件时**照样退化成 1 帧**（实测 `L2_lod_to`：
+官方 exit=0 / MDL=3268 / `animations 108 bytes (1 anims) (1 frames)`）——
+即「同文件静默 1 帧」在 `$lod` 路径下同样成立（mdlc 侧照常采出全部帧，只提示）。
 
 ⭐ **陷阱 2**：**`fps` 参数只写 `animdesc.fps` 字段，不参与重采样。**
 `U5` 写 `fps 10` 得到 `fps=10 frames=6` —— 但帧数仍是按 30 fps 采出来的 6 帧，
@@ -651,10 +695,11 @@ $ mdlc build-qc a_body.qc --out outA
         已自动注册 2 个 shape key 为 flex：`wide`(帧 1)、`tall`(帧 2)。
         该 FBX 有 4 条动画栈，但本条 `$body` 只取网格 —— 动画栈在 `$sequence` 处选。
   警告：`$sequence idle "rig.fbx"` 与 `$body body "rig.fbx"` 引用了同一个文件。
-        官方在这个组合下**静默地**只产出 1 帧（实测 exit=0、无警告），mdlc 不产出这种结果。
-        请任选其一：
-          · 把动画拆到独立的 FBX 文件（推荐）
-          · 用 `$animation idle "rig.fbx"` + `$sequence idle { idle }` 显式声明
+        FBX 可以同时包含网格与动画，mdlc 正常采出了 6 帧 ——
+        但官方 studiomdl 在这个组合下会**静默地**只产出 1 帧（实测 exit=0、无警告）。
+        这是**有意的偏离**：mdlc 不复制这个退化行为。
+        ⚠️ 若你在与官方产物对照，这里的帧数不一致是**预期**的。
+        想让两边一致，把动画拆到独立的 FBX 文件（官方与 mdlc 都会正常）。
 ```
 
 ⟹ **一句话**：从「一个和用户意图无关的 UTF-8 报错」变成「说清发生了什么、默认怎么处理、
@@ -688,7 +733,7 @@ $ mdlc build-qc a_body.qc --out outA
 | **shape key → flex** | **自动注册**（desc + controller + rule + 载荷） | **同官方** | §1.6b；**零 QC 语法** |
 | **FBX 上写 `flexfile "<x.fbx>"` + `flex`** | **崩溃** | **报错**（见 §4.4 陷阱 4） | ⚠️ 默认偏离 |
 | **FBX 上只写 `flexfile "<x.fbx>"`** | 不崩，但**静默空操作** | **报错** | ⚠️ 默认偏离（用户以为生效了，其实没有） |
-| 同一文件既是网格源又是动画源（**仅 `.fbx`**） | 静默 1 帧 | **拒绝**（见 §4.4） | ⚠️ **默认偏离**；SMD 同文件正常，**放行** |
+| 同一文件既是网格源又是动画源（**仅 `.fbx`**） | 静默 1 帧 | **提示 + 正常采帧**（见 §4.4） | ⭐ **mdlc 更对**；SMD 同文件两边都正常 |
 
 ### 4.3 命名原则：按概念命名，不按格式命名
 
@@ -811,7 +856,7 @@ mdlc 对这两种写法都会**报错**并指向 `srcshapekey*` 系列（§4.4 �
 
 ⭐⭐ **这是 FBX 专属**：SMD 同文件完全正常（`oracle_samefile_smd.js` 的
 `M1_smd_same` 8 帧源出 8 帧、`M5_smd_same_5f` 5 帧源出 5 帧）。
-mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 报错。
+mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 
 ⭐⭐ **出路只有一条**（`oracle_samefile_fix.js`，6 用例实测）：
 
@@ -825,23 +870,41 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 报错。
 | `N6_twostack_anim_block` | `$body "twostack.fbx"` + `$animation anim "twostack.fbx"` + `$sequence idle { anim }` | **1** ❌ |
 
 ⚠️ **`$animation` 走不通** —— N2/N4/N5/N6 全部仍是 1 帧。
-「同一文件」这个条件一旦成立，**无论怎么改写 QC 都拿不回动画**
+「同一文件」这个条件一旦成立，**无论怎么改写 QC 官方都拿不回动画**
 （N5 甚至会同时产出 1 帧的 `anim` 和 1 帧的 `@idle`）。
-唯一有效的出路是 **N3：把动画放到另一个 FBX 文件**。
 
-mdlc **拒绝**，并给出可操作的出路：
+⭐⭐⭐⭐⭐ **但 mdlc 不复制这个退化行为**（**用户裁决，2026-10-02**）：
+**FBX 本来就是网格与动画合一的容器** —— 强迫用户为一个官方 bug 把资产拆成两个文件，
+正是 §4.1 原则 2 反对的「让用户猜编译器内部机制」。因此 mdlc **正常采出全部帧**，
+只发一条提示：
 
 ```
-错误：`$sequence idle` 引用的 twostack.fbx 已经被 `$body body "twostack.fbx"` 当作网格源加载。
-      官方在这个组合下**静默地**只产出 1 帧（实测 exit=0、无警告），mdlc 不产出这种结果。
-      改 QC 没有用 —— `$animation` 块、按名引用、重写 `$sequence` 都被实测证明仍是 1 帧
-      （`oracle_samefile_fix.js` 的 N2/N4/N5/N6）。唯一有效的做法是：
-        · 把动画拆到独立的 FBX 文件（唯一可行）
-        · 若确实要 1 帧静态姿态，写 `numframes 1`
+警告：`$sequence idle` 引用的 twostack.fbx 同时用作网格源与动画源。
+      FBX 可以同时包含网格与动画，mdlc 正常采出了 6 帧 ——
+      但官方 studiomdl 在这个组合下会**静默地**只产出 1 帧（实测 exit=0、无警告）。
+      这是**有意的偏离**：mdlc 不复制这个退化行为。
+      ⚠️ 若你在与官方产物对照，这里的帧数不一致是**预期**的。
+      想让两边一致，把动画拆到独立的 FBX 文件（官方与 mdlc 都会正常）。
 ```
 
-> ⚠️ **这是两处默认偏离之一**（另一处见陷阱 4）。理由是官方结果**没有任何可用性**（1 帧动画），
-> 而它**没有任何诊断**。若用户确实需要「1 帧静态姿态」，写 `numframes 1` 即可显式表达。
+> ⭐ **这是「官方错、mdlc 对」的一处**：官方结果**没有任何可用性**（1 帧动画）且**没有任何诊断**，
+> 而用户的意图（FBX 自带网格+动画）是完全合理的。提示里给出「想让两边一致该怎么做」，
+> 而不是拒绝编译。
+>
+> ⚠️ **与 §4.6 偏离表的对应**：表里那条写的是「**提示**」而非「拒绝」。
+
+⚠️ **两条被实测否掉的写法**（别写进文档、别写进文案）：
+
+| 写法 | 实测结果 |
+|---|---|
+| `$body body "x.fbx" numframes 1` | `未知的 studio 选项 "numframes"` —— **`$body` 不接受该选项** |
+| 先前的「`numframes 1` 即可」建议 | 即使能写，`forceNumframes`（`simplify.cpp:1279-1293`）**只延长不缩短** ⟹ 语义上也做不到 |
+
+⚠️ **`frames 0 0` 仍然有效，但它不再是「绕过拒绝」的手段**：mdlc 本来就放行同文件，
+`frames 0 0` 只是「我确实只要 1 帧」的正常表达。判据仍然必须在**应用帧区间之后**跑，
+否则「只要 1 帧」会被误报成「有分歧」——
+（已由 `frames_range_still_applies_on_a_same_file_fbx` +
+`same_file_fbx_without_a_frame_range_yields_all_frames` **成对**钉住，见 §4.6b）。
 
 **陷阱 2 —— `fps` 字段与重采样率脱钩**
 
@@ -931,7 +994,7 @@ mdlc **拒绝**，并给出可操作的出路：
 
 | # | 偏离 | 理由 |
 |---|---|---|
-| 1 | **同一文件既是网格源又是动画源 ⟹ 报错**（官方静默 1 帧）**——仅当该文件是 `.fbx`** | 官方结果不可用且无诊断（§4.4 陷阱 1）；**SMD 同文件正常**（8 帧源出 8 帧），故不报错 |
+| 1 | **同一文件既是网格源又是动画源 ⟹ 正常采出全部帧 + 提示**（官方静默 1 帧）**——仅当该文件是 `.fbx`** | ⭐ **mdlc 更对**：FBX 本来就是网格+动画合一的容器（用户裁决 2026-10-02），官方结果不可用且无诊断（§4.4 陷阱 1）；**SMD 同文件两边都正常**（8 帧源出 8 帧），故也不提示 |
 | 2 | **FBX 源上写 `flexfile "<某.fbx>"` + `flex` ⟹ 报错**（官方必崩） | 官方 4 个变体全部 `EXCEPTION_ACCESS_VIOLATION`；只写 `flexfile "x.fbx"` 虽不崩但是**静默空操作**；而 FBX 的 shape key 本就自动注册（§1.6b） |
 | 3 | 新增 `srcpart` / `srcmaterial` / `srcscale` / `srcaxis` / `srcstack` / `srcfps` | 用户授权（§4 前提）；官方对这些决策**没有**任何语法 |
 | 4 | 新增 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore` | 官方的自动注册**不可控**（取哪些 / 顺序 / 忽略都做不到），且禁止显式语法 |
@@ -954,23 +1017,23 @@ mdlc 的做法与官方一致，但错误/提示信息必须把它们讲清楚�
 
 | # | 情形 | 官方行为 | mdlc 的处置 |
 |---|---|---|---|
-| A | 同一 FBX 既作网格源又作动画源，且它**真的有多帧** | 静默只出 1 帧 | **报错**（偏离 1），并给出**两条真正可用**的出路：① 拆到独立 FBX；② 在 `$animation` 里写 `frames 0 0` |
-| B | 想让多帧源缩成 1 帧而写 `numframes 1` | `forceNumframes` 只**延长**（`simplify.cpp:1279-1293` 从 `panim->numframes` 起补帧），不会缩短；且 `$body` 行根本不接受 `numframes` | 同上 —— 错误信息里**不再**建议 `numframes 1` |
+| A | 同一 FBX 既作网格源又作动画源，且它**真的有多帧** | 静默只出 1 帧 | **提示 + 正常采出全部帧**（偏离 1）—— 这是「官方错、mdlc 对」：FBX 本来就是网格动画合一的容器。提示里说明「与官方对照时帧数不同是预期的」 |
+| B | 想让多帧源缩成 1 帧而写 `numframes 1` | `forceNumframes` 只**延长**（`simplify.cpp:1279-1293` 从 `panim->numframes` 起补帧），不会缩短；且 `$body` 行根本不接受 `numframes` | 同上 —— 提示文案里**不再**建议 `numframes 1`（改为「拆到独立 FBX」） |
 
-⚠️ 情形 A 的出路 ② 有个**实现顺序**要求：`frames` 区间必须在
-「同文件判据」**之前**应用。早先把判据放在前面 ⟹ 它看到的是源的原始帧数，
-于是把「我只要 1 帧」的合法表达也拦下了 —— **错误信息里建议的出路自己走不通**
-（实测：`$animation a1 "same.fbx" frames 0 0` 仍报同一个错）。
+⚠️ 情形 A 里 `frames 0 0` 仍然有效，但它**不再是绕过拒绝的手段**（mdlc 本来就放行）。
+判据有个**实现顺序**要求：`frames` 区间必须在「同文件提示」**之前**应用，
+否则「我只要 1 帧」的合法表达会被误报成「有分歧」。
 判据看的是**最终**采到几帧，所以顺序是硬约束，已由
-`frames_range_is_applied_before_the_same_file_guard` +
-`same_file_fbx_is_still_rejected_without_a_frame_range` **成对**钉住
+`frames_range_still_applies_on_a_same_file_fbx` +
+`same_file_fbx_without_a_frame_range_yields_all_frames` **成对**钉住
 （单看前者不能证明判据还在 —— 把判据整个删掉也能过）。
 
 > ⚠️ **跨工具兼容性**：偏离 1–4 意味着**用了新语法的 QC 不能直接跑官方工具**。
 > 这与既有扩展命令（`$optimizevtx` 等）的处理方式一致 ——
 > README 应明确写出这条，并指出「要跨工具通用请改用 TOML 侧字段」。
-> ⚠️ 注意偏离 1、2 是**报错**而非新语法：**没写新语法的 QC 也跑不了官方**
-> （官方在那两种组合下给的是坏结果或崩溃），这一点必须写清楚。
+> ⚠️ 注意偏离 2（`flexfile` 指向 FBX）是**报错**而非新语法：
+> **没写新语法的 QC 也跑不了官方**（官方在那两种组合下给的是坏结果或崩溃）。
+> 偏离 1 则相反：mdlc **正常编译**，只是产物帧数与官方不同。
 
 ### 4.7 完整示例
 
@@ -1145,6 +1208,8 @@ FBX 侧已有 **82 个官方用例**的现成夹具与期望值（§1 各表）�
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_samefile.js` | **6 用例单变量**：证明「静默 1 帧」的触发条件是**同一文件**（§1.11 陷阱 1） |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_smd.js` | **5 用例**：证明该陷阱是 **FBX 专属**（SMD 同文件 8 帧源出 8 帧、5 帧源出 5 帧） |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_fix.js` | **6 用例**：证明 `$animation` 走不通（N2/N4/N5/N6 全 1 帧），唯一出路是换文件（N3=6 帧） |
+| `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_forms.js` | **10 用例**：证明陷阱对**几何声明形式不敏感**（`$body` / `$model` / `$bodygroup` × `$sequence` / `$animation` 的 6 个同文件组合全 1 帧，4 个异文件组合全 6 帧）（§1.11 陷阱 1） |
+| `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_static.js` | **6 用例**：证明**无动画栈**的 FBX（`box` / `morph`）同文件时官方与 mdlc 都是 1 帧 ⟹ **不提示**（判据带 `n_frames` 的理由） |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_axis.js` | 3 用例：证明官方**不做轴向变换**，原样搬运根变换（§1.7b） |
 | `D:\DSH\L4D2ReverseEngineering\_fbxresearch\gen_fbx_axis.py` | 造出只有导出轴向不同的三份 FBX（§1.7b 的决定性夹具） |
 | `D:\GITHUB\mdlc\docs\_probe\_tmp_dump_flexrules.js` | 只读 dump：`mstudioflexrule_t` 逐字段（§1.6b 的三件套） |

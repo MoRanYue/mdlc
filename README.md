@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 762 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 764 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -592,11 +592,16 @@ $model "face" "linnea_face.fbx" {
 > 当成网格名而不是「另一个选项」，后面的选项会被吞掉。网格名带空格用引号解决：
 > `srcpart "my mesh"`。
 
-> ⚠️ **两处默认行为是「报错」而不是新语法**（所以**没写新语法的 QC 也跑不了官方**）：
-> ① 同一个 `.fbx` 既作网格源又作动画源——官方**静默只出 1 帧**，mdlc 报错并给出出路；
-> ② 在 FBX 源上写 `flexfile "<某.fbx>"` + `flex`——官方**必崩**，mdlc 报错。
-> 两条都只在**确实会丢东西**时才触发（例如 ① 只在 mdlc 真采出 > 1 帧时才拒）。
+> ⚠️ **一处默认行为是「报错」而不是新语法**（所以**没写新语法的 QC 也跑不了官方**）：
+> 在 FBX 源上写 `flexfile "<某.fbx>"` + `flex`——官方**必崩**，mdlc 报错。
+> 只在**确实会崩**时才触发。
 > 完整清单见 [`docs/fbx-support.md`](docs/fbx-support.md) §4.6 的偏离表。
+
+> ⭐ **同一个 `.fbx` 既作网格源又作动画源：mdlc 正常编译 + 一条提示。**
+> 官方在这个组合下**静默只出 1 帧**（实测 exit=0、无警告）——但 FBX 本来就是
+> 网格与动画合一的容器，所以 mdlc **不复制这个退化行为**，照常采出全部帧，
+> 只提示「与官方对照时帧数不同是预期的；想让两边一致就把动画拆到独立 FBX」。
+> 提示只在 mdlc 真采出 > 1 帧时才发（静态 FBX 两边都是 1 帧，不提示）。
 
 > ⚠️ **写了 `src*` 的 QC 不能直接跑官方工具**（官方会报 `bad command`），
 > 与 `$optimizevtx` 那三条同理。要跨工具通用请改用 TOML 侧字段
@@ -616,6 +621,7 @@ mdlc 会打一行 `提示：`：
 | 有 shape key（已自动注册成 flex） | 列出名字与帧号 + 「要控制请用 `srcshapekey*`」 |
 
 四条全部是**提示**而非错误，且**对 `.smd` 工程零影响**（连一行输出都不多）。
+另有一条同类提示（同一个 FBX 既作网格源又作动画源）见上面的说明块。
 
 ---
 
@@ -787,7 +793,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 762 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 764 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -816,15 +822,15 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 762 passed / 0 failed / 6 ignored
+cargo test --release          # 764 passed / 0 failed / 6 ignored
 ```
 
-**762 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 768 个单元测试 =
-762 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**764 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 770 个单元测试 =
+764 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
-| `compile` | 154 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一、FBX shape key → flex、`src*` 选项 |
+| `compile` | 156 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一、FBX shape key → flex、`src*` 选项 |
 | `qc` | 145 | QC 词法（`qc::lexer` 24）/ 语法（`qc::parse` 69）/ 规则表达式语义（`qc::flexrule` 52） |
 | `mdl_writer` | 82 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
