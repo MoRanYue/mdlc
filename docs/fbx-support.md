@@ -23,7 +23,7 @@
 | `animsmith-fbx` 能用吗？ | **不建议**。它**主动丢弃 blend shape / morph**，而 mdlc 的表情（flex）系统正建立在 morph 上 `[实测]` |
 | 那用什么？ | **直接用 `ufbx`**（`animsmith-fbx` 的底层依赖）。morph 与采样率都可控 `[实测]`；许可 `MIT OR Unlicense`，与 mdlc 的 GPL-3.0-only 兼容 |
 | 构建成本？ | `ufbx` 是 C 库，但 **`cargo build` 49.8 s 通过，无需额外工具链** `[实测]` |
-| **推荐的 UX？** | **FBX 作为一等源直接写进 QC**（`$body` / `$model` / `$sequence` / `$animation` / `$collisionmodel`），默认行为**逐条对齐官方**，但把官方所有**静默失败**改成**显式诊断**，并给每个隐式决策一个**显式覆盖语法**（§4） |
+| **推荐的 UX？** | **FBX 作为一等源直接写进 QC**（`$body` / `$model` / `$sequence` / `$animation` / `$collisionmodel`），默认行为**逐条对齐官方**，但把官方所有**静默失败**改成**显式诊断**，并给每个隐式决策一个**显式覆盖语法**（§4）。⭐ **新语法按「概念」命名（`src*`）、不按「格式」命名** —— 加 glTF/GLB 时新增语法 **0 条**（§4.3） |
 | 最大的 UX 障碍？ | ⭐⭐⭐ **官方恒取第一条 NLA 栈、完全忽略 `$sequence` 名字**（§1.8）。多栈 FBX 在官方路径下**无解**，必须由 mdlc 提供显式选择 |
 | 表情（flex）怎么走？ | ⭐⭐⭐⭐⭐ **什么都不用写** —— FBX 的 shape key **自动注册**成 flexdesc + controller + rule + 载荷（§1.6b），与官方逐字段一致。⚠️ 但**不能在 FBX 源上写 `flexfile`/`flex`**（官方必崩） |
 
@@ -278,7 +278,7 @@ flexes         888 bytes (2 flexes)     ← 第二个 bodypart（morph.fbx，有
   **根节点变换原样搬进骨骼表**（`Skeleton` 的 quat 就是 FBX 场景根的朝向），
   于是**只要 FBX 的根变换与几何自洽，产物就自洽**。
 - ⚠️ **反面含义**：如果用户的 FBX 导出轴向选错（例如本该 Z-up 却导成 Y-up 且根变换没补偿），
-  官方**不会救**，产物就是躺倒的。⟹ mdlc 的 `fbxaxis` 语法（§4.3）应当
+  官方**不会救**，产物就是躺倒的。⟹ mdlc 的 `srcaxis` 语法（§4.3）应当
   **默认不干预**（与官方一致），只在用户显式写时才施加一次旋转。
 
 > ⚠️ `axis_yup_max` 的 `Skeleton` quat `[-0.5,-0.5,-0.5,0.5]` 与 `axis_yup` 不同，
@@ -590,56 +590,96 @@ $ mdlc build-qc a_body.qc --out outA
 | **FBX 上只写 `flexfile "<x.fbx>"`** | 不崩，但**静默空操作** | **报错** | ⚠️ 默认偏离（用户以为生效了，其实没有） |
 | 同一文件既是网格源又是动画源 | 静默 1 帧 | **拒绝**（见 §4.4） | ⚠️ **默认偏离** |
 
-### 4.3 新增语法总表
+### 4.3 命名原则：按概念命名，不按格式命名
+
+⭐ **语法按「概念」命名，格式由文件扩展名决定。**
+
+这条原则是用户提出的（「如果以后要加 gltf/glb，是否每个格式都要加新语法？」），
+它推翻了本节初稿的 `fbx*` 前缀方案。理由是：把下面的九条语法逐条对照
+glTF/GLB 的等价概念后，**九条全部是通用概念**（详见下表「glTF 对应物」列）：
+
+| 概念 | FBX 里的叫法 | glTF 里的叫法 |
+|---|---|---|
+| 取哪个子网格 | mesh / geometry | mesh / primitive |
+| 无材质时的兜底名 | material | material |
+| 单位缩放 | unit scale | unit scale（米制） |
+| 上轴 | axis up | Y-up（规范固定） |
+| 用哪条动画 | anim stack | `animations[]` |
+| 重采样率 | fps | fps |
+| 形变目标 | shape key / blend shape | **morph target** |
+
+⟹ 若按格式命名，加 glTF 时这九条要**原样重抄**成 `gltfpart` / `gltfmaterial` / …，
+加 OBJ 再抄一遍。那不是「每个格式加新语法」，而是「**每个格式把同一套语法重抄一遍**」，
+比原始担忧更糟。
+
+**格式信号从哪来？** 从文件扩展名 —— 这正好复用 R34 已有的决定
+（「资产引用必须写完整扩展名」，`src\compile.rs:353 resolve_smd_path`）。
+当时那条改动是为了消除「同一 token 在不同上下文解析到不同文件」的歧义，
+顺带让**扩展名成为可靠的格式信号**：`resolve_smd_path` 已经拿到了路径，
+按 `.smd` / `.fbx` / `.glb` 分派 reader 是免费的。
+
+于是：
+
+- **加 glTF 支持 = 加一个 source reader，新增语法 0 条。** 用户把 `.fbx` 换成 `.glb`，同一套选项照用。
+- 选项挂在 `$body` / `$model` / `$sequence` 块内，**每个块各管各的文件**
+  ⟹ 同一个模型里 `body` 用 FBX、`hat` 用 GLB 天然可行，不需要全局格式开关。
+- 用户只需要学**一套**词汇表，而不是每个格式一套。
+
+**例外判据：只有概念本身在某格式里独有时，才带格式前缀。**
+例如 FBX 的 inherit mode（Mixamo 的 `scale 0.01` 那种 Maya 式继承）、glTF 的 extension 开关。
+这类旋钮写成 `fbxinheritmode` 反而更清楚 —— glTF 根本没有对应物，强行通用化才是误导。
+
+> **规则：通用概念用 `src*`；格式独有的旋钮用 `<格式><旋钮>`。前者是常态，后者是例外。**
 
 沿用 mdlc 既有扩展命令的约定（`README.md:493-527`）：
 **TOML 字段名去掉下划线、前面加 `$`**；命令名大小写不敏感；QC 自上而下解释、后写的赢。
+（`src*` 与 `src\compile.rs` 的 `resolve_src` / `mesh_sources` 词汇一致。）
 
 **A. 网格侧（`$body` / `$model` / `$bodygroup { studio }` 的块内选项）**
 
-| QC | TOML | 作用 | 省略时 |
-|---|---|---|---|
-| `fbxpart "body"` | `fbx_parts = ["body"]` | 只取指定名字的网格；可重复 | 取全部并合并（官方） |
-| `fbxmaterial "face"` | `fbx_material = "face"` | 网格**没有**材质时用它 | `debug/debugempty`（官方） |
-| `fbxscale 1.0` | `fbx_scale = 1.0` | 顶点与骨骼位移的缩放 | `1.0`（官方） |
-| `fbxaxis "z"` | `fbx_axis = "z"` | **强制**上轴（`y` / `z`）；见下 | **不干预**（官方，§1.7b） |
+| QC | TOML | 作用 | 省略时 | glTF 对应物 |
+|---|---|---|---|---|
+| `srcpart "body"` | `src_parts = ["body"]` | 只取指定名字的网格；可重复 | 取全部并合并（官方） | mesh / primitive |
+| `srcmaterial "face"` | `src_material = "face"` | 网格**没有**材质时用它 | `debug/debugempty`（官方） | material |
+| `srcscale 1.0` | `src_scale = 1.0` | 顶点与骨骼位移的缩放 | `1.0`（官方） | 同 |
+| `srcaxis "z"` | `src_axis = "z"` | **强制**上轴（`y` / `z`）；见下 | **不干预**（官方，§1.7b） | Y-up 固定 |
 
-> ⭐ **`fbxaxis` 只在 FBX 自身轴向坏掉时才需要。** §1.7b 实测表明：只要 FBX 的
+> ⭐ **`srcaxis` 只在源文件自身轴向坏掉时才需要。** §1.7b 实测表明：只要 FBX 的
 > **根节点变换与几何自洽**（正常导出器都保证这点），官方与 mdlc 的默认行为就已经正确 ——
-> 无论是 Y-up 还是 Z-up 导出。`fbxaxis` 是给「根变换丢了 / 被清掉」的坏文件准备的逃生门，
+> 无论是 Y-up 还是 Z-up 导出。`srcaxis` 是给「根变换丢了 / 被清掉」的坏文件准备的逃生门，
 > **不是常规选项**。默认必须与官方一致（不干预）。
 
 **B. 动画侧（`$sequence` / `$animation` 的块内或行内选项）**
 
-| QC | TOML | 作用 | 省略时 |
-|---|---|---|---|
-| `fbxstack "walk"` | `fbx_stack = "walk"` | **按名字选 NLA 栈** | 第一条（官方）+ 多条时告警 |
-| `fbxfps 30` | `fbx_fps = 30` | 重采样率 | `30`（官方） |
+| QC | TOML | 作用 | 省略时 | glTF 对应物 |
+|---|---|---|---|---|
+| `srcstack "walk"` | `src_stack = "walk"` | **按名字选动画栈** | 第一条（官方）+ 多条时告警 | `animations[]` 的 name |
+| `srcfps 30` | `src_fps = 30` | 重采样率 | `30`（官方） | 同 |
 
 **C. flex 侧（`$model` 块内）**
 
 ⭐ **首先注意：FBX 的 shape key 默认就会自动注册（§1.6b），用户什么都不用写。**
 下面这些语法**只在需要偏离自动行为时才用**。
 
-| QC | TOML | 作用 | 省略时 |
-|---|---|---|---|
-| `fbxshapekey "wide"` | `fbx_shape_keys = ["wide"]` | **只取指定名字的 shape key**；可重复、按写出顺序定帧号 | 取全部（官方） |
-| `fbxshapekeyorder "tall" "wide"` | `fbx_shape_key_order = [...]` | **显式指定帧号顺序** | 文件顺序（官方） |
-| `fbxshapekeyignore` | `fbx_shape_key_ignore = true` | **完全忽略 shape key**（不产出任何 flex） | 自动注册（官方） |
+| QC | TOML | 作用 | 省略时 | glTF 对应物 |
+|---|---|---|---|---|
+| `srcshapekey "wide"` | `src_shape_keys = ["wide"]` | **只取指定名字的形变目标**；可重复、按写出顺序定帧号 | 取全部（官方） | morph target |
+| `srcshapekeyorder "tall" "wide"` | `src_shape_key_order = [...]` | **显式指定帧号顺序** | 文件顺序（官方） | 同 |
+| `srcshapekeyignore` | `src_shape_key_ignore = true` | **完全忽略形变目标**（不产出任何 flex） | 自动注册（官方） | 同 |
 
 ⚠️ **不要在 FBX 源上写 `flexfile "x.fbx"` + `flex "name" frame N`** ——
 **官方在这种组合下必崩**（§1.6b 的 2×2 矩阵）。
 只写 `flexfile "x.fbx"`（无 `flex`）虽不崩，但它是**静默空操作**（什么都不做）。
-mdlc 对这两种写法都会**报错**并指向 `fbxshapekey*` 系列（§4.4 陷阱 4）。
+mdlc 对这两种写法都会**报错**并指向 `srcshapekey*` 系列（§4.4 陷阱 4）。
 
 ⭐ **`.vta` 路径完全不变**：`flexfile "x.vta"` + `flex "name" frame N` 仍然照旧
-（帧号 = 序号 + 1）。**新增的 `fbxshapekey*` 只服务 FBX。**
+（帧号 = 序号 + 1）。**新增的 `srcshapekey*` 只服务「带形变目标的几何源」。**
 
 > 设计理由：官方把「shape key → flex」做成了**全自动、无语法、不可控**，
 > 而它同时**禁止**任何显式 flex 语法（一写就崩）。
 > 对用户来说这是「**只能猜**」的典型场景 —— 想看某个 shape key 对应第几帧、
 > 想跳过某个 shape key、想改帧号顺序，**官方路径下一个都做不到**。
-> `fbxshapekey*` 三个语法正好补上这三件事，且**默认值与官方逐条一致**。
+> `srcshapekey*` 三个语法正好补上这三件事，且**默认值与官方逐条一致**。
 
 ### 4.4 诊断设计：把官方的静默失败变成显式提示
 
@@ -669,7 +709,7 @@ mdlc **拒绝**，并给出可操作的出路：
 ```
 警告：`$sequence walk` 写了 `fps 10`，但 FBX 的重采样率是 30（官方固定值）。
       产物会有 6 帧、`animdesc.fps = 10` ⟹ 播放时长 0.6 s（源 0.1667 s，慢 3.6 倍）。
-      要让两者一致，写 `fbxfps 10`；要保留官方行为，忽略本警告。
+      要让两者一致，写 `srcfps 10`；要保留官方行为，忽略本警告。
 ```
 
 **陷阱 3 —— 多条 NLA 栈（官方静默只取第一条）**
@@ -681,7 +721,7 @@ mdlc **拒绝**，并给出可操作的出路：
         [2] "Skeleton|run"  0.3750 s
         [3] "Skeleton|walk" 0.1667 s
       官方恒取第一条（"walk"），`$sequence` 的名字**不参与选择**。
-      要用别的栈，写 `fbxstack "run"`。
+      要用别的栈，写 `srcstack "run"`。
 ```
 
 **陷阱 4 —— 在 FBX 源上写 `flexfile "<某.fbx>"` + `flex` ⟹ 官方崩溃**
@@ -701,9 +741,9 @@ mdlc **拒绝**，并给出可操作的出路：
       而**不写**任何 flex 语法时，官方会自动把 shape key 注册成 flex。
       FBX 的 shape key 默认就会自动变成 flex，不需要显式声明。
       要控制取哪些 / 顺序 / 忽略，用：
-        · `fbxshapekey "wide"`              只取指定的 shape key
-        · `fbxshapekeyorder "tall" "wide"`  显式指定帧号顺序
-        · `fbxshapekeyignore`               完全忽略 shape key
+        · `srcshapekey "wide"`              只取指定的 shape key
+        · `srcshapekeyorder "tall" "wide"`  显式指定帧号顺序
+        · `srcshapekeyignore`               完全忽略 shape key
       （`.vta` 源不受影响，仍用 `flexfile` + `flex ... frame N`。）
 ```
 
@@ -714,23 +754,23 @@ mdlc **拒绝**，并给出可操作的出路：
 
 | 触发条件 | 提示 |
 |---|---|
-| FBX 的多块网格被合并 | 列出网格名 + 「要分开请用 `fbxpart` 或拆成多个 `$body`」 |
-| 网格没有材质 | 「已合成 `debug/debugempty`；要改用别的写 `fbxmaterial`」 |
+| FBX 的多块网格被合并 | 列出网格名 + 「要分开请用 `srcpart` 或拆成多个 `$body`」 |
+| 网格没有材质 | 「已合成 `debug/debugempty`；要改用别的写 `srcmaterial`」 |
 | `$collisionmodel` 吃 FBX 且凸体分解退化 | 官方会打 `building single convex`；mdlc 应转成明确警告 |
 | FBX 里的骨骼被过滤掉 | 列出被丢的节点名（官方静默丢弃） |
-| FBX 有 shape key | 「已自动注册 N 个 flex：`wide`(帧1) `tall`(帧2)；要控制请用 `fbxshapekey*`」 |
+| FBX 有 shape key | 「已自动注册 N 个 flex：`wide`(帧1) `tall`(帧2)；要控制请用 `srcshapekey*`」 |
 
 ### 4.5 逐问题方案
 
 | 问题 | 方案 |
 |---|---|
-| **多栈 FBX**（§1.8，最大障碍） | 默认第一条 + 告警列出全部；`fbxstack "名"` 显式选择；找不到该名字时**硬报错**并列出可用名 |
-| **材质命名**（§1.9） | 默认原样透传（官方）；`fbxmaterial` 兜底无材质的情况 |
-| **多网格 → 部件**（§1.10） | 默认合并 + 告警；`fbxpart` 选网格；要多个 bodypart 就写多条 `$body` |
-| **单位/缩放**（§1.7） | 默认原样透传（官方）；`fbxscale` 显式缩放 |
-| **轴向**（§1.7b） | **默认不干预**（官方；根变换原样搬运）；只在坏文件上用 `fbxaxis` 强制 |
-| **重采样率**（§1.5） | 默认 30（官方）；`fbxfps` 覆盖 |
-| **shape key → flex**（§1.6b） | **默认自动注册**（与官方逐字段一致：desc + controller `[0,1]` + `MUL` rule + 载荷）；`fbxshapekey*` 控制取哪些/顺序/忽略。⚠️ **FBX 上禁止显式 flex 语法**（官方必崩） |
+| **多栈 FBX**（§1.8，最大障碍） | 默认第一条 + 告警列出全部；`srcstack "名"` 显式选择；找不到该名字时**硬报错**并列出可用名 |
+| **材质命名**（§1.9） | 默认原样透传（官方）；`srcmaterial` 兜底无材质的情况 |
+| **多网格 → 部件**（§1.10） | 默认合并 + 告警；`srcpart` 选网格；要多个 bodypart 就写多条 `$body` |
+| **单位/缩放**（§1.7） | 默认原样透传（官方）；`srcscale` 显式缩放 |
+| **轴向**（§1.7b） | **默认不干预**（官方；根变换原样搬运）；只在坏文件上用 `srcaxis` 强制 |
+| **重采样率**（§1.5） | 默认 30（官方）；`srcfps` 覆盖 |
+| **shape key → flex**（§1.6b） | **默认自动注册**（与官方逐字段一致：desc + controller `[0,1]` + `MUL` rule + 载荷）；`srcshapekey*` 控制取哪些/顺序/忽略。⚠️ **FBX 上禁止显式 flex 语法**（官方必崩） |
 | **骨骼过滤**（§1.4） | 默认同官方；被丢的节点**列出来**（官方静默） |
 
 ### 4.6 与官方的有意偏离（全部列出，便于审计）
@@ -739,8 +779,8 @@ mdlc **拒绝**，并给出可操作的出路：
 |---|---|---|
 | 1 | **同一文件既是网格源又是动画源 ⟹ 报错**（官方静默 1 帧） | 官方结果不可用且无诊断（§4.4 陷阱 1） |
 | 2 | **FBX 源上写 `flexfile "<某.fbx>"` + `flex` ⟹ 报错**（官方必崩） | 官方 4 个变体全部 `EXCEPTION_ACCESS_VIOLATION`；只写 `flexfile "x.fbx"` 虽不崩但是**静默空操作**；而 FBX 的 shape key 本就自动注册（§1.6b） |
-| 3 | 新增 `fbxpart` / `fbxmaterial` / `fbxscale` / `fbxaxis` / `fbxstack` / `fbxfps` | 用户授权（§4 前提）；官方对这些决策**没有**任何语法 |
-| 4 | 新增 `fbxshapekey` / `fbxshapekeyorder` / `fbxshapekeyignore` | 官方的自动注册**不可控**（取哪些 / 顺序 / 忽略都做不到），且禁止显式语法 |
+| 3 | 新增 `srcpart` / `srcmaterial` / `srcscale` / `srcaxis` / `srcstack` / `srcfps` | 用户授权（§4 前提）；官方对这些决策**没有**任何语法 |
+| 4 | 新增 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore` | 官方的自动注册**不可控**（取哪些 / 顺序 / 忽略都做不到），且禁止显式语法 |
 | 5 | 对 §1.11 的全部陷阱发诊断 | 官方静默 |
 | 6 | `$collisionmodel` 的 `building single convex` 升级为明确警告 | 官方只打一行 WARNING 就继续 |
 
@@ -758,33 +798,33 @@ $cdmaterials "models/survivors/linnea_replaces_zoey/"
 
 // ── 网格：直接吃 FBX，只取 body 网格，没有材质时用 face ──
 $body body "linnea.fbx" {
-    fbxpart "body"          // 该 FBX 里还有 hair / eyes，不取
-    fbxmaterial "face"      // FBX 里没给材质时的兜底
-    fbxscale 1.0            // 原样（官方行为）
+    srcpart "body"          // 该 FBX 里还有 hair / eyes，不取
+    srcmaterial "face"      // FBX 里没给材质时的兜底
+    srcscale 1.0            // 原样（官方行为）
 }
 
 // ── 第二个部件：另一个 FBX ──
 $body hat "hat.fbx"
 
 // ── 表情：什么都不用写，shape key 自动注册（官方行为） ──
-// 要控制，用 fbxshapekey*：
+// 要控制，用 srcshapekey*：
 $body face "linnea_face.fbx" {
-    fbxshapekeyorder "blink" "smile" "wide"   // 显式指定帧号 1..3
-    // fbxshapekey "blink"                     // 或者只取某几个
+    srcshapekeyorder "blink" "smile" "wide"   // 显式指定帧号 1..3
+    // srcshapekey "blink"                     // 或者只取某几个
 }
 // 想完全忽略 shape key（不要表情）：
-// $body face "linnea_face.fbx" { fbxshapekeyignore }
+// $body face "linnea_face.fbx" { srcshapekeyignore }
 
 // ⚠️ 不要在 FBX 源上写 flexfile / flex —— 官方会崩，mdlc 会报错。
 //    `.vta` 源照旧：flexfile "x.vta" + flex "name" frame 1
 
 // ── 动画：显式选第二条栈 ──
 $sequence walk "anims.fbx" fps 30 {
-    fbxstack "walk"
+    srcstack "walk"
 }
 
 $sequence run "anims.fbx" fps 30 {
-    fbxstack "run"          // 官方会静默给你 walk；这里显式指定
+    srcstack "run"          // 官方会静默给你 walk；这里显式指定
 }
 ```
 
@@ -795,14 +835,14 @@ $sequence run "anims.fbx" fps 30 {
 name = "body"
 [[bodyparts.models]]
 smd = "linnea.fbx"
-fbx_parts = ["body"]
-fbx_material = "face"
-fbx_scale = 1.0
+src_parts = ["body"]
+src_material = "face"
+src_scale = 1.0
 
 [[sequences]]
 name = "run"
 smd = "anims.fbx"
-fbx_stack = "run"
+src_stack = "run"
 ```
 
 ### 4.8 明确不做
@@ -857,19 +897,19 @@ fbx_stack = "run"
 | 位置 | 现状 | 改动 |
 |---|---|---|
 | `:895 cmd_body` / `:911 cmd_bodygroup` | 调 `option_studio` | 不变 |
-| `:969 option_studio` | 行内选项 `reverse` / `scale` / `faces` / `bias` | **新增块内选项** `fbxpart` / `fbxmaterial` / `fbxscale` / `fbxaxis`（`{ }` 分支现在只是 `UnGetToken` 后 `break`，需要真正进块） |
-| `:1705 cmd_sequence` / `:1784 parse_sequence_body` | — | **新增** `fbxstack` / `fbxfps` |
+| `:969 option_studio` | 行内选项 `reverse` / `scale` / `faces` / `bias` | **新增块内选项** `srcpart` / `srcmaterial` / `srcscale` / `srcaxis`（`{ }` 分支现在只是 `UnGetToken` 后 `break`，需要真正进块） |
+| `:1705 cmd_sequence` / `:1784 parse_sequence_body` | — | **新增** `srcstack` / `srcfps` |
 | `:2180`（`$sequence` 块内「文件路径 vs blend 名」判据） | `t.text.ends_with(".smd") \|\| t.text.ends_with(".SMD")` | ⭐ **必须加 `.fbx`**，否则 FBX 会被当成 blend 名 |
 | `cmd_animation`（`$animation` 分支） | — | 同样要认 `.fbx` |
-| `cmd_model`（`$model` 块） | `flexfile` / `flex` / `eyelid` / `mouth` | **新增** `fbxshapekey` / `fbxshapekeyorder` / `fbxshapekeyignore`；**对 FBX 源上的 `flexfile`/`flex` 报错** |
+| `cmd_model`（`$model` 块） | `flexfile` / `flex` / `eyelid` / `mouth` | **新增** `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`；**对 FBX 源上的 `flexfile`/`flex` 报错** |
 
 ### 6.4 IR（`src\model.rs`）
 
 | 结构 | 现状 | 改动 |
 |---|---|---|
 | `:3261 BodyModel.smd: String` | 源路径 | 字段名**保持不变**（它是 TOML 公开字段，改名是破坏性变更）；改为在 `resolve_smd_path` 侧按扩展名分派 |
-| `:3246 BodyPart` | `name` / `base` / `models` | 新增 `fbx_*` 选项字段（全部 `Option`，`#[serde(skip_serializing_if = "Option::is_none")]`） |
-| `Sequence`（`:1449`） | 已有很多字段 | 新增 `fbx_stack: Option<String>` / `fbx_fps: Option<f32>` |
+| `:3246 BodyPart` | `name` / `base` / `models` | 新增 `src_*` 选项字段（全部 `Option`，`#[serde(skip_serializing_if = "Option::is_none")]`） |
+| `Sequence`（`:1449`） | 已有很多字段 | 新增 `src_stack: Option<String>` / `src_fps: Option<f32>` |
 | `FlexDescriptor`（`:1129`）/ `FlexController`（`:1141`）/ `FlexRule`（`:1295`） | **已够用** | ⭐ **不需要新 IR** —— FBX 的 shape key 正好合成这三样（§1.6b） |
 
 ### 6.5 需要复用的既有设施
