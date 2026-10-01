@@ -217,7 +217,7 @@ impl FbxOpts {
 /// 帧号 = 文件顺序 + 1（`docs/fbx-support.md` §1.6b）。
 ///
 /// ⚠️ 这里存的 `position_offsets` **已经是 Source 空间的**（官方口径
-/// `rot_norm(geometry_to_world) · pos_off`，见 [`shape_keys_of`]），
+/// `rot_norm(geometry_to_world) · pos_off`），
 /// 而 `vertex_index` 也已经过**跨网格偏移**（[`FbxShapeKey::vertex_index`] 是
 /// 全局唯一控制点号，不是「本 mesh 内的控制点号」）。
 #[derive(Debug, Clone, PartialEq)]
