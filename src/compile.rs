@@ -377,6 +377,221 @@ fn read_smd(path: &Path, at: &str) -> Result<Smd, CompileError> {
     parse_smd(&text).map_err(|err| e(at, format!("{} 解析失败：{err}", path.display())))
 }
 
+/// 一个资产引用的**格式**，由扩展名决定。
+///
+/// 自从 [`resolve_smd_path`] 不再补扩展名（R34），扩展名就成了可靠的格式
+/// 信号 —— `docs/fbx-support.md` §4.3 的命名原则正是建立在这上面
+/// （「按概念命名，格式由文件扩展名决定」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// `.smd` —— 文本 SMD。
+    Smd,
+    /// `.fbx` —— FBX（走 `ufbx`）。
+    Fbx,
+}
+
+impl SourceKind {
+    /// 按扩展名判定格式。
+    ///
+    /// ⚠️ 只对**几何源 / 动画源**调用。`.vta` 走 [`resolve_smd_path`] 但
+    /// **不**经过这里（它有自己的解析器，见 [`crate::vta`]）。
+    pub fn of(path: &Path) -> Result<Self, String> {
+        let ext = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(str::to_ascii_lowercase);
+        match ext.as_deref() {
+            Some("smd") => Ok(SourceKind::Smd),
+            Some("fbx") => Ok(SourceKind::Fbx),
+            other => Err(format!(
+                "不认识的资产格式 {other:?}（{}）：目前支持 .smd 与 .fbx。",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// 该 token 看起来是不是一个**资产引用**（而不是动画名 / blend 名）。
+///
+/// QC 里同一位置既能写文件名也能写动画名（`$sequence "x" "y"` 的 `"y"`
+/// 两种都合法），官方的判据是 `Load_Source` 的扩展名试探链。mdlc 从 R34
+/// 起要求写完整扩展名，所以「有没有认识的扩展名」就是判据 —— 加新格式时
+/// 只要往 [`SourceKind::of`] 里加一条，这里自动跟着变。
+pub fn is_source_ref(text: &str) -> bool {
+    SourceKind::of(Path::new(text)).is_ok()
+}
+
+/// 读取一个源文件（`.smd` 或 `.fbx`），统一成中立的 [`Smd`]。
+///
+/// # 这是**唯一**的格式分派点
+///
+/// `compile.rs` 有一万多行，其余部分只认 [`Smd`]。让泛型或 `dyn` 穿过整条
+/// 管线会把编译期与运行期成本都抬起来，而格式来自**运行期**的路径字符串，
+/// 没有任何可以「延迟到单态化」的东西；读一个源文件在整次编译里也只发生
+/// 四五次。所以这里用一次 `match`，把格式问题**收在一个函数里**
+/// （选型讨论见 `docs/fbx-support.md` §6.2）。
+///
+/// # 默认值全部与官方一致
+///
+/// FBX 侧用的是 [`crate::fbx::FbxOpts::default()`]，即「不干预单位与轴向、
+/// 全部网格合并、无材质时合成 `debug/debugempty`」—— 逐条对齐官方实测
+/// （`docs/fbx-support.md` §1）。mdlc 扩展语法（`srcpart` / `srcscale` /
+/// `srcaxis` …）会在这里按需替换掉它。
+pub fn read_source(path: &Path, at: &str) -> Result<Smd, CompileError> {
+    match SourceKind::of(path).map_err(|msg| e(at, msg))? {
+        SourceKind::Smd => read_smd(path, at),
+        SourceKind::Fbx => crate::fbx::read(path, at, &crate::fbx::FbxOpts::default())
+            .map(|g| g.smd)
+            .map_err(|err| e(at, err.to_string())),
+    }
+}
+
+/// 一个**几何源**读出来的全部内容。
+pub struct SourceGeometry {
+    /// 中立几何（节点 / 参考姿态 / 三角形）。
+    pub smd: Smd,
+    /// FBX 的 shape key（**已变换到 Source 空间**）。SMD 源恒为空。
+    ///
+    /// 官方把 FBX 的 shape key 全自动注册成 flex，所以这份数据不能像
+    /// [`read_source`] 那样丢掉 —— 丢了就是「模型能编译，但表情不见了」。
+    pub shape_keys: Vec<crate::fbx::FbxShapeKey>,
+}
+
+/// 读取一个**几何源**，保留 FBX 的 shape key。
+///
+/// 与 [`read_source`] 的唯一区别就是多带一份 [`SourceGeometry::shape_keys`]；
+/// 只有 `$body` / `$model` 的主网格需要它，LOD 与 QC 的文件存在性检查走
+/// [`read_source`] 就够（前者官方也不产出 flex，后者根本不看内容）。
+pub fn read_source_geometry(path: &Path, at: &str) -> Result<SourceGeometry, CompileError> {
+    match SourceKind::of(path).map_err(|msg| e(at, msg))? {
+        SourceKind::Smd => read_smd(path, at).map(|smd| SourceGeometry {
+            smd,
+            shape_keys: Vec::new(),
+        }),
+        SourceKind::Fbx => crate::fbx::read(path, at, &crate::fbx::FbxOpts::default())
+            .map(|g| SourceGeometry {
+                smd: g.smd,
+                shape_keys: g.shape_keys,
+            })
+            .map_err(|err| e(at, err.to_string())),
+    }
+}
+
+/// 读取一个**动画源**的帧数据（`.smd` 或 `.fbx`）。
+///
+/// 与 [`read_source`] 的区别：FBX 的几何读取（[`read_source`]）给的是**参考
+/// 姿态**（每个节点的局部 TRS），而动画读取要走 ufbx 的烘焙路径把
+/// `AnimStack` 采样成逐帧局部变换。对 `.smd` 两者是同一个函数。
+///
+/// 官方把 FBX 动画**固定归一化到 30 fps**（实测 24 / 30 / 60 fps 的源全部
+/// 变成同一份 31 帧 —— `docs/fbx-support.md` §1.5），所以这里用
+/// [`crate::fbx::DEFAULT_FPS`]；mdlc 的 `srcfps` 可以覆盖它。
+///
+/// ⚠️ 返回的 [`Smd`] 的 `triangles` 是空的 —— 调用方只取 `frames`。
+pub fn read_source_frames(path: &Path, at: &str) -> Result<Smd, CompileError> {
+    match SourceKind::of(path).map_err(|msg| e(at, msg))? {
+        SourceKind::Smd => read_smd(path, at),
+        SourceKind::Fbx => crate::fbx::read_frames(
+            path,
+            at,
+            None,
+            crate::fbx::DEFAULT_FPS,
+            &crate::fbx::FbxOpts::default(),
+        )
+        .map_err(|err| e(at, err.to_string())),
+    }
+}
+
+/// 收集**几何源**里的 `.fbx` 文件（规范化后的路径）。
+///
+/// # 为什么需要这个
+///
+/// 官方在 FBX 路径上有一个**静默失败**：**同一个 FBX 既作网格源又作动画源
+/// 时只产出 1 帧**（`docs/fbx-support.md` §1.11 陷阱 1；单变量定案见
+/// `docs/_probe/oracle_fbx_samefile.js` 的 S1–S6 表）。
+///
+/// ⚠️ **这是 FBX 专属的** —— SMD 同文件完全正常
+/// （`docs/_probe/oracle_samefile_smd.js`：8 帧源出 8 帧、5 帧源出 5 帧）。
+/// 所以判据**必须按格式分流**，否则会误伤既有工程
+/// （`$body x.smd` + `$sequence y x.smd` 是常见写法）。
+///
+/// ⚠️ 改 QC **没有用**：`$animation` 块、按名引用、重写 `$sequence` 全都被
+/// 实测证明仍是 1 帧（`docs/_probe/oracle_samefile_fix.js` 的 N2/N4/N5/N6），
+/// 唯一出路是把动画放到**另一个文件**（N3 = 6 帧）。所以这里只能报错，
+/// 报错文案里必须把这一点说清楚，否则用户会去试那些无效的改法。
+fn fbx_geometry_sources(desc: &ModelDesc, base_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for bp in &desc.bodyparts {
+        for m in &bp.models {
+            for src in std::iter::once(&m.smd).chain(m.lods.iter().filter_map(|l| l.smd.as_ref())) {
+                let p = Path::new(src);
+                if SourceKind::of(p) != Ok(SourceKind::Fbx) {
+                    continue;
+                }
+                let joined = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    base_dir.join(p)
+                };
+                // 同一个文件可能被写成 `box.fbx` / `./box.fbx` / `sub/../box.fbx`
+                // ⟹ 能规范化就规范化。
+                out.push(std::fs::canonicalize(&joined).unwrap_or(joined));
+            }
+        }
+    }
+    out
+}
+
+/// 两个路径是不是**同一个文件**（Windows 大小写不敏感，故走 `canonicalize`）。
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// 「同一个 FBX 既作网格源又作动画源」的拒绝判据（见 [`fbx_geometry_sources`]）。
+///
+/// 返回 `Some(错误文案)` 表示应拒绝。
+///
+/// # ⚠️ 只在**真的有动画可丢**时拒绝
+///
+/// 官方陷阱的后果是「静默 1 帧」。如果源**本来就只有 1 帧**
+/// （例如 `box.fbx` / `morph.fbx` 这类没有 `AnimStack` 的静态网格），
+/// 官方与 mdlc 都出 1 帧，**没有任何分歧** ⟹ 不该报错。
+///
+/// 所以判据里带 `n_frames`：只有 mdlc 采出 **> 1 帧**（= 官方会丢掉的那些）
+/// 才拒绝。这让判据**自我校准** —— 不依赖「哪些 FBX 有动画」的静态判断，
+/// 而是直接看「这次实际采到了几帧」。
+///
+/// ⚠️ **只对 `.fbx` 生效** —— SMD 同文件完全正常（8 帧源出 8 帧），
+/// 对 SMD 报错会误伤大量既有工程。
+fn same_fbx_geometry_error(
+    path: &Path,
+    geometry: &[PathBuf],
+    n_frames: usize,
+) -> Option<String> {
+    if n_frames <= 1 {
+        return None;
+    }
+    if SourceKind::of(path) != Ok(SourceKind::Fbx) {
+        return None;
+    }
+    if !geometry.iter().any(|g| same_file(g, path)) {
+        return None;
+    }
+    Some(format!(
+        "引用的 {} 已经被当作**网格源**加载。官方在这个组合下**静默地**\
+         只产出 1 帧（实测 exit=0、无警告；本实现从同一个文件采到了 {n_frames} 帧，\
+         两者分歧），mdlc 不产出这种结果。\
+         改 QC 没有用 —— `$animation` 块、按名引用、重写 `$sequence` 都被实测证明仍是 1 帧\
+         （docs/_probe/oracle_samefile_fix.js 的 N2/N4/N5/N6）。唯一有效的做法是：\
+         ① 把动画拆到独立的 FBX 文件（唯一可行）；\
+         ② 若确实要 1 帧静态姿态，写 `numframes 1`。（SMD 没有这个限制，只有 .fbx 会。）",
+        path.display()
+    ))
+}
+
 /// 一个 LOD 的原始网格：顶点池 + 三角形。
 type LodMesh = (Vec<Vertex>, Vec<[u32; 3]>);
 
@@ -473,7 +688,7 @@ fn build_model_lods(
                     continue;
                 }
             };
-            let smd = match read_smd(&smd_path, &lpath) {
+            let smd = match read_source(&smd_path, &lpath) {
                 Ok(s) => s,
                 Err(err) => {
                     errs.push(err);
@@ -494,7 +709,7 @@ fn build_model_lods(
             // mdlc 侧的对应实现在 `smd_vertex_to_ir`（同一条父链上溯），
             // 所以这里直接放行。
             let meshes = match build_meshes(&smd, desc, &smd_path, &lpath, m.flip_triangles) {
-                Ok(v) => v,
+                Ok((v, _)) => v,
                 Err(err) => {
                     errs.push(err);
                     continue;
@@ -686,13 +901,24 @@ impl<'s, 'd> VertexBoneMap<'s, 'd> {
 ///
 /// 判据（`docs/_probe/probe_winding_order.js`，6 个 `vm_test_group` 模型）：
 /// 官方与 SMD 原始顺序「同序 0 / 逆序 12996」，mdlc 修前「同序 6905 / 逆序 0」。
+/// 把 SMD 三角形流焊接成 IR 网格。
+///
+/// # 返回
+///
+/// `(meshes, src_index)` —— `src_index` 与 `meshes` 一一对应，内层与
+/// `Mesh::vertices` 一一对应，给出每个焊接顶点来自**源文件的哪个控制点号**
+/// （[`crate::smd::SmdVertex::src_index`]）。
+///
+/// ⚠️ SMD 源没有「控制点」概念（[`crate::smd::NO_SOURCE_INDEX`]），此时
+/// `src_index` 返回**空 `Vec`**，而不是「一堆 `u32::MAX`」—— 让「这份表有没有
+/// 用」一眼可判（消费方 `resolve_vta_flexes` 就靠这个分流）。
 fn build_meshes(
     smd: &Smd,
     desc: &ModelDesc,
     smd_path: &Path,
     at: &str,
     flip_triangles: bool,
-) -> Result<Vec<Mesh>, CompileError> {
+) -> Result<(Vec<Mesh>, Vec<Vec<u32>>), CompileError> {
     let names = smd.materials_in_order();
     if names.is_empty() {
         return Err(e(at, format!("{} 里没有任何三角形", smd_path.display())));
@@ -736,6 +962,10 @@ fn build_meshes(
     // 每个 mesh 自己的顶点去重表 + 「位置+UV」次级索引（法线容差焊接用）。
     let mut dedup: HashMap<usize, HashMap<VertexKey, u32>> = HashMap::new();
     let mut secondary: HashMap<usize, HashMap<PosUvKey, Vec<u32>>> = HashMap::new();
+    // 「焊接顶点 → 源控制点号」。SMD 源没有这个概念，只在见到第一个
+    // 非 `NO_SOURCE_INDEX` 的顶点时才建表（见函数文档）。
+    let mut src_per_mesh: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut has_src_index = false;
 
     // 骨骼查找表**只建一次**（原先在 `smd_vertex_to_ir` 里逐顶点重建）。
     let bone_map = VertexBoneMap::new(smd, desc);
@@ -748,14 +978,26 @@ fn build_meshes(
             tris_per_mesh.insert(mi, Vec::new());
             dedup.insert(mi, HashMap::new());
             secondary.insert(mi, HashMap::new());
+            src_per_mesh.insert(mi, Vec::new());
         }
         let pool = per_mesh.get_mut(&mi).unwrap();
         let table = dedup.get_mut(&mi).unwrap();
         let sec = secondary.get_mut(&mi).unwrap();
+        let srcs = src_per_mesh.get_mut(&mi).unwrap();
         let mut corner = [0u32; 3];
         for (c, sv) in t.vertices.iter().enumerate() {
             let v = smd_vertex_to_ir(sv, desc, &bone_map, smd_path, at)?;
             let idx = weld_or_push(pool, table, sec, &v);
+            // ⚠️ 只在**新建**顶点时记录源号：焊接会把多个源角并成一个焊接
+            // 顶点，此时它们的 `src_index` 必然指向同一个控制点（焊接的判据
+            // 里位置/法线/UV 全部相同，而 FBX 的同一控制点的多个角本来就会
+            // 焊在一起），所以「先到先得」与「任意一个」等价。
+            if idx as usize == srcs.len() {
+                if sv.src_index != crate::smd::NO_SOURCE_INDEX {
+                    has_src_index = true;
+                }
+                srcs.push(sv.src_index);
+            }
             corner[c] = idx;
         }
         // ⚠️ **绕序翻转**（`v1support.cpp:192-196`）：交换第 2、3 个角。
@@ -772,6 +1014,7 @@ fn build_meshes(
     }
 
     let mut meshes = Vec::with_capacity(order.len());
+    let mut src_index: Vec<Vec<u32>> = Vec::with_capacity(order.len());
     let mut dropped = 0usize;
     for mi in order {
         let vertices = per_mesh.remove(&mi).unwrap();
@@ -779,6 +1022,9 @@ fn build_meshes(
         if vertices.is_empty() || triangles.is_empty() {
             dropped += 1;
             continue;
+        }
+        if has_src_index {
+            src_index.push(src_per_mesh.remove(&mi).unwrap());
         }
         meshes.push(Mesh {
             material: mi,
@@ -798,7 +1044,7 @@ fn build_meshes(
             ),
         ));
     }
-    Ok(meshes)
+    Ok((meshes, src_index))
 }
 
 /// 把一个 SMD 三角形顶点转成 IR 顶点，并做边界校验。
@@ -1061,17 +1307,10 @@ fn load_smd_frames(
         message: msg,
     };
     let bone_count = desc.bones.len();
-    let text = match std::fs::read_to_string(smd_path) {
-        Ok(t) => t,
-        Err(err) => {
-            errs.push(e(format!("读不到 {}：{err}", smd_path.display())));
-            return None;
-        }
-    };
-    let smd = match parse_smd(&text) {
+    let smd = match read_source_frames(smd_path, at) {
         Ok(s) => s,
         Err(err) => {
-            errs.push(e(format!("{} 解析失败：{err}", smd_path.display())));
+            errs.push(err);
             return None;
         }
     };
@@ -1920,26 +2159,14 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
-                let text = match std::fs::read_to_string(&smd_path) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        errors.push(e(
-                            format!("{at}.smd"),
-                            format!("读不到 {}：{err}", smd_path.display()),
-                        ));
-                        continue;
-                    }
-                };
-                let smd = match parse_smd(&text) {
+                let geom = match read_source_geometry(&smd_path, &format!("{at}.smd")) {
                     Ok(s) => s,
                     Err(err) => {
-                        errors.push(e(
-                            format!("{at}.smd"),
-                            format!("{} 解析失败：{err}", smd_path.display()),
-                        ));
+                        errors.push(err);
                         continue;
                     }
                 };
+                let smd = geom.smd;
 
                 // ⚠️ **不要**因为「网格源 SMD 里有 `[[bones]]` 没有的骨骼」而报错。
                 //
@@ -1952,13 +2179,14 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 // mdlc 侧对应实现在 `smd_vertex_to_ir`（同一条父链上溯），
                 // 所以这里直接放行。
 
-                let meshes = match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        errors.push(err);
-                        continue;
-                    }
-                };
+                let (meshes, mesh_src_index) =
+                    match build_meshes(&smd, desc, &smd_path, &at, m.flip_triangles) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
 
                 // ---- 多 LOD：读每个 LOD 的 SMD，按材质名对齐 mesh ----
                 // 只有描述里写了 `lods` 才走这条路；否则 `lods` 保持 `None`，
@@ -2031,6 +2259,8 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     lods,
                     eyeballs: Vec::new(),
                     mesh_flexes: Vec::new(),
+                    mesh_src_index,
+                    shape_keys: geom.shape_keys,
                 });
             }
             bodyparts.push(CompiledBodyPart {
@@ -2077,6 +2307,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         }
     };
     let mut anims: Vec<crate::model::CompiledAnimation> = Vec::with_capacity(desc.animations.len());
+    // 官方的 FBX「同文件静默 1 帧」陷阱需要知道**哪些文件是几何源**
+    // （见 `fbx_geometry_sources`）。⚠️ 只对 `.fbx` 生效。
+    let fbx_geometry = fbx_geometry_sources(desc, base_dir);
     let mut anim_index: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(desc.animations.len());
     // 先只读原始帧（不减除），并记下减除参数。
@@ -2097,15 +2330,23 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 continue;
             }
         };
-        let Some((mut frames, _smd)) = load_smd_frames(
+        // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱 —— 见 `same_fbx_geometry_error`。
+        // 判据要 `n_frames`，所以先读帧再判（读一个 FBX 两次的代价可接受：
+        // 只有「同文件」这一种情形会走到第二次）。
+        let loaded = load_smd_frames(
             &p,
             desc,
             &bone_index,
             &format!("{at}.smd"),
             &mut seq_errors,
-        ) else {
+        );
+        let Some((mut frames, _smd)) = loaded else {
             continue;
         };
+        if let Some(msg) = same_fbx_geometry_error(&p, &fbx_geometry, frames.len()) {
+            seq_errors.push(e(format!("{at}.smd"), msg));
+            continue;
+        }
         // ---- 取帧区间（QC 的 `frames a b`，闭区间）----
         if let Some([lo, hi]) = a.frames {
             let n = frames.len() as i32;
@@ -2630,6 +2871,14 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     ) else {
                         continue;
                     };
+                    // ⚠️ 官方的 FBX「同文件静默 1 帧」陷阱（SMD 不受影响）。
+                    // 判据带帧数：只有真的会丢帧（> 1 帧）才拒绝。
+                    if let Some(msg) =
+                        same_fbx_geometry_error(&smd_path, &fbx_geometry, frames.len())
+                    {
+                        seq_errors.push(e(format!("{at}.smd"), msg));
+                        continue;
+                    }
                     let i = anims.len();
                     let name = format!("@{}", s.name);
                     // 登记在**动画名**下，与官方一致。
@@ -3131,9 +3380,17 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // 逆变换 —— 与自动 hitbox / 姿态包围盒**同一份口径**（官方
         // `g_bonetable[k].boneToPose`，不是骨骼表最终矩阵）。
         //
-        // ⚠️ VTA 的 flexdesc 注册必须在这里做（**早于** flexrule/eyeball 的
-        // 名字解析），因为 `flex` 会**追加** flexdesc，而后续所有按名查表
-        // 都依赖最终的下标。所以先注册 VTA 的 desc，再统一解析。
+        // ⚠️ flexdesc 的注册必须在这里做（**早于** flexrule/eyeball 的
+        // 名字解析），因为两者都会**追加** flexdesc，而后续所有按名查表
+        // 都依赖最终的下标。所以先注册 desc，再统一解析。
+        //
+        // 顺序：**shape key 在前，`.vta` 在后**。官方在 FBX 导入阶段
+        // （`Load_Source` 里）就把 shape key 注册成 flex，而 QC 的 `flex`
+        // 语句要等 `$model` 块解析时才处理 —— 实测
+        // `oracle_fbx_isolate.js` 的 `W2_morphfbx_vta_flex` 得到
+        // `desc = ["wide", "tall", "v1"]`，shape key 的两条在显式 `flex`
+        // 之前。
+        resolve_shape_key_flexes(&mut compiled)?;
         resolve_vta_flexes(&mut compiled, base_dir)?;
 
         resolve_flex_eyeball_mouth(&mut compiled)?;
@@ -5705,7 +5962,231 @@ fn resolve_vta_flexes(
                 }
             }
 
-            compiled.bodyparts[bi].models[mi].mesh_flexes = per_mesh;
+            // ⚠️ **追加**，不是覆盖：`resolve_shape_key_flexes` 先跑，
+            // 它的载荷已经在这个字段里了。直接赋值会把 FBX 的 shape key
+            // 静默丢掉 —— 而那种产物**不报任何错**，只是表情不动。
+            let slot = &mut compiled.bodyparts[bi].models[mi].mesh_flexes;
+            if slot.len() < per_mesh.len() {
+                slot.resize(per_mesh.len(), Vec::new());
+            }
+            for (mesh, add) in per_mesh.into_iter().enumerate() {
+                slot[mesh].extend(add);
+            }
+        }
+    }
+
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// **FBX shape key → flex 自动注册**。
+///
+/// # 官方行为（真 exe 实测，`docs/fbx-support.md` §1.6b）
+///
+/// QC 里**不需要**写任何 flex 语法 —— 只要几何源是 FBX，官方就把文件里的
+/// 每个 shape key 自动变成一条 flex：
+///
+/// | 段 | 内容 |
+/// |---|---|
+/// | `flexdesc` | shape key 名**原样** |
+/// | `flexcontroller` | 每个 shape key 一条，`type = name = 形状名`、`min = 0`、`max = 1` |
+/// | `flexrule` | 每条一个 op：`STUDIO_FETCH1`（`code = 2`）指向自己的 controller |
+/// | mesh flex | `targets = [0, 1, 10, 11]`、`pair = 0`、`vertanimtype = 0` |
+/// | vertanim | `speed = 255`、`side = 255`、`ndelta = (0,0,0)`，`delta` = 变换后的 `pos_off` |
+///
+/// # 与 `.vta` 路径（[`resolve_vta_flexes`]）的三点差别
+///
+/// 1. **没有 `.vta` 文件** —— 位移直接来自 FBX 的 `position_offsets`，
+///    在 [`crate::fbx::read`] 里已经用 `rot_norm(geometry_to_world)` 变换到
+///    Source 空间（实测 9/9 数据点，见 `docs/fbx-support.md` §1.6b）。
+/// 2. **不做就近匹配** —— shape key 给的是**控制点号**，而
+///    [`CompiledModel::mesh_src_index`] 记着每个焊接顶点来自哪个控制点，
+///    所以这里是精确的「一对多展开」，不是 `build_vanim_map` 那种
+///    3×3×3 网格搜索（也就没有 `.vta` 路径的匹配失败问题）。
+/// 3. **`side` 写 255**（不是 `.vta` 非 pair 路径的 0）。官方 FBX 路径实测
+///    如此；对 `flexpair = 0` 的 flex 这个字段被引擎忽略，写它是为了让
+///    产物与官方**逐字段**一致。
+///
+/// # 与 `.vta` 路径可以共存
+///
+/// 实测 `oracle_fbx_isolate.js` 的 `W2_morphfbx_vta_flex`：同一个 FBX 网格源
+/// 上，shape key 的 desc 与显式 `flex` 的 desc **共存**
+/// （`desc = ["wide", "tall", "v1"]`）。所以本函数是**追加**，不是替换。
+///
+/// ⚠️ 必须**早于** [`resolve_flex_eyeball_mouth`]：后者按名建 flexdesc /
+/// flexcontroller 查找表，而本函数会**追加**这两张表的内容。
+fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<CompileError>> {
+    let mut errs: Vec<CompileError> = Vec::new();
+
+    // 先把 shape key **克隆**出来：注册会改 `compiled.desc.*`，
+    // 而同时借用 `compiled.bodyparts` 会被借用检查拒绝
+    // （与 `resolve_vta_flexes` 的 `specs` 同一手法）。
+    let specs: Vec<Vec<Vec<crate::fbx::FbxShapeKey>>> = compiled
+        .bodyparts
+        .iter()
+        .map(|bp| bp.models.iter().map(|m| m.shape_keys.clone()).collect())
+        .collect();
+
+    // 没有 shape key 就直接返回 —— 保证非 FBX 工程的产物**逐字节不变**。
+    let any = specs.iter().any(|bp| bp.iter().any(|m| !m.is_empty()));
+    if !any {
+        return Ok(());
+    }
+
+    // ---- 1. 注册 flexdesc / flexcontroller / flexrule ----
+    //
+    // desc 与 controller 都**按名去重**（官方 `Add_Flexdesc` 用 `stricmp`；
+    // 用户显式写过同名的 `flexcontroller` 时复用自己的，不去制造第二条），
+    // 而 flexrule **不去重** —— 每条 flex 一条规则。
+    let mut desc_index: HashMap<String, usize> = compiled
+        .desc
+        .flex_descriptors
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+    let mut fc_index: HashMap<String, usize> = compiled
+        .desc
+        .flex_controllers
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+
+    // 每个 `(bodypart, model, shape key)` 的 flexdesc 下标。
+    let mut desc_of: Vec<Vec<Vec<usize>>> = Vec::new();
+
+    for (bi, bp) in specs.iter().enumerate() {
+        let mut per_model = Vec::new();
+        for (mi, keys) in bp.iter().enumerate() {
+            let mut row = Vec::with_capacity(keys.len());
+            for (ki, k) in keys.iter().enumerate() {
+                let at = format!("bodyparts[{bi}].models[{mi}].shape_keys[{ki}]");
+                if k.name.is_empty() {
+                    errs.push(e(
+                        &at,
+                        "shape key 的名字是空的，不能注册成 flexdesc".to_string(),
+                    ));
+                    row.push(0);
+                    continue;
+                }
+                let d = match desc_index.get(&k.name) {
+                    Some(&i) => i,
+                    None => {
+                        compiled
+                            .desc
+                            .flex_descriptors
+                            .push(crate::model::FlexDescriptor {
+                                name: k.name.clone(),
+                            });
+                        let i = compiled.desc.flex_descriptors.len() - 1;
+                        desc_index.insert(k.name.clone(), i);
+                        i
+                    }
+                };
+                if !fc_index.contains_key(&k.name) {
+                    compiled
+                        .desc
+                        .flex_controllers
+                        .push(crate::model::FlexController {
+                            name: k.name.clone(),
+                            kind: k.name.clone(),
+                            min: 0.0,
+                            max: 1.0,
+                        });
+                    fc_index.insert(k.name.clone(), compiled.desc.flex_controllers.len() - 1);
+                }
+                compiled.desc.flex_rules.push(crate::model::FlexRule {
+                    flex: k.name.clone(),
+                    ops: vec![crate::model::FlexOp {
+                        op: crate::model::FlexOpKind::Fetch1,
+                        value: None,
+                        controller: Some(k.name.clone()),
+                        flexdesc: None,
+                    }],
+                });
+                row.push(d);
+            }
+            per_model.push(row);
+        }
+        desc_of.push(per_model);
+    }
+
+    // ---- 2. 算载荷 ----
+    //
+    // 每个 shape key 的 `position_offsets[k]` 对应控制点 `vertex_index[k]`。
+    // 该控制点在模型里可能被焊成**多个**顶点（位置/法线/UV 任一不同就会分裂），
+    // 官方对每一个都写一条 vertanim —— 实测 `axisprobe.fbx` 的一个控制点
+    // 展开成 3 条（`docs/fbx-support.md` §1.6b）。
+    for (bi, bp) in specs.iter().enumerate() {
+        for (mi, keys) in bp.iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let n_meshes = compiled.bodyparts[bi].models[mi].meshes.len();
+
+            // 「控制点号 → [(mesh, mesh 内局部下标)]」倒排表。
+            let mut by_cp: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+            for (ki, srcs) in compiled.bodyparts[bi].models[mi]
+                .mesh_src_index
+                .iter()
+                .enumerate()
+            {
+                for (vi, &cp) in srcs.iter().enumerate() {
+                    by_cp.entry(cp).or_default().push((ki, vi as u32));
+                }
+            }
+
+            let mut per_mesh: Vec<Vec<crate::flex::ResolvedFlex>> = vec![Vec::new(); n_meshes];
+            for (ki, k) in keys.iter().enumerate() {
+                let d = desc_of[bi][mi][ki];
+                // 按 mesh 分组收集本 shape key 的全部 vertanim。
+                let mut grouped: Vec<Vec<crate::flex::ResolvedVertAnim>> =
+                    vec![Vec::new(); n_meshes];
+                for (k2, &cp) in k.vertex_index.iter().enumerate() {
+                    // shape key 动了一个没进模型的顶点 —— 官方静默跳过。
+                    let Some(hits) = by_cp.get(&cp) else {
+                        continue;
+                    };
+                    let delta = k.position_offsets[k2];
+                    for &(mesh, local) in hits {
+                        grouped[mesh].push(crate::flex::ResolvedVertAnim {
+                            index: local as u16,
+                            speed: 255,
+                            side: 255,
+                            delta,
+                            ndelta: [0.0; 3],
+                        });
+                    }
+                }
+                for (mesh, mut anims) in grouped.into_iter().enumerate() {
+                    if anims.is_empty() {
+                        continue;
+                    }
+                    // ⚠️ **有意偏离**：官方 FBX 路径的 vertanim 顺序既不是升序
+                    // 也不是任何从文件内容能推出的序（实测 `k4_morph.mdl` 与
+                    // `shapemix.fbx` 两组互不相同，见 `docs/fbx-support.md`
+                    // §4.6）。这里按顶点号升序 —— 数组顺序对渲染无影响。
+                    anims.sort_by_key(|a| a.index);
+                    per_mesh[mesh].push(crate::flex::ResolvedFlex {
+                        flexdesc: d as i32,
+                        targets: [0.0, 1.0, 10.0, 11.0],
+                        flexpair: 0,
+                        vertanimtype: 0,
+                        vertanims: anims,
+                    });
+                }
+            }
+
+            // 追加到 `.vta` 路径算出来的载荷之后。`mesh_flexes` 可能是空的
+            // （没有 `flex` 语句时 `resolve_vta_flexes` 直接早退了），
+            // 所以先补齐长度。
+            let slot = &mut compiled.bodyparts[bi].models[mi].mesh_flexes;
+            if slot.len() < n_meshes {
+                slot.resize(n_meshes, Vec::new());
+            }
+            for (mesh, add) in per_mesh.into_iter().enumerate() {
+                slot[mesh].extend(add);
+            }
         }
     }
 
@@ -8067,6 +8548,302 @@ type = "mouth"
         assert_eq!(uis.iter().filter(|u| !u.3).count(), 14, "14 条单声道");
     }
 
+    // ---- FBX shape key → flex 自动注册（`resolve_shape_key_flexes`）----
+    //
+    // 官方行为全部来自真 exe 实测（`docs/fbx-support.md` §1.6b）：
+    // `oracle_fbx_morph_full.js` 8 用例 + `oracle_fbx_shapeaxis.js`
+    // + `oracle_fbx_shapeany.js`（30 例 shape key 表）。
+    //
+    // ⚠️ 这些测试**直接调 `resolve_shape_key_flexes`**，不走 `compile()` ——
+    // 造一个真 FBX 夹具要写二进制文件，而本模块的夹具全是 SMD。
+    // 端到端覆盖在 `target/fbxcheck/` 的 7 用例上做（对照官方产物）。
+
+    /// 造一个「1 个 bodypart / 1 个 model / 1 个 mesh」的 IR，并把
+    /// `mesh_src_index` 设成给定的「控制点号」序列。
+    fn ir_with_src_index(src: &[u32]) -> crate::model::CompiledModelDesc {
+        let meshes = vec![crate::model::Mesh {
+            material: 0,
+            vertices: src
+                .iter()
+                .map(|_| crate::model::Vertex {
+                    pos: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                    bones: vec![[0.0, 1.0]],
+                })
+                .collect(),
+            triangles: Vec::new(),
+            eyeball_tag: None,
+        }];
+        let mut c = desc_with_meshes(meshes);
+        c.bodyparts[0].models[0].mesh_src_index = vec![src.to_vec()];
+        c.bodyparts[0].models[0].shape_keys = Vec::new();
+        c
+    }
+
+    /// 造一个 shape key：`(名字, [(控制点号, delta)])`。
+    fn key(name: &str, offs: &[(u32, [f32; 3])]) -> crate::fbx::FbxShapeKey {
+        crate::fbx::FbxShapeKey {
+            name: name.to_string(),
+            position_offsets: offs.iter().map(|&(_, d)| d).collect(),
+            normal_offsets: vec![[0.0; 3]; offs.len()],
+            vertex_index: offs.iter().map(|&(cp, _)| cp).collect(),
+        }
+    }
+
+    /// ⭐ **没有 shape key 时必须是完全 no-op** —— 这是「既有产物逐字节不变」
+    /// 的依据（非 FBX 工程走的就是这条路径）。
+    #[test]
+    fn shape_key_pass_is_noop_without_shape_keys() {
+        let mut c = ir_with_src_index(&[0, 1, 2]);
+        let before = c.desc.flex_descriptors.len();
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+        assert_eq!(c.desc.flex_descriptors.len(), before);
+        assert!(c.desc.flex_controllers.is_empty());
+        assert!(c.desc.flex_rules.is_empty());
+        assert!(c.bodyparts[0].models[0].mesh_flexes.is_empty());
+    }
+
+    /// ⭐⭐⭐ **官方 `k4_morph.mdl` 的 desc / controller / rule 三段逐字段复刻**
+    /// （真 exe 实测：`desc = ["wide","tall"]`、`ctrl[0] type="wide" name="wide"
+    /// min=0 max=1`、`rule[0] flex=0 numops=1 {op=2 index=0}`）。
+    ///
+    /// `op = 2` 是 `STUDIO_FETCH1`（`studio.h:2795`），**不是** `STUDIO_MUL`。
+    #[test]
+    fn shape_keys_register_official_desc_controller_rule() {
+        let mut c = ir_with_src_index(&[0, 1, 2, 3]);
+        c.bodyparts[0].models[0].shape_keys = vec![
+            key("wide", &[(0, [2.5, 0.0, 0.0]), (1, [2.5, 0.0, 0.0])]),
+            key("tall", &[(2, [0.0, 2.5, 0.0]), (3, [0.0, -2.5, 0.0])]),
+        ];
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        let descs: Vec<&str> = c
+            .desc
+            .flex_descriptors
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(descs, ["wide", "tall"], "desc 名 = shape key 名，按文件顺序");
+
+        assert_eq!(c.desc.flex_controllers.len(), 2);
+        for (i, n) in ["wide", "tall"].iter().enumerate() {
+            let fc = &c.desc.flex_controllers[i];
+            assert_eq!(fc.name, *n);
+            assert_eq!(fc.kind, *n, "type 与 name 同形（fx4 实测）");
+            assert_eq!((fc.min, fc.max), (0.0, 1.0), "官方 min=0 max=1");
+        }
+
+        assert_eq!(c.desc.flex_rules.len(), 2, "每条 flex 一条 rule（不去重）");
+        for (i, r) in c.desc.flex_rules.iter().enumerate() {
+            assert_eq!(r.flex, ["wide", "tall"][i]);
+            assert_eq!(r.ops.len(), 1);
+            assert_eq!(
+                r.ops[0].op.code(),
+                2,
+                "op = STUDIO_FETCH1（k4_morph.mdl 实测 op=2）"
+            );
+            assert_eq!(r.ops[0].controller.as_deref(), Some(["wide", "tall"][i]));
+        }
+    }
+
+    /// ⭐⭐⭐ **载荷逐字段复刻**：`targets = [0,1,10,11]`、`flexpair = 0`、
+    /// `vertanimtype = 0`、`speed = side = 255`、`ndelta = 0`、`delta` 原样。
+    ///
+    /// 真 exe 实测（`k4_morph.mdl`）：48 条 vertanim 的 `speed` 集合 = `{255}`、
+    /// `side` 集合 = `{255}`、`ndelta` 集合 = `{(0,0,0)}`。
+    #[test]
+    fn shape_key_payload_matches_official_fields() {
+        let mut c = ir_with_src_index(&[0, 1]);
+        c.bodyparts[0].models[0].shape_keys = vec![key("wide", &[(1, [2.5, 0.0, 0.0])])];
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        let fx = &c.bodyparts[0].models[0].mesh_flexes[0];
+        assert_eq!(fx.len(), 1);
+        let f = &fx[0];
+        assert_eq!(f.flexdesc, 0);
+        assert_eq!(f.targets, [0.0, 1.0, 10.0, 11.0], "官方 targets 恒为这四档");
+        assert_eq!(f.flexpair, 0);
+        assert_eq!(f.vertanimtype, 0);
+        assert_eq!(f.vertanims.len(), 1);
+        let v = &f.vertanims[0];
+        assert_eq!(v.index, 1, "控制点 1 → 焊接顶点 1");
+        assert_eq!(v.speed, 255);
+        assert_eq!(v.side, 255, "FBX 路径写 255，不是 .vta 非 pair 路径的 0");
+        assert_eq!(v.delta, [2.5, 0.0, 0.0]);
+        assert_eq!(v.ndelta, [0.0; 3], "官方 FBX 路径丢弃 nrm_off");
+    }
+
+    /// ⭐ **一个控制点展开到它的全部焊接顶点**。
+    ///
+    /// 真 exe 实测（`oracle_fbx_shapeaxis.js`）：`axisprobe.fbx` 的
+    /// `(5,5,5)` 这个控制点在官方 VVD 里有 3 个焊接顶点（v9/v14/v23），
+    /// 官方就写了 **3 条** vertanim，内容完全相同。
+    #[test]
+    fn one_control_point_expands_to_all_welded_vertices() {
+        // 控制点 2 被焊成 3 个顶点（0/3/5），控制点 7 只有 1 个。
+        let mut c = ir_with_src_index(&[2, 7, 2, 2]);
+        c.bodyparts[0].models[0].shape_keys = vec![key("ax", &[(2, [1.0, 3.0, -2.0])])];
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        let f = &c.bodyparts[0].models[0].mesh_flexes[0][0];
+        let idx: Vec<u16> = f.vertanims.iter().map(|a| a.index).collect();
+        assert_eq!(idx, [0, 2, 3], "控制点 2 的三个焊接顶点，升序");
+        for a in &f.vertanims {
+            assert_eq!(a.delta, [1.0, 3.0, -2.0], "同一控制点的位移完全相同");
+        }
+    }
+
+    /// ⭐ **shape key 动了没进模型的顶点 ⟹ 静默跳过**（不报错、不写载荷）。
+    ///
+    /// 官方对 FBX 里没被任何网格引用的控制点也是静默的
+    /// （`simplify.cpp:2524` 的 `if (scale > 0 && vanim_mapcount[vertex])`）。
+    #[test]
+    fn shape_key_touching_absent_control_point_is_skipped() {
+        let mut c = ir_with_src_index(&[0, 1]);
+        c.bodyparts[0].models[0].shape_keys = vec![key("ghost", &[(99, [1.0, 0.0, 0.0])])];
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+        // desc / controller / rule 照注册（官方也是先注册再算载荷），
+        // 但载荷为空 ⟹ 该 mesh 一条 flex 都不写。
+        assert_eq!(c.desc.flex_descriptors.len(), 1);
+        assert!(
+            c.bodyparts[0].models[0].mesh_flexes.is_empty()
+                || c.bodyparts[0].models[0].mesh_flexes[0].is_empty(),
+            "没有命中任何顶点时不该产出 flex 记录"
+        );
+    }
+
+    /// ⭐ **与 `.vta` 路径的载荷共存**（官方 `oracle_fbx_isolate.js` 的
+    /// `W2_morphfbx_vta_flex`：`desc = ["wide","tall","v1"]`）。
+    ///
+    /// ⚠️ 这里必须让 `.vta` 路径**真的算完并走到收尾赋值**，否则测不到
+    /// 「追加 vs 覆盖」—— 第一版只调 `resolve_vta_flexes` 且 `flexes` 为空，
+    /// 它直接早退，把收尾那行换成覆盖式赋值**变异测试逃逸了**。
+    ///
+    /// 所以夹具里放一条真的 `flex`：`.vta` 只动**顶点 0**（`tip` 的顶点），
+    /// 而 shape key 动**控制点 0**（同一个顶点）。两者都落进同一个 mesh，
+    /// 于是「覆盖」会把 flex 数从 2 打回 1。
+    /// 造一份最小 `.vta`：`time 0` = 基准帧（`base`），`time 1` = 形状帧
+    /// （`base` 但把**顶点 0** 换成 `moved0`）。
+    ///
+    /// `.vta` 的 `nodes`/`skeleton` 段与模型骨架对齐（`root` → `tip`），
+    /// `vertexanimation` 的每行是 `index px py pz nx ny nz`（7 个字段）。
+    fn vta_text(base: &[[f32; 3]], moved0: &[f32; 3]) -> String {
+        let mut s = String::from(
+            "version 1\n\
+             nodes\n\
+             \x20 0 \"root\" -1\n\
+             \x20 1 \"tip\" 0\n\
+             end\n\
+             skeleton\n\
+             \x20 time 0\n\
+             \x20 0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n\
+             \x20 1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\n\
+             \x20 time 1\n\
+             \x20 0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n\
+             \x20 1 0.000000 0.000000 8.000000 0.000000 0.000000 0.000000\n\
+             end\n\
+             vertexanimation\n",
+        );
+        let mut frame = |t: i32, first: Option<&[f32; 3]>| {
+            s.push_str(&format!("  time {t}\n"));
+            for (i, p) in base.iter().enumerate() {
+                let q = match (i, first) {
+                    (0, Some(m)) => m,
+                    _ => p,
+                };
+                s.push_str(&format!(
+                    "  {i} {:.6} {:.6} {:.6} 0.000000 0.000000 1.000000\n",
+                    q[0], q[1], q[2]
+                ));
+            }
+        };
+        frame(0, None);
+        frame(1, Some(moved0));
+        s.push_str("end\n");
+        s
+    }
+
+    #[test]
+    fn shape_key_payload_survives_the_vta_pass() {
+        let d = tmpdir("skvta");
+        write(&d, "myprop-ref.smd", SMD);
+        let toml = format!(
+            "{}\n[[bodyparts.models.flexes]]\nvta = \"shape.vta\"\nname = \"v1\"\nframe = 1\n",
+            desc_toml("myprop-ref.smd")
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+
+        // ⚠️ `.vta` 的顶点是靠**位置**就近匹配到模型顶点的
+        // （`build_vanim_map` 的 3×3×3 网格，容差 `MATCH_DIST_SQR = 0.15`），
+        // 而模型顶点在 `remap_vertices_to_reference_pose` 之后会**动**。
+        // 所以先写一个占位 `.vta` 空跑一遍拿到真实位置，再据此重写它 ——
+        // 手写坐标的第一版就因为这个匹配不上（`vta_only` 是 0），
+        // 测试自己抓住了。
+        write(&d, "shape.vta", &vta_text(&[[0.0, 0.0, 0.0]; 3], &[0.0; 3]));
+        let c0 = compile(&desc, &d).expect("占位 .vta 也应能编译");
+        let pos: Vec<[f32; 3]> = c0.bodyparts[0].models[0].meshes[0]
+            .vertices
+            .iter()
+            .map(|v| v.pos)
+            .collect();
+        assert!(!pos.is_empty(), "夹具 mesh 应该有顶点");
+
+        // 真 `.vta`：基准帧 = 真实位置，第 1 帧把**第一个顶点**沿 +X 推 4。
+        let mut moved = pos.clone();
+        moved[0][0] += 4.0;
+        write(&d, "shape.vta", &vta_text(&pos, &moved[0]));
+
+        let mut c = compile(&desc, &d).expect("夹具应能编译");
+        let vta_only = c.bodyparts[0].models[0].mesh_flexes[0].len();
+        assert!(vta_only > 0, "夹具的 .vta 应该真的产出载荷（否则测不到覆盖 bug）");
+
+        // 摆出**生产顺序**：清掉 `.vta` 的载荷，只留 shape key，
+        // 然后 `resolve_shape_key_flexes` → `resolve_vta_flexes`。
+        let n_verts = c.bodyparts[0].models[0].meshes[0].vertices.len();
+        c.bodyparts[0].models[0].mesh_flexes = Vec::new();
+        c.bodyparts[0].models[0].mesh_src_index =
+            vec![(0..n_verts as u32).collect::<Vec<u32>>()];
+        c.bodyparts[0].models[0].shape_keys = vec![key("wide", &[(0, [2.5, 0.0, 0.0])])];
+
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+        let after_sk = c.bodyparts[0].models[0].mesh_flexes[0].len();
+        assert_eq!(after_sk, 1, "shape key 应产出 1 条");
+        // ⚠️ desc 表里已经有一条 `.vta` 留下的 `v1`（第一次 `compile` 注册的），
+        // 所以 shape key 的 `wide` 拿到的**不是** 0 —— 断言相对关系而不是绝对值。
+        let sk_desc = c.bodyparts[0].models[0].mesh_flexes[0][0].flexdesc;
+        let sk_name = c.desc.flex_descriptors[sk_desc as usize].name.clone();
+        assert_eq!(sk_name, "wide");
+
+        resolve_vta_flexes(&mut c, &d).expect("`.vta` 应能再跑一遍");
+        std::fs::remove_dir_all(&d).ok();
+
+        let fx = &c.bodyparts[0].models[0].mesh_flexes[0];
+        let descs: Vec<i32> = fx.iter().map(|f| f.flexdesc).collect();
+        let names: Vec<&str> = c
+            .desc
+            .flex_descriptors
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            fx.len(),
+            vta_only + 1,
+            "shape key 的载荷必须**留在** `.vta` 路径的载荷之前（覆盖式赋值会让它消失）；\
+             实际 descs={descs:?} names={names:?}"
+        );
+        assert_eq!(
+            c.desc.flex_descriptors[fx[0].flexdesc as usize].name,
+            "wide",
+            "shape key 的 flex 在前（它先跑）"
+        );
+        assert_eq!(
+            c.desc.flex_descriptors[fx[1].flexdesc as usize].name,
+            "v1",
+            "`.vta` 的 flex 在后"
+        );
+    }
+
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----
     //
     // 规则全部来自受控实验（`docs/_probe/smdl/jig{1,2,4,6,7,8}.qc` →
@@ -10253,6 +11030,68 @@ end
         );
         let desc = ModelDesc::from_toml(&toml).unwrap();
         let c = compile(&desc, &d).expect("引用动画名必须编译成功");
+        assert_eq!(c.sequences.len(), 1);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ⭐ **官方的 FBX「同文件静默 1 帧」陷阱必须被拒绝**，但**只在真的会丢帧时**。
+    ///
+    /// 三条判据（缺一不可，见 [`same_fbx_geometry_error`]）：
+    /// ① 源是 `.fbx`（**SMD 同文件完全正常**，8 帧源出 8 帧）；
+    /// ② 该文件确实是几何源；
+    /// ③ 从它采出的帧数 **> 1**（只有 1 帧时官方与 mdlc 一致，无分歧 ⟹ 不报错）。
+    ///
+    /// ⚠️ 判据 ③ 是**自我校准**的关键：`box.fbx` / `morph.fbx` 这类没有
+    /// `AnimStack` 的静态网格，「同文件」也不会丢任何东西
+    /// （`docs/_probe/oracle_samefile_smd.js` 的对照与 `fbxcheck` 的
+    /// K1/K3/K6 三个 Δ=0 用例都是这种情况），报错会误伤。
+    #[test]
+    fn same_fbx_geometry_is_rejected_only_when_frames_would_be_lost() {
+        let d = tmpdir("samefbx");
+        let geom = vec![PathBuf::from("box.fbx")];
+        let p = Path::new("box.fbx");
+        // ① 多帧 + 几何源 ⟹ 拒绝，且文案要点明「改 QC 没有用」。
+        let msg = same_fbx_geometry_error(p, &geom, 6).expect("多帧同文件必须拒绝");
+        assert!(msg.contains("网格源"), "{msg}");
+        assert!(
+            msg.contains("改 QC 没有用"),
+            "必须明确告诉用户 $animation 走不通：{msg}"
+        );
+        assert!(msg.contains("独立的 FBX 文件"), "必须给出唯一可行出路：{msg}");
+        // ② 只有 1 帧 ⟹ 官方与 mdlc 一致，**不报错**。
+        assert!(
+            same_fbx_geometry_error(p, &geom, 1).is_none(),
+            "1 帧时没有分歧，不该报错"
+        );
+        assert!(same_fbx_geometry_error(p, &geom, 0).is_none());
+        // ③ 不是几何源 ⟹ 不报错（FBX 只作动画源是合法的）。
+        assert!(
+            same_fbx_geometry_error(Path::new("rig.fbx"), &geom, 6).is_none(),
+            "不是几何源就不该报错"
+        );
+        // ④ SMD 同文件**必须放行** —— 官方在 SMD 上没有这个陷阱。
+        assert!(
+            same_fbx_geometry_error(Path::new("a.smd"), &[PathBuf::from("a.smd")], 8).is_none(),
+            "SMD 同文件正常（8 帧源出 8 帧），报错会误伤既有工程"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// SMD 同文件必须**能编过**（端到端钉住「陷阱是 FBX 专属」这条结论）。
+    ///
+    /// `docs/_probe/oracle_samefile_smd.js` 实测：`$body ab_z8.smd` +
+    /// `$sequence idle "ab_z8.smd"` 官方出 **8 帧**（8 帧源出 8 帧），
+    /// 与 FBX 的「静默 1 帧」形成对照。mdlc 必须同样放行。
+    #[test]
+    fn smd_used_as_both_geometry_and_animation_is_accepted() {
+        let d = tmpdir("smdsame");
+        write(&d, "a.smd", SMD);
+        let toml = format!(
+            "{}\n[[sequences]]\nname = \"idle\"\nsmd = \"a.smd\"\n",
+            desc_toml("a.smd")
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+        let c = compile(&desc, &d).expect("SMD 同文件必须编译成功（官方也是如此）");
         assert_eq!(c.sequences.len(), 1);
         std::fs::remove_dir_all(&d).ok();
     }

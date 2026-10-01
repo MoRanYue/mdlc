@@ -384,6 +384,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "toml",
+ "ufbx",
 ]
 
 [[package]]
@@ -773,6 +774,15 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "ufbx"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "260522f1eb74139f0e78b29dd82a58e5437d728c5498024a39e5af7282694240"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "unicode-ident"

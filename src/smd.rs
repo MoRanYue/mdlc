@@ -111,7 +111,23 @@ pub struct SmdVertex {
     pub uv: [f32; 2],
     /// 蒙皮绑定，1..=3 组（SMD 允许更多，本实现只保留前 3 组）。
     pub links: Vec<SmdBoneLink>,
+    /// **源文件里的顶点号**。
+    ///
+    /// * SMD 路径：恒为 [`NO_SOURCE_INDEX`]（SMD 的顶点号就是它在三角形
+    ///   流里的位置，没有独立含义）。
+    /// * FBX 路径：该角对应的 **控制点号**（`mesh.vertex_indices[corner]`）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// FBX 的 shape key 是**按控制点**给位移的，而最终落到 `.mdl` 里的
+    /// vertanim 是**按焊接顶点**写的（一个控制点会展开成多个焊接顶点，
+    /// 见 `docs/fbx-support.md` §1.6b）。要把两者对上，就必须在焊接时
+    /// 记住每个焊接顶点来自哪个控制点。
+    pub src_index: u32,
 }
+
+/// 「这个顶点没有源文件顶点号」——SMD 路径的哨兵值。
+pub const NO_SOURCE_INDEX: u32 = u32::MAX;
 
 /// 一个三角形：材质名 + 3 个顶点。
 #[derive(Debug, Clone, PartialEq)]
@@ -480,8 +496,7 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 })?;
 
                 pending[pending_len] = Some(SmdVertex {
-                    parent_bone: parse_i32(t[0], line, "parentBone")?,
-                    position: [
+                    parent_bone: parse_i32(t[0], line, "parentBone")?,                    position: [
                         parse_f32(t[1], line, "pos.x")?,
                         parse_f32(t[2], line, "pos.y")?,
                         parse_f32(t[3], line, "pos.z")?,
@@ -527,6 +542,8 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                         1.0 - parse_f32(t[8], line, "v")?,
                     ],
                     links,
+                    // SMD 的顶点号就是它在三角形流里的位置，没有独立含义。
+                    src_index: NO_SOURCE_INDEX,
                 });
                 pending_len += 1;
 

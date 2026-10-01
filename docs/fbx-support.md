@@ -171,11 +171,54 @@ $sequence idle "morph.fbx" fps 30
 flexdesc      : ["wide", "tall"]              ← shape key 名原样
 flexcontroller: type="wide" name="wide" min=0 max=1   ← 每个 shape key 一个，范围 [0,1]
                 type="tall" name="tall" min=0 max=1
-flexrule      : rule[0] flexdesc=0("wide") numops=1 op[0]=FLEXOP_MUL index=0
-                rule[1] flexdesc=1("tall") numops=1 op[0]=FLEXOP_MUL index=1
+flexrule      : rule[0] flexdesc=0("wide") numops=1 op[0]=STUDIO_FETCH1 index=0
+                rule[1] flexdesc=1("tall") numops=1 op[0]=STUDIO_FETCH1 index=1
 mesh flex 记录: flexdesc=0 targets=[0,1,10,11] numverts=24 pair=0 vtype=0
                 flexdesc=1 targets=[0,1,10,11] numverts=24 pair=0 vtype=0
 ```
+
+> ⚠️ **勘误**：本节早期版本写的是 `op[0] = FLEXOP_MUL`，**错了**。
+> 直接在官方产物 `k4_morph.mdl` 上读出来的 `flexrule.op` 是 **`2`**，
+> 即 `hl2sdk-l4d2\public\studio.h:2795` 的 **`#define STUDIO_FETCH1 2`**
+> （`// get Flexcontroller value`），不是 `STUDIO_MUL`（`6`）。
+> 验证：`node docs\_probe\fbx_shape_payload.js <k4_morph.mdl>`
+> ⟹ `rule[0] {op=2 index=0}` / `rule[1] {op=2 index=1}`。
+
+⭐⭐⭐ **载荷字段全表**（在 `k4_morph.mdl` 上逐条读出，48 条 vertanim 无例外）：
+
+| 字段 | 官方取值 | 说明 |
+|---|---|---|
+| `flexdesc` | `0` / `1` | 指向自己的 flexdesc |
+| `targets` | **恒 `[0, 1, 10, 11]`** | 与 `.vta` 路径默认值同形 |
+| `flexpair` | **恒 `0`** | shape key 不做左右配对 |
+| `vertanimtype` | **恒 `0`** | 没有 wrinkle（步长 16） |
+| `speed` | **恒 `255`** | = 1.0（等价于 `decay = 0.0`） |
+| `side` | **恒 `255`** | = 1.0（`.vta` 非 pair 路径写 0，**这里不同**） |
+| `ndelta` | **恒 `(0,0,0)`** | 官方 FBX 路径**丢弃** `nrm_off` |
+| `delta` | 见下 | 已变换到 Source 空间 |
+
+⭐⭐⭐⭐⭐ **`delta` 的轴向已单顶点定案**（`gen_fbx_shapeaxis.py` → `axisprobe.fbx`
+→ `oracle_fbx_shapeaxis.js`）：Blender 里把 `(5,5,5)` 那个顶点移动 **`(+1,+2,+3)`**，
+官方产物 `delta = (1.0000, 2.9980, -2.0000)` ⟹ **变换是 `(x,y,z) → (x, z, −y)`**
+（绕 X 轴 **−90°**，即 FBX 导入的 Z-up → Y-up 约定）。
+`3.0 → 2.9980` 是**半精度向零截断**（`f32_to_half_bits`，`probe_half_rounding.js` 7/7）。
+
+⭐⭐⭐⭐⭐ **vertanim 的排列规则已解出**（`docs\_probe\k4_group_rule.js`）：
+**按控制点号分组，组内按 mesh 顶点号降序；控制点组的出现顺序 = 该 mesh 里
+各控制点的首次出现顺序**（= 官方 VVD 的顶点顺序）。
+
+`morph.fbx` 的 `wide`：`cp6→20,10,5` → `cp4→18,8,7` → `cp7→23,14,9` → `cp5→17,12,11`
+→ `cp2→22,6,1` → `cp0→16,4,3` → `cp3→21,13,2` → `cp1→19,15,0`，
+与官方产物逐项吻合。`tall` 同序。
+
+⚠️ **但 mdlc 有意不复刻这个顺序**（§4.6 偏离 9）：它取决于官方的顶点焊接顺序，
+而那个顺序与 mdlc **本就不同**（同一批顶点、不同编号）。载荷的**内容**
+（顶点集合 + delta 多重集）完全一致，已由 `k4_flex_align.js` 按 VVD 位置
+对齐验证：`位置对齐相同 16，不同 0，仅 A 0，仅 B 0`。
+
+⭐⭐⭐ **一个控制点展开到它的全部焊接顶点**：`axisprobe.fbx` 的 `(5,5,5)`
+在官方 VVD 里有 3 个焊接顶点（v9/v14/v23），官方就写了 **3 条** vertanim，
+内容完全相同。
 
 ⟹ ⭐ **每个 shape key 自动产生：1 个 flexdesc + 1 个 flexcontroller（`[0,1]`）+ 1 条
 `MUL <自己的 controller 下标>` 的 flexrule + 逐顶点载荷。**
@@ -390,6 +433,20 @@ order_rw.fbx:
 ⭐ **陷阱 1（最危险）**：**同一个 FBX 既作网格源又作动画源 ⟹ 静默只得 1 帧。**
 `U1`/`U2`/`U4` 三例都命中，`exit=0`、无任何警告、产物"成功"。
 
+⭐⭐ **这是 FBX 专属行为，SMD 没有这个陷阱**（`oracle_samefile_smd.js`，5 用例）：
+
+| 用例 | `$body` 源 | `$sequence` 源 | 帧数 |
+|---|---|---|---|
+| `M1_smd_same` | `ab_z8.smd`（8 帧） | `ab_z8.smd`（**同**） | **8** ✅ 正常 |
+| `M2_smd_diff` | `ab_z8.smd` | `abi7.smd`（异） | 5 |
+| `M3_fbx_same` | `rig_anim.fbx` | `rig_anim.fbx`（**同**） | **1** ❌ 陷阱 |
+| `M4_fbx_diff` | `rig.fbx` | `rig_anim.fbx`（异） | 6 |
+| `M5_smd_same_5f` | `abi7.smd`（5 帧） | `abi7.smd`（**同**） | **5** ✅ 正常 |
+
+⟹ **SMD 同文件完全正常（8 帧源出 8 帧、5 帧源出 5 帧），只有 FBX 退化成 1 帧。**
+因此 mdlc 的拒绝判据**必须按源格式分流** —— 对 SMD 同文件放行，
+否则会误伤大量既有工程（parity 语料里 `$body x.smd` + `$sequence y x.smd` 是常见写法）。
+
 ⭐ **精确边界已单变量定案**（`oracle_fbx_samefile.js`，6 用例）：
 触发条件是**「同一个文件」**，**不是**「body 源本身带动画」：
 
@@ -588,7 +645,7 @@ $ mdlc build-qc a_body.qc --out outA
 | **shape key → flex** | **自动注册**（desc + controller + rule + 载荷） | **同官方** | §1.6b；**零 QC 语法** |
 | **FBX 上写 `flexfile "<x.fbx>"` + `flex`** | **崩溃** | **报错**（见 §4.4 陷阱 4） | ⚠️ 默认偏离 |
 | **FBX 上只写 `flexfile "<x.fbx>"`** | 不崩，但**静默空操作** | **报错** | ⚠️ 默认偏离（用户以为生效了，其实没有） |
-| 同一文件既是网格源又是动画源 | 静默 1 帧 | **拒绝**（见 §4.4） | ⚠️ **默认偏离** |
+| 同一文件既是网格源又是动画源（**仅 `.fbx`**） | 静默 1 帧 | **拒绝**（见 §4.4） | ⚠️ **默认偏离**；SMD 同文件正常，**放行** |
 
 ### 4.3 命名原则：按概念命名，不按格式命名
 
@@ -690,14 +747,34 @@ mdlc 对这两种写法都会**报错**并指向 `srcshapekey*` 系列（§4.4 �
 ⭐ 触发条件是**文件路径相同**（已单变量定案，见 §1.11 的 S1–S6 表），
 与「body 源带不带动画」无关。
 
+⭐⭐ **这是 FBX 专属**：SMD 同文件完全正常（`oracle_samefile_smd.js` 的
+`M1_smd_same` 8 帧源出 8 帧、`M5_smd_same_5f` 5 帧源出 5 帧）。
+mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 报错。
+
+⭐⭐ **出路只有一条**（`oracle_samefile_fix.js`，6 用例实测）：
+
+| 用例 | 写法 | 官方帧数 |
+|---|---|---|
+| `N1_direct_same` | `$body "rig_anim.fbx"` + `$sequence idle "rig_anim.fbx" fps 30` | **1** |
+| `N2_anim_block_same` | 同上 + `$animation anim "rig_anim.fbx"` + `$sequence idle { anim }` | **1** ❌ |
+| `N3_anim_block_diff` | `$body "rig.fbx"` + `$animation anim "rig_anim.fbx"` + `$sequence idle { anim }` | 6 ✅ |
+| `N4_seq_by_name` | `$body "rig_anim.fbx"` + `$animation anim "rig_anim.fbx"` + `$sequence idle "anim"` | **1** ❌ |
+| `N5_anim_then_seq_same_file` | 同上 + `$sequence idle "rig_anim.fbx" fps 30` | **1** ❌（还多出一条 `@idle`） |
+| `N6_twostack_anim_block` | `$body "twostack.fbx"` + `$animation anim "twostack.fbx"` + `$sequence idle { anim }` | **1** ❌ |
+
+⚠️ **`$animation` 走不通** —— N2/N4/N5/N6 全部仍是 1 帧。
+「同一文件」这个条件一旦成立，**无论怎么改写 QC 都拿不回动画**
+（N5 甚至会同时产出 1 帧的 `anim` 和 1 帧的 `@idle`）。
+唯一有效的出路是 **N3：把动画放到另一个 FBX 文件**。
+
 mdlc **拒绝**，并给出可操作的出路：
 
 ```
 错误：`$sequence idle` 引用的 twostack.fbx 已经被 `$body body "twostack.fbx"` 当作网格源加载。
       官方在这个组合下**静默地**只产出 1 帧（实测 exit=0、无警告），mdlc 不产出这种结果。
-      请任选其一：
-        · 把动画拆到独立的 FBX 文件（推荐）
-        · 用 `$animation idle "twostack.fbx"` + `$sequence idle { idle }` 显式声明
+      改 QC 没有用 —— `$animation` 块、按名引用、重写 `$sequence` 都被实测证明仍是 1 帧
+      （`oracle_samefile_fix.js` 的 N2/N4/N5/N6）。唯一有效的做法是：
+        · 把动画拆到独立的 FBX 文件（唯一可行）
         · 若确实要 1 帧静态姿态，写 `numframes 1`
 ```
 
@@ -777,12 +854,21 @@ mdlc **拒绝**，并给出可操作的出路：
 
 | # | 偏离 | 理由 |
 |---|---|---|
-| 1 | **同一文件既是网格源又是动画源 ⟹ 报错**（官方静默 1 帧） | 官方结果不可用且无诊断（§4.4 陷阱 1） |
+| 1 | **同一文件既是网格源又是动画源 ⟹ 报错**（官方静默 1 帧）**——仅当该文件是 `.fbx`** | 官方结果不可用且无诊断（§4.4 陷阱 1）；**SMD 同文件正常**（8 帧源出 8 帧），故不报错 |
 | 2 | **FBX 源上写 `flexfile "<某.fbx>"` + `flex` ⟹ 报错**（官方必崩） | 官方 4 个变体全部 `EXCEPTION_ACCESS_VIOLATION`；只写 `flexfile "x.fbx"` 虽不崩但是**静默空操作**；而 FBX 的 shape key 本就自动注册（§1.6b） |
 | 3 | 新增 `srcpart` / `srcmaterial` / `srcscale` / `srcaxis` / `srcstack` / `srcfps` | 用户授权（§4 前提）；官方对这些决策**没有**任何语法 |
 | 4 | 新增 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore` | 官方的自动注册**不可控**（取哪些 / 顺序 / 忽略都做不到），且禁止显式语法 |
 | 5 | 对 §1.11 的全部陷阱发诊断 | 官方静默 |
 | 6 | `$collisionmodel` 的 `building single convex` 升级为明确警告 | 官方只打一行 WARNING 就继续 |
+| 7 | **shape key 名含 `_` 时保留原名**（官方会做 token 重排，`t_2e3` → `2e3_t`） | 官方行为让 QC 作者必须猜内部机制（`%t_2e3` 还是 `%2e3_t`？）；用户明确反对「猜编译器内部机制」（§4.0 前提） |
+| 8 | **shape key 名含 `_` 时照常写 `flexrule`**（官方 `numflexrules` 变 0） | 官方是**静默**丢掉规则 ⟹ 表情不动且不报错，属有害行为 |
+| 9 | **vertanim 顺序 = 焊接顶点升序**（官方 FBX 是「控制点首次出现序 × 组内降序」） | 官方的顺序取决于它自己的顶点焊接顺序，**该顺序 mdlc 与官方本就不同**（见偏离 11），复刻它毫无意义；载荷内容（顶点集合 + delta 多重集）完全一致，已由 `k4_flex_align.js` 按 VVD 位置对齐验证（16/16） |
+| 10 | **丢弃 `nrm_off`，`ndelta` 恒 0** | 与官方 FBX 路径一致（`axisprobe.fbx` 的 `nrm_off` 非零而官方产物 `ndelta=(0,0,0)`）；`flex` 的 `.vta` 路径仍照常算 `ndelta` |
+| 11 | **`mesh.vertexdata` / `model.vertexdata` 写 0**（官方写运行期堆指针） | 官方把**进程地址**写进产物（语料 87/87 个 mesh 非 0，如 `0x7de5088c`）—— 那是 ASLR 后的堆地址，**逐字节对齐既不可能也无意义**；这两个字段由引擎在加载时填 |
+
+> ⚠️ **偏离 11 的连带后果**：`k4_morph.mdl` 与官方产物**不可能逐字节一致**
+> （还有 `checksum`、1 ULP 级的 `hull_min/hull_max`、`seqdesc.bbmin/bbmax`）。
+> 验收口径是**逐字段**（`docs/_probe/mdl_field_dump.js`）而非逐字节。
 
 > ⚠️ **跨工具兼容性**：偏离 1–4 意味着**用了新语法的 QC 不能直接跑官方工具**。
 > 这与既有扩展命令（`$optimizevtx` 等）的处理方式一致 ——
@@ -956,6 +1042,8 @@ FBX 侧已有 **82 个官方用例**的现成夹具与期望值（§1 各表）�
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_isolate.js` | 6 用例：FBX 自动注册与 `.vta` 显式 flex **可共存** |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_eyelid.js` | 5 用例：`eyelid` / `flexcontroller` 在 FBX 上安全 |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_samefile.js` | **6 用例单变量**：证明「静默 1 帧」的触发条件是**同一文件**（§1.11 陷阱 1） |
+| `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_smd.js` | **5 用例**：证明该陷阱是 **FBX 专属**（SMD 同文件 8 帧源出 8 帧、5 帧源出 5 帧） |
+| `D:\GITHUB\mdlc\docs\_probe\oracle_samefile_fix.js` | **6 用例**：证明 `$animation` 走不通（N2/N4/N5/N6 全 1 帧），唯一出路是换文件（N3=6 帧） |
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_axis.js` | 3 用例：证明官方**不做轴向变换**，原样搬运根变换（§1.7b） |
 | `D:\DSH\L4D2ReverseEngineering\_fbxresearch\gen_fbx_axis.py` | 造出只有导出轴向不同的三份 FBX（§1.7b 的决定性夹具） |
 | `D:\GITHUB\mdlc\docs\_probe\_tmp_dump_flexrules.js` | 只读 dump：`mstudioflexrule_t` 逐字段（§1.6b 的三件套） |

@@ -13,7 +13,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 719 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 740 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -135,15 +135,20 @@ QC 脚本  ──┘
 
 网格**不写在描述里** —— 真实模型有几万到几十万个顶点（官方 `v_autoshotgun` 有
 388,765 个），内联会让描述文件膨胀到几百 MB 且无法用文本工具处理。描述文件只
-**引用** SMD。
+**引用**网格源。
+
+网格源可以是 **SMD**，也可以是 **FBX**（`.fbx`，走 `ufbx`，见
+[`docs/fbx-support.md`](docs/fbx-support.md)）。**格式由扩展名决定，所以必须写全**
+—— 这也是不自动补扩展名的原因之一（见 `## 已知未实现`）。
 
 职责划分：
 
 | 内容 | 由谁承载 | 对应 QC |
 |---|---|---|
 | 模型名 / 材质 / 骨骼 / bodypart 树 | TOML 描述文件 | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
-| **网格（顶点、法线、UV、蒙皮）** | **SMD 文件** | `studio "x.smd"` |
-| **参考姿态** | **SMD 的 `skeleton` 第 0 帧** | 参考 SMD |
+| **网格（顶点、法线、UV、蒙皮）** | **SMD / FBX 文件** | `studio "x.smd"` / `$body body "x.fbx"` |
+| **参考姿态** | **SMD 的 `skeleton` 第 0 帧**（FBX 用节点的局部 TRS） | 参考 SMD |
+| **表情（flex）** | **`.vta` 的帧**，或 **FBX 的 shape key**（自动注册） | `flexfile` + `flex` |
 
 ---
 
@@ -696,7 +701,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 719 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 740 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -725,29 +730,30 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 719 passed / 0 failed / 6 ignored
+cargo test --release          # 740 passed / 0 failed / 6 ignored
 ```
 
-**719 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 725 个单元测试 =
-719 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**740 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 746 个单元测试 =
+740 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
 | `qc` | 141 | QC 词法（`qc::lexer` 24）/ 语法（`qc::parse` 65）/ 规则表达式语义（`qc::flexrule` 52） |
-| `compile` | 133 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一 |
-| `mdl_writer` | 81 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
+| `compile` | 141 | 描述 + SMD → IR、跨文件一致性校验、拆分、LOD 统一、FBX shape key → flex |
+| `mdl_writer` | 82 | 各结构体偏移与大小的硬编码断言、字符串池、段顺序 |
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
 | `phy` | 77 | 凸包、`$concave`、ragdoll、IVP 布局不变量 |
-| `vtx_writer` | 30 | strip group 链、骨骼调色板、按 `maxBonesPerStrip` 拆 strip |
+| `vtx_writer` | 31 | strip group 链、骨骼调色板、按 `maxBonesPerStrip` 拆 strip |
 | `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
 | `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
-| `smd` | 18 | SMD 解析（含 9/10 token 顶点行） |
-| `bone_math` | 17 | 欧拉/四元数、矩阵约定 |
-| `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
+| `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
+| `bone_math` | 19 | 欧拉/四元数、矩阵约定 |
 | `ani_writer` | 16 | `.ani` 容器与块对齐 |
+| `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
 | `vta` | 14 | `.vta` 解析 |
-| `lib.rs` 的 `tests` | 10 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
+| `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
+| `fbx` | 12 | FBX 三条几何口径（R3/N3/E）、`src*` 选项矩阵、shape key 帧号 |
 | `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
 | `layout` | 6 | 段偏移计算与单调性 |
 
@@ -811,7 +817,8 @@ src/
   lib.rs          库根：模块声明与 VVD 往返判据
   model.rs        IR（ModelDesc）与全部校验规则；含 TEMPLATE_TOML
   smd.rs          SMD 网格 / 骨架解析
-  compile.rs      TOML|QC + SMD → 编译期 IR（跨文件校验、拆分、LOD 统一）
+  fbx.rs          FBX 源读取（ufbx → 中立 SMD；含 shape key → flex 元数据）
+  compile.rs      TOML|QC + SMD|FBX → 编译期 IR（跨文件校验、拆分、LOD 统一）
   qc/             QC 前端
     lexer.rs        词法（含官方 TokenAvailable 的行内语义）
     parse.rs        命令分发表 → ModelDesc
@@ -838,7 +845,8 @@ src/
 换成 `+ n * SIZE`、在 `write_mdl` 里按偏移写字节。
 
 **数学用现成 crate**：`parry3d`（quickhull 凸包、VHACD、质量属性）、`meshopt`
-（顶点缓存优化）、`clap`（CLI）、`toml` + `serde`（描述文件）。
+（顶点缓存优化）、`ufbx`（FBX 解析，MIT OR Unlicense）、`clap`（CLI）、
+`toml` + `serde`（描述文件）。
 
 ---
 

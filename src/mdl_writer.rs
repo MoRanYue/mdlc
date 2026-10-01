@@ -1641,13 +1641,63 @@ fn build_string_pool(
     for p in &desc.materials.search_paths {
         cd_offsets.push(reg!(&normalize_cd_material(p)));
     }
-    // ⛔ **不要在这里自动追加空串。**
+    // ⭐ **FBX 几何源 ⟹ 末尾追加一条空串**（L4D2 导入器的私有行为）。
+    //
+    // 这条规则是**真 exe 单变量阶梯**测出来的，不是猜的
+    // （`docs\_probe\oracle_cdtex_{texture,multi,order,scope,path}.js`）：
+    //
+    // | 用例 | 几何源 | `$cdmaterials` | `numcdtextures` |
+    // |---|---|---|---|
+    // | C0 | FBX | 无 | 1 = `[""]` |
+    // | C1 | FBX | 1 条 | 2 = `["models\mymod\", ""]` |
+    // | C3 | FBX | 2 条 | 3 = `[real, real, ""]` |
+    // | C1 | **SMD** | 1 条 | **1** = `["models\mymod\"]` |
+    // | C0 | **SMD** | 无 | 1 = 合成 `models/<outname>/` |
+    //
+    // 三条已钉死的细节：
+    //
+    // 1. **恒在最后**。与 `$body` 写在 `$cdmaterials` 之前还是之后无关
+    //    （N1 ≡ N2）；把两条 `$cdmaterials` 夹住 `$body` 仍得
+    //    `["models\aaa\", "models\zzz\", ""]`（P1）⟹ 是**写出阶段的追加**，
+    //    不是「加载 FBX 时 append」。
+    // 2. **恒为 `""`**，**不是** FBX 的目录 —— FBX 放子目录
+    //    （`$body "sub/box.fbx"`）或 `$pushd "sub"` 时追加值仍是 `""`
+    //    （Q2/Q4/Q6）。
+    // 3. **per-model 一条**，不是 per-file —— 两个 FBX 几何源（Q5）也只追加
+    //    一条。
+    //
+    // 触发范围（P2/P3/P4 + M6）：`$bodygroup { studio "x.fbx" }` ✅、
+    // `$lod … replacemodel` ✅、`$collisionmodel "x.fbx"` ❌、FBX 只作
+    // **动画源** ❌。⟹ 判据正好是「**bodypart 的网格源或任一 LOD 的网格源**
+    // 里有没有 `.fbx`」—— `$collisionmodel` 与动画源都不在这两个位置里，
+    // 所以这里只看 `bodyparts` 与 `lods`。
+    //
+    // ⚠️ 判据用**扩展名**（[`crate::compile::SourceKind::of`]），不用
+    // `SourceKind` 以外的信息 —— R34 之后扩展名就是可靠的格式信号
+    // （见 `docs/fbx-support.md` §4.3）。
+    let has_fbx_geometry = desc.bodyparts.iter().any(|bp| {
+        bp.models.iter().any(|m| {
+            crate::compile::SourceKind::of(std::path::Path::new(&m.smd))
+                == Ok(crate::compile::SourceKind::Fbx)
+        }) || bp.models.iter().any(|m| {
+            m.lods.iter().any(|l| {
+                l.smd.as_deref().is_some_and(|s| {
+                    crate::compile::SourceKind::of(std::path::Path::new(s))
+                        == Ok(crate::compile::SourceKind::Fbx)
+                })
+            })
+        })
+    });
+    if has_fbx_geometry {
+        cd_offsets.push(reg!(""));
+    }
+    // ⛔ **不要在这里做任何**其他**推断。**
     //
     // 我一度根据语料相关性（「纹理名含 `/` ⟺ 有空 cdtexture」，
     // 1460/0/0/1841 完美分离）写了一条「自动加根目录哨兵」的规则。
     // **那是把相关性当成了因果。**
     //
-    // 受控实验（`docs\_probe\smdl\cdexp{1,2,3}.qc`）证明真实机制是
+    // 受控实验（`docs\_probe\smdl\cdexp{1,2,3}.qc`）证明**SMD 源**的真实机制是
     // **QC 里显式写了 `$cdmaterials ""`**：
     //
     // | QC | `numcdtextures` | 内容 |
@@ -1664,9 +1714,12 @@ fn build_string_pool(
     // `$cdmaterials ""`**（Crowbar 反编译出来的 QC 常见形态）——
     // 相关性的来源在这里，不在纹理名本身。
     //
-    // ⇒ **表达方式是 TOML 的 `search_paths` 里写一个 `""`**，
+    // ⇒ **SMD 源的表达方式是 TOML 的 `search_paths` 里写一个 `""`**，
     // 由用户显式给出；写出器**不做任何推断**。
     // 见 `normalize_cd_material("")` == `""`。
+    //
+    // 上面那条 FBX 规则是**例外**，而且它不是推断 —— 它是官方导入器自己
+    // 干的事（源码不可得，但 5 个探针、20+ 个用例一致复现）。
 
     Ok(StringPool {
         string_buf,
@@ -4944,6 +4997,104 @@ end
             String::from_utf8_lossy(&b2[o..e]).to_string()
         };
         assert_eq!(s(rd2(cd_at + 4) as usize), "", "第 2 条应是空串");
+    }
+
+    /// **FBX 几何源 ⟹ `cdtextures` 末尾多一条空串**（L4D2 导入器的私有行为）。
+    ///
+    /// 受控实验（真 exe，`docs\_probe\oracle_cdtex_{texture,multi,order,scope,path}.js`）：
+    ///
+    /// | 用例 | 几何源 | `$cdmaterials` | `numcdtextures` |
+    /// |---|---|---|---|
+    /// | C0 | FBX | 无 | 1 = `[""]` |
+    /// | C1 | FBX | 1 条 | 2 = `["models\mymod\", ""]` |
+    /// | C3 | FBX | 2 条 | 3 = `[real, real, ""]` |
+    /// | C1 | **SMD** | 1 条 | **1** |
+    /// | C0 | **SMD** | 无 | 1 = 合成 `models/<outname>/` |
+    ///
+    /// 触发范围：`$bodygroup { studio }` ✅ / `$lod … replacemodel` ✅ /
+    /// `$collisionmodel` ❌ / FBX 只作动画源 ❌。
+    ///
+    /// 本测试**直接改 IR 里的源路径**，不碰真 FBX 文件 —— 写出器读的是
+    /// `desc.bodyparts[].models[].smd` 这个**字符串**，判据只看扩展名，
+    /// 所以不需要让 `ufbx` 真去解析一个文件。这样测试就不依赖
+    /// `docs/_probe/`（那棵树在 `.gitignore` 里，CI 上没有）。
+    #[test]
+    fn fbx_geometry_appends_an_empty_cdtexture() {
+        let cd_count = |d: &CompiledModelDesc| -> i32 {
+            let out = write_mdl(d).unwrap();
+            let b = &out.bytes;
+            i32::from_le_bytes(b[off::CD_TEXTURE_COUNT..off::CD_TEXTURE_COUNT + 4].try_into().unwrap())
+        };
+        let cd_last = |d: &CompiledModelDesc| -> String {
+            let out = write_mdl(d).unwrap();
+            let b = &out.bytes;
+            let rd = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            let n = rd(off::CD_TEXTURE_COUNT) as usize;
+            let at = rd(off::CD_TEXTURE_OFFSET) as usize;
+            let o = rd(at + (n - 1) * 4) as usize;
+            let mut e = o;
+            while e < b.len() && b[e] != 0 {
+                e += 1;
+            }
+            String::from_utf8_lossy(&b[o..e]).to_string()
+        };
+
+        // ① SMD 几何源（`minimal()` 就是）：恰好等于 `search_paths` 的条数。
+        let smd = minimal();
+        assert_eq!(
+            cd_count(&smd),
+            smd.desc.materials.search_paths.len() as i32,
+            "SMD 几何源不应被追加空串"
+        );
+
+        // ② 把 `$model` 的源换成 FBX ⟹ +1 条，且最后一条是空串。
+        let mut fbx = minimal();
+        fbx.desc.bodyparts[0].models[0].smd = "box.fbx".into();
+        assert_eq!(
+            cd_count(&fbx),
+            fbx.desc.materials.search_paths.len() as i32 + 1,
+            "FBX 几何源应追加一条"
+        );
+        assert_eq!(cd_last(&fbx), "", "追加的应是空串，不是 FBX 的目录");
+
+        // ③ `$lod … replacemodel` 也触发（P3），即使 `$model` 本身是 SMD。
+        let lod_of = |smd: &str| crate::model::LodModel {
+            smd: Some(smd.into()),
+            switch_point: Some(20.0),
+            bone_tree_collapse: Vec::new(),
+            replace_bone: Vec::new(),
+            no_facial: false,
+        };
+        let mut lod = minimal();
+        lod.desc.bodyparts[0].models[0]
+            .lods
+            .push(lod_of("box.fbx"));
+        assert_eq!(
+            cd_count(&lod),
+            lod.desc.materials.search_paths.len() as i32 + 1,
+            "LOD 的 replacemodel 指向 FBX 时也应追加"
+        );
+
+        // ④ 多个 FBX 几何源仍只追加**一条**（per-model，不是 per-file；Q5/M2）。
+        let mut two = minimal();
+        two.desc.bodyparts[0].models[0].smd = "box.fbx".into();
+        two.desc.bodyparts[0].models[0]
+            .lods
+            .push(lod_of("sub/box.fbx"));
+        assert_eq!(
+            cd_count(&two),
+            two.desc.materials.search_paths.len() as i32 + 1,
+            "两个 FBX 几何源也只追加一条"
+        );
+
+        // ⑤ 大小写不敏感（Windows 上 `.FBX` 与 `.fbx` 是同一个文件）。
+        let mut upper = minimal();
+        upper.desc.bodyparts[0].models[0].smd = "BOX.FBX".into();
+        assert_eq!(
+            cd_count(&upper),
+            upper.desc.materials.search_paths.len() as i32 + 1,
+            "扩展名判据应大小写不敏感"
+        );
     }
 
     #[test]

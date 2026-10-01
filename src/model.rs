@@ -3830,6 +3830,23 @@ pub struct CompiledModel {
     /// 空 `Vec` = 该 mesh 没有形状（`numflexes = 0`，完全正常 ——
     /// 语料里 `survivor_coach` 的 5 个 mesh 就有 2 个是 0）。
     pub mesh_flexes: Vec<Vec<crate::flex::ResolvedFlex>>,
+    /// **每个 mesh 的「焊接顶点 → 源控制点号」平行表**。
+    ///
+    /// 与 [`Self::meshes`] 一一对应，内层与 `Mesh::vertices` 一一对应。
+    /// SMD 源没有控制点概念，此时**整个 `Vec` 是空的**（`Vec::new()`），
+    /// 不是「一堆空内层」。
+    ///
+    /// ⚠️ 这张表只在 [`crate::compile`] 的 flex 解析阶段有效 ——
+    /// `split_oversized_meshes` 会重排顶点，之后它与 `meshes` 就不再对应。
+    /// 之所以仍然放在 IR 上而不是当场用掉：flex 解析发生在 bodypart 循环
+    /// **之后**，中间隔着 `remap_vertices_to_reference_pose` 等若干阶段，
+    /// 没有别的通道能把这份信息带过去。
+    pub mesh_src_index: Vec<Vec<u32>>,
+    /// 该 model 的几何源是 FBX 时，从文件里读出的 shape key。
+    ///
+    /// 官方把 FBX 的 shape key **全自动**注册成 flex（`docs/fbx-support.md`
+    /// §1.6b），所以这里不需要 QC 写任何 flex 语法。
+    pub shape_keys: Vec<crate::fbx::FbxShapeKey>,
 }
 
 /// 一个 body part 的编译结果。

@@ -2177,7 +2177,7 @@ impl<'a> Parser<'a> {
                             format!("未知的命令 {:?}（官方是 unknown command {:?}）", t.text, t.text),
                         ));
                     }
-                    if t.text.ends_with(".smd") || t.text.ends_with(".SMD") {
+                    if crate::compile::is_source_ref(&t.text) {
                         if blend_names.is_empty() && seq.smd.is_empty() {
                             seq.smd = self.resolve_src(&t.text);
                             self.referenced_files.push(seq.smd.clone());
@@ -4014,73 +4014,74 @@ impl<'a> Parser<'a> {
                 }
             };
             // ⚠️ **不要静默吞掉读失败** —— 那正是本项目反复踩到的
-            // 「静默吃数据」：SMD 读不到时骨骼表会变空，
+            // 「静默吃数据」：源读不到时骨骼表会变空，
             // 最后只报一句「至少需要一根骨骼」，指向不了真因。
-            let info = match std::fs::read_to_string(&p) {
-                Err(e) => {
+            //
+            // ⚠️⚠️ 必须走 `compile::read_source`，**不能**自己
+            // `read_to_string` + `parse_smd`：QC 里的资产引用从 R35 起可以
+            // 是 `.fbx`（`docs/fbx-support.md`），而 FBX 是**二进制** ——
+            // 走文本读取会直接报 `stream did not contain valid UTF-8`，
+            // 与「文件坏了」毫无关系。格式分派只允许存在于 `read_source`
+            // 一处，否则加 glTF 时要记得改这里（第 N 个调用点）。
+            //
+            // ⚠️ `CompileError` 没有行号字段，`.smd` 的解析行号在
+            // `SmdError` 的 `Display` 里（`第 N 行：…`），已包含在 message
+            // 中；`.fbx` 本来就没有行号概念。所以这里统一填 0。
+            let info = match crate::compile::read_source(&p, "QC 里引用了它") {
+                Err(err) => {
                     self.errors.push(QcError::new(
                         p.display().to_string(),
                         0,
-                        format!("读不到 SMD（QC 里引用了它）：{e}"),
+                        err.message,
                     ));
                     None
                 }
-                Ok(text) => match crate::smd::parse_smd(&text) {
-                    Err(e) => {
-                        self.errors.push(QcError::new(
-                            p.display().to_string(),
-                            e.line,
-                            format!("SMD 解析失败：{e}"),
-                        ));
-                        None
-                    }
-                    Ok(s) => Some(SmdInfo {
-                        nodes: s.nodes.iter().map(|n| n.name.clone()).collect(),
-                        materials: s.materials_in_order(),
-                        num_frames: s.frames.len(),
-                        // `links` 已保证非空（见 `SmdInfo::vert_refs` 的注释），
-                        // 下标越界的引用直接丢弃 —— 顶点路径
-                        // （`compile::smd_vertex_to_ir`）另有更精确的报错。
-                        vert_refs: s
-                            .triangles
-                            .iter()
-                            .flat_map(|t| t.vertices.iter())
-                            .flat_map(|v| v.links.iter())
-                            .filter_map(|l| usize::try_from(l.bone).ok())
-                            .filter(|&b| b < s.nodes.len())
-                            .collect(),
-                        parents: s.nodes.iter().map(|n| n.parent).collect(),
-                        // 第 0 帧（`Smd::reference_frame`）的**局部**姿态。
-                        // 帧里没提到的骨骼留零 —— 官方 `Grab_Animation`
-                        // （`studiomdl.cpp:1065-1135`）用 `kalloc` 零填充。
-                        rest_positions: {
-                            let mut v = vec![[0.0f32; 3]; s.nodes.len()];
-                            if let Some(f0) = s.reference_frame() {
-                                for p in &f0.poses {
-                                    if let Ok(b) = usize::try_from(p.bone)
-                                        && b < v.len()
-                                    {
-                                        v[b] = p.position;
-                                    }
+                Ok(s) => Some(SmdInfo {
+                    nodes: s.nodes.iter().map(|n| n.name.clone()).collect(),
+                    materials: s.materials_in_order(),
+                    num_frames: s.frames.len(),
+                    // `links` 已保证非空（见 `SmdInfo::vert_refs` 的注释），
+                    // 下标越界的引用直接丢弃 —— 顶点路径
+                    // （`compile::smd_vertex_to_ir`）另有更精确的报错。
+                    vert_refs: s
+                        .triangles
+                        .iter()
+                        .flat_map(|t| t.vertices.iter())
+                        .flat_map(|v| v.links.iter())
+                        .filter_map(|l| usize::try_from(l.bone).ok())
+                        .filter(|&b| b < s.nodes.len())
+                        .collect(),
+                    parents: s.nodes.iter().map(|n| n.parent).collect(),
+                    // 第 0 帧（`Smd::reference_frame`）的**局部**姿态。
+                    // 帧里没提到的骨骼留零 —— 官方 `Grab_Animation`
+                    // （`studiomdl.cpp:1065-1135`）用 `kalloc` 零填充。
+                    rest_positions: {
+                        let mut v = vec![[0.0f32; 3]; s.nodes.len()];
+                        if let Some(f0) = s.reference_frame() {
+                            for p in &f0.poses {
+                                if let Ok(b) = usize::try_from(p.bone)
+                                    && b < v.len()
+                                {
+                                    v[b] = p.position;
                                 }
                             }
-                            v
-                        },
-                        rest_rotations: {
-                            let mut v = vec![[0.0f32; 3]; s.nodes.len()];
-                            if let Some(f0) = s.reference_frame() {
-                                for p in &f0.poses {
-                                    if let Ok(b) = usize::try_from(p.bone)
-                                        && b < v.len()
-                                    {
-                                        v[b] = p.rotation;
-                                    }
+                        }
+                        v
+                    },
+                    rest_rotations: {
+                        let mut v = vec![[0.0f32; 3]; s.nodes.len()];
+                        if let Some(f0) = s.reference_frame() {
+                            for p in &f0.poses {
+                                if let Ok(b) = usize::try_from(p.bone)
+                                    && b < v.len()
+                                {
+                                    v[b] = p.rotation;
                                 }
                             }
-                            v
-                        },
-                    }),
-                },
+                        }
+                        v
+                    },
+                }),
             };
             smd_cache.insert(f.clone(), info);
         }
@@ -4319,27 +4320,33 @@ impl<'a> Parser<'a> {
                 parent_of.insert(b.name.to_ascii_lowercase(), p.clone());
             }
         }
-        for f in &files {
-            let p = if Path::new(f).is_absolute() {
-                PathBuf::from(f)
-            } else {
-                self.qdir.join(f)
-            };
-            let Ok(text) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            let Ok(smd) = crate::smd::parse_smd(&text) else {
-                continue;
-            };
-            for n in &smd.nodes {
-                let key = n.name.to_ascii_lowercase();
+        //
+        // ⚠️⚠️ **必须走 `smd_cache`，不能自己 `read_to_string` + `parse_smd`**。
+        // 这里曾经是第二个「硬编码的 SMD 文本读取点」：`.fbx` 是二进制，
+        // `read_to_string` 直接失败 ⟹ `continue` ⟹ **父链整段丢失**，
+        // 全部骨骼都写成了根骨骼（`parent = -1`）。产物字节数只差几十字节，
+        // 肉眼看不出，但骨骼树整个塌成平的 —— 引擎里就是一堆互不相干的
+        // 独立骨骼。同一个教训在 `finish()` 的资产读取处也记过一次
+        // （见上面 `read_source` 那段注释）：**格式分派只允许存在于
+        // `read_source` 一处**。
+        //
+        // `smd_cache` 里的 `SmdInfo` 已经带了 `nodes` 与 `parents`
+        // （逐字对应 `psource->localBone[j].parent`），顺序也与 `files`
+        // 一致，所以直接查表即可，顺带省掉一次重复解析。
+        for info in files
+            .iter()
+            .filter_map(|f| smd_cache.get(f).and_then(|x| x.as_ref()))
+        {
+            for (i, name) in info.nodes.iter().enumerate() {
+                let key = name.to_ascii_lowercase();
                 if parent_of.contains_key(&key) {
                     continue;
                 }
-                if n.parent >= 0
-                    && let Some(par) = smd.nodes.get(n.parent as usize)
+                if let Some(&par) = info.parents.get(i)
+                    && par >= 0
+                    && let Some(pname) = info.nodes.get(par as usize)
                 {
-                    parent_of.insert(key, par.name.clone());
+                    parent_of.insert(key, pname.clone());
                 }
             }
         }

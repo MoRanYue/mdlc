@@ -47,6 +47,7 @@
 //! | [`tangent`] | **切线空间计算**（法线贴图用，对应 studiomdl 的 `CalcModelTangentSpaces`） |
 //! | [`lod`] | **多 LOD 与 fixup 表**（顶点池排序、分段、重映射） |
 //! | [`vta`] | **`.vta` 顶点动画解析**（SMD 语法、7 字段行、相对帧号） |
+//! | [`fbx`] | **FBX 源读取**（`ufbx` → 中立 SMD；含 shape key → flex 的元数据） |
 //! | [`flex`] | **VTA 形状解析**（就近匹配 → 差量 → smoothstep → 载荷） |
 //! | [`qc`] | **QC 前端**（`.qc` 脚本 → [`model::ModelDesc`]） |
 //! | `test_assets` | 真实素材测试的路径解析（**仅 `#[cfg(test)]`**，故此处不作链接） |
@@ -57,6 +58,7 @@ pub mod bone_math;
 pub mod cli;
 pub mod compile;
 pub mod diag;
+pub mod fbx;
 pub mod flex;
 pub mod layout;
 pub mod lod;
