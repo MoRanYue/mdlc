@@ -531,6 +531,80 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 > 一条「关掉」的命令没有实际用途（官方的裸标志位如 `$staticprop` 也都没有
 > 反向命令）。同理命令行 `--optimize-vtx` 也只能开、不能关。
 
+### FBX 源选项（`src*`，9 条）
+
+网格源是 `.fbx` 时，官方 `studiomdl` 会替你做一串**隐式决定**，而且
+**全部静默**：合并所有网格、恒取第一条 NLA 栈、材质名直接用 FBX 里的、
+轴向与单位原样搬运。mdlc 的默认行为**逐条对齐官方**，但把这些决定
+变成**显式语法**——不写就等于官方行为，写了就能改。
+
+命名规则是**按概念命名，不按格式命名**（格式由文件扩展名决定）：所以叫
+`srcpart` 而不是 `fbxpart`——将来加 glTF/GLB 时**新增语法 0 条**。
+
+| 命令 | 写在哪 | 作用 | 不写时（= 官方） |
+|---|---|---|---|
+| `srcpart "名"` | `$body` / `$model` 行内或块内 | 只取这些名字的网格；**可重复写** | 全部网格合并进同一个部件 |
+| `srcmaterial "名"` | 同上 | FBX 里没有材质时的兜底名 | `debug/debugempty` |
+| `srcscale 1.0` | 同上 | 统一缩放 | 1.0 |
+| `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | 不干预（原样搬运根变换） |
+| `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条 NLA 栈 | **第一条** |
+| `srcfps 30` | 同上 | 动画重采样率 | 30 |
+| `srcshapekey "名"` | `$model` 块内 | 只取这些 shape key，**并定序**；可重复写 | 全部，按文件顺序 |
+| `srcshapekeyorder "名"` | 同上 | 只定序，不筛 | 文件顺序 |
+| `srcshapekeyignore` | 同上 | 全部忽略（不注册 flex） | 全部注册 |
+
+```qc
+$modelname "models/mymod/linnea.mdl"
+$cdmaterials "models/mymod/"
+
+// 一个 FBX 里有 body / hair / eyes 三块网格，只要 body
+$body body "linnea.fbx" srcpart "body" srcmaterial "face"
+
+// 多栈 FBX：官方恒取第一条，这里点名要 run
+$sequence run "anim.fbx" srcstack "run" srcfps 30
+
+// 表情：什么都不用写，shape key 自动注册；要控制就这样写
+$model "face" "linnea_face.fbx" {
+    srcshapekey "smile"
+    srcshapekey "blink"
+}
+```
+
+⭐ **表情（flex）的默认路径不需要任何新语法。** FBX 的 shape key 会被
+**自动注册**成 flexdesc + flexcontroller + flexrule + 载荷，与官方逐字段一致
+（已用 `docs/_probe/k4_flex_align.js` 按 VVD 顶点位置对齐验证 16/16）。
+`srcshapekey*` 三条只在你想**筛掉或重排**时才需要。
+
+> ⚠️ **`srcpart` / `srcshapekey` / `srcshapekeyorder` 每次只读一个 token**
+> （所以可以重复写）。**不要**写成 `srcpart "body" "hair"`——第二个名字会被
+> 当成网格名而不是「另一个选项」，后面的选项会被吞掉。网格名带空格用引号解决：
+> `srcpart "my mesh"`。
+
+> ⚠️ **两处默认行为是「报错」而不是新语法**（所以**没写新语法的 QC 也跑不了官方**）：
+> ① 同一个 `.fbx` 既作网格源又作动画源——官方**静默只出 1 帧**，mdlc 报错并给出出路；
+> ② 在 FBX 源上写 `flexfile "<某.fbx>"` + `flex`——官方**必崩**，mdlc 报错。
+> 两条都只在**确实会丢东西**时才触发（例如 ① 只在 mdlc 真采出 > 1 帧时才拒）。
+> 完整清单见 [`docs/fbx-support.md`](docs/fbx-support.md) §4.6 的偏离表。
+
+> ⚠️ **写了 `src*` 的 QC 不能直接跑官方工具**（官方会报 `bad command`），
+> 与 `$optimizevtx` 那三条同理。要跨工具通用请改用 TOML 侧字段
+> （`src_parts` / `src_material` / `src_scale` / `src_axis` / `src_stack` /
+> `src_fps` / `src_shape_keys` / `src_shape_key_order` / `src_shape_key_ignore`）。
+
+### FBX 的四条诊断
+
+官方在这些情形下**静默通过**（`exit=0`），但结果通常不是你要的。
+mdlc 会打一行 `提示：`：
+
+| 情形 | 提示内容 |
+|---|---|
+| 多块网格被合并进同一个部件 | 列出网格名 + 「要分开请用 `srcpart` 或拆成多个 `$body`」 |
+| 网格没有材质 | 「已合成 `debug/debugempty`；要改用别的写 `srcmaterial`」 |
+| 有多条动画栈而没写 `srcstack` | 列出全部栈名 + 「默认只用第一条」 |
+| 有 shape key（已自动注册成 flex） | 列出名字与帧号 + 「要控制请用 `srcshapekey*`」 |
+
+四条全部是**提示**而非错误，且**对 `.smd` 工程零影响**（连一行输出都不多）。
+
 ---
 
 ## 命令行参考
