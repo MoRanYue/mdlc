@@ -1,0 +1,234 @@
+name: Artifacts
+
+# 目标：**每次提交**都产出三平台可直接下载运行的二进制 ——
+# 让「这个提交在 Windows / macOS / Linux 上都能构建」从声称变成事实，
+# 同时省掉「想试用一下还得自己装 Rust 工具链」的门槛。
+#
+# 与 `ci.yml` 的分工：
+#   - `ci.yml`        = 正确性门禁（测试 / clippy / doc / MSRV），必须全绿。
+#   - `artifacts.yml` = 产物门禁（真的编得出来、真的启动得了），**不重复跑测试**。
+# 两者都执行 `cargo build --release --locked`，但用不同的缓存键，互不干扰。
+#
+# ⚠️ **为什么有「冒烟测试」而不是只上传**：`cargo build` 成功只说明**链接**过了，
+# 不说明产出的可执行文件能跑起来（缺动态库、入口点错、架构不对都会在这里暴露）。
+# 本项目的两个 C/C++ 依赖 —— meshopt 的 vendored C++ 与 ufbx 的 C —— 正是最容易
+# 在跨平台构建上出问题的地方，所以每个平台都要真的启动一次。
+#
+# ⚠️ **为什么 Linux 用 `ubuntu-22.04` 而不是 `ubuntu-latest`**：产物的 glibc 下限
+# 由构建机决定。`ubuntu-latest`（24.04 / glibc 2.39）编出来的二进制在 Debian 12、
+# Ubuntu 22.04 上会直接报 `GLIBC_2.39 not found`。用 22.04（glibc 2.35）构建，
+# 兼容范围大得多，而代价为零。
+# ⚠️ 代价是**这个镜像有寿命**：22.04 已于 2026-09-17 进入弃用期
+# （actions/runner-images#14254），2027-04-17 下线。届时要么抬 glibc 下限，
+# 要么改用容器/交叉工具链（如 `cargo-zigbuild`）继续产出低 glibc 产物。
+#
+# ⚠️ **为什么两个 macOS 目标跑在两个不同的 runner 上**（`macos-latest` + `macos-15-intel`）：
+# 早先的写法是在 arm64 上交叉编译 x86_64（cc-rs 支持 `-arch x86_64`），但那样
+# 既验证不了产物能否执行，也验证不了 Intel 用户真正的构建路径。原生 runner 两条都解决。
+# ⚠️ `macos-15-intel` 是 Actions **最后一代 x86_64 镜像**（2025-09 公告，
+# 支持到 2027 秋）；之后 Apple Silicon 是唯一选项，x86_64 产物只能靠交叉编译。
+#
+# ⚠️ **为什么 Windows 保留动态 CRT**（不加 `+crt-static`）：与本仓库已发布的
+# `v0.1.0` asset 保持一致。代价是使用者需要装 VC++ 运行库
+# （`VCRUNTIME140.dll` / `api-ms-win-crt-*`）；若日后想改成单文件零依赖，
+# 只需给 Windows 那条加 `RUSTFLAGS: -C target-feature=+crt-static`。
+
+on:
+  push:
+    branches: [main, master]
+    # 打 tag 时也跑：发版那一刻的产物应当能直接下载，而不是从某次 push 的运行里翻。
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一 ref 上只保留最新一次产物构建：被取代的 PR 构建没有价值。
+# ⚠️ 分支与 tag 上**不**取消 —— 那些运行的结果是要被下载/引用的。
+concurrency:
+  group: artifacts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows：主要开发与验证平台（本机差分对照的就是这个）。
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          # Linux：证明代码本身可移植（源码里没有任何 `cfg(windows)` 专有 API）。
+          # ⚠️ `ubuntu-22.04` 已于 **2026-09-17 进入弃用期**（actions/runner-images#14254），
+          # 2027-04-17 彻底下线。它现在仍可用，保留的理由是产物的 glibc 下限 ——
+          # 迁移到新镜像时会抬高下限，届时要一并复核 README 里
+          # 「兼容 Debian 12 / Ubuntu 22.04」的说法。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          # macOS 两条：分别在**各自的原生架构**上构建 —— `macos-latest` 是
+          # arm64（M1），`macos-15-intel` 是 x86_64。
+          # ⭐ 原生构建比「在 arm64 上用 cc-rs 的 `-arch x86_64` 交叉编译」更可信：
+          # 它验证的是用户真正会走的那条路径，而且产物能当场执行（见冒烟测试）。
+          # ⚠️ `macos-15-intel` 是 Actions 最后一代 x86_64 镜像（支持到 2027 秋），
+          # 之后要么改用 `macos-26-intel`，要么退回交叉编译。
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # `targets:` 把交叉目标一并装上；Windows/Linux 上就是本机目标，无副作用。
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ⚠️ `key: ${{ matrix.target }}` 是矩阵构建的推荐写法：否则同一 OS 上的两个
+      # macOS 目标会共用一条缓存记录，互相覆盖。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # meshopt 要编 vendored C++、ufbx 要编 C，都需要本机编译器。
+      # 三个 runner 都自带（MSVC / g++ / clang），这里只做确认，失败即早退。
+      - name: 确认 C/C++ 工具链可用
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "windows-latest 自带 MSVC，由 cc-rs 通过 vswhere 定位"
+          else
+            ${CXX:-c++} --version | head -1
+            ${CC:-cc} --version | head -1
+          fi
+
+      # ⚠️ 显式 `shell: bash`：默认 shell 在 Windows 上是 pwsh、在 Linux/macOS 上是
+      # bash，同一个 `run:` 的引号与变量展开规则并不一致。这里命令很简单，
+      # 但统一 shell 能消掉一整类「只在某个平台炸」的隐患。
+      - name: cargo build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      # 产物统一落到 `dist/` 并带上目标三元组：三个平台的文件名互不冲突，
+      # 下载解压到一个目录也不会互相覆盖。
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/mdlc${{ matrix.ext }}"
+          dst="dist/mdlc-${{ matrix.target }}${{ matrix.ext }}"
+          test -f "$src" || { echo "::error::找不到产物 $src"; exit 1; }
+          cp "$src" "$dst"
+          # `cp` 通常会带上可执行位，但不值得赌 —— 下面那步要真的执行它。
+          chmod +x "$dst"
+          ls -l "$dst"
+
+      # 真的把它跑起来 —— `cargo build` 成功只说明链接过了，不说明产物能启动。
+      #
+      # 因为每个目标都跑在**自己的原生架构**上（见上面的矩阵），正常情况下
+      # 这里走的都是「原生执行」那条路。下面保留的跨架构退化分支是**防御性的**：
+      # runner 镜像的架构由 GitHub 决定（`macos-latest` 从 Intel 换成 arm64 就是
+      # 一次静默迁移），哪天某条又变成交叉编译，这里不会因此变成假绿。
+      #   1. 先直接试着执行 —— 能跑就跑（转译层在的场合）；
+      #   2. 跑不了才退化成 `file(1)` 核对架构。
+      # ⚠️ 第 2 条**不是假装通过**：它断言 `file` 的输出里真的出现了期望的
+      # 架构名，否则这一步失败。否则「无法执行」就成了任何坏产物的免罪符。
+      - name: 冒烟测试（必须能启动并打印帮助）
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="dist/mdlc-${{ matrix.target }}${{ matrix.ext }}"
+
+          host=$(uname -m)
+          case "$host" in
+            amd64) host=x86_64 ;;
+            arm64) host=aarch64 ;;
+          esac
+          # Rust 的目标三元组首段就是架构名（x86_64 / aarch64）。
+          tarch="${{ matrix.target }}"
+          tarch="${tarch%%-*}"
+
+          if [ "$host" = "$tarch" ]; then
+            "$bin" help > /dev/null
+            echo "✅ 冒烟测试通过：$bin 在 $host 上原生启动并打印了帮助"
+            exit 0
+          fi
+
+          echo "::notice::$bin 是 $tarch，本机是 $host —— 先尝试直接执行（可能经 Rosetta）"
+          if "$bin" help > /dev/null 2>&1; then
+            echo "✅ 冒烟测试通过：$bin 在 $host 上经转译启动成功"
+            exit 0
+          fi
+
+          echo "无法执行（$host 上缺少 $tarch 的转译层），退化为架构核对"
+          file "$bin"
+
+          # ⚠️ `file(1)` 的架构拼写与 Rust 目标三元组**不一致**，这里必须都认：
+          #   Rust `aarch64` → file 在 Mach-O 上写 `arm64`
+          #   Rust `x86_64`  → file 在 PE 上写 `x86-64`（连字符！）、在 Mach-O 上写 `x86_64`
+          # 只认一种拼写会让这条检查在正确的产物上误报失败。
+          case "$tarch" in
+            aarch64) want="arm64 aarch64" ;;
+            x86_64)  want="x86_64 x86-64 amd64" ;;
+            *)       want="$tarch" ;;
+          esac
+
+          out=$(file "$bin")
+          for w in $want; do
+            if echo "$out" | grep -qF "$w"; then
+              echo "✅ 架构核对通过：产物确实是 $tarch（file 写作 $w）"
+              exit 0
+            fi
+          done
+          echo "::error::产物架构不是 $tarch（可接受拼写：$want）—— file(1) 的输出见上"
+          exit 1
+
+      - name: 记录大小与哈希
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="dist/mdlc-${{ matrix.target }}${{ matrix.ext }}"
+          {
+            echo "### \`${{ matrix.target }}\`"
+            echo
+            echo '```'
+            ls -l "$bin"
+            # Linux 有 sha256sum，macOS 有 shasum；Windows 的 git bash 两者之一。
+            if command -v sha256sum > /dev/null 2>&1; then
+              sha256sum "$bin"
+            elif command -v shasum > /dev/null 2>&1; then
+              shasum -a 256 "$bin"
+            else
+              echo "（本机既无 sha256sum 也无 shasum，跳过哈希）"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # `if-no-files-found: error` 是**防空洞绿**：路径写错时宁可红，
+      # 也不要产出一个空的 artifact 让人以为构建成功了。
+      #
+      # ⚠️ 已知限制：`actions/upload-artifact@v4` **不保留文件权限位**，所以
+      # Linux/macOS 的下载者拿到后要先 `chmod +x`。这里刻意不上传 tar.gz 来
+      # 绕过它 —— 裸二进制更好检查（`file` / `sha256sum` 直接可用），
+      # 而 `chmod +x` 是一步能写进说明的事。上面的冒烟测试在**上传前**跑，
+      # 不受这条限制影响。
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdlc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error

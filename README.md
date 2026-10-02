@@ -6,7 +6,8 @@
 `.mdl` + `.vvd` + `.dx90.vtx`（带碰撞时另有 `.phy`，用 `$animblocksize` 时另有 `.ani`）。
 
 - **语言**：Rust **1.89+**（源码用了 `let`-chains，1.88 才稳定；`edition 2024`）
-- **平台**：无平台专有 API；CI 在 Windows 与 Linux 上同时构建与测试
+- **平台**：无平台专有 API；每次提交都在 Windows / Linux / macOS（arm64 + x86_64）
+  上构建产物，Windows 与 Linux 上跑全量测试
 - **许可证**：[GPL-3.0-only](LICENSE)
 
 ```powershell
@@ -817,6 +818,50 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 > 照样全绿）；判据里「差异计数等于 0」的形式天然会被**空夹具**满足，所以必须在
 > 判定前加「夹具非空」硬门。
 
+### 两个 GitHub Actions 工作流
+
+职责分开，互不重复：
+
+| 工作流 | 管什么 | 平台 |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | **正确性门禁**：测试 / clippy / doc / MSRV | Windows、Linux |
+| [`artifacts.yml`](.github/workflows/artifacts.yml) | **产物门禁**：真的编得出来、真的启动得了 | Windows、Linux、macOS（arm64 + x86_64） |
+
+`artifacts.yml` **每次提交**都产出四份可直接下载运行的二进制
+（在 Actions 运行的 Artifacts 区，名字形如 `mdlc-x86_64-pc-windows-msvc`），
+所以「这个提交在三平台上都能构建」是**跑出来的**而不是声称的。
+
+> **它为什么不重复跑测试**：`ci.yml` 已经在 Windows/Linux 上跑了全量测试；
+> 产物工作流只回答一个不同的问题 —— 「产出的可执行文件能不能启动」。
+> `cargo build` 成功只说明**链接**过了，不说明能跑（缺动态库、入口点错、
+> 架构不对都会在这里才暴露）。两个 C/C++ 依赖 —— meshopt 的 vendored C++
+> 与 ufbx 的 C —— 正是最容易在跨平台构建上出问题的地方。
+
+几个刻意的选择：
+
+- **Linux 用 `ubuntu-22.04` 而不是 `ubuntu-latest`**：产物的 glibc 下限由构建机决定。
+  24.04（glibc 2.39）编出来的二进制在 Debian 12 / Ubuntu 22.04 上会直接报
+  `GLIBC_2.39 not found`。用 22.04（glibc 2.35）构建，兼容范围大得多，代价为零。
+  > ⚠️ 这个镜像**有寿命**：22.04 已于 2026-09-17 进入弃用期
+  > （[runner-images#14254](https://github.com/actions/runner-images/issues/14254)），
+  > 2027-04-17 下线。届时要么抬高 glibc 下限，要么改用容器 / 交叉工具链
+  > （如 `cargo-zigbuild`）继续产出低 glibc 产物。
+- **两个 macOS 架构跑在两个不同的 runner 上**：`macos-latest`（arm64）与
+  `macos-15-intel`（x86_64），各自**原生**构建。比「在 arm64 上交叉编译 x86_64」
+  更可信 —— 后者既验证不了产物能否执行，也验证不了 Intel 用户真正的构建路径。
+  > ⚠️ `macos-15-intel` 是 Actions **最后一代 x86_64 镜像**
+  > （[2025-09 公告](https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/)，
+  > 支持到 2027 秋）；之后 x86_64 产物只能靠交叉编译。
+- **Windows 保留动态 CRT**（不加 `+crt-static`）：与已发布的 `v0.1.0` asset 一致，
+  代价是使用者需装 VC++ 运行库。
+- **跨架构产物的冒烟测试不是免罪符**：x86_64 的 macOS 产物在 arm64 runner 上
+  可能跑不起来（取决于 Rosetta）。这时会退化成 `file(1)` 核对架构 —— 但那条
+  路径**断言** `file` 输出里真的出现了期望的架构名，否则失败。否则「无法执行」
+  就成了任何坏产物的挡箭牌。
+- **Linux/macOS 的下载者需要 `chmod +x`**：`actions/upload-artifact` 不保留文件
+  权限位。刻意不上传 tar.gz 来绕过 —— 裸二进制更好检查（`file` / `sha256sum`
+  直接可用），而 `chmod +x` 是一步能写进说明的事。
+
 ---
 
 ## 测试
@@ -885,7 +930,7 @@ cargo test --release -- --ignored
 
 | 路径 | 内容 |
 |---|---|
-| `docs/_probe/` | 判据脚本（1100+ 个 `.js`）、受控实验夹具、官方与 mdlc 的对照产物 |
+| `docs/_probe/` | 判据脚本（1300+ 个 `.js`、17 个 `.py`、2 个 `.sh`）、受控实验夹具、官方与 mdlc 的对照产物 |
 | `parity/` | 101 个 `.toml` + 64 个 `.smd` + 11 个 `.qc` 输入，以及 `_snap/` 快照 |
 | `out/`、`mymod/` | mdlc 自己的编译输出 |
 | `verify_parity.ps1`、`cmp_features.ps1` | 两个回归脚本（依赖上面两项） |
