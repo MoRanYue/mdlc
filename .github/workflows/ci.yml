@@ -35,7 +35,7 @@ jobs:
         # 且本项目面向 Source 引擎的 Windows 工具链。
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +112,7 @@ jobs:
     name: MSRV（Cargo.toml 的 rust-version 必须是真的）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ⚠️ 这条 job 存在的理由：Cargo.toml 曾把 rust-version 写成 1.85，
       # 而源码里用了 `let`-chains（1.88 才稳定）—— **声称的 MSRV 是假的**。

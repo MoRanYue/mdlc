@@ -828,7 +828,8 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 | [`artifacts.yml`](.github/workflows/artifacts.yml) | **产物门禁**：真的编得出来、真的启动得了 | Windows、Linux、macOS（arm64 + x86_64） |
 
 `artifacts.yml` **每次提交**都产出四份可直接下载运行的二进制
-（在 Actions 运行的 Artifacts 区，名字形如 `mdlc-x86_64-pc-windows-msvc`），
+（在 Actions 运行的 Artifacts 区，名字就是文件名，形如
+`mdlc-x86_64-pc-windows-msvc.exe` / `mdlc-aarch64-apple-darwin`），
 所以「这个提交在三平台上都能构建」是**跑出来的**而不是声称的。
 
 > **它为什么不重复跑测试**：`ci.yml` 已经在 Windows/Linux 上跑了全量测试；
@@ -858,9 +859,10 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
   可能跑不起来（取决于 Rosetta）。这时会退化成 `file(1)` 核对架构 —— 但那条
   路径**断言** `file` 输出里真的出现了期望的架构名，否则失败。否则「无法执行」
   就成了任何坏产物的挡箭牌。
-- **Linux/macOS 的下载者需要 `chmod +x`**：`actions/upload-artifact` 不保留文件
-  权限位。刻意不上传 tar.gz 来绕过 —— 裸二进制更好检查（`file` / `sha256sum`
-  直接可用），而 `chmod +x` 是一步能写进说明的事。
+- **上传裸文件而不是 zip**（`archive: false`）：`actions/upload-artifact` 用 zip
+  上传会把权限压成 `644`，Linux/macOS 的下载者拿到后必须先 `chmod +x`。裸文件
+  没有这个问题 —— 下载即运行。代价是这条路径只支持单个文件、且 `name:` 被忽略
+  （artifact 名就是文件名，即 `mdlc-<目标三元组>[.exe]`）。
 
 ---
 
