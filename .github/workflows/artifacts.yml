@@ -221,18 +221,32 @@ jobs:
       # `if-no-files-found: error` 是**防空洞绿**：路径写错时宁可红，
       # 也不要产出一个空的 artifact 让人以为构建成功了。
       #
-      # `archive: false` 上传**裸文件**而不是 zip，为的是保住可执行位 ——
-      # 官方文档明确说 zip 上传会把权限压成 644/755（"File permissions are
-      # not maintained during zipped artifact upload"），Linux/macOS 的下载者
-      # 拿到后必须先 `chmod +x` 才能跑。裸文件没有这个问题：下载即运行。
+      # 这里用 zip（`archive` 保持默认的 true），不用 `archive: false` 的裸文件。
+      # 踩过一次坑，记下来免得再犯：
       #
-      # 代价是这条路径**只支持单个文件**，且 `name:` 会被忽略 —— artifact 的
-      # 名字就是文件名（也就是 dist/ 里那个带目标三元组的名字），所以下面
-      # 刻意不写 `name:`，并把 path 写成精确路径而不是 `dist/*` 通配，
-      # 免得将来 dist/ 里多出文件时这条静默失败。
+      # 换成裸文件的动机是「保住可执行位」。upload-artifact 的 README 里
+      # "Permission Loss" 一节说 zip 上传会把权限压成 644/755，Linux/macOS 的
+      # 下载者必须先 `chmod +x`。但**实测并非如此**：直接读 zip 的中央目录
+      # （EOCD 在尾部，条目里的 external attributes 高 16 位是 Unix 模式）可以看到
+      # Linux 与 macOS 产物的模式都是 0o100755 —— 可执行位原样记在里面；
+      # 而 gh 的解压器（`cli/cli` 的 `internal/zip/zip.go`，函数 `getPerm`）
+      # 正是按这个模式还原权限的：模式里带 0111 位就给 0755，否则给 0644。
+      # 也就是说 zip 路径本来就能做到「下载即运行」，为了它换成裸文件是白付代价。
+      #
+      # 代价则是实打实的：`archive: false` 的 artifact **不是 zip**，而
+      # `gh run download` 会**无条件**把它当 zip 读 —— `cli/cli` 的
+      # `pkg/cmd/run/download/http.go` 里 `zip.NewReader` 没有非 zip 分支，
+      # 于是必然失败（三次重试均为同一错误，不是网络抖动）：
+      #
+      #     error extracting zip archive: zip: not a valid zip file
+      #
+      # 顺带 zip 还能把 4.9 MB 压到 1.9 MB，对 artifact 存储配额也更友好。
+      #
+      # path 仍写成精确路径而不是 `dist/*` 通配：万一将来 dist/ 里多出文件，
+      # 通配会静默地把它们一起塞进 artifact。
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
+          name: mdlc-${{ matrix.target }}
           path: dist/mdlc-${{ matrix.target }}${{ matrix.ext }}
-          archive: false
           if-no-files-found: error

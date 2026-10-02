@@ -828,8 +828,8 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 | [`artifacts.yml`](.github/workflows/artifacts.yml) | **产物门禁**：真的编得出来、真的启动得了 | Windows、Linux、macOS（arm64 + x86_64） |
 
 `artifacts.yml` **每次提交**都产出四份可直接下载运行的二进制
-（在 Actions 运行的 Artifacts 区，名字就是文件名，形如
-`mdlc-x86_64-pc-windows-msvc.exe` / `mdlc-aarch64-apple-darwin`），
+（在 Actions 运行的 Artifacts 区，按目标三元组命名，形如
+`mdlc-x86_64-pc-windows-msvc` / `mdlc-aarch64-apple-darwin`），
 所以「这个提交在三平台上都能构建」是**跑出来的**而不是声称的。
 
 > **它为什么不重复跑测试**：`ci.yml` 已经在 Windows/Linux 上跑了全量测试；
@@ -859,10 +859,20 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
   可能跑不起来（取决于 Rosetta）。这时会退化成 `file(1)` 核对架构 —— 但那条
   路径**断言** `file` 输出里真的出现了期望的架构名，否则失败。否则「无法执行」
   就成了任何坏产物的挡箭牌。
-- **上传裸文件而不是 zip**（`archive: false`）：`actions/upload-artifact` 用 zip
-  上传会把权限压成 `644`，Linux/macOS 的下载者拿到后必须先 `chmod +x`。裸文件
-  没有这个问题 —— 下载即运行。代价是这条路径只支持单个文件、且 `name:` 被忽略
-  （artifact 名就是文件名，即 `mdlc-<目标三元组>[.exe]`）。
+- **产物用 zip 上传**（`archive` 保持默认）：`upload-artifact` 的 README 声称 zip
+  上传会丢文件权限（一律 `644`），所以 Linux/macOS 的下载者必须先 `chmod +x`。
+  **实测不成立** —— 读 zip 的中央目录可以看到 Linux / macOS 产物的 external
+  attributes 都是 `0o100755`，可执行位原样记着；`gh` 的解压器（`cli/cli` 的
+  `internal/zip/zip.go` 里 `getPerm`）正是按这个模式还原权限的（带 `0111` 就给
+  `0755`），所以用 `gh run download` 拿到的文件本来就能直接跑。反过来，改用
+  `archive: false` 上传裸文件会**破坏 `gh run download`** —— 那条路径的产物不是
+  zip，而 `gh` 会无条件按 zip 解析（`pkg/cmd/run/download/http.go` 的
+  `zip.NewReader`），必然报 `error extracting zip archive: zip: not a valid zip
+  file`。zip 顺带还把 4.9 MB 压到 1.9 MB，对 artifact 存储配额更友好。
+  > 从**浏览器**下载时结论也一样：裸文件走 HTTP 没有任何权限元数据，落地就是
+  > 默认权限（通常 `0644`），下载者照样得 `chmod +x`；反倒是 zip 里的模式能被
+  > 解压工具还原（macOS 归档实用工具、Linux 的 `unzip` 都会）。所以「裸文件
+  > 下载即运行」这个前提本身就是错的。
 
 ---
 
