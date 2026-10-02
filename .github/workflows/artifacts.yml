@@ -221,32 +221,42 @@ jobs:
       # `if-no-files-found: error` 是**防空洞绿**：路径写错时宁可红，
       # 也不要产出一个空的 artifact 让人以为构建成功了。
       #
-      # 这里用 zip（`archive` 保持默认的 true），不用 `archive: false` 的裸文件。
-      # 踩过一次坑，记下来免得再犯：
+      # 这里刻意用 `archive: false`（裸文件上传），**不**打包成 zip。
+      # 理由是**主要受众在 Windows**：浏览器点一下拿到的就是能直接运行的
+      # `mdlc-x86_64-pc-windows-msvc.exe`，不用先解压。裸文件也不存在
+      # 「解压后丢了可执行位」的问题 —— 因为根本没有解压这一步。
       #
-      # 换成裸文件的动机是「保住可执行位」。upload-artifact 的 README 里
-      # "Permission Loss" 一节说 zip 上传会把权限压成 644/755，Linux/macOS 的
-      # 下载者必须先 `chmod +x`。但**实测并非如此**：直接读 zip 的中央目录
-      # （EOCD 在尾部，条目里的 external attributes 高 16 位是 Unix 模式）可以看到
-      # Linux 与 macOS 产物的模式都是 0o100755 —— 可执行位原样记在里面；
-      # 而 gh 的解压器（`cli/cli` 的 `internal/zip/zip.go`，函数 `getPerm`）
-      # 正是按这个模式还原权限的：模式里带 0111 位就给 0755，否则给 0644。
-      # 也就是说 zip 路径本来就能做到「下载即运行」，为了它换成裸文件是白付代价。
+      # 已知代价（有意接受，不是疏忽）：
       #
-      # 代价则是实打实的：`archive: false` 的 artifact **不是 zip**，而
-      # `gh run download` 会**无条件**把它当 zip 读 —— `cli/cli` 的
-      # `pkg/cmd/run/download/http.go` 里 `zip.NewReader` 没有非 zip 分支，
-      # 于是必然失败（三次重试均为同一错误，不是网络抖动）：
+      #   1. `gh run download` 会**必然失败**。`archive: false` 的 artifact
+      #      **不是 zip**，而 gh 会**无条件**把它当 zip 读 —— `cli/cli` 的
+      #      `pkg/cmd/run/download/http.go` 里 `zip.NewReader` 没有非 zip 分支：
       #
-      #     error extracting zip archive: zip: not a valid zip file
+      #          error extracting zip archive: zip: not a valid zip file
       #
-      # 顺带 zip 还能把 4.9 MB 压到 1.9 MB，对 artifact 存储配额也更友好。
+      #      三次重试均为同一错误，是确定性行为而非网络抖动。要用 gh 下载，
+      #      得走 `gh api .../artifacts/<id>/zip` 并自己去掉那层「zip」语义。
+      #      Web UI 与浏览器直接下载不受影响（`Content-Disposition: attachment`
+      #      给出的就是裸文件本身）。
       #
-      # path 仍写成精确路径而不是 `dist/*` 通配：万一将来 dist/ 里多出文件，
-      # 通配会静默地把它们一起塞进 artifact。
+      #   2. artifact 存储不压缩：4.9 MB 的产物就是 4.9 MB（zip 能压到 1.9 MB）。
+      #      对本项目四个产物的体量而言无所谓。
+      #
+      #   3. `name:` 参数会被忽略 —— action.yml 明确写了「The name of the file
+      #      will be used as the artifact name (ignoring the `name` parameter)」，
+      #      所以 artifact 名就是文件名（含 `.exe`）。这是**想要**的效果：
+      #      名字自带目标三元组，四个产物互不冲突。也正因为 `archive: false`
+      #      只允许单个文件，`path` 必须精确到文件。
+      #
+      # ⚠️ Linux/macOS 的下载者拿到的裸文件没有可执行位（HTTP 不传权限元数据），
+      # 需要自己 `chmod +x`。这一点与 zip 路径相比确实是退步，属上面第 1 条
+      # 之外的另一项代价。
+      #
+      # path 写成精确路径而不是 `dist/*` 通配：一是上面说的单文件限制，
+      # 二是万一将来 dist/ 里多出文件，通配会静默地把它们一起塞进 artifact。
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
-          name: mdlc-${{ matrix.target }}
+          archive: false
           path: dist/mdlc-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
