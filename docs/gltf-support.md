@@ -24,7 +24,9 @@
 | 那怎么验收？ | **传递式 oracle**：同一 Blender 场景双导出 `.fbx` + `.glb`，官方编 `.fbx` 给出「官方口径」，再证明「glTF 的数能推出 FBX 的数」。 |
 | 传递式 oracle 成立吗？ | **成立，且已逐值验证**：顶点 / 法线 / UV / flex 位移**四项全部逐值相同**；骨骼表的**名字、顺序、父子关系**也完全一致（只差一个 100× 因子，见下一行）。[实测] |
 | `gltf` crate 能用吗？ | **能用，但有三个坑**（见 §3），其中一个是**crate 的 bug**，会拒掉 Blender 导出的**最常见**文件形态。 |
-| 依赖代价多大？ | **+6 个包**（关掉 `import` feature）；开 `import` 是 **+22 个包**且对 mdlc 毫无用处。[实测] |
+| 那个 bug 修了吗？ | **上游 master 已修**（`ca97641`，2025-03-19，PR #449），但**尚未发版**（crates.io 仍是 1.4.1，`git tag --contains` 为空）。见 §3.5。 |
+| 那用 GitHub nightly？ | **不建议**。坑一有确定的绕法；而 git 依赖有 5 条**无法用代码消除**的代价（最硬的一条：**`cargo publish` 会被 crates.io 拒绝**）。见 §4.4。 |
+| 依赖代价多大？ | **+5 个包**（master，关 `import`）/ **+6 个**（1.4.1，关 `import`）；开 `import` 是 **+21/+22 个包**且对 mdlc 毫无用处。[实测] |
 | 要新增 QC 语法吗？ | **0 条**。九条 `src*` 语法按概念命名，一条都不用改。[读码] |
 | 两套输入会产出同一个模型吗？ | **不会，差 100×** —— 这是 Blender 的 **FBX 导出器**把 m→cm 单位换算烘进骨架根节点造成的，**glTF 导出器不做**。见 §5.2，**这是本次调研最重要的工程结论**；⚠️ **`srcscale` 补偿不了**（它是整体缩放，比值不变，已实测）。 |
 | 建议 | **做**。按 §7 的落点实现，把「无 oracle」这件事在文档里说清楚。 |
@@ -182,8 +184,12 @@ FBX 路径**要**自己翻（`src\fbx.rs` 的 `uv = [u.x as f32, 1.0 - u.y as f3
 
 ## 3. `gltf` crate：能力与三个坑
 
-版本 **1.4.1**（2026-08-31）/ `MIT OR Apache-2.0` / `edition = "2021"` / **`rust-version = "1.61"`**
-（对 mdlc 的 MSRV 1.89 无约束）。`gltf-json = "=1.4.1"`（精确版本）。
+**crates.io 上最新仍是 1.4.1**（2024-05-10 发布）/ `MIT OR Apache-2.0` / `edition = "2021"` /
+**`rust-version = "1.61"`**（对 mdlc 的 MSRV 1.89 无约束）。`gltf-json = "=1.4.1"`（精确版本）。
+
+⚠️ **上游 master 已经领先 1.4.1 一年多**，且**坑一已被修掉**（见 §3.5）。
+项目**从不发 GitHub Release**（唯一的 Release 是 2022 年的 `1.0.0`，早已过时），
+所以「用 nightly」只能用 **git 依赖**（`rev = "50d6522…"`）。
 
 ### 3.1 读得出来的（全部实测成功）
 
@@ -310,19 +316,68 @@ nrm 首个 = None                                   ← 无 bufferView ⟹ 规�
 （`sparse` accessor **支持完整**：`gltf-1.4.1\src\accessor\util.rs:22-23 Iter::Sparse(SparseIter)`、
 `src\accessor\sparse.rs`。）
 
+### 3.5 ⭐ 坑一在上游 master 上**已被修掉**（2025-03-19）
+
+[实测 + 读码] 上游 issue [#346](https://github.com/gltf-rs/gltf/issues/346)
+「`Accessor` implementation not conformant with specification」（2022-05-31 开，**已 closed**）
+就是这条，正文与评论都引用了规范原文。修复提交：
+
+| 项 | 值 |
+|---|---|
+| 提交 | **`ca97641`「allow empty accessors」**（2025-03-19，PR [#449](https://github.com/gltf-rs/gltf/pull/449) from `robtfm`） |
+| 合并 | `12fc1b7`（2025-05-01） |
+| 改动 | `gltf-json/src/accessor.rs` **-15 行**（删掉 `accessor_validate_hook` 整段）+ `src/accessor/util.rs` +28 行（新增 `SparseIter::empty`） |
+| 进过 tag 吗？ | **没有**（`git tag --contains ca97641` 为空）⟹ 只在 master 上 |
+
+**实测对照**（同一组夹具，`from_slice` **带校验**路径）：
+
+| 文件 | crates.io 1.4.1 | GitHub master `50d6522` |
+|---|---|---|
+| `morph.glb` | ❌ `accessors[6].bufferView: Missing data` | ✅ **OK**，`pos=16 idx=54 目标数=2` |
+| `morph_zeronrm.glb` | ❌ `accessors[7]` / `[9]` 同错 | ✅ **OK**，`pos=16 idx=54 目标数=2` |
+
+⭐⭐ **而且 master 做得比「不报错」更多** —— 它按规范把缺失的数据**物化成全零**：
+
+```
+target[0] pos=16 nrm=16 tan=0
+  nrm[0]=[0.0000,0.0000,0.0000]  ← Some，说明按全零给了数据（1.4.1 给的是 None）
+```
+
+⟹ 这才是规范要求的语义（*"MUST be initialized with zeros"*），不是简单地跳过检查。
+
+⚠️ 上游还把 `Accessor::byte_offset` 从 `USize64` 改成了 **`Option<USize64>`**（`gltf-json` 层），
+属**破坏性变更**（`gltf-json` 历史上不受 semver 约束，见其 CHANGELOG）。对 mdlc 无影响（我们不读该字段）。
+
+### 3.6 坑二 / 坑三在 master 上**仍未变**
+
+| 坑 | master 状态 | 证据 |
+|---|---|---|
+| 坑二 data URI 与 `import` 绑定 | **未变** | 关 `import` 跑 `embed.gltf` ⟹ `各长度=[0]` / `pos=0 idx=0 首顶点=None`（**静默零几何照旧**）；开 `import` ⟹ `[import] OK 各长度=[1032] pos=24 idx=36` |
+| 坑三 不支持 Draco / meshopt | **未变** | 全仓（`*.rs` / `*.toml` / `*.md`）搜 `draco\|meshopt` **零命中** |
+
+**master 新增的能力**（`CHANGELOG.md` 的 `## Unreleased` 段）：`KHR_animation_pointer` 扩展 +
+`allow_empty_animation_target_node` feature + `EXT_texture_webp`。
+另有一批 **panic 修复**（PR [#471](https://github.com/gltf-rs/gltf/pull/471)「Fix panics」，2026-05-07）：
+`fix crash if accessor is not available` / `fix crash with invalid UTF-8` / `fix crash if header is too small` /
+`avoid underflows with zero counts` / `fix crashes if uri or mimeType is missing` —— 对**读不可信输入**的编译器来说，这一批本身就有价值。
+
 ---
 
 ## 4. 依赖与构建成本 [实测]
 
 ### 4.1 增量（`Cargo.lock` 的 `[[package]]` 逐条 diff）
 
-mdlc 现在 **102** 个包。
+mdlc 现在 **102** 个包。下表左半 = crates.io **1.4.1**，右半 = GitHub **master `50d6522`**：
 
-| 方案 | 新增包数 | 具体 |
-|---|---|---|
-| 关 `import`，不处理 data URI | **+5** | `gltf` / `gltf-derive` / `gltf-json` / `inflections` / `lazy_static` |
-| **关 `import` + 开 `base64`（推荐）** | **+6** | 上面 5 个 + `base64 0.13.1` |
-| 开 `import` | **+22** | 上面 6 个 + `adler2` / `byteorder-lite` / `crc32fast` / `fdeflate` / `flate2` / `image` / `miniz_oxide`×2 / `moxcms` / `png` / `pxfm` / `simd-adler32` / `urlencoding` / `zlib-rs` / `zune-core` / `zune-jpeg` |
+| 方案 | 1.4.1 | master | 具体 |
+|---|---|---|---|
+| 关 `import`，不处理 data URI | **+5** | **+4** | `gltf` / `gltf-derive` / `gltf-json` / `inflections`（master 少了 `lazy_static`） |
+| **关 `import` + 开 `base64`（推荐）** | **+6** | **+5** | 上面 + `base64 0.13.1` |
+| 开 `import` | **+22** | **+21** | 上面 + `adler2` / `byteorder-lite` / `crc32fast` / `fdeflate` / `flate2` / `image` / `miniz_oxide`×2 / `moxcms` / `png` / `pxfm` / `simd-adler32` / `urlencoding` / `zlib-rs` / `zune-core` / `zune-jpeg` |
+
+⭐ **master 少一个包**：`lazy_static` 被彻底移除了（`gltf-json/Cargo.toml` 的 `[dependencies]` 现在只有
+`gltf-derive` / `serde` / `serde_derive` / `serde_json`，源码里也搜不到 `lazy_static`）。
+`[[package]]` 计数：master 关 import **19**（1.4.1 是 20）、开 import **40**（1.4.1 是 41）。
 
 ⭐ **`serde_json` 已经在 mdlc 的 `Cargo.lock:604`**（传递依赖）
 ⟹ 若要用它读 `extras.targetNames`，**加为直接依赖不新增任何包**。
@@ -333,6 +388,7 @@ mdlc 现在 **102** 个包。
 |---|---|
 | 构建耗时（关 `import`） | `Finished \`release\` profile in 7.78s`（只编 `base64` + `gltf` + 探针） |
 | 构建耗时（开 `import`） | `Finished in 20.72s`（编 22 个包） |
+| 构建耗时（master，关 `import`） | `Finished \`release\` profile in 56.44s`（**含从 GitHub 克隆 + 编译三个 git 源包**） |
 | 二进制大小（关 `import`） | `gltflite.exe` 712704 B |
 | 二进制大小（开 `import`） | `gltfi.exe` 723456 B（**只差 +10752 B ≈ +1.5%**） |
 | 需要 C 工具链吗？ | **不需要**（纯 Rust，与 `ufbx` 不同） |
@@ -341,24 +397,53 @@ mdlc 现在 **102** 个包。
 
 ### 4.3 建议的 `Cargo.toml` 条目
 
+**方案 A（推荐）：用 crates.io 的 1.4.1**
+
 ```toml
 # glTF / GLB 源（走 gltf crate）。
 #
 # `default-features = false` 关掉 `import`：它只做三件事 —— 解 data URI、
 # 读外部 .bin、解码全部图片。前两件我们自己做得更可控（见 §3.3），
 # 第三件对 mdlc 完全无用（只要材质**名**，不要纹理像素）。
-# 关掉它省下 17 个包（含整条 image/png/zune-jpeg 链）。
+# 关掉它省下 16 个包（含整条 image/png/zune-jpeg 链）：+22 ⟹ +6。
 #
 # `base64` 是独立 feature，用来解内嵌 .gltf 的 data URI。
 # `names` 拿节点/材质名，`extras` 拿 morph target 名（`extras.targetNames`）。
 #
-# ⚠️ 即使开着 `import` 也必须用 `Gltf::from_slice_without_validation`：
+# ⚠️ 1.4.1 必须用 `Gltf::from_slice_without_validation`：
 # crate 会把「无 bufferView 的 accessor」（规范允许，表示全零）判为错误，
 # 而 Blender 对「法线偏移全零」的 morph target 正是这么写的（见 §3.2）。
+# 上游 master 已修（§3.5），但尚未发版。
 gltf = { version = "1.4", default-features = false, features = [
     "utils", "names", "extras", "base64",
 ] }
 ```
+
+**方案 B：钉到上游 master（拿到坑一的修复）**
+
+```toml
+# ⚠️ 未发版的 git 依赖。好处是坑一（§3.2）已被修掉，可以走带校验的 `from_slice`，
+# 不必再用 `from_slice_without_validation`；还白拿一批 panic 修复（§3.6）。
+# 代价见 §4.4。
+gltf = { git = "https://github.com/gltf-rs/gltf", rev = "50d65229477fe5f785c2c90df21eb59c93ea2261", default-features = false, features = [
+    "utils", "names", "extras", "base64",
+] }
+```
+
+### 4.4 ⚠️ 用 git 依赖的代价
+
+| # | 代价 | 说明 |
+|---|---|---|
+| 1 | **`cargo publish` 会被 crates.io 拒绝** | crates.io **不允许**发布带 git 依赖的包（[Rust 论坛](https://users.rust-lang.org/t/help-cargo-package-with-github-dependencies/96275)、[crates.io#652](https://github.com/rust-lang/crates.io/issues/652)）。mdlc 的 `Cargo.toml` 目前**没有** `publish = false`，也从未发布过 ⟹ 一旦上 git 依赖，**发布这条路就断了**。 |
+| 2 | 需要网络（或 vendor） | 首次 `cargo build` 要克隆 `gltf-rs/gltf`。CI 上没问题（GitHub 通），但**离线构建**要配 `[source]` 替换或 `cargo vendor`（mdlc 现在没有 `vendor\`，也没有 `.cargo\config`）。 |
+| 3 | **构建耗时** | 56.44 s vs 7.78 s（首次；有缓存后差异小）。 |
+| 4 | **没有版本号锚** | `rev` 是死钉的，但上游不会为它做兼容性承诺 —— `gltf-json` 历史上不受 semver 约束。 |
+| 5 | 依赖升级靠手动 | `cargo update` 不会自动跟进；要自己改 `rev`。 |
+
+⭐ **权衡**：坑一**已经有确定的绕法**（`from_slice_without_validation` + reader 层自带的越界保护），
+而 git 依赖引入的 5 条代价**没有一条能靠代码消除**。
+⟹ **建议先用方案 A**；把方案 B 记为「等上游发版后切换」——
+届时两条好处（免绕校验 + panic 修复）都会自动到手，且**没有任何一条代价**。
 
 ---
 
@@ -583,10 +668,32 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 |---|---|---|
 | 1 | **无 oracle** | **最高**。所有口径都只能靠「与 FBX 传递等价」或「mdlc 自定」。文档必须逐条标注。 |
 | 2 | `from_slice_without_validation` 绕过全部校验 | 中。需要自己补 buffer 长度 / 索引范围检查（reader 层已有越界保护，见 §3.2）。 |
-| 3 | crate 的 `bufferView` bug | 中。若上游修了，我们的绕过代码要能自动失效（不能依赖 bug 存在）。 |
+| 3 | crate 的 `bufferView` bug | 中。**上游 master 已修**（`ca97641`，§3.5），但**尚未发版**（crates.io 仍是 1.4.1）。绕过代码要能**自动失效**（不能依赖 bug 存在）—— 见下方「兼容两种上游的写法」。 |
 | 4 | `CubicSpline` 插值 | 低-中。Blender 默认不写，但第三方工具会。 |
 | 5 | 两套输入差 100× | 中。**必须在文档里明说**，否则会被当成 bug 报上来。⚠️ **没有旋钮能补偿**（§5.2 实测：`srcscale` 是整体缩放，比值不变）。 |
 | 6 | `base64 0.13.1` 版本较老（2021） | 低。只在解 data URI 时用，且输入是本地文件。 |
+
+### 8.1 兼容两种上游的写法（风险 2 + 3）
+
+风险 2 与风险 3 的解法是同一个：**永远走 `from_slice_without_validation`，自己补齐校验**。
+这样上游修与不修**都不影响我们** —— 修了只是我们少报一条错误，绕过的代码本身仍然正确。
+
+```rust
+// 不写成「先试 from_slice，失败了再退到 without_validation」——
+// 那会让行为依赖 crate 的版本（同一个文件在两个版本下走不同分支），
+// 而且失败重试本身有成本。直接固定走绕校验的那条路。
+let gltf = Gltf::from_slice_without_validation(&bytes)?;
+// 自己补的三件事（顺序即成本从低到高）：
+// 1. 每个 buffer 声明的 byteLength ≤ 实际读到的字节数（GLB 的 BIN chunk / 外部 .bin / data URI）
+// 2. 每个 bufferView 的 [byteOffset, byteOffset+byteLength) 落在对应 buffer 内
+// 3. accessor 的 stride/count/type 推出的字节数落在其 bufferView 内
+//    （⚠️ accessor 没有 bufferView 时**跳过**，按规范当全零 —— 这正是坑一）
+```
+
+⚠️ **不要**依赖 `accessor.buffer_view.is_some()` 来分支处理「全零」：
+master 上它仍然是 `None`（修复是在 reader 层返回全零迭代器，没有伪造一个 bufferView）。
+判据是**读出来的迭代器**：1.4.1 给 `None`、master 给「`count` 个全零」，
+两者都表示「这个 target 的法线偏移是全零」⟹ **按全零处理即可，不需要区分版本**。
 
 ---
 
@@ -611,6 +718,19 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 - `bin\probe11.rs`：**data URI**（`gltf::import` vs 手工）
 - `bin\probe12.rs`（172 行）：**世界矩阵逐关节**（发现 `scene.nodes` 是层序）
 - `bin\probe13.rs`：**G1 收骨**（`skin.joints` + 祖先 + DFS 先序 + `bone_offset`），与官方 MDL 逐根对照
+
+**探针（`...\_gltfresearch\gltfnightly\` 与 `gltfnightly-import\`）—— 验证上游 master**
+- 两个工程都钉 `gltf = { git = "https://github.com/gltf-rs/gltf", rev = "50d65229477fe5f785c2c90df21eb59c93ea2261" }`；
+  前者 `default-features = false, features = ["utils","names","extras","base64"]`（关 `import`），
+  后者把 `base64` 换成 **`import`**。
+- `gltfnightly\src\main.rs`：对每个夹具跑 **[A] `Gltf::from_slice`（带校验）** 与 **[B] `from_slice_without_validation`**，
+  打印 buffers 长度 / `pos` / `idx` / 目标数 / 首顶点 / 每个 buffer 的 `uri` 前缀。
+- `gltfnightly\src\bin\probe_morph.rs`：**把 morph target 摊开**，逐个 target 打印 `pos`/`nrm`/`tan` 计数与前两个位移
+  —— 这是看出「master 把缺失数据物化成全零」的那一支。
+- `gltfnightly-import\src\main.rs`：显式调 **`gltf::import(path)`** 与手工路径对照。
+  ⚠️ **教训**：上一轮的 `gltflite-import` 复制了关 `import` 版的 `main.rs`，
+  用的是 `from_slice_without_validation` + 手工 `std::fs::read`，**根本没调 `gltf::import`**
+  ⟹ 那次 A/B 对「`import` 能否解 data URI」**零信息量**。**对照组必须真的走那条路径，不能只改 `Cargo.toml`。**
 
 **对照脚本**
 - `cmp_gltf_vvd.js`（4826 B）：`.glb` 几何 vs 官方 `.vvd`（去重集合比对）
@@ -642,3 +762,13 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
    实测后**被推翻** —— `srcscale` 是整体缩放，顶点与骨骼同乘，比值恒定。
    教训：**当两条口径只差一个比例因子时，任何「也乘同一个因子」的旋钮都补偿不了它**；
    要证明补偿有效，必须看到**比值变化**，而不只是某一侧的数字变好看。
+9. **「上游修了吗」要查三件事，缺一不可**：① 修复提交在不在 master（`git log`）；
+   ② 它在不在**已发布的 tag** 里（`git tag --contains <sha>`）；
+   ③ 有没有**新的 Release**（`gltf-rs/gltf` 从不发 Release，唯一的 `1.0.0` 是 2022 年的，
+   `get_latest_release` 会把人骗到那里去）。只看 ① 就会得出「已经修了，可以用 nightly」，
+   而实际上要用只能上 git 依赖。
+10. **对照组必须真的走那条路径，不能只改配置。** `gltflite-import` 复制了关 `import` 版的 `main.rs`
+   （`from_slice_without_validation` + 手工 `std::fs::read`），**根本没调 `gltf::import`**
+   ⟹ 那次「开/关 `import`」的 A/B 对 data URI 问题**零信息量**，
+   而且两次日志**逐字节相同**这个可疑现象当时没被追下去。
+   **判据：如果两组实验的输出完全一样，先怀疑实验没做对，再下结论。**

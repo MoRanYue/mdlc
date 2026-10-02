@@ -1098,7 +1098,7 @@ src/
 | [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | 以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准的 QC 覆盖对照 |
 | [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
 | [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的可行性调研与 UX 方案（**82 个官方 oracle 用例**的实测结论 + 九条 `src*` 语法的设计理由 + 偏离表） |
-| [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持的可行性调研（**官方零支持** ⟹ 传递式 oracle；crate 的三个坑；新增语法 0 条） |
+| [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持的可行性调研（**官方零支持** ⟹ 传递式 oracle；crate 的三个坑，其一上游 master 已修但**尚未发版**；新增语法 0 条） |
 
 > ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
 > 带有明确的快照日期（当时的文件 SHA256 与测试数）。**它们描述的是历史状态**，
