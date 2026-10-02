@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 764 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 774 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -33,6 +33,7 @@ cargo test --release        # 764 passed / 0 failed / 6 ignored（不需要任�
 - [TOML 描述文件](#toml-描述文件)
 - [QC 支持与 Crowbar 直接替换](#qc-支持与-crowbar-直接替换)
 - [命令行参考](#命令行参考)
+- [作为依赖使用](#作为依赖使用)
 - [格式上限：只保留格式能表示的那些](#格式上限只保留格式能表示的那些)
 - [顶点超限自动拆分](#顶点超限自动拆分)
 - [多 LOD](#多-lod)
@@ -662,6 +663,65 @@ QC 侧等价命令是 `$optimizevtx`（见 [mdlc 扩展的 QC 命令](#mdlc-扩�
 
 ---
 
+## 作为依赖使用
+
+`mdlc` 同时是一个库。要给第三方 GUI / 构建系统内置编译器时，**不要自己串一遍
+管线** —— 用 `mdlc::pipeline`：
+
+```rust
+use std::path::Path;
+use mdlc::model::ModelDesc;
+use mdlc::pipeline::{self, PipelineOptions};
+
+let text = std::fs::read_to_string("model.toml")?;
+let desc = ModelDesc::from_toml(&text)?;
+
+// 只编译，不碰文件系统：拿到四件套字节 + 编译期 IR。
+let out = pipeline::build(&desc, Path::new("."), PipelineOptions::default())?;
+
+// 或者直接落盘（按 `$modelname` 建目录）。
+let paths = pipeline::write_files(&out, Path::new("out"))?;
+println!("{}", paths.mdl.display());
+```
+
+`pipeline::build` 只读文件、不写文件；`write_files` 只写文件。**分两步是为了让
+GUI 能在写盘前显示摘要或让用户确认。**
+
+### 为什么必须用它
+
+`compile()` 只做「描述 → 编译期 IR」，它**完全不管碰撞 SMD**，也不写任何文件。
+自己串管线最容易漏掉的是「碰撞 SMD → `physicsbone`」这一步：
+
+```rust
+// 这一步漏了，`.mdl`/`.vvd`/`.dx90.vtx` 全对，只有 physicsbone 悄悄全 0。
+if let Some(cs) = &collision_smd {
+    let parents = mdlc::compile::bone_parents(&compiled.desc);
+    compiled.physics_bone = mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
+}
+```
+
+### 错误与退出码
+
+`PipelineError` 分四类，`kind()` 映射到与 `mdlc.exe` 相同的退出码：
+
+| 变体 | `kind()` | 退出码 | 触发 |
+|---|---|---|---|
+| `Compile(Vec<CompileError>)` | `Build` | 1 | 描述/QC 校验失败、读不到源 SMD |
+| `Collision(String)` | `Build` | 1 | 碰撞 SMD 解析失败 |
+| `Write(String)` | `Build` | 1 | 写出或自检失败（本实现的 bug） |
+| `Io(String)` | `Io` | 2 | 路径解析、读文件、建目录、写文件失败 |
+
+`lines()` 给出与 CLI 逐行相同的文案（编译失败是多行，其余是单行）；`Display`
+就是它们拼起来的。GUI 直接用 `lines()` 渲染日志即可，不必自己拼字符串。
+
+### 摘要
+
+`PipelineOutput::summary_lines(&paths)` 复刻 `mdlc.exe` 成功时打印的那张表
+（模型 / 版本 / checksum / 统计 / 每个产物的字节数与路径 / `**编译成功**`）。
+CLI 自己就是逐行 `println!` 它 —— 所以 GUI 显示的与命令行看到的**逐字相同**。
+
+---
+
 ## 格式上限：只保留格式能表示的那些
 
 `studiomdl` 里有一批**人为**上限（例如单 model 65536 顶点、材质 32 个），它们不是
@@ -794,7 +854,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 764 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 774 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -878,11 +938,11 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 764 passed / 0 failed / 6 ignored
+cargo test --release          # 774 passed / 0 failed / 6 ignored
 ```
 
-**764 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 770 个单元测试 =
-764 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**774 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 780 个单元测试 =
+774 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
@@ -902,6 +962,7 @@ cargo test --release          # 764 passed / 0 failed / 6 ignored
 | `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
 | `vta` | 14 | `.vta` 解析 |
 | `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
+| `pipeline` | 10 | 编排管线：碰撞 SMD → `physicsbone`、错误分类与退出码、摘要行、`optimize_vtx` 的 `||` |
 | `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
 | `layout` | 6 | 段偏移计算与单调性 |
 
@@ -959,7 +1020,8 @@ cargo test --release -- --ignored
 
 ```text
 src/
-  main.rs         命令行入口与编排（编译 → 写出 → 摘要）
+  main.rs         命令行入口（参数解析 → 调 `pipeline` → 打印摘要与退出码）
+  pipeline.rs     编排管线：ModelDesc → 四件套字节 → 落盘（库的对外入口）
   cli.rs          clap 定义 + 官方 studiomdl 单横线选项的归一化兼容层
   diag.rs         诊断输出的流路由（兼容形态走 stdout）
   lib.rs          库根：模块声明与 VVD 往返判据

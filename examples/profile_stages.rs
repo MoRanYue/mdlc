@@ -1,7 +1,7 @@
 //! 分阶段性能剖析探针（**只读**，不修改任何既有模块）。
 //!
 //! 用途：回答「mdlc 的时间花在哪个阶段」，为 SIMD 化选点提供实测依据。
-//! 与 `src/main.rs` 的 `compile_and_write` 走**同一串公开 API**，
+//! 与 [`mdlc::pipeline::build`] 走**同一串公开 API**，
 //! 只是把每个阶段单独计时。
 //!
 //! 用法：
@@ -71,18 +71,9 @@ fn one_pass(toml_path: &Path, stages: &mut [Stage]) {
     let flat = flatten_vertices(&compiled, &out.spans);
     stages[3].push(t.elapsed().as_secs_f64() * 1e3);
 
-    // ---- 阶段 4：build_vvd（切线 + 多 LOD fixup）----
+    // ---- 阶段 4：build_vvd（切线 + 多 LOD fixup；单/多 LOD 自动分派）----
     let t = Instant::now();
-    let multi = compiled
-        .bodyparts
-        .iter()
-        .flat_map(|bp| &bp.models)
-        .any(|m| m.lods.as_ref().is_some_and(|l| l.is_multi()));
-    let vvd = if multi {
-        mdlc::lod::build_multi_lod_vvd(&compiled, out.checksum).expect("multi vvd").0
-    } else {
-        mdlc::lod::build_single_lod_vvd(&compiled, out.checksum).expect("single vvd")
-    };
+    let vvd = mdlc::lod::build_vvd(&compiled, out.checksum).expect("build_vvd");
     stages[4].push(t.elapsed().as_secs_f64() * 1e3);
 
     // ---- 阶段 5：VVD 序列化 ----

@@ -666,6 +666,29 @@ pub fn build_multi_lod_vvd(
     Ok((vvd, layout))
 }
 
+/// 按 `compiled` 里有没有 LOD 数据，自动分派单 LOD / 多 LOD 两条路径。
+///
+/// 判据 = 「**任一** model 带 LOD 且 `num_lods > 1`」（见
+/// [`crate::model::ModelLods::is_multi`]）。多 LOD 时丢弃 [`LodLayout`]
+/// —— 只想要 VVD 字节的调用者不需要它；需要 `layout` 的
+/// （MDL 字段填充 / VTX 重映射）直接调 [`build_multi_lod_vvd`]。
+pub fn build_vvd(
+    compiled: &crate::model::CompiledModelDesc,
+    checksum: i32,
+) -> Result<crate::vvd::Vvd, crate::vvd::VvdError> {
+    let multi = compiled
+        .bodyparts
+        .iter()
+        .flat_map(|bp| &bp.models)
+        .any(|m| m.lods.as_ref().is_some_and(|l| l.is_multi()));
+    if multi {
+        let (vvd, _layout) = build_multi_lod_vvd(compiled, checksum)?;
+        Ok(vvd)
+    } else {
+        build_single_lod_vvd(compiled, checksum)
+    }
+}
+
 /// 一个 model 在**多 LOD** 下写 MDL 所需的字段。
 ///
 /// # 为什么 MDL 也要跟着变

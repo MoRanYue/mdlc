@@ -384,7 +384,7 @@ pub fn build_qc_args(m: &ArgMatches) -> (PathBuf, PathBuf, bool) {
 /// ```
 ///
 /// 所以 `-game <gamedir>` ⟹ `out_root = <gamedir>\models`，
-/// 再叠加 `$modelname` 里的相对路径（由 `compile_and_write` 拼）。
+/// 再叠加 `$modelname` 里的相对路径（由 [`crate::pipeline::write_files`] 拼）。
 ///
 /// `--out` 显式给了就优先用它（mdlc 扩展，方便测试与脚本）。
 pub fn official_out_root(m: &ArgMatches) -> PathBuf {

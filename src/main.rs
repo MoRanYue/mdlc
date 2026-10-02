@@ -19,10 +19,8 @@ use mdlc::compile::compile;
 // 诊断输出的路由版（`eprintln!` / `eprint!` 的替代）—— 官方兼容模式下
 // 自动改走 stdout，理由见 [`mdlc::diag`] 模块文档。
 use mdlc::{diagln, diagprint};
-use mdlc::mdl_writer::write_mdl;
 use mdlc::model::ModelDesc;
 use mdlc::phy::{self, PhyHull, PhyParams, PhySolid};
-use mdlc::vtx_writer::{self, write_vtx_with};
 use mdlc::vvd::{Vvd, check_invariants};
 
 const USAGE: &str = "\
@@ -380,334 +378,40 @@ fn build_qc_from(qc: &Path, out_root: &Path, optimize_vtx: bool) -> ExitCode {
 /// `build`（TOML）与 `build-qc`（QC）共用这条路径 —— 两者只在
 /// **怎么得到 `ModelDesc`** 上不同，之后完全一致。这正是
 /// `model.rs` 模块文档承诺的「写出器一行都不用改」。
+///
+/// 编排本身在 [`mdlc::pipeline`] 里（第三方工具可直接用同一套 API）；
+/// 这里只负责把结果按 `mdlc.exe` 的契约打印出来并映射成退出码。
 fn compile_and_write(
     desc: &ModelDesc,
     base: &Path,
     out_root: &Path,
     cli_optimize_vtx: bool,
 ) -> ExitCode {
-    let mut compiled = hotpath::measure_block!("main: compile()", {
-        match compile(desc, base) {
-            Ok(c) => c,
-            Err(errs) => {
-                diagln!("编译失败，{} 处错误：", errs.len());
-                for e in &errs {
-                    diagln!("  - {e}");
-                }
-                return ExitCode::from(1);
+    let opts = mdlc::pipeline::PipelineOptions {
+        optimize_vtx: cli_optimize_vtx,
+    };
+    let out = match mdlc::pipeline::build(desc, base, opts) {
+        Ok(o) => o,
+        Err(e) => {
+            for line in e.lines() {
+                diagln!("{line}");
             }
-        }
-    });
-
-    // ---- 碰撞 SMD：**必须在 `write_mdl` 之前**解析 ----
-    //
-    // 因为 `physicsbone`（`mstudiobone_t` `+0xAC`）要写进**骨骼表**，
-    // 而骨骼表是 `write_mdl` 产出的。碰撞几何来自**单独的 SMD**
-    // （官方 `$collisionmodel` / `$collisionjoints`），所以要提前读。
-    //
-    // 解析结果留到下面构造 `.phy` 时**复用**，避免读两次。
-    let collision_smd: Option<mdlc::smd::Smd> = match desc.physics.smd.as_deref() {
-        None => None,
-        Some(rel_smd) => {
-            let p = match mdlc::compile::resolve_smd_path(base, rel_smd) {
-                Ok(p) => p,
-                Err(msg) => {
-                    diagln!("错误：{msg}");
-                    return ExitCode::from(2);
-                }
-            };
-            let text = match std::fs::read_to_string(&p) {
-                Ok(t) => t,
-                Err(e) => {
-                    diagln!("错误：读不到碰撞 SMD {}：{e}", p.display());
-                    return ExitCode::from(2);
-                }
-            };
-            match mdlc::smd::parse_smd(&text) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    diagln!("错误：解析碰撞 SMD {} 失败：{e}", p.display());
-                    return ExitCode::from(1);
-                }
-            }
+            return ExitCode::from(e.kind().exit_code());
         }
     };
-
-    // `physicsbone`：只有**碰撞几何**能提供 solid→骨骼的映射。
-    //
-    // 官方（`collisionmodel.cpp:2141-2184`）在**跑了碰撞模型**之后填它，
-    // 没跑就保持 0 —— 实测单 solid 2459/2459 全 0、多 solid 38/38 非平凡。
-    //
-    // ⚠️ 用**骨骼表**的父链（`compiled.desc.bones`）而不是碰撞 SMD 的
-    // `nodes` —— 两者在静态道具 / 骨骼塌缩后可能不同，而落盘的
-    // `physicsbone` 下标必须对**最终骨骼表**成立。
-    if let Some(cs) = &collision_smd {
-        let bi = compiled.desc.bone_index();
-        let parents: Vec<i32> = compiled
-            .desc
-            .bones
-            .iter()
-            .map(|b| match b.parent.as_deref() {
-                Some(p) => bi.get(p).map(|v| *v as i32).unwrap_or(-1),
-                None => -1,
-            })
-            .collect();
-        compiled.physics_bone =
-            mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
-    }
-
-    let out = hotpath::measure_block!("main: write_mdl", {
-        match write_mdl(&compiled) {
-            Ok(o) => o,
-            Err(e) => {
-                diagln!("错误：{e}");
-                return ExitCode::from(1);
+    let paths = match mdlc::pipeline::write_files(&out, out_root) {
+        Ok(p) => p,
+        Err(e) => {
+            for line in e.lines() {
+                diagln!("{line}");
             }
-        }
-    });
-    // `vvd` 只在块内用（自检读它的字段）；逃逸出去的只有字节。
-    let vvd_bytes = hotpath::measure_block!("main: build_vvd + to_bytes", {
-        let vvd = match build_vvd(&compiled, out.checksum) {
-            Ok(v) => v,
-            Err(e) => {
-                diagln!("错误：构造 VVD 失败：{e}");
-                return ExitCode::from(1);
-            }
-        };
-        let vvd_bytes = match vvd.to_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                diagln!("错误：写出 VVD 失败：{e}");
-                return ExitCode::from(1);
-            }
-        };
-        // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
-        if let Err(e) = check_invariants(&vvd, vvd_bytes.len()) {
-            diagln!("错误：写出的 VVD 不自洽（本实现的 bug）：{e}");
-            return ExitCode::from(1);
-        }
-        vvd_bytes
-    });
-
-    // VTX：没有它模型在游戏里根本不渲染。
-    //
-    // 缓存优化默认关闭（保持与真 studiomdl 逐字节一致）；
-    // TOML 的 `[model] optimize_vtx` 或命令行 `--optimize-vtx` 可打开，
-    // 后者**覆盖**前者（命令行优先）。
-    let vtx_opts = vtx_writer::VtxOptions {
-        optimize_vertex_cache: desc.model.optimize_vtx || cli_optimize_vtx,
-    };
-    let vtx = hotpath::measure_block!("main: write_vtx", {
-        match write_vtx_with(&compiled, vtx_opts) {
-            Ok(v) => v,
-            Err(e) => {
-                diagln!("错误：写出 VTX 失败：{e}");
-                return ExitCode::from(1);
-            }
-        }
-    });
-    if let Err(e) = vtx_writer::check_invariants(&vtx, &compiled) {
-        diagln!("错误：写出的 VTX 不自洽（本实现的 bug）：{e}");
-        return ExitCode::from(1);
-    }
-
-    // 输出路径：out_root + 模型名（去掉 .mdl 换扩展名）。
-    let rel = desc.output_name();
-    let stem = rel.strip_suffix(".mdl").unwrap_or(&rel);
-    let mdl_path = out_root.join(format!("{stem}.mdl"));
-    let vvd_path = out_root.join(format!("{stem}.vvd"));
-    let vtx_path = out_root.join(format!("{stem}.dx90.vtx"));
-
-    // ---- PHY 碰撞模型（可选，由 `[model].collision_smd` 触发）----
-    //
-    // 官方 QC 的 `$collisionmodel <.smd>` **指向另一个 SMD**（通常
-    // `*_phys.smd`），碰撞几何与渲染网格是两份数据 —— 碰撞网格通常刻意
-    // 做得更简单、更接近凸体。所以本实现同样接受一个**单独的 SMD 路径**。
-    //
-    // `checksum` 用 `.mdl` 的那一个（配对令牌，引擎会校验）。
-    //
-    // ⚠️ 碰撞 SMD **已在上面（`write_mdl` 之前）解析过** —— 这里复用，
-    // 因为 `physicsbone` 需要它，而那个字段要写进骨骼表。
-    let phy_bytes: Option<Vec<u8>> = match &collision_smd {
-        None => None,
-        Some(smd) => {
-            // `editparams.modelname` 用**不带扩展名**的模型名 ——
-            // 与 `mdlc phy` 的 `file_stem` 行为一致。
-            let phys_name = Path::new(stem)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unnamed".to_string());
-            // `[physics].mass` 与 `.mdl` 头部 `+0x148` 是**同一个值**
-            // （`write.cpp:2092` `phdr->mass = GetCollisionModelMass();`），
-            // 所以两处都取 `effective_mass()`。
-            //
-            // `joints` 走 ragdoll（每骨骼一个 solid），
-            // 否则走 prop 形态（单 solid，可选 `concave`）。
-            let mass = desc.physics.effective_mass();
-            // ---- prop 形态的 solid `name` = **碰撞 SMD 的 basename** ----
-            //
-            // 官方 `ProcessSingleBody`（`collisionmodel.cpp:1563-1571`）：
-            // `Q_FileBase( pmodel->filename, tmp, ... )` —— `pmodel` 是
-            // `$collisionmodel <smd>` 指向的那个 SMD，**与 `$modelname` 无关**。
-            // 受控实验（`gen_phyname.js`）：`physign_geo.smd` → `"physign_geo"`。
-            let collision_smd_name = desc
-                .physics
-                .smd
-                .as_deref()
-                .map(|p| {
-                    std::path::Path::new(p)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.to_string())
-                })
-                .unwrap_or_else(|| phys_name.clone());
-            // ---- `surfaceprop` 从**模型头**取 ----
-            //
-            // `GetSurfaceProp`（`studiomdl.cpp:4974-5001`）先查
-            // `$jointsurfaceprop`、再沿父链上溯，最后回落到
-            // `s_pDefaultSurfaceProp`（= `$surfaceprop`）。
-            // prop 形态的 solid 名是碰撞 SMD 的 basename ⟹ 必然查不到 ⟹
-            // 恒等于 `$surfaceprop`。实测 **2498/2498 = 100%** 的 `.phy`
-            // 的 surfaceprop 等于 `.mdl` 头部 `+0x134`。
-            let surface_prop = desc.model.surface_prop.as_deref().unwrap_or("default");
-            // ---- 官方 `ConvertToWorldSpace` 用的是**第一个序列第 0 帧** ----
-            //
-            // `collisionmodel.cpp:713` `CalcBoneTransforms( g_panimation[0], 0, ... )`。
-            // 碰撞 SMD 自己的姿态**完全不参与** —— 这一点用受控实验定过案
-            // （`docs/_probe/gen_phyrot.js`：三个几何相同、只有序列姿态不同的
-            // 模型，`.phy` 互不相同而 `.vvd` 相同）。
-            //
-            // 没有序列时传 `None`，退化成用碰撞 SMD 自己的参考姿态。
-            let pose_world = compiled
-                .sequences
-                .first()
-                .and_then(|s| s.frames.first())
-                .map(|f| mdlc::phy::sequence_pose_world(&compiled.desc.bones, f));
-            let ident = mdlc::phy::PhyIdentity {
-                model_name: &phys_name,
-                collision_smd_name: &collision_smd_name,
-                surface_prop,
-            };
-            let built = if desc.physics.joints {
-                phy::build_ragdoll_phy_from_smd(
-                    smd,
-                    ident,
-                    out.checksum as u32,
-                    mass,
-                    &desc.physics,
-                )
-            } else {
-                phy::build_phy_from_smd(
-                    smd,
-                    ident,
-                    out.checksum as u32,
-                    mass,
-                    &desc.physics,
-                    pose_world.as_ref(),
-                )
-            };
-            match built {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    diagln!("错误：构造 PHY 失败：{e}");
-                    return ExitCode::from(1);
-                }
-            }
+            return ExitCode::from(e.kind().exit_code());
         }
     };
-    // 写出前自检 —— 13 条硬约束，失败说明是本实现的 bug。
-    if let Some(b) = &phy_bytes
-        && let Err(e) = phy::check_invariants(b)
-    {
-        diagln!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
-        return ExitCode::from(1);
+    for line in out.summary_lines(&paths) {
+        println!("{line}");
     }
-    let phy_path = phy_bytes.as_ref().map(|_| out_root.join(format!("{stem}.phy")));
-
-    // `$animblocksize` 的外置动画块。**文件名必须是 `models/<模型名>.ani`**
-    // —— `.mdl` 头部 `+0x15C` 存的就是这个路径，写错名字引擎就找不到。
-    //
-    // 注意 `output_name()` 已经是 `models/` 前缀形式（如 `mymod/x.mdl`
-    // 的 `models/mymod/x.mdl`），所以这里直接用 `{stem}.ani`。
-    let ani_path = out.ani.as_ref().map(|_| out_root.join(format!("{stem}.ani")));
-    for p in [&mdl_path, &vvd_path, &vtx_path]
-        .into_iter()
-        .chain(ani_path.iter())
-        .chain(phy_path.iter())
-    {
-        if let Some(dir) = p.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            diagln!("错误：建目录 {} 失败：{e}", dir.display());
-            return ExitCode::from(2);
-        }
-    }
-    for (path, bytes) in [
-        (&mdl_path, &out.bytes),
-        (&vvd_path, &vvd_bytes),
-        (&vtx_path, &vtx.bytes),
-    ] {
-        if let Err(e) = std::fs::write(path, bytes) {
-            diagln!("错误：写 {} 失败：{e}", path.display());
-            return ExitCode::from(2);
-        }
-    }
-    if let (Some(path), Some(bytes)) = (&ani_path, &out.ani)
-        && let Err(e) = std::fs::write(path, bytes)
-    {
-        diagln!("错误：写 {} 失败：{e}", path.display());
-        return ExitCode::from(2);
-    }
-    if let (Some(path), Some(bytes)) = (&phy_path, &phy_bytes)
-        && let Err(e) = std::fs::write(path, bytes)
-    {
-        diagln!("错误：写 {} 失败：{e}", path.display());
-        return ExitCode::from(2);
-    }
-
-    println!("模型        {}", desc.model.name);
-    println!("版本        {}", desc.version());
-    println!("checksum    {}  （已写入各文件，配对一致）", out.checksum);
-    println!();
-    println!("骨骼        {}", desc.bones.len());
-    println!("材质        {}", desc.materials.textures.len());
-    println!("body part   {}", desc.bodyparts.len());
-    println!("顶点        {}", compiled.total_vertices());
-    println!("三角形      {}", compiled.total_triangles());
-    println!();
-    println!("MDL         {:>10} 字节  {}", out.bytes.len(), mdl_path.display());
-    println!("VVD         {:>10} 字节  {}", vvd_bytes.len(), vvd_path.display());
-    println!("VTX         {:>10} 字节  {}", vtx.bytes.len(), vtx_path.display());
-    if let (Some(p), Some(b)) = (&phy_path, &phy_bytes) {
-        println!("PHY         {:>10} 字节  {}", b.len(), p.display());
-    }
-    println!();
-    println!("**编译成功**（各文件布局自检均通过）");
     ExitCode::SUCCESS
-}
-
-/// 把 IR 顶点转成 VVD —— **切线按真实三角形计算**，多 LOD 时生成 fixup 表。
-///
-/// 走哪条路径由 `compiled` 里有没有 LOD 数据决定：
-/// - 全部 model 都是单 LOD → [`mdlc::lod::build_single_lod_vvd`]，
-///   顶点顺序与旧的「摊平」实现完全一致（除切线块外逐字节相同）；
-/// - 有 model 带 LOD → [`mdlc::lod::build_multi_lod_vvd`]，
-///   顶点池跨 LOD 去重并按 LOD 归属排序，附带 fixup 表。
-fn build_vvd(
-    compiled: &mdlc::model::CompiledModelDesc,
-    checksum: i32,
-) -> Result<Vvd, mdlc::vvd::VvdError> {
-    let multi = compiled
-        .bodyparts
-        .iter()
-        .flat_map(|bp| &bp.models)
-        .any(|m| m.lods.as_ref().is_some_and(|l| l.is_multi()));
-    if multi {
-        let (vvd, _layout) = mdlc::lod::build_multi_lod_vvd(compiled, checksum)?;
-        Ok(vvd)
-    } else {
-        mdlc::lod::build_single_lod_vvd(compiled, checksum)
-    }
 }
 
 fn vvd_info(path: &str) -> ExitCode {

@@ -50,6 +50,7 @@
 //! | [`fbx`] | **FBX 源读取**（`ufbx` → 中立 SMD；含 shape key → flex 的元数据） |
 //! | [`flex`] | **VTA 形状解析**（就近匹配 → 差量 → smoothstep → 载荷） |
 //! | [`qc`] | **QC 前端**（`.qc` 脚本 → [`model::ModelDesc`]） |
+//! | [`pipeline`] | **编排管线**（`ModelDesc` → 四件套字节 → 落盘；第三方工具的入口） |
 //! | `test_assets` | 真实素材测试的路径解析（**仅 `#[cfg(test)]`**，故此处不作链接） |
 
 pub mod anim_writer;
@@ -65,6 +66,7 @@ pub mod lod;
 pub mod mdl_writer;
 pub mod model;
 pub mod phy;
+pub mod pipeline;
 pub mod qc;
 pub mod smd;
 pub mod tangent;
