@@ -52,6 +52,7 @@
 //! | [`flex`] | **VTA 形状解析**（就近匹配 → 差量 → smoothstep → 载荷） |
 //! | [`qc`] | **QC 前端**（`.qc` 脚本 → [`model::ModelDesc`]） |
 //! | [`pipeline`] | **编排管线**（`ModelDesc` → 四件套字节 → 落盘；第三方工具的入口） |
+//! | [`update`] | **更新检测**（后台静默、派生子进程，永不阻塞编译） |
 //! | `test_assets` | 真实素材测试的路径解析（**仅 `#[cfg(test)]`**，故此处不作链接） |
 
 pub mod anim_writer;
@@ -75,6 +76,7 @@ pub mod tangent;
 /// 真实素材测试的路径解析（**仅测试**，`#[cfg(test)]`）。
 #[cfg(test)]
 pub mod test_assets;
+pub mod update;
 pub mod vta;
 pub mod vtx_writer;
 pub mod vvd;

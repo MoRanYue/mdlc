@@ -68,6 +68,10 @@ mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
   mdlc template
       打印一份带注释的最小 TOML 模板。
 
+  mdlc --version / -V
+      打印版本号。更新检测会把本地版本与 GitHub 上最新的 Release 比较，
+      有新版本时在这里提到的同一行提示里给出来。
+
 官方 studiomdl 兼容形态（用于直接替换 Crowbar 等宿主的编译器路径）：
   mdlc -game <gamedir> [-nop4] [-verbose] <model.qc>
       等价于 `build-qc <model.qc> --out <gamedir>\\models`
@@ -107,14 +111,37 @@ fn main() -> ExitCode {
     // - 首参就是 `.qc`：`mdlc <x.qc>`（选项全默认）。
     //
     // 两者与 mdlc 自有形态无歧义：mdlc 的子命令都是**裸词**，且没有以
-    // `.qc` 结尾的。`-h` / `--help` 例外 —— 仍归 mdlc（官方 `-h` 是
-    // dump hboxes，归一化后是 `--h`，不会撞上 `--help`）。
+    // `.qc` 结尾的。`-h` / `--help` / `-V` / `--version` 例外 —— 它们仍归
+    // mdlc（官方 `-h` 是 dump hboxes，归一化后是 `--h`，不会撞上 `--help`）。
+    //
+    // ⚠️ 这段必须**早于下面的更新检测**：更新提示是一条诊断，它得遵守
+    // 同一条流路由（官方形态走 stdout）。判据纯由 `rest` 决定，没有副作用。
     let first = rest.first().map(String::as_str);
     let official_form = match first {
-        Some(f) if f.starts_with('-') => f != "-h" && f != "--help",
+        Some(f) if f.starts_with('-') => !matches!(f, "-h" | "--help" | "-V" | "--version"),
         Some(f) => f.to_ascii_lowercase().ends_with(".qc"),
         None => false,
     };
+
+    // ---- 更新检测（后台静默，永不阻塞）----
+    //
+    // 放在**最前面**、早于 clap 解析：这样 mdlc 自有形态与官方兼容形态
+    // 共用同一套行为，也不会因为某个子命令的早退而漏掉。
+    //
+    // 开销 = 读一个约 100 字节的缓存文件；**只有缓存过期（24 小时）时**
+    // 才会额外派生一个子进程，且不等它。
+    //
+    // ⚠️ `__update-check` 正是那个被派生出来的子进程 —— 它**不能**再
+    // 触发一次检测，否则每次运行都会裂变成两个进程。
+    let is_update_probe = rest
+        .first()
+        .is_some_and(|a| a == mdlc::update::HIDDEN_SUBCOMMAND);
+    if !is_update_probe {
+        // 先定路由，再检测 —— 否则官方形态下的提示会落到 stderr 上，
+        // 而 Crowbar 只认 stdout（见 [`mdlc::diag`]）。
+        mdlc::diag::set_to_stdout(official_form);
+        mdlc::update::startup();
+    }
 
     if official_form {
         return run_official(&argv);
@@ -155,6 +182,13 @@ fn main() -> ExitCode {
         Some(("vvd-info", m)) => vvd_info(m.get_one::<String>("file").expect("required")),
         Some(("vvd-roundtrip", m)) => {
             vvd_roundtrip(m.get_one::<String>("file").expect("required"))
+        }
+        // 隐藏子命令：`update::spawn_check` 派生出来的子进程走这里。
+        // 同步跑一次检测（写缓存），**不打印任何东西** —— 它的 stdout
+        // 在派生时已被接到 NUL；手动跑时想看结果就开 `MDLC_UPDATE_DEBUG=1`。
+        Some((name, _)) if name == mdlc::update::HIDDEN_SUBCOMMAND => {
+            mdlc::update::run_check();
+            ExitCode::SUCCESS
         }
         Some((other, _)) => {
             diagln!("错误：未知子命令 {other:?}\n");

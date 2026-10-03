@@ -99,6 +99,30 @@ base64 = "0.13"
 # 它已在 `Cargo.lock` 里（`gltf` 的传递依赖）⟹ 加为直接依赖不新增包。
 serde_json = "1"
 
+# ---- 更新检测的 HTTP 栈 ----
+# `ureq`（同步、纯 Rust）+ `rustls`（`ring` provider）：无 tokio、无 hyper、
+# 无系统 TLS 依赖（`native-tls` 在 Linux 上要 libssl-dev，会打断 CI）。
+# 实测依赖增量 **+27 个包**；对比 `reqwest`（blocking+rustls+json）的
+# **+116 个包**。冷构建代价见 `docs/update-check.md`。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# ---- 仅 Windows：摘掉后台子进程不该继承的 std 句柄 ----
+#
+# `std::process::Command` 在 Windows 上**无条件**用 `bInheritHandles = TRUE`
+# 调 `CreateProcessW`（`inherit_handles` 默认 `true`，且它没有用
+# `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 收窄集合）⟹ 后台子进程会复制**我们
+# 进程里所有**可继承句柄，包括调用方为了让 `ReadToEnd()` 拿到 EOF 而建的
+# stdout 管道。`Stdio::null()` 挡不住：它只换子进程的 0/1/2。
+#
+# `windows-sys 0.52.0` **已在 `Cargo.lock` 里**（`ring` 的传递依赖）
+# ⟹ 加为直接依赖**不新增任何包**，只多两个 feature。
+# 详细取证与实测见 `docs/update-check.md`。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [features]
 # 分段计时探针。**默认关闭** —— 打开后 `measure_block!` 会在每个计时点做
 # 一次原子读，实测给单 LOD 常见路径带来约 2.5% 开销（历史数据见 `src/lod.rs`

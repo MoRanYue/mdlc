@@ -176,7 +176,7 @@ pub fn normalize_official_args(argv: &[String]) -> Normalized {
 pub fn build_cli() -> Command {
     Command::new("mdlc")
         .about("Source 引擎模型编译器（studiomdl 重写）")
-        .disable_version_flag(true)
+        .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(false)
         .arg_required_else_help(false)
         .subcommand(build_cmd())
@@ -187,6 +187,8 @@ pub fn build_cli() -> Command {
         .subcommand(vvd_info_cmd())
         .subcommand(vvd_roundtrip_cmd())
         .subcommand(template_cmd())
+        // 隐藏：更新检测的子进程入口。见 [`crate::update`]。
+        .subcommand(update_check_cmd())
 }
 
 /// 官方兼容模式的命令行（首参为 `-` 时走这里）。
@@ -301,6 +303,21 @@ fn vvd_roundtrip_cmd() -> Command {
 
 fn template_cmd() -> Command {
     Command::new("template").about("打印一份带注释的最小 TOML 模板")
+}
+
+/// **隐藏**子命令：更新检测的子进程入口（`mdlc __update-check`）。
+///
+/// 它刻意不出现在 `--help` 里（`.hide(true)`）—— 这是给 `crate::update`
+/// 派生出去的子进程用的，不是给用户的功能。手动跑它只是为了排错：
+/// 它会**同步**执行一次检测，把结果写进缓存。
+///
+/// 之所以做成「真子命令」而不是内部环境变量开关：`spawn` 出去的是
+/// **同一个可执行文件**，走同一条参数解析路径，所以「手动跑」与
+/// 「后台跑」不可能分叉出两种行为。
+fn update_check_cmd() -> Command {
+    Command::new(crate::update::HIDDEN_SUBCOMMAND)
+        .about("（内部）跑一次更新检测并写缓存")
+        .hide(true)
 }
 
 /// `phy` 子命令（参数多，单独一个函数）。

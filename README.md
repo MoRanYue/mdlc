@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test                  # 805 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test                  # 815 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -33,6 +33,7 @@ cargo test                  # 805 passed / 0 failed / 6 ignored（不需要任�
 - [TOML 描述文件](#toml-描述文件)
 - [QC 支持与 Crowbar 直接替换](#qc-支持与-crowbar-直接替换)
 - [命令行参考](#命令行参考)
+- [更新检测](#更新检测)
 - [作为依赖使用](#作为依赖使用)
 - [格式上限：只保留格式能表示的那些](#格式上限只保留格式能表示的那些)
 - [顶点超限自动拆分](#顶点超限自动拆分)
@@ -672,6 +673,7 @@ mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
 mdlc vvd-info <file.vvd>
 mdlc vvd-roundtrip <file.vvd>
 mdlc template
+mdlc --version | -V
 ```
 
 | 子命令 | 作用 |
@@ -685,12 +687,45 @@ mdlc template
 | `vvd-roundtrip` | VVD 读入再写出并逐字节比对（布局判据） |
 | `template` | 打印带注释的完整 TOML 模板 |
 
+`--version` / `-V` 打印 `mdlc <版本>`。⚠️ **官方兼容形态不认它** ——
+`mdlc -game <dir> <qc>` 会把它当未知选项警告后继续（官方 `studiomdl`
+没有这个选项）。
+
 `--optimize-vtx` 用 `meshopt` 对每个 strip group 重排索引以提升 GPU 后变换顶点
 缓存命中率。它**只改索引顺序**，顶点池与三角形集合都不变（写出前有守门断言校验
 这两条），所以渲染结果相同。默认**关闭**，以保持与既有产物逐字节相同。
 
 它与 `[model].optimize_vtx` 是 `||` 关系（任一为真即生效），所以**只能开、不能关**；
 QC 侧等价命令是 `$optimizevtx`（见 [mdlc 扩展的 QC 命令](#mdlc-扩展的-qc-命令)）。
+
+---
+
+## 更新检测
+
+`mdlc` 每次运行都会在后台检查有没有新版本 —— **不阻塞编译**：网络 I/O 发生在
+派生出去的子进程里，主进程只读一个约 100 字节的缓存文件。
+
+| 项 | 值 |
+|---|---|
+| 间隔 | 24 小时；期内**不派生任何进程** |
+| 提示时机 | **下一次运行**（第 1 次派生子进程去查，第 2 次读缓存打印） |
+| 关闭 | 环境变量 `MDLC_NO_UPDATE_CHECK=1` |
+| CI | 检测到 `CI` 环境变量时自动跳过 |
+| 排错 | `MDLC_UPDATE_DEBUG=1` 把失败原因打到 stderr |
+| 缓存 | Windows `%LOCALAPPDATA%\mdlc\update-check.json`；其余 `$XDG_CACHE_HOME/mdlc/` 或 `~/.cache/mdlc/` |
+
+**代价**：二进制从 5.77 MB 涨到 **7.78 MB**（+2.0 MB / +35%，主要是
+`rustls` + `ring`）；`Cargo.lock` 多 27 个包；冷构建 +16 s（**增量无可测差异**）。
+
+提示是一条诊断，所以它跟着既有规则走：**官方兼容形态落 stdout**（与官方
+`studiomdl` 一致，Crowbar 只认 stdout），mdlc 自有形态落 stderr。
+
+> ⚠️ 一个不显然的坑：`std::process::Command` 在 Windows 上**无条件**用
+> `bInheritHandles = TRUE` 调 `CreateProcessW`，子进程会继承调用方的 stdout
+> 管道。调用方（Crowbar）等的是**管道 EOF** 而不是进程退出，于是「后台」
+> 检测反而让它白等 **599 ms**。修法是在 `spawn` 前后临时清掉自身 std 句柄的
+> `HANDLE_FLAG_INHERIT` 位（stable 上唯一的解法 —— `inherit_handles(false)`
+> 是 unstable）。完整实测见 [`docs/update-check.md`](docs/update-check.md)。
 
 ---
 
@@ -885,7 +920,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test                            # 应为 805 passed / 0 failed / 6 ignored
+cargo test                            # 应为 815 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -982,11 +1017,11 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test                  # 805 passed / 0 failed / 6 ignored
+cargo test                  # 815 passed / 0 failed / 6 ignored
 ```
 
-**805 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 811 个单元测试 =
-805 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**815 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 821 个单元测试 =
+815 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
@@ -1008,6 +1043,7 @@ cargo test                  # 805 passed / 0 failed / 6 ignored
 | `vta` | 14 | `.vta` 解析 |
 | `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
 | `pipeline` | 10 | 编排管线：碰撞 SMD → `physicsbone`、错误分类与退出码、摘要行、`optimize_vtx` 的 `||` |
+| `update` | 10 | 版本号比较、缓存读写、提示文案、**std 句柄可继承位的清除与恢复** |
 | `tangent` | 9 | 切线算法（轴对齐 / 手性 / 退化 UV） |
 | `layout` | 6 | 段偏移计算与单调性 |
 
@@ -1069,6 +1105,7 @@ src/
   pipeline.rs     编排管线：ModelDesc → 四件套字节 → 落盘（库的对外入口）
   cli.rs          clap 定义 + 官方 studiomdl 单横线选项的归一化兼容层
   diag.rs         诊断输出的流路由（兼容形态走 stdout）
+  update.rs       更新检测（后台静默派生子进程；含 Windows 句柄可继承位的处理）
   lib.rs          库根：模块声明与 VVD 往返判据
   model.rs        IR（ModelDesc）与全部校验规则；含 TEMPLATE_TOML
   smd.rs          SMD 网格 / 骨架解析
@@ -1146,6 +1183,7 @@ MIT OR Apache-2.0；**关掉 `import` feature**，所以不拉图片解码链）
 | [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
 | [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的可行性调研与 UX 方案（**82 个官方 oracle 用例**的实测结论 + 九条 `src*` 语法的设计理由 + 偏离表） |
 | [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持（**官方零支持** ⟹ 传递式 oracle；`gltf` crate 的三个坑，其一上游 master 已修但**尚未发版**；新增语法 0 条；**已实现并验收通过**） |
+| [`docs/update-check.md`](docs/update-check.md) | 更新检测的设计与实测代价（**+2.0 MB 二进制**；「后台」为何还会让调用方白等 **599 ms**，以及怎么修掉） |
 
 > ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
 > 带有明确的快照日期（当时的文件 SHA256 与测试数）。**它们描述的是历史状态**，
