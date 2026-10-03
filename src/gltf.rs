@@ -33,7 +33,8 @@
 //! 反过来，**没有**对照物的口径（文档里逐条标了「mdlc 自定」）：
 //!
 //! * 动画重采样（glTF 有显式秒轴 + 插值模式，FBX 是烘焙关键帧）；
-//! * `CubicSpline` 插值（尚未处理，见 [`resample`]）；
+//! * `CubicSpline` 插值（**尚未处理**：降级成线性重采样，切线值被丢掉，
+//!   并打一条提示 —— 见 `Channel::apply`）；
 //! * `KHR_draco_mesh_compression` / `EXT_meshopt_compression`（**明确报错**）。
 //!
 //! # 数据口径（与 FBX 的**结构性差别**）
@@ -90,7 +91,7 @@ pub type GltfError = FbxError;
 /// 打印），这样这条路径才测得了 —— `diagln!` 走 stdout/stderr，测试里抓不到。
 ///
 /// ⚠️ **报错的那几条不走这里**（data URI 解码失败 / Draco / meshopt 都在
-/// [`load_document`] 里直接返回 `Err`）—— 静默零几何是绝对不能接受的。
+/// 读文件那一步直接返回 `Err`）—— 静默零几何是绝对不能接受的。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GltfNotes {
     /// 有 accessor 没有 `bufferView`（规范语义 = 全零）。crate 的校验层会
@@ -1269,7 +1270,7 @@ fn buffer_getter<'a, 's>(
 ///
 /// [`GltfNotes`] 里的每一条都在这里 `diagln!` 出去（与 `compile.rs` 的
 /// `emit_fbx_diagnostics` 一个路数）。**报错的那几条不在这里** —— data URI
-/// 解码失败 / Draco / meshopt 都在 [`load_document`] 里就返回 `Err` 了。
+/// 解码失败 / Draco / meshopt 都在读文件那一步就返回 `Err` 了。
 ///
 /// ⚠️ 与 FBX 不同，glTF **没有**「骨骼被过滤」这条诊断：收骨用的是显式的
 /// `skin.joints`，没有 FBX 那套「蒙皮簇 + 祖先上溯」的推断，也就没有

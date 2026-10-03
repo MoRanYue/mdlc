@@ -721,6 +721,7 @@ cdtexture 表**差一条空串**。第三方实现（NekoMDL 的 `neko_rig.mdl` 
 | 5 | `ufbx::Vec3` / `ufbx::Quat` **没实现 `PartialEq`**（C 绑定）⟹ `#[derive(PartialEq)]` 的 `LocalTrs` 报 `E0369` | 去掉 `PartialEq` |
 | 6 | `shape_key_frame` 是 **`FbxGeometry` 的关联函数**，不是 `crate::fbx` 的自由函数 | 写 `FbxGeometry::shape_key_frame(ti)` |
 | 7 | ⚠️ 夹具里把 accessor **插到数组开头**会把整张表挪位（下标就是引用编号）—— **而且不报错**，只是静默读出垃圾 | 测试夹具一律**追加**到末尾（`add_accessor` / `add_view` 的锚点取「数组收尾 + 下一节开头」，这样能连续追加） |
+| 8 | ⚠️ 公开条目的文档注释里写了指向**私有条目**的 intra-doc 链接（`GltfNotes` / `read` 里的 `[`load_document`]`），以及一个**根本不存在**的名字 `[`resample`]` ⟹ CI 的 `cargo doc` 报 3 个 error（`RUSTDOCFLAGS=-D warnings`） | 改成普通文字（私有条目不加链接）。⚠️ **本地跑 `cargo doc` 必须换新 `--target-dir`**，否则 cargo 认为 doc 已最新直接跳过 ⟹ 假绿 |
 
 ---
 
@@ -844,6 +845,12 @@ master 上它仍然是 `None`（修复是在 reader 层返回全零迭代器，�
    第一次写 morph 测试时把新 accessor 插在最前面，于是 `POSITION` 指向法线、`TEXCOORD_0`
    指向索引表 —— **而且不报错**，只在读取层炸出 `size_of` 不符，看起来像代码 bug。
    解法：夹具辅助函数一律**追加到末尾**，锚点取「数组收尾 + 下一节开头」（可连续追加）。
+13. **⚠️ 公开条目的文档注释里不能写指向私有条目的 intra-doc 链接。**
+   CI 的 `cargo doc`（`RUSTDOCFLAGS=-D warnings`）抓到三处：`pub struct GltfNotes` 与
+   `pub fn read` 的文档里写了 `[`load_document`]`（私有函数），以及一句
+   `[`resample`]`（**根本没有这个名字**）。
+   **判据：`cargo doc` 要在 CI 之外也跑一次**（本地默认不开 `-D warnings`，
+   而且**必须换一个新的 `--target-dir`**，否则 cargo 认为 doc 已最新直接跳过 ⟹ 假绿）。
 
 **实现新增的探针 / 夹具**
 - `docs\_probe\dump_cd_raw.js`：把 cdtexture 槽值的三种解释并排打出来
