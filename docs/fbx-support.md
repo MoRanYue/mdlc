@@ -29,6 +29,7 @@
 | **推荐的 UX？** | **FBX 作为一等源直接写进 QC**（`$body` / `$model` / `$sequence` / `$animation` / `$collisionmodel`），默认行为**逐条对齐官方**，但把官方所有**静默失败**改成**显式诊断**，并给每个隐式决策一个**显式覆盖语法**（§4）。⭐ **新语法按「概念」命名（`src*`）、不按「格式」命名** —— 加 glTF/GLB 时新增语法 **0 条**（§4.3） |
 | 最大的 UX 障碍？ | ⭐⭐⭐ **官方恒取第一条 NLA 栈、完全忽略 `$sequence` 名字**（§1.8）。多栈 FBX 在官方路径下**无解**，必须由 mdlc 提供显式选择 |
 | 表情（flex）怎么走？ | ⭐⭐⭐⭐⭐ **什么都不用写** —— FBX 的 shape key **自动注册**成 flexdesc + controller + rule + 载荷（§1.6b），与官方逐字段一致。⚠️ 但**不能在 FBX 源上写 `flexfile`/`flex`**（官方必崩） |
+| 单位/缩放对得上吗？ | ⚠️ **官方在这里有个 bug**：FBX 标准单位是**厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、完全忽略 `UnitScaleFactor`** ⟹ 默认导出（`All Local`）下官方编出的模型**骨骼比网格大 100 倍**（比值 0.0153）。**mdlc 有意偏离并修掉它**（§1.7.3 / §4.6 偏离 12）：`All Local` 与 `FBX Units Scale` 两种导出**编出逐值相同的产物**，用户不必关心 Blender 的 `Apply Scalings` 选项 |
 
 ---
 
@@ -329,6 +330,43 @@ flexes         888 bytes (2 flexes)     ← 第二个 bodypart（morph.fbx，有
 
 ### 1.7 单位与缩放
 
+#### 1.7.1 FBX 的标准单位是**厘米**
+
+三方独立一致：
+
+- **Autodesk**（`FbxSystemUnit`）：`GetScaleFactor()` 逐字「Returns the system unit's scale factor,
+  **relative to centimeters**. This factor scales system unit values to centimeters.」；
+  构造函数参数逐字「`pScaleFactor` — **The equivalent number of centimeters in the new
+  system unit. For example, an inch unit uses a scale factor of 2.54.**」
+- **Blender 导出器**（`export_fbx_bin.py:3541`）注释逐字：「**Default Blender unit is equivalent
+  to meter, while FBX one is centimeter...**」；`fbx_utils.py:212-215` 注释逐字：
+  「FBX can store the 'reference' unit of a file in its UnitScaleFactor property
+  **(1.0 meaning centimeter, AFAIK)** … **Note that when no default unit is available, we
+  assume 'meters' (and hence scale by 100)**.」
+- **NVIDIA 开发者论坛**：「Since the fbx format has a fixed unit (default is cm)…」
+
+⟹ Blender 场景用**米**、FBX 用**厘米** ⟹ 两者差 **100×**。这个 ×100 是**导出器**写的，
+不是 studiomdl 引入的。
+
+#### 1.7.2 官方把 ×100 放在哪：`LclS`，而它**完全不读 `UnitScaleFactor`**
+
+Blender 的 `apply_scale_options` 有四种取值，它们**只决定单位信息放在哪**：
+
+| `apply_scale_options` | UI 名 | 节点 `LclS` | `UnitScaleFactor` | 官方产物比值 |
+|---|---|---|---|---|
+| `FBX_SCALE_NONE`（**默认**） | All Local | `Skeleton` / `body` **各带 `(100,100,100)`** | `1` | **0.0153 ❌** |
+| `FBX_SCALE_UNITS` | FBX Units Scale | **无** | `100` | **1.5264 ✅** |
+| `FBX_SCALE_ALL` | FBX All | 无 | `100` | 1.5264 ✅ |
+| `FBX_SCALE_CUSTOM` | FBX Custom Scale | 各带 `(100,100,100)` | `1` | 0.0153 ❌ |
+
+（`fbx_tree.js` 对 `unitscale2\aso_none.fbx` / `aso_units.fbx` 的实测；两者几何**逐值相同**，
+唯一差别就是单位信息放在节点 `LclS` 还是文件级 `UnitScaleFactor`。）
+
+⭐ **官方 studiomdl 只认节点 `LclS`，把 `UnitScaleFactor` 整个忽略** ⟹ 同一个 45 米高的场景
+编出两个**大小差 100 倍**的模型（`u_aso_none.mdl` 骨骼跨度 3000 vs `u_aso_units.mdl` 30）。
+
+#### 1.7.3 ⭐⭐⭐⭐⭐ 官方的 bug：骨骼比网格大 100 倍
+
 `b_rig_body.mdl`（源 `rig_anim.fbx`）：`Skeleton` 的 `S=(100,100,100)`、`Spine` 的 `T=(0,10,0)`
 ⟹ MDL 里 `Spine.pos = [0, 1000, 0]`、`Head1.pos = [0, 2000, 0]`（**×100**）。
 但 VVD 顶点 `[-3,0,-3]..[3,45,3]`（**×1**，与源网格一致）。
@@ -336,12 +374,43 @@ flexes         888 bytes (2 flexes)     ← 第二个 bodypart（morph.fbx，有
 `f_mixamo.mdl`（源 `mixamo_style.fbx`，其 `Skeleton` 的 `S=(1,1,1)`）：
 `Spine.pos = [0, 10, 0]`、`Head1.pos = [0, 20, 0]`（**×1**）。
 
-⟹ 结论：**没有隐藏的单位换算 —— 官方把 FBX 的局部变换原样传递**（含父节点的 scale）。
-那个 ×100 是 **Blender 默认导出时压在骨架根节点上的 m→cm 缩放**，不是官方引入的。
+⟹ 机制：官方对**顶点**用 `rot_norm(geometry_to_world)`（丢掉缩放，R3），对**骨骼位移**用
+`R_norm(parent)ᵀ · d`（`d` 里含父链缩放，口径 E）⟹ **同一个 ×100 在一处被丢掉、在另一处被保留**。
 
-⚠️ **但骨骼被 ×100 而网格顶点没有** ⟹ 该夹具的骨架比网格高 100 倍。
-这究竟是「官方本来就不给网格顶点乘父节点 scale」还是「夹具本身不自洽」，
-**本次调研未定案**，实现前需要用一份真实 Source 绑定 FBX 复验。
+判定探针 `docs/_probe/bone_mesh_space.js`（输出「网格对角线 ÷ 骨骼跨度」，人形应落 **0.3~3**）：
+
+| 产物 | 骨骼跨度 | 网格对角线 | 比值 | 判定 |
+|---|---|---|---|---|
+| 官方编 `rig.fbx`（All Local） | 3000 | 45.79 | **0.0153** | ❌ 不自洽 |
+| 官方编 `aso_units.fbx`（Units Scale） | 30 | 45.79 | **1.5264** | ✅ |
+| NekoMDL 编 `rig.fbx` | 3000 | 4579.30 | **1.5264** | ✅（网格 ×100） |
+| **mdlc（本次修复后）** | 30 | 45.79 | **1.5264** | ✅ |
+
+⚠️ 这不是「夹具本身不自洽」—— `fbx_tree.js` 实测 `Skeleton` 与 `body` **各带一份
+`LclS=(100,100,100)`**、两者是兄弟，**文件本身完全自洽**。出问题的是**下游**。
+
+⚠️ **用户侧的规避手段**（Blender 导出时把 `Apply Scalings` 从默认的 "All Local" 改成
+**"FBX Units Scale"**）能让官方也编出自洽的模型 —— 但要求每个用户都记得改这个选项，
+正是「让用户猜编译器内部机制」。
+
+#### 1.7.4 mdlc 的处置（有意偏离，见 §4.6 偏离 12）
+
+**骨骼位移改成正牌的局部平移**：在 `R_norm(parent)ᵀ · d` 之后**再除以父世界的列长**
+（父链没有缩放时列长 = 1，除法是恒等 ⟹ 不带缩放的 FBX 逐值不变）。
+
+验收（本次实测）：
+
+- `u_aso_none` 与 `u_aso_units` 两个 mdlc 产物**逐值相同**（`mdl_byte_regions.js`：
+  只有 `checksum` 与内嵌的模型名/源文件名不同，那本来就不同）
+- 骨骼表与官方 `u_aso_units.mdl` **数值相同**（差异仅 1e-7 级浮点噪声：
+  `9.999999046325684` vs `10`）
+- 比值 **1.5264 ✅**（官方 All Local 是 0.0153 ❌）
+
+⟹ **用户从此不必关心 Blender 的 `Apply Scalings` 选项** —— 正是「像 UE / Unity 一样
+自动处理」的效果（UE 有 `Convert Scene Unit`，Unity 的 Scale Factor 默认 0.01）。
+
+> ⚠️ 与 `srcscale` 的区别：`srcscale` 是**整体缩放**（顶点与骨骼同乘，比值不变）
+> ⟹ **补偿不了**这个口径差。它只用于「源文件单位真的错了」。
 
 ### 1.7b ⭐⭐⭐⭐ 轴向：官方**不做任何变换**，原样透传
 
@@ -727,7 +796,7 @@ $ mdlc build-qc a_body.qc --out outA
 | 动画栈 | **恒取第一条** | **同官方** + ⚠️ 告警 | ⚠️ 有多条时告警并列出名字 |
 | 重采样率 | 固定 30 fps | **同官方**（30） | §1.5 |
 | `animdesc.fps` 字段 | 取 `$sequence ... fps N` | **同官方** | ⚠️ 与重采样率不等时告警 |
-| 单位/缩放 | 局部变换原样传递 | **同官方** | §1.7 |
+| 单位/缩放 | **骨骼位移不继承父链缩放**（顶点侧同官方） | ⚠️ **有意偏离**（见 §4.6 偏离 12） | §1.7.3 官方的 bug |
 | 轴向 | **不干预**（原样搬运根变换） | **同官方** | §1.7b |
 | 骨骼过滤 | 丢网格节点与空叶节点 | **同官方** | §1.4，但需复验例外 |
 | **shape key → flex** | **自动注册**（desc + controller + rule + 载荷） | **同官方** | §1.6b；**零 QC 语法** |
@@ -984,7 +1053,7 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 | **多栈 FBX**（§1.8，最大障碍） | 默认第一条 + 告警列出全部；`srcstack "名"` 显式选择；找不到该名字时**硬报错**并列出可用名 |
 | **材质命名**（§1.9） | 默认原样透传（官方）；`srcmaterial` 兜底无材质的情况 |
 | **多网格 → 部件**（§1.10） | 默认合并 + 告警；`srcpart` 选网格；要多个 bodypart 就写多条 `$body` |
-| **单位/缩放**（§1.7） | 默认原样透传（官方）；`srcscale` 显式缩放 |
+| **单位/缩放**（§1.7） | 顶点侧原样透传（官方）；**骨骼位移不继承父链缩放**（有意偏离 12，修掉官方的 100× 不自洽）；`srcscale` 整体缩放 |
 | **轴向**（§1.7b） | **默认不干预**（官方；根变换原样搬运）；只在坏文件上用 `srcaxis` 强制 |
 | **重采样率**（§1.5） | 默认 30（官方）；`srcfps` 覆盖 |
 | **shape key → flex**（§1.6b） | **默认自动注册**（与官方逐字段一致：desc + controller `[0,1]` + `MUL` rule + 载荷）；`srcshapekey*` 控制取哪些/顺序/忽略。⚠️ **FBX 上禁止显式 flex 语法**（官方必崩） |
@@ -1005,10 +1074,15 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 | 9 | **vertanim 顺序 = 焊接顶点升序**（官方 FBX 是「控制点首次出现序 × 组内降序」） | 官方的顺序取决于它自己的顶点焊接顺序，**该顺序 mdlc 与官方本就不同**（见偏离 11），复刻它毫无意义；载荷内容（顶点集合 + delta 多重集）完全一致，已由 `k4_flex_align.js` 按 VVD 位置对齐验证（16/16） |
 | 10 | **丢弃 `nrm_off`，`ndelta` 恒 0** | 与官方 FBX 路径一致（`axisprobe.fbx` 的 `nrm_off` 非零而官方产物 `ndelta=(0,0,0)`）；`flex` 的 `.vta` 路径仍照常算 `ndelta` |
 | 11 | **`mesh.vertexdata` / `model.vertexdata` 写 0**（官方写运行期堆指针） | 官方把**进程地址**写进产物（语料 87/87 个 mesh 非 0，如 `0x7de5088c`）—— 那是 ASLR 后的堆地址，**逐字节对齐既不可能也无意义**；这两个字段由引擎在加载时填 |
+| 12 | ⭐ **骨骼位移不继承父链缩放**：`(R_norm(parent)·S(parent))⁻¹ · d`（官方是 `R_norm(parent)ᵀ · d`，父链缩放进位移） | ⭐ **官方错、mdlc 对**：官方对顶点丢掉父链缩放、对骨骼保留 ⟹ 同一个 FBX 编出**骨骼比网格大 100 倍**的不自洽模型（§1.7.3，比值 0.0153 vs 人形应有的 0.3~3）。修完之后 `aso_none.fbx`（Blender 默认 "All Local"）与 `aso_units.fbx`（"FBX Units Scale"）编出**逐值相同**的产物，用户不必再关心 Blender 的 `Apply Scalings` 选项；父链无缩放时本改动是恒等，**不带缩放的 FBX 逐值不变** |
 
 > ⚠️ **偏离 11 的连带后果**：`k4_morph.mdl` 与官方产物**不可能逐字节一致**
 > （还有 `checksum`、1 ULP 级的 `hull_min/hull_max`、`seqdesc.bbmin/bbmax`）。
 > 验收口径是**逐字段**（`docs/_probe/mdl_field_dump.js`）而非逐字节。
+>
+> ⚠️ **偏离 12 的连带后果**：带节点缩放的 FBX（Blender 默认导出的**全部**文件）
+> 骨骼表与官方产物**数值不同** —— 官方是 ×100 的那个，mdlc 是 ÷100 的那个。
+> 对照时请用官方 `FBX Units Scale` 的产物（`u_aso_units.mdl`），那才是 mdlc 的对应物。
 
 #### 4.6b 不是偏离、但必须写明的两条「官方的坑」
 
@@ -1105,7 +1179,7 @@ src_stack = "run"
 
 | # | 事项 | 说明 | 状态 |
 |---|---|---|---|
-| 1 | **单位/缩放定案** | §1.7 的「骨骼 ×100、网格 ×1」需要一份**真实 Source 绑定 FBX** 复验；现有夹具是 Blender 默认导出（根节点带 m→cm 缩放）。⚠️ §1.7b 已证明**轴向**侧官方不做变换，单位侧大概率同理（都是「原样搬运根变换」），但仍需一份真实资产确认 | ⏳ 待复验（**骨骼位移口径已由 E 定案，10/10**） |
+| 1 | **单位/缩放定案** | §1.7 的「骨骼 ×100、网格 ×1」已查清：**FBX 标准单位是厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、忽略 `UnitScaleFactor`**，于是同一个场景在 `All Local` 下编出骨骼比网格大 100 倍的不自洽模型（§1.7.3）。判据由用户给定（「BST 做不做 HU 换算？」⟹ 不做 ⟹ 保留源单位、只修自洽） | ✅ **已定案并修复**（§1.7.4 / 偏离 12；验收：`aso_none` 与 `aso_units` 产物逐值相同、与官方 `u_aso_units.mdl` 骨骼表数值相同、比值 0.0153 → **1.5264**） |
 | 2 | **骨骼过滤规则** | §1.4 的例外（`box.fbx` 的网格节点成了骨骼）需要更多样本确认边界（多根骨骼、多网格、嵌套骨架） | ✅ **已定案**（§1.4b 的 6 个单变量样本：主规则无例外，`box.fbx` 不是例外；§1.4c 的**排列顺序 = DFS 先序**也已修）。⚠️ 「骨骼被过滤」的**诊断**仍未实现 —— 但它现在缺的是「怎么措辞」而非「规则不明」，见 §4.4 |
 | 3 | **flex 的 oracle 差分** | 用 `morph.fbx` 做「官方 FBX→flex」vs「mdlc FBX→flex」的逐字段对照；再复验「shape key 顺序 = 帧 1..N」这条映射 | ✅ **已完成**（`k4_flex_align.js`：desc/controller/rule/targets/vtype/speed/side/ndelta **全部逐字段一致**；载荷按 VVD 位置对齐 16/16） |
 | 4 | **动画采样率** | 官方固定 30 fps（§1.5）；`ufbx` 需显式设 `minimum_sample_rate` 才能复刻（§2.3） | ✅ **已可用**（`srcfps` 端到端实测：60 ⟹ 11 帧、30 ⟹ 6 帧） |

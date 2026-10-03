@@ -41,9 +41,10 @@ fn main() {
             let n = &scene.nodes[i];
             let t = n.local_transform;
             println!(
-                "  node[{i}] {:?} is_root={} mesh={} localT=({:.3},{:.3},{:.3}) localS=({:.3},{:.3},{:.3}) localQ=({:.4},{:.4},{:.4},{:.4})",
+                "  node[{i}] {:?} is_root={} parent={:?} mesh={} localT=({:.3},{:.3},{:.3}) localS=({:.3},{:.3},{:.3}) localQ=({:.4},{:.4},{:.4},{:.4})",
                 n.element.name,
                 n.is_root,
+                n.parent.as_ref().map(|p| p.element.name.to_string()),
                 n.mesh.is_some(),
                 t.translation.x,
                 t.translation.y,

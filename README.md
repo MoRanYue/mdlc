@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 774 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test --release        # 775 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -549,8 +549,14 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 
 网格源是 `.fbx` 时，官方 `studiomdl` 会替你做一串**隐式决定**，而且
 **全部静默**：合并所有网格、恒取第一条 NLA 栈、材质名直接用 FBX 里的、
-轴向与单位原样搬运。mdlc 的默认行为**逐条对齐官方**，但把这些决定
+轴向原样搬运。mdlc 的默认行为**逐条对齐官方**，但把这些决定
 变成**显式语法**——不写就等于官方行为，写了就能改。
+
+> ⚠️ **唯一的例外是单位缩放**：官方在 FBX 路径上有个 bug —— 它只认节点上的
+> `LclS`、完全忽略 `UnitScaleFactor`，于是 Blender 默认导出（`Apply Scalings`
+> = "All Local"，×100 烘在节点上）的模型会**骨骼比网格大 100 倍**。
+> mdlc **有意修掉它**（骨骼位移不继承父链缩放）：两种导出方式编出**逐值相同**
+> 的产物，你不必关心 Blender 的那个选项。细节见 `docs/fbx-support.md` §1.7.3。
 
 命名规则是**按概念命名，不按格式命名**（格式由文件扩展名决定）：所以叫
 `srcpart` 而不是 `fbxpart`——将来加 glTF/GLB 时**新增语法 0 条**。
@@ -559,7 +565,7 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 |---|---|---|---|
 | `srcpart "名"` | `$body` / `$model` 行内或块内 | 只取这些名字的网格；**可重复写** | 全部网格合并进同一个部件 |
 | `srcmaterial "名"` | 同上 | FBX 里没有材质时的兜底名 | `debug/debugempty` |
-| `srcscale 1.0` | 同上 | 统一缩放 | 1.0 |
+| `srcscale 1.0` | 同上 | 统一缩放（顶点与骨骼同乘） | 1.0 |
 | `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | 不干预（原样搬运根变换） |
 | `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条 NLA 栈 | **第一条** |
 | `srcfps 30` | 同上 | 动画重采样率 | 30 |
@@ -854,7 +860,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 774 passed / 0 failed / 6 ignored
+cargo test --release                  # 应为 775 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -938,11 +944,11 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 774 passed / 0 failed / 6 ignored
+cargo test --release          # 775 passed / 0 failed / 6 ignored
 ```
 
-**774 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 780 个单元测试 =
-774 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**775 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 781 个单元测试 =
+775 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
@@ -957,7 +963,7 @@ cargo test --release          # 774 passed / 0 failed / 6 ignored
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
 | `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
 | `bone_math` | 19 | 欧拉/四元数、矩阵约定 |
-| `fbx` | 17 | FBX 三条几何口径（R3/N3/E）、`src*` 选项矩阵、shape key 帧号、骨骼表 DFS 先序 |
+| `fbx` | 18 | FBX 三条几何口径（R3/N3/E）、骨骼位移的父链缩放处理、`src*` 选项矩阵、shape key 帧号、骨骼表 DFS 先序 |
 | `ani_writer` | 16 | `.ani` 容器与块对齐 |
 | `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
 | `vta` | 14 | `.vta` 解析 |

@@ -464,11 +464,12 @@ fn quat_to_source_euler(q: ufbx::Quat) -> [f32; 3] {
 }
 
 // ---------------------------------------------------------------------------
-// 官方 FBX 导入器的三条几何口径
+// 官方的两条几何口径 + 一条**有意偏离**
 //
-// 全部由 `examples/probe_fbx_cmp.rs`（顶点 / 法线 / UV）与
-// `examples/probe_fbx_bonepos.rs`（骨骼位移）对**官方产物**逐样本裁决得出，
-// 细节见 `docs/fbx-support.md` §1.7。
+// 顶点 / 法线 / UV 三条由 `examples/probe_fbx_cmp.rs` 对**官方产物**逐样本裁决
+// 得出（细节见 `docs/fbx-support.md` §1.7）；骨骼位移由
+// `examples/probe_fbx_bonepos.rs` 裁决出官方的 `E = P*scale`，但**本实现不照抄**
+// —— 官方那个口径会让骨骼比网格大 100 倍，理由见 [`bone_offset`]。
 // ---------------------------------------------------------------------------
 
 /// 把一个矩阵的 3×3 部分**逐列归一化**，得到纯旋转（丢掉缩放）。
@@ -476,7 +477,7 @@ fn quat_to_source_euler(q: ufbx::Quat) -> [f32; 3] {
 /// FBX 里 `Skeleton` 这类节点常带 `localS = (100,100,100)`（Blender 导出的
 /// m→cm 缩放），于是 `geometry_to_world` / `node_to_world` 的基里混着它。
 /// 官方在**顶点**与**法线**上把它丢掉（`probe_fbx_cmp` 的 R3/N3，10/10 命中），
-/// 只在**骨骼位移**上保留（见 [`bone_offset`]）。
+/// 却在**骨骼位移**上保留 —— mdlc 两边都丢掉，见 [`bone_offset`]。
 fn rotation_of(m: &ufbx::Matrix) -> ufbx::Matrix {
     fn unit(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
         let len = (x * x + y * y + z * z).sqrt();
@@ -543,16 +544,42 @@ fn geometry_normal(g: &ufbx::Matrix, v: ufbx::Vec3) -> ufbx::Vec3 {
     }
 }
 
-/// 骨骼位移：`pos = R_norm(parent_world)ᵀ · (child_world.t − parent_world.t)`。
+/// 矩阵 3×3 部分的**逐列长度**（= 该矩阵施加的缩放）。
 ///
-/// 展开后等于 `S_parent ⊙ l`（父链的**缩放**进位移、**旋转**不进）—— 这是官方
-/// FBX 导入器的既定行为：`rig.fbx` 的 `Skeleton` 带 `localS = 100`，官方把
-/// `Spine` 的位移写成 `(0,1000,0)` 而不是 FBX 的局部 `(0,10,0)`。
+/// `parent_world` 的列长就是父链累积的缩放；`Skeleton` 带 `localS = 100` 时它是
+/// `(100,100,100)`。列长为 0 时退回 `1.0`（退化矩阵不该把位移变成 `NaN`）。
+fn column_lengths(m: &ufbx::Matrix) -> (f64, f64, f64) {
+    fn len(x: f64, y: f64, z: f64) -> f64 {
+        let l = (x * x + y * y + z * z).sqrt();
+        if l > 0.0 { l } else { 1.0 }
+    }
+    (
+        len(m.m00, m.m10, m.m20),
+        len(m.m01, m.m11, m.m21),
+        len(m.m02, m.m12, m.m22),
+    )
+}
+
+/// 骨骼位移：`pos = (R_norm(parent_world) · S(parent_world))⁻¹ · (child_world.t − parent_world.t)`。
 ///
-/// 判别样本是 `axis_zup.fbx`：那里 `Skeleton` 的旋转是恒等、`Pelvis` 自带旋转，
-/// 于是父世界旋转不是单位阵，六个候选里**只有本条**与官方逐根吻合
-/// （`probe_fbx_bonepos` 10/10；B「父基乘」/C「世界差」/D「世界位置」/F「逆变换」
-/// 都在它上面失手）。
+/// ⭐ **这是 mdlc 有意偏离官方的一处**（见 `docs/fbx-support.md` §4.6）。
+///
+/// 官方（`probe_fbx_bonepos` 的 **E ≡ G**）算的是 `R_norm(parent_world)ᵀ · d`，
+/// 父链的**缩放**因此进了位移：`rig.fbx` 的 `Skeleton` 带 `localS = 100`，
+/// 官方把 `Spine` 的位移写成 `(0,1000,0)`，而 FBX 里它的局部平移是 `(0,10,0)`。
+/// 与此同时官方在**顶点**上用 `rot_norm(geometry_to_world)` 把同一个 100 丢掉了
+/// （[`geometry_point`] 的 R3）⟹ 同一个文件编出来**骨骼比网格大 100 倍**，
+/// 模型不自洽（`docs/_probe/bone_mesh_space.js` 实测比值 0.0153，人形应落 0.3~3）。
+///
+/// 这里改成正牌的局部平移：再除以父世界的列长。父链没有缩放时列长 = 1，
+/// 除法是恒等 ⟹ 与官方逐值相同（`parity` 的 101 个用例全走 SMD，不受影响；
+/// 不带缩放的 FBX 也不受影响）。
+///
+/// 验收：`aso_none.fbx`（Blender 默认 "All Local"，节点带 `localS = 100`）与
+/// `aso_units.fbx`（"FBX Units Scale"，节点无 `localS`、`UnitScaleFactor = 100`）
+/// 编出**逐值相同**的产物，且等于官方在 "FBX Units Scale" 下编出的那个
+/// （`u_aso_units.mdl`：骨骼 `(0,10,0)` / `(0,30,0)` + 网格 `[-3,-3,0]..[3,3,45]`，
+/// 比值 1.5264 ✅）。用户从此不必关心 Blender 的 `Apply Scalings` 选项。
 fn bone_offset(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Vec3 {
     let d = ufbx::Vec3 {
         x: child_world.m03 - parent_world.m03,
@@ -561,10 +588,17 @@ fn bone_offset(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx:
     };
     let r = rotation_of(parent_world);
     // `Rᵀ · d`：`R` 的第 i 列与 `d` 点积。
-    ufbx::Vec3 {
+    let local = ufbx::Vec3 {
         x: r.m00 * d.x + r.m10 * d.y + r.m20 * d.z,
         y: r.m01 * d.x + r.m11 * d.y + r.m21 * d.z,
         z: r.m02 * d.x + r.m12 * d.y + r.m22 * d.z,
+    };
+    // 再除掉父链的缩放，得到真正的局部平移。
+    let (sx, sy, sz) = column_lengths(parent_world);
+    ufbx::Vec3 {
+        x: local.x / sx,
+        y: local.y / sy,
+        z: local.z / sz,
     }
 }
 
@@ -806,10 +840,10 @@ fn from_scene(
     // 官方 `Build_Reference()`（`studiomdl.cpp:728-762`）用的是源的第 0 帧；
     // FBX 源的「第 0 帧」就是节点自己的局部 TRS。
     //
-    // 旋转 = 节点自己的局部旋转；**位移不是** `local_transform.translation`
-    // —— 官方把父链的缩放累积了进去（`rig.fbx` 的 `Skeleton` 带
+    // 旋转 = 节点自己的局部旋转；位移 = **真正的局部平移**（[`bone_offset`]）。
+    // ⚠️ 官方把父链的缩放累积进了位移（`rig.fbx` 的 `Skeleton` 带
     // `localS = (100,100,100)`，官方把 `Spine` 写成 `(0,1000,0)` 而不是
-    // FBX 里的 `(0,10,0)`）。口径与判别样本见 [`bone_offset`]。
+    // FBX 里的 `(0,10,0)`）—— mdlc 有意不照抄，理由见 [`bone_offset`]。
     let poses = reference_poses(scene, &kept, opts);
 
     // ---- 几何 ----
@@ -1180,7 +1214,10 @@ mod tests {
         ));
     }
 
-    /// 默认选项必须**逐条等于官方**（不写 `src*` 时产物与官方同）。
+    /// 默认选项必须**逐条等于官方**（不写 `src*` 时不做任何额外的单位/轴干预）。
+    ///
+    /// ⚠️ 唯一的例外是 [`bone_offset`] 的父链缩放处理 —— 那处是**有意偏离**，
+    /// 与这里的选项无关（它修的是官方自身的不自洽，不是用户旋钮）。
     #[test]
     fn default_opts_are_the_official_behaviour() {
         let o = FbxOpts::default();
@@ -1300,13 +1337,14 @@ mod tests {
         assert!(near(geometry_normal(&r, v(0.0, 1.0, 0.0)), (0.0, 0.0, -1.0)));
     }
 
-    /// ⭐ **E ≡ G**：骨骼位移 = `R_norm(父世界)ᵀ · (子世界平移 − 父世界平移)`。
+    /// ⭐ **有意的偏离**：骨骼位移是**真正的局部平移**，不继承父链缩放。
     ///
-    /// 判别样本是 `axis_zup.fbx`：父世界旋转**不是**单位阵时，
-    /// 「父基乘」/「世界差」/「世界位置」/「逆变换」全部失手，只有本条吻合
-    /// （`probe_fbx_bonepos` 10/10）。
+    /// 判别样本是 `axis_zup.fbx` 的形状：父世界旋转**不是**单位阵
+    /// （`Skeleton` 恒等、`Pelvis` 自带旋转）。官方的 `E ≡ P*scale` 在这里给出
+    /// `(0,1000,0)`（`probe_fbx_bonepos` 10/10 吻合），本实现给出 `(0,10,0)` ——
+    /// 后者才是 FBX 里 `Spine` 的局部平移，也才与网格同尺度。
     #[test]
-    fn bone_offset_matches_the_axis_zup_discriminating_case() {
+    fn bone_offset_drops_the_parent_chain_scale() {
         // `axis_zup.fbx`：Skeleton 恒等、Pelvis 自带旋转，Spine 的局部平移 (0,10,0)。
         let skeleton = scale100();
         let pelvis = ufbx::matrix_mul(&skeleton, &blender_export_rotation());
@@ -1315,23 +1353,79 @@ mod tests {
             t.m13 = 10.0;
             t
         });
-        // 官方 "ValveBiped.Bip01_Spine" pos = [0, 999.9999389648438, ~0]
+        // 官方 "ValveBiped.Bip01_Spine" pos = [0, 999.9999389648438, ~0]（= 100×）
         let p = bone_offset(&pelvis, &spine);
         assert!(
-            near(p, (0.0, 1000.0, 0.0)),
-            "应为 (0,1000,0)（缩放进位移、旋转不进）；实际 {p:?}"
+            near(p, (0.0, 10.0, 0.0)),
+            "应为 (0,10,0)（父链 100× 缩放必须除掉）；实际 {p:?}"
         );
     }
 
-    /// 父链旋转恰好抵消时，E 与「世界位移差」数值相同 —— 这正是
-    /// `rig.fbx` 上多个候选都能「绿」的原因（必须靠 `axis_zup` 才能分开）。
+    /// ⭐ **验收判据**：Blender 的两种单位导出方式编出**逐值相同**的骨骼表。
+    ///
+    /// `aso_none.fbx`（默认 "All Local"）把 ×100 写进 `Skeleton` / `body` 的
+    /// `localS`；`aso_units.fbx`（"FBX Units Scale"）不写 `localS`，改用
+    /// `UnitScaleFactor = 100`。两者几何完全相同，只有单位信息放在哪的差别。
+    /// 官方编出两个**骨骼跨度差 100 倍**的模型（比值 0.0153 vs 1.5264）；
+    /// 本实现两边都归到 `(0,10,0)` / `(0,20,0)`，用户不必关心那个选项。
     #[test]
-    fn bone_offset_equals_world_delta_when_parent_rotation_is_identity() {
-        let parent = scale100();
-        let mut child = scale100();
+    fn bone_offset_is_identical_for_both_blender_unit_export_forms() {
+        let rot = blender_export_rotation();
+        let local = |dy: f64| {
+            let mut t = blender_export_rotation();
+            t.m13 = dy;
+            t
+        };
+
+        // "All Local"：×100 烘在 Skeleton 的 localS 里。
+        let all_local = {
+            let skeleton = scale100();
+            let pelvis = ufbx::matrix_mul(&skeleton, &rot);
+            let spine = ufbx::matrix_mul(&pelvis, &local(10.0));
+            let head = ufbx::matrix_mul(&spine, &local(10.0));
+            [
+                bone_offset(&skeleton, &pelvis),
+                bone_offset(&pelvis, &spine),
+                bone_offset(&spine, &head),
+            ]
+        };
+
+        // "FBX Units Scale"：没有 localS，单位记在 UnitScaleFactor（本函数看不到）。
+        let units_scale = {
+            let skeleton = ident();
+            let pelvis = ufbx::matrix_mul(&skeleton, &rot);
+            let spine = ufbx::matrix_mul(&pelvis, &local(10.0));
+            let head = ufbx::matrix_mul(&spine, &local(10.0));
+            [
+                bone_offset(&skeleton, &pelvis),
+                bone_offset(&pelvis, &spine),
+                bone_offset(&spine, &head),
+            ]
+        };
+
+        for i in 0..3 {
+            assert!(
+                near(all_local[i], (units_scale[i].x, units_scale[i].y, units_scale[i].z)),
+                "骨骼 {i} 两种导出方式必须一致：All Local {:?} vs Units Scale {:?}",
+                all_local[i],
+                units_scale[i]
+            );
+        }
+        assert!(near(all_local[1], (0.0, 10.0, 0.0)), "{:?}", all_local[1]);
+        assert!(near(all_local[2], (0.0, 10.0, 0.0)), "{:?}", all_local[2]);
+    }
+
+    /// 父链没有缩放时，本实现与官方口径**逐值相同**（除法是恒等）。
+    ///
+    /// 这是「改动不影响既有 FBX 用例」的守门测试：`parity` 的 101 个用例全走
+    /// SMD，而不带节点缩放的 FBX（绝大多数）走的就是这条路径。
+    #[test]
+    fn bone_offset_equals_official_when_parent_has_no_scale() {
+        let parent = ident();
+        let mut child = ident();
         child.m13 = 1000.0;
         let p = bone_offset(&parent, &child);
-        assert!(near(p, (0.0, 1000.0, 0.0)));
+        assert!(near(p, (0.0, 1000.0, 0.0)), "无缩放时应与官方相同：{p:?}");
     }
 
     /// `shape_key_frame` = 文件顺序 + 1（帧 0 是基准，恒空载荷）。

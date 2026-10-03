@@ -3378,9 +3378,12 @@ pub struct BodyModel {
     /// `srcscale <f>`：顶点与骨骼位移的缩放。`None` = `1.0`（官方不做单位换算）。
     ///
     /// ⚠️ 官方**不**按 FBX 的 `unit_meters` 换算 —— `rig.fbx` 的
-    /// `Skeleton` 局部缩放 `(100,100,100)` 被原样搬进骨骼表，而顶点位置
-    /// 仍按原值（`docs/fbx-support.md` §1.7）。`srcscale` 是给「源文件单位
-    /// 真的错了」准备的逃生门，不是常规选项。
+    /// `Skeleton` 局部缩放 `(100,100,100)` 会进骨骼表（`docs/fbx-support.md` §1.7）。
+    /// `srcscale` 是给「源文件单位真的错了」准备的逃生门，不是常规选项。
+    ///
+    /// ⚠️ 它**不是**用来对齐两套导入器口径的：`srcscale` 是**整体缩放**
+    /// （顶点与骨骼同乘，比值不变）⟹ 补偿不了「骨骼比网格大 100 倍」那个
+    /// 不自洽。后者已由 `crate::fbx::bone_offset` 修掉（§4.6 偏离 12）。
     #[serde(default)]
     pub src_scale: Option<f32>,
     /// `srcaxis "y"` / `"z"`：**强制**上轴。`None` = 不干预（官方原样透传）。
