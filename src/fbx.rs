@@ -420,7 +420,9 @@ pub fn read_frames(
                 Some(mi) => match n.parent.as_ref().and_then(|p| node_ix.get(&p.element.element_id))
                 {
                     Some(&pi) => bone_offset(&world[pi], &world[mi]),
-                    None => translation_of(&world[mi]),
+                    // 根骨骼没有父链可除，但自己那份累积缩放仍要除掉（见
+                    // [`normalized_translation`]）。
+                    None => normalized_translation(&world[mi]),
                 },
                 None => n.local_transform.translation,
             };
@@ -515,15 +517,22 @@ fn translation_of(m: &ufbx::Matrix) -> ufbx::Vec3 {
     }
 }
 
-/// 顶点位置：`rot_norm(geometry_to_world) · p + translation(geometry_to_world)`。
+/// 顶点位置：`rot_norm(geometry_to_world) · p + normalized_translation(g)`。
 ///
-/// 这就是 `probe_fbx_cmp` 的 **R3**（9 个样本 10/10 全绿；R1 原样、R2 只旋转、
+/// 旋转部分就是 `probe_fbx_cmp` 的 **R3**（9 个样本 10/10 全绿；R1 原样、R2 只旋转、
 /// R4 含缩放各有失手）。判别样本是 `rig.fbx` / `twostack.fbx` / `axis_yup.fbx`
 /// 这类带「绕 X −90°」旋转的 —— `box.fbx` / `axis_zup.fbx` 上 R1 也会「绿」，
 /// 那是旋转恰好为恒等或轴置换造成的**假绿**。
+///
+/// ⚠️ **平移列与官方的 R3 不同**：官方直接加原始平移，mdlc 加
+/// [`normalized_translation`]（除掉累积缩放）。理由是**同一份缩放对两者的作用不同**：
+/// 平移列在矩阵链里**会**被父链缩放乘到（`world = parent · T · R · S`），而顶点
+/// **尺寸**不会（`rot_norm` 已经把它丢掉）⟹ 不除就会让网格**位置**与网格**尺寸**
+/// 差 100 倍（`be1_two_roots.fbx` 的 `body_a` 平移 `(0,50,0)` 其实是 Blender 里的
+/// `(0,0.5,0)`，而它 1 米见方的网格顶点仍是 `±0.5`）。
 fn geometry_point(g: &ufbx::Matrix, p: ufbx::Vec3) -> ufbx::Vec3 {
     let r = rotation_of(g);
-    let t = translation_of(g);
+    let t = normalized_translation(g);
     ufbx::Vec3 {
         x: r.m00 * p.x + r.m01 * p.y + r.m02 * p.z + t.x,
         y: r.m10 * p.x + r.m11 * p.y + r.m12 * p.z + t.y,
@@ -560,6 +569,25 @@ fn column_lengths(m: &ufbx::Matrix) -> (f64, f64, f64) {
     )
 }
 
+/// 平移列**除掉累积缩放**：`translation_of(m) / column_lengths(m)`。
+///
+/// 与 [`bone_offset`] 用的是同一个判据（见那里的推导）：Blender 的
+/// `FBX_SCALE_NONE`（默认 "All Local"）把 m→cm 的 ×100 **左乘**进每个顶层节点的
+/// 局部矩阵，于是平移列被 ×100，而它 3×3 部分的列长也正是 100 ⟹ 除掉列长就回到
+/// 米。网格节点与骨架节点各带一份同样的 `localS`（两者是兄弟），所以两边都除才
+/// 自洽；只除一边就会差 100 倍。
+///
+/// 列长为 0（退化矩阵）时 [`column_lengths`] 退回 1.0 ⟹ 这里是恒等。
+fn normalized_translation(m: &ufbx::Matrix) -> ufbx::Vec3 {
+    let t = translation_of(m);
+    let (sx, sy, sz) = column_lengths(m);
+    ufbx::Vec3 {
+        x: t.x / sx,
+        y: t.y / sy,
+        z: t.z / sz,
+    }
+}
+
 /// 骨骼位移：`pos = (R_norm(parent_world) · S(parent_world))⁻¹ · (child_world.t − parent_world.t)`。
 ///
 /// ⭐ **这是 mdlc 有意偏离官方的一处**（见 `docs/fbx-support.md` §4.6）。
@@ -581,24 +609,21 @@ fn column_lengths(m: &ufbx::Matrix) -> (f64, f64, f64) {
 /// （`u_aso_units.mdl`：骨骼 `(0,10,0)` / `(0,30,0)` + 网格 `[-3,-3,0]..[3,3,45]`，
 /// 比值 1.5264 ✅）。用户从此不必关心 Blender 的 `Apply Scalings` 选项。
 fn bone_offset(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Vec3 {
+    // 两端都取「除掉累积缩放」的世界位置（见 [`normalized_translation`]）——
+    // 与顶点口径用的是同一个判据，这样骨骼与网格才落在同一个尺度里。
+    let pc = normalized_translation(parent_world);
+    let cc = normalized_translation(child_world);
     let d = ufbx::Vec3 {
-        x: child_world.m03 - parent_world.m03,
-        y: child_world.m13 - parent_world.m13,
-        z: child_world.m23 - parent_world.m23,
+        x: cc.x - pc.x,
+        y: cc.y - pc.y,
+        z: cc.z - pc.z,
     };
     let r = rotation_of(parent_world);
     // `Rᵀ · d`：`R` 的第 i 列与 `d` 点积。
-    let local = ufbx::Vec3 {
+    ufbx::Vec3 {
         x: r.m00 * d.x + r.m10 * d.y + r.m20 * d.z,
         y: r.m01 * d.x + r.m11 * d.y + r.m21 * d.z,
         z: r.m02 * d.x + r.m12 * d.y + r.m22 * d.z,
-    };
-    // 再除掉父链的缩放，得到真正的局部平移。
-    let (sx, sy, sz) = column_lengths(parent_world);
-    ufbx::Vec3 {
-        x: local.x / sx,
-        y: local.y / sy,
-        z: local.z / sz,
     }
 }
 
@@ -642,7 +667,9 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
             let pos = match mi {
                 Some(mi) => match n.parent.as_ref().and_then(|p| ix.get(&p.element.element_id)) {
                     Some(&pi) => bone_offset(&world[pi], &world[mi]),
-                    None => translation_of(&world[mi]),
+                    // 根骨骼没有父链可除，但自己那份累积缩放仍要除掉（见
+                    // [`normalized_translation`]）。
+                    None => normalized_translation(&world[mi]),
                 },
                 None => n.local_transform.translation,
             };
@@ -1304,10 +1331,15 @@ mod tests {
         assert_eq!((t.x, t.y, t.z), (5.0, 6.0, 7.0));
     }
 
-    /// ⭐ **R3**：顶点位置用 `rot_norm·p + t`，**缩放不进顶点**。
+    /// ⭐ **R3 + 归一化平移**：顶点位置用 `rot_norm·p + 归一化平移`，**缩放既不进顶点尺寸、也不进顶点位置**。
     ///
     /// 判别性：`rig.fbx` 的 `Skeleton` 带 100× 缩放，官方 VVD 顶点仍是
     /// `[-3,-0,-3]..[3,45,3]`（源网格 6×6×45）而不是 ×100 倍。
+    ///
+    /// ⚠️ 平移那一项与官方的 R3 **不同**（这是有意偏离，见 [`normalized_translation`]）：
+    /// 官方加原始平移 `(5,6,7)`，本实现加 `(0.05,0.06,0.07)`。理由是平移列**会**被
+    /// 父链缩放乘到（`world = parent·T·R·S`），而顶点尺寸不会 ⟹ 不除就会让网格的
+    /// **位置**与**尺寸**差 100 倍（`be1_two_roots.fbx` 的实测症状）。
     #[test]
     fn geometry_point_uses_normalized_rotation_plus_translation() {
         let g = ufbx::matrix_mul(&scale100(), &blender_export_rotation());
@@ -1317,8 +1349,101 @@ mod tests {
             m23: 7.0,
             ..g
         };
-        // (x,y,z) → 归一化旋转 → (x, z, −y)，再加平移；缩放必须不见。
-        assert!(near(geometry_point(&g, v(1.0, 2.0, 3.0)), (6.0, 9.0, 5.0)));
+        // 旋转：(x,y,z) → (x, z, −y)；平移：原始 (5,6,7) ÷ 列长 100。
+        assert!(near(
+            geometry_point(&g, v(1.0, 2.0, 3.0)),
+            (1.05, 3.06, -1.93)
+        ));
+    }
+
+    /// `normalized_translation` = 平移列 ÷ 列长；无缩放时与 [`translation_of`] 相同。
+    #[test]
+    fn normalized_translation_divides_out_the_column_lengths() {
+        let scaled = ufbx::Matrix {
+            m03: 500.0,
+            m13: 50.0,
+            m23: 0.0,
+            ..scale100()
+        };
+        let t = normalized_translation(&scaled);
+        assert!(
+            near(t, (5.0, 0.5, 0.0)),
+            "应除掉 100× 列长；实际 {t:?}"
+        );
+
+        // 无缩放时是恒等（官方口径不受影响）。
+        let plain = ufbx::Matrix {
+            m03: 5.0,
+            m13: 6.0,
+            m23: 7.0,
+            ..ufbx::Matrix::default()
+        };
+        let t = normalized_translation(&plain);
+        assert!(near(t, (5.0, 6.0, 7.0)), "无缩放时不该改动：{t:?}");
+    }
+
+    /// ⭐ **网格位置与网格尺寸必须同尺度**（`be1_two_roots.fbx` 的回归判据）。
+    ///
+    /// 该夹具的 Blender 场景：1 米见方的立方体，网格节点 `body_a` 带 `localS = 100`
+    /// 且局部平移 `(0,50,0)`（= Blender 里的 `(0,0.5,0)`）；骨架祖先 `RigA` 也带
+    /// `localS = 100`，骨骼 `A_root → A_tip` 的局部平移是 `(0,1,0)`（1 米）。
+    ///
+    /// 自洽的判据：**立方体的边长（1 米）应等于骨骼长度（1 米）**，且立方体正好
+    /// 骑在这根骨骼上。修复前 mdlc 让骨骼留在 100×（跨度 5.1），修复后又让骨骼掉到
+    /// 1× 而网格**位置**留在 100× —— 两次都错；现在两边都在米里。
+    #[test]
+    fn mesh_position_and_mesh_size_share_one_scale() {
+        // R(+90°)，即 `blender_export_rotation()` 的**转置**（= 逆）—— 夹具里
+        // `A_root` 的旋转，它把 `RigA` 的 −90° 抵掉（所以 `A_root` 的世界旋转是单位阵）。
+        // 逐列写：col0=(1,0,0)、col1=(0,0,1)、col2=(0,−1,0)。
+        let rot_plus90 = ufbx::Matrix {
+            m11: 0.0,
+            m21: 1.0,
+            m12: -1.0,
+            m22: 0.0,
+            ..ident()
+        };
+
+        // 骨架：RigA（100× ∘ R(−90°)）→ A_root（R(+90°)）→ A_tip（局部平移 (0,1,0)）。
+        let rig_a = ufbx::matrix_mul(&scale100(), &blender_export_rotation());
+        let a_root = ufbx::matrix_mul(&rig_a, &rot_plus90);
+        let a_tip = ufbx::matrix_mul(&a_root, &{
+            let mut t = ident();
+            t.m13 = 1.0;
+            t
+        });
+
+        // 网格：body_a 带 100× 与局部平移 (0,50,0)（cm）；立方体自身是 ±0.5 米。
+        let body_a = ufbx::Matrix {
+            m03: 0.0,
+            m13: 50.0,
+            m23: 0.0,
+            ..scale100()
+        };
+        let lo = geometry_point(&body_a, v(0.0, -0.5, 0.0));
+        let hi = geometry_point(&body_a, v(0.0, 0.5, 0.0));
+        let mesh_span = hi.y - lo.y;
+        let mesh_center = (hi.y + lo.y) / 2.0;
+
+        // 骨骼长度（局部口径）与骨骼末端的世界位置。
+        let tip_local = bone_offset(&a_root, &a_tip);
+        let bone_len = tip_local.y;
+        let tip_world = normalized_translation(&a_tip);
+
+        assert!(
+            (mesh_span - 1.0).abs() < 1e-9 && (bone_len - 1.0).abs() < 1e-9,
+            "网格边长与骨骼长度应同为 1 米；实际 网格={mesh_span} 骨骼={bone_len}"
+        );
+        assert!(
+            (tip_world.y - 1.0).abs() < 1e-9,
+            "A_tip 应落在世界 y=1 米处；实际 {}",
+            tip_world.y
+        );
+        assert!(
+            (mesh_center - tip_world.y / 2.0).abs() < 1e-9,
+            "立方体应骑在骨骼上（中心 = 骨骼中点）；实际 网格中心={mesh_center} 骨骼中点={}",
+            tip_world.y / 2.0
+        );
     }
 
     /// ⭐ **N3**：法线只有 `rot_norm`，没有平移；缩放必须丢掉。

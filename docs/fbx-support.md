@@ -29,7 +29,7 @@
 | **推荐的 UX？** | **FBX 作为一等源直接写进 QC**（`$body` / `$model` / `$sequence` / `$animation` / `$collisionmodel`），默认行为**逐条对齐官方**，但把官方所有**静默失败**改成**显式诊断**，并给每个隐式决策一个**显式覆盖语法**（§4）。⭐ **新语法按「概念」命名（`src*`）、不按「格式」命名** —— 加 glTF/GLB 时新增语法 **0 条**（§4.3） |
 | 最大的 UX 障碍？ | ⭐⭐⭐ **官方恒取第一条 NLA 栈、完全忽略 `$sequence` 名字**（§1.8）。多栈 FBX 在官方路径下**无解**，必须由 mdlc 提供显式选择 |
 | 表情（flex）怎么走？ | ⭐⭐⭐⭐⭐ **什么都不用写** —— FBX 的 shape key **自动注册**成 flexdesc + controller + rule + 载荷（§1.6b），与官方逐字段一致。⚠️ 但**不能在 FBX 源上写 `flexfile`/`flex`**（官方必崩） |
-| 单位/缩放对得上吗？ | ⚠️ **官方在这里有个 bug**：FBX 标准单位是**厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、完全忽略 `UnitScaleFactor`** ⟹ 默认导出（`All Local`）下官方编出的模型**骨骼比网格大 100 倍**（比值 0.0153）。**mdlc 有意偏离并修掉它**（§1.7.3 / §4.6 偏离 12）：`All Local` 与 `FBX Units Scale` 两种导出**编出逐值相同的产物**，用户不必关心 Blender 的 `Apply Scalings` 选项 |
+| 单位/缩放对得上吗？ | ⚠️ **官方在这里有个 bug，而且是两半**：FBX 标准单位是**厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、完全忽略 `UnitScaleFactor`** ⟹ 默认导出（`All Local`）下官方编出的模型**骨骼比网格大 100 倍**（比值 0.0153），且**网格位置留在厘米、网格尺寸在米**（`be1_two_roots` 比值 0.9825）。**mdlc 有意偏离并两半都修掉**（§1.7.3 / §4.6 偏离 12）：`All Local` 与 `FBX Units Scale` 两种导出**编出逐值相同的产物**，NekoMDL 独立仲裁 8/8 逐位相同，用户不必关心 Blender 的 `Apply Scalings` 选项 |
 
 ---
 
@@ -377,6 +377,22 @@ Blender 的 `apply_scale_options` 有四种取值，它们**只决定单位信�
 ⟹ 机制：官方对**顶点**用 `rot_norm(geometry_to_world)`（丢掉缩放，R3），对**骨骼位移**用
 `R_norm(parent)ᵀ · d`（`d` 里含父链缩放，口径 E）⟹ **同一个 ×100 在一处被丢掉、在另一处被保留**。
 
+⚠️ **同一个 bug 还有第二半，而且它才是更常见的那一半**：顶点的**尺寸**走了 `rot_norm`
+（丢掉缩放），但顶点的**位置**（矩阵的平移列）**会**被父链缩放乘到（`world = parent · T · R · S`）
+⟹ 官方产物里网格的**位置在厘米、尺寸在米**。
+
+判别样本 `be1_two_roots.fbx`（`docs/_probe/fbx_ab_corpus.js` 的夹具之一）：
+Blender 场景是两块 1 米见方的立方体，分别在 `y=0.5` 与 `x=5`；骨骼 `A_root → A_tip` 长 1 米、
+`B_root` 在 `x=5` ⟹ **米制真值** = 网格包围盒对角线 `6.164`（6×1×1）÷ 骨骼跨度 `5.099`
+= **1.2089**。
+
+| 产物 | 网格 bbox | 骨骼跨度 | 比值 | 判定 |
+|---|---|---|---|---|
+| 官方编 `be1_two_roots.fbx` | 位置 cm / 尺寸 m | 5.099 | 0.9825 | ❌（位置与尺寸不同尺度） |
+| NekoMDL 编 `be1_two_roots.fbx` | `[-250,-50,-50]..[550,50,50]` | 509.9 | **1.2089** | ✅（米制真值 ×100） |
+| mdlc 修复第一轮 | 位置 cm / 尺寸 m | 5.099 | 98.25 | ❌（反过来错一半） |
+| **mdlc 修复第二轮** | 位置 m / 尺寸 m | 5.099 | **1.2089** | ✅ |
+
 判定探针 `docs/_probe/bone_mesh_space.js`（输出「网格对角线 ÷ 骨骼跨度」，人形应落 **0.3~3**）：
 
 | 产物 | 骨骼跨度 | 网格对角线 | 比值 | 判定 |
@@ -385,6 +401,10 @@ Blender 的 `apply_scale_options` 有四种取值，它们**只决定单位信�
 | 官方编 `aso_units.fbx`（Units Scale） | 30 | 45.79 | **1.5264** | ✅ |
 | NekoMDL 编 `rig.fbx` | 3000 | 4579.30 | **1.5264** | ✅（网格 ×100） |
 | **mdlc（本次修复后）** | 30 | 45.79 | **1.5264** | ✅ |
+
+⚠️ **该比值在只有一根骨骼的夹具上无意义**（骨骼跨度为 0 ⟹ 分母为 0）：`be4_meshnode_anim`
+与 `be5_unweighted` 属于此类，它们要看**绝对位置**（`be4` 的网格应落在 `[-1,5,-1]..[1,7,1]`
+而不是 `[-1,599,-1]..[1,601,1]`；`be5` 的 `body` 骨骼世界位置应是 `[0,0.5,0]` 而不是 `[0,50,0]`）。
 
 ⚠️ 这不是「夹具本身不自洽」—— `fbx_tree.js` 实测 `Skeleton` 与 `body` **各带一份
 `LclS=(100,100,100)`**、两者是兄弟，**文件本身完全自洽**。出问题的是**下游**。
@@ -395,16 +415,33 @@ Blender 的 `apply_scale_options` 有四种取值，它们**只决定单位信�
 
 #### 1.7.4 mdlc 的处置（有意偏离，见 §4.6 偏离 12）
 
-**骨骼位移改成正牌的局部平移**：在 `R_norm(parent)ᵀ · d` 之后**再除以父世界的列长**
-（父链没有缩放时列长 = 1，除法是恒等 ⟹ 不带缩放的 FBX 逐值不变）。
+**一句话：顶点与骨骼都只保留旋转，缩放一律不进产物。**
+
+1. **骨骼位移**：`R_norm(parent)ᵀ · (normalized_translation(child) − normalized_translation(parent))`
+   —— 两端先各自除掉累积缩放，再转进父的旋转空间（父链没有缩放时列长 = 1，
+   除法是恒等 ⟹ 不带缩放的 FBX 逐值不变）。
+2. **顶点位置**：`rot_norm(g) · p + normalized_translation(g)` —— 平移项也除掉累积缩放
+   （官方 R3 直接加原始平移）。理由见上：平移列**会**被父链缩放乘到，而顶点尺寸不会。
+3. **根骨骼**（`read_frames` 与 `reference_poses` 两处）：同样用 `normalized_translation`。
+
+三者共用同一个原语 `normalized_translation(m) = translation_of(m) / column_lengths(m)`
+（`src/fbx.rs`），所以「网格位置 / 网格尺寸 / 骨骼位移」永远落在同一个尺度里。
 
 验收（本次实测）：
 
 - `u_aso_none` 与 `u_aso_units` 两个 mdlc 产物**逐值相同**（`mdl_byte_regions.js`：
-  只有 `checksum` 与内嵌的模型名/源文件名不同，那本来就不同）
+  只有 `checksum` 与内嵌的模型名/源文件名不同，那本来就不同；骨骼表剩 1e-21 级浮点残渣）
 - 骨骼表与官方 `u_aso_units.mdl` **数值相同**（差异仅 1e-7 级浮点噪声：
   `9.999999046325684` vs `10`）
 - 比值 **1.5264 ✅**（官方 All Local 是 0.0153 ❌）
+- **65 个夹具的 A/B**（`docs/_probe/fbx_ab_corpus.js`，旧二进制 vs 新二进制）：
+  产物有差异 **16** / 逐字节相同 **49** / 退出码变化 **0** ⟹ 只有带节点缩放的夹具变，
+  其余完全不动
+- **NekoMDL 独立仲裁**（NekoMDL 在厘米里工作，所以它的比值是**尺度不变量**，可直接比）：
+  `be1` **1.2089** ✅ / `be2` **0.7746** ✅ / `be3` **3.4641** ✅ / `be6` **0.2474** ✅ /
+  `bo1_fork` **1.1447** ✅ / `twomesh` **1.6905** ✅ / `rig` **1.5264** ✅ /
+  `order_rw` **4.5793** ✅ —— **8 个夹具全部与 mdlc 逐位相同**
+- `parity_snapshot.js --compare`：SMD 侧 **101/101 逐字节相同，0 有差异**（零回归）
 
 ⟹ **用户从此不必关心 Blender 的 `Apply Scalings` 选项** —— 正是「像 UE / Unity 一样
 自动处理」的效果（UE 有 `Convert Scene Unit`，Unity 的 Scale Factor 默认 0.01）。
@@ -778,6 +815,9 @@ $ mdlc build-qc a_body.qc --out outA
 
 1. **默认逐条对齐官方。** 同一份 QC 喂官方与喂 mdlc，产物应当一致。
    这是 mdlc 的验收方式（AGENTS.md），也是用户迁移的前提。
+   ⚠️ **唯一的例外是单位/缩放**（§1.7.3）：官方在那里同时犯了两个错（骨骼比网格大
+   100 倍、网格位置与尺寸不同尺度），照抄它等于把一个 bug 变成用户的负担。该处**有意偏离**
+   并在文档与诊断里写明（偏离 12）。
 2. **官方的静默失败一律改成显式诊断。** 官方在 FBX 路径上有 3 类静默陷阱（§1.11），
    全部表现为 `exit=0` + "成功"的产物。**mdlc 不能复制这种沉默** ——
    这正是用户说的「猜测编译器的内部机制和意图」。
@@ -796,7 +836,7 @@ $ mdlc build-qc a_body.qc --out outA
 | 动画栈 | **恒取第一条** | **同官方** + ⚠️ 告警 | ⚠️ 有多条时告警并列出名字 |
 | 重采样率 | 固定 30 fps | **同官方**（30） | §1.5 |
 | `animdesc.fps` 字段 | 取 `$sequence ... fps N` | **同官方** | ⚠️ 与重采样率不等时告警 |
-| 单位/缩放 | **骨骼位移不继承父链缩放**（顶点侧同官方） | ⚠️ **有意偏离**（见 §4.6 偏离 12） | §1.7.3 官方的 bug |
+| 单位/缩放 | **顶点尺寸**丢缩放、**顶点位置**与**骨骼位移**保留 ⟹ 骨骼比网格大 100 倍 + 网格位置在厘米 | ⚠️ **有意偏离**：顶点与骨骼都不进缩放（见 §4.6 偏离 12） | §1.7.3 官方的 bug |
 | 轴向 | **不干预**（原样搬运根变换） | **同官方** | §1.7b |
 | 骨骼过滤 | 丢网格节点与空叶节点 | **同官方** | §1.4，但需复验例外 |
 | **shape key → flex** | **自动注册**（desc + controller + rule + 载荷） | **同官方** | §1.6b；**零 QC 语法** |
@@ -1053,7 +1093,7 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 | **多栈 FBX**（§1.8，最大障碍） | 默认第一条 + 告警列出全部；`srcstack "名"` 显式选择；找不到该名字时**硬报错**并列出可用名 |
 | **材质命名**（§1.9） | 默认原样透传（官方）；`srcmaterial` 兜底无材质的情况 |
 | **多网格 → 部件**（§1.10） | 默认合并 + 告警；`srcpart` 选网格；要多个 bodypart 就写多条 `$body` |
-| **单位/缩放**（§1.7） | 顶点侧原样透传（官方）；**骨骼位移不继承父链缩放**（有意偏离 12，修掉官方的 100× 不自洽）；`srcscale` 整体缩放 |
+| **单位/缩放**（§1.7） | **顶点与骨骼都不进缩放**：顶点位置用 `rot_norm(g)·p + 归一化平移`，骨骼位移用 `R_norm(parent)ᵀ·(归一化平移差)`（有意偏离 12，修掉官方的 100× 不自洽）；`srcscale` 整体缩放 |
 | **轴向**（§1.7b） | **默认不干预**（官方；根变换原样搬运）；只在坏文件上用 `srcaxis` 强制 |
 | **重采样率**（§1.5） | 默认 30（官方）；`srcfps` 覆盖 |
 | **shape key → flex**（§1.6b） | **默认自动注册**（与官方逐字段一致：desc + controller `[0,1]` + `MUL` rule + 载荷）；`srcshapekey*` 控制取哪些/顺序/忽略。⚠️ **FBX 上禁止显式 flex 语法**（官方必崩） |
@@ -1074,7 +1114,7 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 | 9 | **vertanim 顺序 = 焊接顶点升序**（官方 FBX 是「控制点首次出现序 × 组内降序」） | 官方的顺序取决于它自己的顶点焊接顺序，**该顺序 mdlc 与官方本就不同**（见偏离 11），复刻它毫无意义；载荷内容（顶点集合 + delta 多重集）完全一致，已由 `k4_flex_align.js` 按 VVD 位置对齐验证（16/16） |
 | 10 | **丢弃 `nrm_off`，`ndelta` 恒 0** | 与官方 FBX 路径一致（`axisprobe.fbx` 的 `nrm_off` 非零而官方产物 `ndelta=(0,0,0)`）；`flex` 的 `.vta` 路径仍照常算 `ndelta` |
 | 11 | **`mesh.vertexdata` / `model.vertexdata` 写 0**（官方写运行期堆指针） | 官方把**进程地址**写进产物（语料 87/87 个 mesh 非 0，如 `0x7de5088c`）—— 那是 ASLR 后的堆地址，**逐字节对齐既不可能也无意义**；这两个字段由引擎在加载时填 |
-| 12 | ⭐ **骨骼位移不继承父链缩放**：`(R_norm(parent)·S(parent))⁻¹ · d`（官方是 `R_norm(parent)ᵀ · d`，父链缩放进位移） | ⭐ **官方错、mdlc 对**：官方对顶点丢掉父链缩放、对骨骼保留 ⟹ 同一个 FBX 编出**骨骼比网格大 100 倍**的不自洽模型（§1.7.3，比值 0.0153 vs 人形应有的 0.3~3）。修完之后 `aso_none.fbx`（Blender 默认 "All Local"）与 `aso_units.fbx`（"FBX Units Scale"）编出**逐值相同**的产物，用户不必再关心 Blender 的 `Apply Scalings` 选项；父链无缩放时本改动是恒等，**不带缩放的 FBX 逐值不变** |
+| 12 | ⭐ **缩放完全不进产物**：骨骼位移 `(R_norm(parent)·S(parent))⁻¹ · d`、顶点位置 `rot_norm(g)·p + t/column_lengths(g)`（官方骨骼是 `R_norm(parent)ᵀ · d`、顶点是 `rot_norm(g)·p + t`，两处都保留父链缩放） | ⭐ **官方错、mdlc 对**：官方对顶点**尺寸**丢掉父链缩放、对**顶点位置**和**骨骼位移**却保留 ⟹ 同一个 FBX 编出**骨骼比网格大 100 倍**（§1.7.3，比值 0.0153）以及**网格位置在厘米、尺寸在米**（§1.7.3 第二半，`be1_two_roots` 的官方比值 0.9825）两种不自洽。修完之后 `aso_none.fbx`（Blender 默认 "All Local"）与 `aso_units.fbx`（"FBX Units Scale"）编出**逐值相同**的产物，用户不必再关心 Blender 的 `Apply Scalings` 选项；NekoMDL 独立仲裁 8/8 与 mdlc 逐位相同。父链无缩放时本改动是恒等，**不带缩放的 FBX 逐值不变**（65 夹具 A/B：只有 16 个带缩放的变，其余 49 个逐字节相同） |
 
 > ⚠️ **偏离 11 的连带后果**：`k4_morph.mdl` 与官方产物**不可能逐字节一致**
 > （还有 `checksum`、1 ULP 级的 `hull_min/hull_max`、`seqdesc.bbmin/bbmax`）。
@@ -1083,6 +1123,9 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 > ⚠️ **偏离 12 的连带后果**：带节点缩放的 FBX（Blender 默认导出的**全部**文件）
 > 骨骼表与官方产物**数值不同** —— 官方是 ×100 的那个，mdlc 是 ÷100 的那个。
 > 对照时请用官方 `FBX Units Scale` 的产物（`u_aso_units.mdl`），那才是 mdlc 的对应物。
+> 同理，网格的**位置**也不同（官方留在厘米、mdlc 换算到米），所以带节点缩放的
+> 夹具连 `.vvd` 都不能逐字节对照 —— 用 `docs/_probe/bone_mesh_space.js` 看比值，
+> 或与 NekoMDL 的产物对照（它同样在米/厘米自洽的一侧）。
 
 #### 4.6b 不是偏离、但必须写明的两条「官方的坑」
 
@@ -1179,7 +1222,7 @@ src_stack = "run"
 
 | # | 事项 | 说明 | 状态 |
 |---|---|---|---|
-| 1 | **单位/缩放定案** | §1.7 的「骨骼 ×100、网格 ×1」已查清：**FBX 标准单位是厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、忽略 `UnitScaleFactor`**，于是同一个场景在 `All Local` 下编出骨骼比网格大 100 倍的不自洽模型（§1.7.3）。判据由用户给定（「BST 做不做 HU 换算？」⟹ 不做 ⟹ 保留源单位、只修自洽） | ✅ **已定案并修复**（§1.7.4 / 偏离 12；验收：`aso_none` 与 `aso_units` 产物逐值相同、与官方 `u_aso_units.mdl` 骨骼表数值相同、比值 0.0153 → **1.5264**） |
+| 1 | **单位/缩放定案** | §1.7 的「骨骼 ×100、网格 ×1」已查清：**FBX 标准单位是厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、忽略 `UnitScaleFactor`**，于是同一个场景在 `All Local` 下编出骨骼比网格大 100 倍的不自洽模型（§1.7.3）。判据由用户给定（「BST 做不做 HU 换算？」⟹ 不做 ⟹ 保留源单位、只修自洽）。⚠️ 修复分两轮：第一轮只改骨骼，第二轮才发现**顶点位置**也被同一个 ×100 污染（`be1_two_roots` 的官方比值 0.9825）⟹ 最终**顶点与骨骼都不进缩放** | ✅ **已定案并修复**（§1.7.4 / 偏离 12；验收：`aso_none` 与 `aso_units` 产物逐值相同、与官方 `u_aso_units.mdl` 骨骼表数值相同、比值 0.0153 → **1.5264**；NekoMDL 仲裁 8/8 逐位相同；65 夹具 A/B 只有 16 个变；parity 101/101 零回归） |
 | 2 | **骨骼过滤规则** | §1.4 的例外（`box.fbx` 的网格节点成了骨骼）需要更多样本确认边界（多根骨骼、多网格、嵌套骨架） | ✅ **已定案**（§1.4b 的 6 个单变量样本：主规则无例外，`box.fbx` 不是例外；§1.4c 的**排列顺序 = DFS 先序**也已修）。⚠️ 「骨骼被过滤」的**诊断**仍未实现 —— 但它现在缺的是「怎么措辞」而非「规则不明」，见 §4.4 |
 | 3 | **flex 的 oracle 差分** | 用 `morph.fbx` 做「官方 FBX→flex」vs「mdlc FBX→flex」的逐字段对照；再复验「shape key 顺序 = 帧 1..N」这条映射 | ✅ **已完成**（`k4_flex_align.js`：desc/controller/rule/targets/vtype/speed/side/ndelta **全部逐字段一致**；载荷按 VVD 位置对齐 16/16） |
 | 4 | **动画采样率** | 官方固定 30 fps（§1.5）；`ufbx` 需显式设 `minimum_sample_rate` 才能复刻（§2.3） | ✅ **已可用**（`srcfps` 端到端实测：60 ⟹ 11 帧、30 ⟹ 6 帧） |
@@ -1287,6 +1330,14 @@ FBX 侧已有 **82 个官方用例**的现成夹具与期望值（§1 各表）�
 | `D:\GITHUB\mdlc\docs\_probe\oracle_fbx_axis.js` | 3 用例：证明官方**不做轴向变换**，原样搬运根变换（§1.7b） |
 | `D:\DSH\L4D2ReverseEngineering\_fbxresearch\gen_fbx_axis.py` | 造出只有导出轴向不同的三份 FBX（§1.7b 的决定性夹具） |
 | `D:\GITHUB\mdlc\docs\_probe\_tmp_dump_flexrules.js` | 只读 dump：`mstudioflexrule_t` 逐字段（§1.6b 的三件套） |
+| `D:\GITHUB\mdlc\docs\_probe\bone_mesh_space.js` | **自洽性判定探针**：输出「骨骼世界坐标逐根 / 骨骼跨度 / 网格 bbox / 对角线 / **网格对角线 ÷ 骨骼跨度**」（§1.7.3 的判据；⚠️ 单骨骼夹具上分母为 0，比值无意义） |
+| `D:\GITHUB\mdlc\docs\_probe\fbx_tree.js` | **FBX 二进制节点树解析器**（手写递归，不靠字符串搜索）：`node fbx_tree.js <a.fbx> [...] [--all]`，默认打 `GlobalSettings` 单位字段 + 每个 `Model` 的 `LclT/LclR/LclS`（§1.7.2 的决定性工具） |
+| `D:\GITHUB\mdlc\docs\_probe\fbx_ab_corpus.js` | **65 夹具 A/B**：`node fbx_ab_corpus.js <old.exe> <new.exe> [夹具目录]`，逐夹具编两遍比 `mdl/vvd/vtx/ani/phy` 的 sha256；**自检「两侧是同一个文件 ⟹ exit(2)」**（防自比自） |
+| `D:\GITHUB\mdlc\docs\_probe\mdl_byte_regions.js` | MDL 差异按**连续段**聚合并给出语义位置（验收「只有 checksum 与名字不同」用） |
+| `D:\DSH\L4D2ReverseEngineering\_fbxresearch\gen_unitscale.py` | 生成 `unitscale\`（`default` / `gs001` / `no_apply_unit` / `unit_cm`）—— 定位「哪个选项影响 ×100」 |
+| `D:\DSH\L4D2ReverseEngineering\_fbxresearch\gen_unitscale2.py` | 生成 `unitscale2\`（`aso_all` / `aso_custom` / `aso_none` / `aso_units` / `gs_001` / `gs_10`）—— **§1.7.2 四种 `apply_scale_options` 的夹具** |
+| `D:\DSH\L4D2ReverseEngineering\_gltfresearch\dual\` | 同一 Blender 场景**双导出**（`rig.fbx` / `rig.glb` / `full.fbx` / `full.glb` / `zup.glb`）—— 传递式 oracle 的夹具（见 `docs/gltf-support.md`） |
+| `D:\DSH\L4D2ReverseEngineering\_gltfresearch\neko\`、`neko2\` | **NekoMDL 仲裁工作区**（QC + 夹具副本 + 日志）；产物落在 `left4dead2\models\neko\` 与 `\neko2\` |
 
 > ⚠️ Blender 无头启动**必须加 `--factory-startup`**：用户装的 `io_scene_valvesource` 与
 > `comfyui_blender` 会在无头启动时抛 `AttributeError: 'Scene' object has no attribute 'vs'`
