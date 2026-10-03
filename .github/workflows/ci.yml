@@ -13,6 +13,27 @@ name: CI
 # **复用缓存直接返回成功**，把 allow-by-default 的 lint（如
 # `chunks_exact_to_as_chunks`）全部漏掉。所以这里不依赖裸的
 # `-D warnings`，而是显式写出等级，并且 CI 总是全新构建、不受此影响。
+#
+# ⚠️ **为什么测试跑 debug 而构建跑 release**：
+#
+# `[profile.release]` 是 `lto = "thin"` + `codegen-units = 1` —— 对**发布产物**
+# 是对的，但拿它跑测试是**双输**：
+#
+# 1. **慢**：codegen-units = 1 让 codegen 无法并行。本机实测（28 逻辑核，
+#    各自全新 target 目录）`cargo test --no-run`：
+#      thin LTO + cgu=1 → 161.8s
+#      无 LTO   + cgu=16 →  35.7s      （4.5×）
+#    CI 上差距更大：Windows job 14 分钟里有 **12.5 分钟是编译**，
+#    而测试本身只跑 1.67s。
+# 2. **弱**：`--release` 下 `debug_assert!` 被静默编译掉。本仓库有 22 处
+#    `debug_assert`（mdl_writer 6 / anim_writer 4 / vvd 4 / phy 3 /
+#    bone_math 2 / vtx_writer 2 / ani_writer 1），用 release 跑测试
+#    等于**从来没验证过它们**。
+#
+# 所以：`cargo build --release` 保留（证明 release profile 真的编得出来），
+# 测试全部走默认的 debug profile（同时验证 `debug_assert`）。
+# 判据来自 `cargo rustc --lib -- --print cfg`：debug 有 `debug_assertions`，
+# release 没有。
 
 on:
   push:
@@ -53,23 +74,41 @@ jobs:
       - name: cargo build
         run: cargo build --release --locked
 
-      # 526 个测试，**不需要任何外部素材**。
+      # 783 个测试，**不需要任何外部素材**。
       # 需要素材的 6 个已 #[ignore]，结果行会显示 "6 ignored"。
+      #
+      # ⚠️ 不写 `--release`：理由见文件头「为什么测试跑 debug 而构建跑 release」。
+      # 顺带让 22 处 `debug_assert` 真正生效。
+      #
+      # 输出同时 tee 到文件，供下一步的计数断言读取 —— 否则断言步骤要把
+      # 整个测试套件**再跑一遍**（旧版就是这样，白花一次全量测试的时间）。
       - name: cargo test
-        run: cargo test --release --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target
+          cargo test --locked 2>&1 | tee target/test-output.txt
 
       # ⚠️ 防止 CI 变成**空洞的绿**：如果有人把测试大量标 `#[ignore]`
       # （或测试被误删），上一步依然退出 0。这里显式要求
       # 「通过数 ≥ 520 且 ignored ≤ 6」。
       # 本项目被空洞测试坑过多次，所以对 CI 自己也设一条非空洞判据。
+      #
+      # ⚠️ 读上一步 tee 出来的文件，**不重跑测试** —— 旧版在这里又跑了一次
+      # 全量测试，在 Windows 上白花 278s。
       - name: 断言测试计数（防空洞绿）
         shell: bash
         run: |
           set -o pipefail
-          out=$(cargo test --release --locked 2>&1)
-          echo "$out" | tail -5
-          passed=$(echo "$out" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '[0-9]+')
-          ignored=$(echo "$out" | grep -oE '[0-9]+ ignored' | head -1 | grep -oE '[0-9]+')
+          if [ ! -s target/test-output.txt ]; then
+            echo "::error::没找到 target/test-output.txt —— 上一步的 tee 没生效？"
+            exit 1
+          fi
+          tail -5 target/test-output.txt
+          # ⚠️ 直接 grep 文件，不要 `out=$(cat ...)`：测试输出里有 NUL 字节，
+          # 命令替换会告警（`ignored null byte in input`）并可能截断内容。
+          passed=$(grep -oE '[0-9]+ passed' target/test-output.txt | head -1 | grep -oE '[0-9]+')
+          ignored=$(grep -oE '[0-9]+ ignored' target/test-output.txt | head -1 | grep -oE '[0-9]+')
           echo "passed=$passed ignored=$ignored"
           if [ "${passed:-0}" -lt 520 ]; then
             echo "::error::通过数只有 $passed（期望 ≥520）—— 测试被跳过或删除了？"
@@ -81,8 +120,9 @@ jobs:
           fi
 
       # hotpath feature 也必须能编过（探针配置的回归纪律）。
+      # ⚠️ 同样走 debug：这个 feature 会展开 `hotpath` 宏，debug 下同样能验证。
       - name: cargo test（hotpath feature）
-        run: cargo test --release --locked --features hotpath
+        run: cargo test --locked --features hotpath
 
       # ⚠️ 显式把 clippy 的 lint 组推到 deny，而不是只靠裸的 `-D warnings`
       # —— 理由见文件头注释（缓存会让 `-D warnings` 静默复用旧结果，
@@ -132,7 +172,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # ⚠️ 这里**不**用 `--release`：本 job 要回答的问题是「源码能不能被这个
+      # rustc 编出来、测试过不过」—— debug profile 同样能回答，而且快得多。
+      # release profile（thin LTO + cgu=1）由上面 test job 在**同一个提交**上验证。
       - name: 用声明的 MSRV 构建 + 测试
         run: |
-          cargo build --release --locked
-          cargo test --release --locked
+          cargo build --locked
+          cargo test --locked

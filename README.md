@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test --release        # 777 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test                  # 777 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -861,10 +861,17 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test --release                  # 应为 777 passed / 0 failed / 6 ignored
+cargo test                            # 应为 777 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
+
+> ⚠️ **测试跑 debug，不要加 `--release`。** `[profile.release]` 是
+> `lto = "thin"` + `codegen-units = 1` —— 对发布产物是对的，但拿它跑测试**双输**：
+> ① 慢（codegen 无法并行；本机 `cargo test --no-run` 实测 161.8s → 35.7s，**4.5×**，
+> CI 上 Windows job 14 分钟里 12.5 分钟是编译而测试本身只跑 1.67s）；
+> ② 弱（`--release` 下 `debug_assert!` 被静默编译掉 —— 本仓库有 22 处，
+> 用 release 跑测试等于从来没验证过它们）。CI 也是这么跑的。
 
 > ⚠️ **`cargo clippy -- -D warnings` 会被缓存骗过**：cargo 的 clippy 结果按
 > **源码内容**缓存，**不区分 `-D warnings`**。先跑过一次不带它的 clippy，之后带它
@@ -893,6 +900,12 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 |---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | **正确性门禁**：测试 / clippy / doc / MSRV | Windows、Linux |
 | [`artifacts.yml`](.github/workflows/artifacts.yml) | **产物门禁**：真的编得出来、真的启动得了 | Windows、Linux、macOS（arm64 + x86_64） |
+
+> **`ci.yml` 里构建用 release、测试用 debug。** `cargo build --release` 保留
+> （证明 release profile 真的编得出来），但**测试全部走 debug profile** ——
+> 既快 4.5×（`codegen-units = 1` 让 codegen 无法并行），又让 22 处
+> `debug_assert` 真正生效。测试输出 `tee` 到文件供计数断言读取，
+> 断言步骤**不重跑**测试（旧版重跑一次，Windows 上白花 278s）。
 
 `artifacts.yml` **每次提交**都产出四份可直接下载运行的二进制
 （在 Actions 运行的 Artifacts 区，按目标三元组命名，形如
@@ -945,7 +958,7 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test --release          # 777 passed / 0 failed / 6 ignored
+cargo test                  # 777 passed / 0 failed / 6 ignored
 ```
 
 **777 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 783 个单元测试 =
@@ -979,7 +992,7 @@ cargo test --release          # 777 passed / 0 failed / 6 ignored
 （体量大、含 Valve 版权内容），所以它们标了 `#[ignore]`：
 
 ```powershell
-cargo test --release -- --ignored
+cargo test -- --ignored
 ```
 
 素材用**环境变量**指定（不设则回退到开发机的历史路径）：
@@ -994,7 +1007,7 @@ cargo test --release -- --ignored
 
 ```powershell
 $env:MDLC_TEST_CORPUS = 'D:\somewhere\mdl-corpus'
-cargo test --release -- --ignored
+cargo test -- --ignored
 ```
 
 > ⚠️ **为什么用 `#[ignore]` 而不是「读不到就 `return`」。**
