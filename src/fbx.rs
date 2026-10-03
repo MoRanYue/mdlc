@@ -54,7 +54,11 @@ impl std::fmt::Display for FbxError {
 
 impl std::error::Error for FbxError {}
 
-fn ferr(message: impl Into<String>) -> FbxError {
+/// 造一个读取错误。
+///
+/// `pub(crate)` 而不是私有：`crate::gltf` 与这里同构，共用同一个错误类型
+/// （见 [`crate::gltf::GltfError`]）。
+pub(crate) fn ferr(message: impl Into<String>) -> FbxError {
     FbxError {
         message: message.into(),
     }
@@ -123,10 +127,14 @@ impl ForcedAxis {
     }
 }
 
-/// 读一个 FBX 源时的 mdlc 扩展选项（对应 `srcpart` / `srcmaterial` /
+/// 读一个 FBX 源 / glTF 源时的 mdlc 扩展选项（对应 `srcpart` / `srcmaterial` /
 /// `srcscale` / `srcaxis`）。
 ///
 /// **全部默认值与官方逐条一致** —— 不写这些语法时行为与官方相同。
+///
+/// ⚠️ 名字里带 `Fbx` 是历史原因：这四条 `src*` 选项**与格式无关**
+/// （`docs/gltf-support.md` §6.2「新增语法 0 条」），所以 [`crate::gltf`] 用的是
+/// **同一个**结构，只是几何读取那一段的实现不同。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FbxOpts {
     /// `srcpart`：只取这些名字的网格；空 = 取全部并合并（官方）。
@@ -153,12 +161,12 @@ impl Default for FbxOpts {
 
 impl FbxOpts {
     /// 是否有任何「会改变几何」的选项被设置（用于决定要不要做矩阵变换）。
-    fn is_identity(&self) -> bool {
+    pub(crate) fn is_identity(&self) -> bool {
         self.axis.is_none() && (self.scale - 1.0).abs() < f32::EPSILON
     }
 
     /// 归一化到 Z-up 的完整变换 `M = S(s) · R(axis)`。
-    fn matrix(&self) -> ufbx::Matrix {
+    pub(crate) fn matrix(&self) -> ufbx::Matrix {
         let r = self.axis.unwrap_or(ForcedAxis::Z).rotation();
         let s = f64::from(self.scale);
         ufbx::Matrix {
@@ -178,7 +186,7 @@ impl FbxOpts {
     }
 
     /// 顶点位置用：`M · p`。
-    fn point(&self, p: ufbx::Vec3) -> ufbx::Vec3 {
+    pub(crate) fn point(&self, p: ufbx::Vec3) -> ufbx::Vec3 {
         if self.is_identity() {
             return p;
         }
@@ -186,7 +194,7 @@ impl FbxOpts {
     }
 
     /// 法线用：只有旋转，没有缩放与平移。
-    fn direction(&self, v: ufbx::Vec3) -> ufbx::Vec3 {
+    pub(crate) fn direction(&self, v: ufbx::Vec3) -> ufbx::Vec3 {
         let Some(a) = self.axis else { return v };
         ufbx::transform_direction(&a.rotation(), v)
     }
@@ -196,7 +204,7 @@ impl FbxOpts {
     /// 推导：世界变换 `W_i = L_parent · L_i`。要求 `W'_i = M · W_i`，于是
     /// `L'_i = M · L_i · M⁻¹`（`M` 是「均匀缩放 + 旋转」时这个式子成立，
     /// 非均匀缩放才会引入剪切）。旋转部分是 `R·Q·R⁻¹`，平移是 `M·T`。
-    fn local(&self, t: ufbx::Transform) -> (ufbx::Vec3, ufbx::Quat) {
+    pub(crate) fn local(&self, t: ufbx::Transform) -> (ufbx::Vec3, ufbx::Quat) {
         if self.is_identity() {
             return (t.translation, t.rotation);
         }
@@ -462,7 +470,15 @@ pub fn read_frames(
 /// `QuaternionAngles` 的逐字复刻），不能手搓 —— 那条路径带**万向锁分支**
 /// （`matrix_angles` 的 `xy_dist > 0.001`），在锁死附近会丢掉一个自由度。
 fn quat_to_source_euler(q: ufbx::Quat) -> [f32; 3] {
-    crate::bone_math::quaternion_angles([q.x as f32, q.y as f32, q.z as f32, q.w as f32])
+    source_euler_from_quat(q.x, q.y, q.z, q.w)
+}
+
+/// 把一个**四元数**转成 Source 的 `RadianEuler`（`[roll, pitch, yaw]`，弧度）。
+///
+/// 与 [`quat_to_source_euler`] 是同一条路径，只是收裸的四个分量 ——
+/// [`crate::gltf`] 的四元数来自 `gltf` crate 而不是 `ufbx`，所以要有这个入口。
+pub(crate) fn source_euler_from_quat(x: f64, y: f64, z: f64, w: f64) -> [f32; 3] {
+    crate::bone_math::quaternion_angles([x as f32, y as f32, z as f32, w as f32])
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +594,7 @@ fn column_lengths(m: &ufbx::Matrix) -> (f64, f64, f64) {
 /// 自洽；只除一边就会差 100 倍。
 ///
 /// 列长为 0（退化矩阵）时 [`column_lengths`] 退回 1.0 ⟹ 这里是恒等。
-fn normalized_translation(m: &ufbx::Matrix) -> ufbx::Vec3 {
+pub(crate) fn normalized_translation(m: &ufbx::Matrix) -> ufbx::Vec3 {
     let t = translation_of(m);
     let (sx, sy, sz) = column_lengths(m);
     ufbx::Vec3 {
@@ -608,7 +624,7 @@ fn normalized_translation(m: &ufbx::Matrix) -> ufbx::Vec3 {
 /// 编出**逐值相同**的产物，且等于官方在 "FBX Units Scale" 下编出的那个
 /// （`u_aso_units.mdl`：骨骼 `(0,10,0)` / `(0,30,0)` + 网格 `[-3,-3,0]..[3,3,45]`，
 /// 比值 1.5264 ✅）。用户从此不必关心 Blender 的 `Apply Scalings` 选项。
-fn bone_offset(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Vec3 {
+pub(crate) fn bone_offset(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Vec3 {
     // 两端都取「除掉累积缩放」的世界位置（见 [`normalized_translation`]）——
     // 与顶点口径用的是同一个判据，这样骨骼与网格才落在同一个尺度里。
     let pc = normalized_translation(parent_world);
@@ -801,7 +817,10 @@ fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node>
 /// ⚠️ **单链样本上两种顺序恰好重合**，所以只有「分叉」样本能把它分开 ——
 /// 早先按 `scene.nodes` 原样过滤，在 `rig.fbx` 等 7 个用例上全部通过，
 /// 直到 `be1` / `bo1` 才暴露。兄弟姐妹之间沿用输入里的相对顺序。
-fn dfs_preorder(nodes: &[(u32, Option<u32>)], keep: &std::collections::HashSet<u32>) -> Vec<u32> {
+pub(crate) fn dfs_preorder(
+    nodes: &[(u32, Option<u32>)],
+    keep: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut roots: Vec<u32> = Vec::new();
     for &(id, parent) in nodes {

@@ -1675,6 +1675,31 @@ fn build_string_pool(
     // ⚠️ 判据用**扩展名**（[`crate::compile::SourceKind::of`]），不用
     // `SourceKind` 以外的信息 —— R34 之后扩展名就是可靠的格式信号
     // （见 `docs/fbx-support.md` §4.3）。
+    //
+    // # 这条规则其实是「DMX 导入器家族」的，不是 FBX 专属
+    //
+    // 后续用**只换源格式、其余 QC 逐字相同**的受控实验钉死了触发面
+    // （`target\dmxprobe\`，官方 `studiomdl.exe` 真跑）：
+    //
+    // | 几何源 | 官方日志 | `numcdtextures` |
+    // |---|---|---|
+    // | `.smd` | `grabbing box.smd` | **1** |
+    // | `.obj` | `grabbing box.obj` | **1** |
+    // | `.dmx` | `DMX Model box.dmx` | **2** |
+    // | `.fbx` | `DMX Model box.fbx` | **2** |
+    //
+    // ⟹ `.fbx` 只是 **DMX 导入器的一个前端**（日志逐字 `DMX Model …fbx`），
+    // 所以继承了 DMX 的哨兵；`.obj` 走的是另一条 loader（`grabbing …obj`），
+    // 所以没有。另外把 DMX 里的材质名从 `debug/debugempty` 改成与 cd 路径
+    // **匹配**的 `models/mymod/face` 后重编，哨兵**依然追加** ⟹ 是
+    // **无条件**的，与材质名能否匹配上 cd 路径无关。
+    //
+    // ⚠️ **glTF 故意不触发这条规则**（用户裁决，见
+    // `docs/gltf-support.md` §6.5）：官方对 glTF 零支持、没有 oracle 可问；
+    // 与其按「同族的 DMX 会追加」外推，不如按「只写 `$cdmaterials` 给出的
+    // 条目」这条**能从 QC 直接读出来的**规则来 —— 后者不需要用户猜
+    // mdlc 的内部推断。代价是同一 Blender 场景的 `.fbx` 与 `.glb` 产物
+    // 在 cdtexture 表上差一条，已记入偏离表。
     let has_fbx_geometry = desc.bodyparts.iter().any(|bp| {
         bp.models.iter().any(|m| {
             crate::compile::SourceKind::of(std::path::Path::new(&m.smd))

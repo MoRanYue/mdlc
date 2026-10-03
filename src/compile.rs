@@ -388,6 +388,9 @@ pub enum SourceKind {
     Smd,
     /// `.fbx` —— FBX（走 `ufbx`）。
     Fbx,
+    /// `.gltf` / `.glb` —— glTF 2.0（走 `gltf` crate；官方**完全不支持**这个格式，
+    /// 见 `docs/gltf-support.md` §1）。
+    Gltf,
 }
 
 impl SourceKind {
@@ -403,8 +406,12 @@ impl SourceKind {
         match ext.as_deref() {
             Some("smd") => Ok(SourceKind::Smd),
             Some("fbx") => Ok(SourceKind::Fbx),
+            // `.gltf` 是分离式（JSON + 外部 `.bin`），`.glb` 是单文件容器；
+            // 两者走同一条读取路径（`gltf::Gltf::from_slice_without_validation`
+            // 自己认头四字节 `glTF`）。
+            Some("gltf" | "glb") => Ok(SourceKind::Gltf),
             other => Err(format!(
-                "不认识的资产格式 {other:?}（{}）：目前支持 .smd 与 .fbx。",
+                "不认识的资产格式 {other:?}（{}）：目前支持 .smd、.fbx 与 .gltf/.glb。",
                 path.display()
             )),
         }
@@ -596,6 +603,9 @@ pub fn read_source(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, Compile
         SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
             .map(|g| g.smd)
             .map_err(|err| e(at, err.to_string())),
+        SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
+            .map(|g| g.smd)
+            .map_err(|err| e(at, err.to_string())),
     }
 }
 
@@ -644,6 +654,15 @@ pub fn read_source_geometry(
             anim_stacks: Vec::new(),
         }),
         SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
+            .map(|g| SourceGeometry {
+                smd: g.smd,
+                shape_keys: g.shape_keys,
+                untextured_meshes: g.untextured_meshes,
+                merged_meshes: g.merged_meshes,
+                anim_stacks: g.anim_stacks,
+            })
+            .map_err(|err| e(at, err.to_string())),
+        SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
             .map(|g| SourceGeometry {
                 smd: g.smd,
                 shape_keys: g.shape_keys,
@@ -743,6 +762,14 @@ pub fn read_source_frames(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, 
     match SourceKind::of(path).map_err(|msg| e(at, msg))? {
         SourceKind::Smd => read_smd(path, at),
         SourceKind::Fbx => crate::fbx::read_frames(
+            path,
+            at,
+            opts.stack.as_deref(),
+            opts.fps_or_default(),
+            &opts.fbx,
+        )
+        .map_err(|err| e(at, err.to_string())),
+        SourceKind::Gltf => crate::gltf::read_frames(
             path,
             at,
             opts.stack.as_deref(),

@@ -2,7 +2,7 @@
 
 **Source 引擎模型编译器** —— Valve `studiomdl.exe` 的 Rust 独立重写。
 
-把 **TOML 描述文件**或 **QC 脚本** + **SMD 网格**编译成 Source 引擎能加载的
+把 **TOML 描述文件**或 **QC 脚本** + **SMD / FBX / glTF 网格**编译成 Source 引擎能加载的
 `.mdl` + `.vvd` + `.dx90.vtx`（带碰撞时另有 `.phy`，用 `$animblocksize` 时另有 `.ani`）。
 
 - **语言**：Rust **1.89+**（源码用了 `let`-chains，1.88 才稳定；`edition 2024`）
@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test                  # 777 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test                  # 805 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -139,14 +139,21 @@ QC 脚本  ──┘
 388,765 个），内联会让描述文件膨胀到几百 MB 且无法用文本工具处理。描述文件只
 **引用**网格源。
 
-网格源可以是 **SMD**，也可以是 **FBX**（`.fbx`，走 `ufbx`，见
-[`docs/fbx-support.md`](docs/fbx-support.md)）。**格式由扩展名决定，所以必须写全**
+网格源可以是 **SMD**、**FBX**（`.fbx`，走 `ufbx`，见
+[`docs/fbx-support.md`](docs/fbx-support.md)）或 **glTF / GLB**（`.gltf` / `.glb`，走
+`gltf` crate，见 [`docs/gltf-support.md`](docs/gltf-support.md)）。
+**格式由扩展名决定，所以必须写全**
 —— 这也是不自动补扩展名的原因之一（见 `## 已知未实现`）。
 
-> **FBX 可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
+> **FBX / glTF 都可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
 > （合并所有网格、恒取第一条 NLA 栈、shape key 自动注册成 flex），
 > 而官方那些**静默失败**会被 mdlc 变成显式提示，每个隐式决定都有一个
-> 显式覆盖语法（九条 `src*`，见 [`### FBX 源选项`](#fbx-源选项src9-条)）。
+> 显式覆盖语法（九条 `src*`，见 [`### FBX / glTF 源选项`](#fbx--gltf-源选项src9-条)）。
+>
+> ⚠️ **glTF 没有官方 oracle**（官方 `studiomdl.exe` 完全不认这个格式），
+> 它的口径是靠**传递式 oracle** 定的 —— 同一个 Blender 场景双导出 `.fbx` + `.glb`，
+> 官方编 `.fbx` 给基准，再证明「glTF 的数能推出 FBX 的数」。
+> 每一条口径的来源都标在 `docs/gltf-support.md` §5。
 >
 > ```qc
 > $modelname "models/mymod/linnea.mdl"
@@ -160,9 +167,9 @@ QC 脚本  ──┘
 | 内容 | 由谁承载 | 对应 QC |
 |---|---|---|
 | 模型名 / 材质 / 骨骼 / bodypart 树 | TOML 描述文件 | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
-| **网格（顶点、法线、UV、蒙皮）** | **SMD / FBX 文件** | `studio "x.smd"` / `$body body "x.fbx"` |
-| **参考姿态** | **SMD 的 `skeleton` 第 0 帧**（FBX 用节点的局部 TRS） | 参考 SMD |
-| **表情（flex）** | **`.vta` 的帧**，或 **FBX 的 shape key**（自动注册） | `flexfile` + `flex` |
+| **网格（顶点、法线、UV、蒙皮）** | **SMD / FBX / glTF 文件** | `studio "x.smd"` / `$body body "x.fbx"` / `$body body "x.glb"` |
+| **参考姿态** | **SMD 的 `skeleton` 第 0 帧**（FBX / glTF 用节点的局部 TRS） | 参考 SMD |
+| **表情（flex）** | **`.vta` 的帧**，或 **FBX shape key / glTF morph target**（自动注册） | `flexfile` + `flex` |
 
 ---
 
@@ -545,12 +552,16 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 > 一条「关掉」的命令没有实际用途（官方的裸标志位如 `$staticprop` 也都没有
 > 反向命令）。同理命令行 `--optimize-vtx` 也只能开、不能关。
 
-### FBX 源选项（`src*`，9 条）
+### FBX / glTF 源选项（`src*`，9 条）
 
-网格源是 `.fbx` 时，官方 `studiomdl` 会替你做一串**隐式决定**，而且
-**全部静默**：合并所有网格、恒取第一条 NLA 栈、材质名直接用 FBX 里的、
-轴向原样搬运。mdlc 的默认行为**逐条对齐官方**，但把这些决定
-变成**显式语法**——不写就等于官方行为，写了就能改。
+网格源是 `.fbx` 或 `.gltf` / `.glb` 时，导入器会替你做一串**隐式决定**，而且
+**全部静默**：合并所有网格、恒取第一条 NLA 栈、材质名直接用文件里的、
+轴向原样搬运。mdlc 的默认行为**逐条对齐官方**（glTF 侧对齐的是传递式 oracle），
+但把这些决定变成**显式语法**——不写就等于默认行为，写了就能改。
+
+⭐ **九条语法在 glTF 上逐条都适用**，因为它们是**按概念命名**的
+（格式由文件扩展名决定）：所以叫 `srcpart` 而不是 `fbxpart`。
+加 glTF 支持时**新增语法 0 条**。
 
 > ⚠️ **唯一的例外是单位缩放**：官方在 FBX 路径上有个 bug，而且是两半 —— 它只认节点上的
 > `LclS`、完全忽略 `UnitScaleFactor`，于是 Blender 默认导出（`Apply Scalings`
@@ -558,19 +569,19 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 > 网格对角线 45.79），而且**网格位置留在厘米、网格尺寸在米**。
 > mdlc **有意修掉它**（顶点与骨骼都不进缩放）：两种导出方式编出**逐值相同**
 > 的产物，你不必关心 Blender 的那个选项。细节见 `docs/fbx-support.md` §1.7.3。
-
-命名规则是**按概念命名，不按格式命名**（格式由文件扩展名决定）：所以叫
-`srcpart` 而不是 `fbxpart`——将来加 glTF/GLB 时**新增语法 0 条**。
+>
+> ⚠️ **glTF 侧不存在这个问题** —— Blender 的 glTF 导出器不写 `LclS`，
+> 所以 `.glb` 从一开始就是自洽的（实测比值 1.5264）。两套输入现在编出同一量级的模型。
 
 | 命令 | 写在哪 | 作用 | 不写时（= 官方） |
 |---|---|---|---|
 | `srcpart "名"` | `$body` / `$model` 行内或块内 | 只取这些名字的网格；**可重复写** | 全部网格合并进同一个部件 |
-| `srcmaterial "名"` | 同上 | FBX 里没有材质时的兜底名 | `debug/debugempty` |
+| `srcmaterial "名"` | 同上 | 文件里没有材质时的兜底名 | `debug/debugempty` |
 | `srcscale 1.0` | 同上 | 统一缩放（顶点与骨骼同乘，**比值不变**） | 1.0 |
 | `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | 不干预（原样搬运根变换） |
-| `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条 NLA 栈 | **第一条** |
+| `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条动画栈 | **第一条**（glTF 按 `animation.name()` 选） |
 | `srcfps 30` | 同上 | 动画重采样率 | 30 |
-| `srcshapekey "名"` | `$model` 块内 | 只取这些 shape key，**并定序**；可重复写 | 全部，按文件顺序 |
+| `srcshapekey "名"` | `$model` 块内 | 只取这些 shape key / morph target，**并定序**；可重复写 | 全部，按文件顺序 |
 | `srcshapekeyorder "名"` | 同上 | 只定序，不筛 | 文件顺序 |
 | `srcshapekeyignore` | 同上 | 全部忽略（不注册 flex） | 全部注册 |
 
@@ -581,19 +592,22 @@ $cdmaterials "models/mymod/"
 // 一个 FBX 里有 body / hair / eyes 三块网格，只要 body
 $body body "linnea.fbx" srcpart "body" srcmaterial "face"
 
+// glTF 一样写（格式由扩展名决定，语法不用换）
+$body body "linnea.glb" srcpart "body"
+
 // 多栈 FBX：官方恒取第一条，这里点名要 run
 $sequence run "anim.fbx" srcstack "run" srcfps 30
 
-// 表情：什么都不用写，shape key 自动注册；要控制就这样写
+// 表情：什么都不用写，shape key / morph target 自动注册；要控制就这样写
 $model "face" "linnea_face.fbx" {
     srcshapekey "smile"
     srcshapekey "blink"
 }
 ```
 
-⭐ **表情（flex）的默认路径不需要任何新语法。** FBX 的 shape key 会被
-**自动注册**成 flexdesc + flexcontroller + flexrule + 载荷，与官方逐字段一致
-（已用 `docs/_probe/k4_flex_align.js` 按 VVD 顶点位置对齐验证 16/16）。
+⭐ **表情（flex）的默认路径不需要任何新语法。** FBX 的 shape key 与
+glTF 的 morph target 都会被**自动注册**成 flexdesc + flexcontroller + flexrule + 载荷，
+与官方逐字段一致（已用 `docs/_probe/k4_flex_align.js` 按 VVD 顶点位置对齐验证 16/16）。
 `srcshapekey*` 三条只在你想**筛掉或重排**时才需要。
 
 > ⚠️ **`srcpart` / `srcshapekey` / `srcshapekeyorder` 每次只读一个 token**
@@ -617,7 +631,7 @@ $model "face" "linnea_face.fbx" {
 > （`src_parts` / `src_material` / `src_scale` / `src_axis` / `src_stack` /
 > `src_fps` / `src_shape_keys` / `src_shape_key_order` / `src_shape_key_ignore`）。
 
-### FBX 的四条诊断
+### FBX / glTF 的诊断
 
 官方在这些情形下**静默通过**（`exit=0`），但结果通常不是你要的。
 mdlc 会打一行 `提示：`：
@@ -627,10 +641,20 @@ mdlc 会打一行 `提示：`：
 | 多块网格被合并进同一个部件 | 列出网格名 + 「要分开请用 `srcpart` 或拆成多个 `$body`」 |
 | 网格没有材质 | 「已合成 `debug/debugempty`；要改用别的写 `srcmaterial`」 |
 | 有多条动画栈而没写 `srcstack` | 列出全部栈名 + 「默认只用第一条」 |
-| 有 shape key（已自动注册成 flex） | 列出名字与帧号 + 「要控制请用 `srcshapekey*`」 |
+| 有 shape key / morph target（已自动注册成 flex） | 列出名字与帧号 + 「要控制请用 `srcshapekey*`」 |
 
 四条全部是**提示**而非错误，且**对 `.smd` 工程零影响**（连一行输出都不多）。
 另有一条同类提示（同一个 FBX 既作网格源又作动画源）见上面的说明块。
+
+glTF 侧另有三条自己的提示（见 `docs/gltf-support.md` §6.3）：
+
+| 情形 | 类型 | 说明 |
+|---|---|---|
+| accessor 没有 `bufferView` | 提示 | 按规范当**全零**处理（Blender 对「法线偏移全零」的 morph target 正是这么写的） |
+| 有 `CubicSpline` 插值的通道 | 提示 | 按**线性**降级重采样（切线值被丢掉） |
+| 有通道驱动 `MorphTargetWeights` | 提示 | **忽略** —— 表情只由 QC 的 `flex` 语句控制 |
+| 用了 Draco / meshopt 压缩扩展 | **错误** | mdlc 不解压（`KHR_draco_mesh_compression` / `EXT_meshopt_compression`） |
+| `data:` URI 解码失败 | **错误** | 不能静默退化成零几何 |
 
 ---
 
@@ -861,7 +885,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test                            # 应为 777 passed / 0 failed / 6 ignored
+cargo test                            # 应为 805 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -958,11 +982,11 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test                  # 777 passed / 0 failed / 6 ignored
+cargo test                  # 805 passed / 0 failed / 6 ignored
 ```
 
-**777 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 783 个单元测试 =
-777 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**805 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 811 个单元测试 =
+805 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
@@ -972,6 +996,7 @@ cargo test                  # 777 passed / 0 failed / 6 ignored
 | `anim_writer` | 78 | 动画链编码、量化、RLE、IK 误差、段表、外置块 |
 | `phy` | 77 | 凸包、`$concave`、ragdoll、IVP 布局不变量 |
 | `vtx_writer` | 31 | strip group 链、骨骼调色板、按 `maxBonesPerStrip` 拆 strip |
+| `gltf` | 28 | glTF/GLB 数据口径（**UV 不翻 V**、层序世界矩阵、`JOINTS_0` 经 skin 换节点）、无 `bufferView` 的 accessor、压缩扩展拒绝、morph target → shape key、动画按秒轴重采样 |
 | `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
 | `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
@@ -1048,7 +1073,8 @@ src/
   model.rs        IR（ModelDesc）与全部校验规则；含 TEMPLATE_TOML
   smd.rs          SMD 网格 / 骨架解析
   fbx.rs          FBX 源读取（ufbx → 中立 SMD；含 shape key → flex 元数据）
-  compile.rs      TOML|QC + SMD|FBX → 编译期 IR（跨文件校验、拆分、LOD 统一）
+  gltf.rs         glTF / GLB 源读取（gltf crate → 同一个中立 SMD；含 morph target → flex）
+  compile.rs      TOML|QC + SMD|FBX|glTF → 编译期 IR（跨文件校验、拆分、LOD 统一）
   qc/             QC 前端
     lexer.rs        词法（含官方 TokenAvailable 的行内语义）
     parse.rs        命令分发表 → ModelDesc
@@ -1075,7 +1101,8 @@ src/
 换成 `+ n * SIZE`、在 `write_mdl` 里按偏移写字节。
 
 **数学用现成 crate**：`parry3d`（quickhull 凸包、VHACD、质量属性）、`meshopt`
-（顶点缓存优化）、`ufbx`（FBX 解析，MIT OR Unlicense）、`clap`（CLI）、
+（顶点缓存优化）、`ufbx`（FBX 解析，MIT OR Unlicense）、`gltf`（glTF / GLB 解析，
+MIT OR Apache-2.0；**关掉 `import` feature**，所以不拉图片解码链）、`clap`（CLI）、
 `toml` + `serde`（描述文件）。
 
 ---
@@ -1118,7 +1145,7 @@ src/
 | [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | 以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准的 QC 覆盖对照 |
 | [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
 | [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的可行性调研与 UX 方案（**82 个官方 oracle 用例**的实测结论 + 九条 `src*` 语法的设计理由 + 偏离表） |
-| [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持的可行性调研（**官方零支持** ⟹ 传递式 oracle；crate 的三个坑，其一上游 master 已修但**尚未发版**；新增语法 0 条） |
+| [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持（**官方零支持** ⟹ 传递式 oracle；`gltf` crate 的三个坑，其一上游 master 已修但**尚未发版**；新增语法 0 条；**已实现并验收通过**） |
 
 > ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
 > 带有明确的快照日期（当时的文件 SHA256 与测试数）。**它们描述的是历史状态**，

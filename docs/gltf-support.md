@@ -1,6 +1,6 @@
 # mdlc 的 glTF / GLB 支持：可行性调研与 UX 设计
 
-> **状态**：调研完成，**未写任何生产代码**。
+> **状态**：调研完成，**实现已落地并验收通过**（`src\gltf.rs`，2026-10）。
 > **结论**：**可以做，但必须先接受一个前提 —— glTF 没有官方 oracle。**
 >
 > 本文的每一条结论都标了来源：
@@ -13,6 +13,15 @@
 > - 探针工程：`...\_gltfresearch\gltfprobe\`（`src\main.rs` + `src\bin\probe2..13.rs`）、`...\gltflite\`、`...\gltflite-import\`
 > - 官方对照：`D:\GITHUB\mdlc\docs\_probe\oracle_dual.js` → `docs\_probe\_oracle_dual\official.json`
 > - 几何/载荷对照：`...\_gltfresearch\cmp_gltf_vvd.js`、`D:\GITHUB\mdlc\docs\_probe\flex_vs_vvd.js`
+>
+> **实现验收记录（与调研结论逐条对应）**：
+> - 几何：`g_rig.qc`（`rig.glb`）⟹ MDL **3148 B / VVD 1600 / VTX 437**，与官方 FBX 路径
+>   `dual_rig.mdl` **尺寸完全相同**；`bone_mesh_space.js` 比值 **1.5264 ✅**。
+> - flex：`k4_flex_align.js` 按 VVD 顶点位置对齐后，官方 `dual_full.mdl` vs mdlc `g_full.mdl`
+>   **wide 24 vs 24、tall 24 vs 24，不同 0**（载荷逐值一致；只有排列顺序是有意偏离）。
+> - 动画：`probe_anim_frames.js` 官方 `@idle` / `ValveBiped.Bip01_Spine` 31 帧 vs mdlc
+>   **逐帧吻合**（差 ≤0.002°，ANIMROT 量化噪声）。
+> - 单元测试 28 个（`src\gltf.rs` 的 `mod tests`）；回归三连全绿。
 
 ---
 
@@ -625,13 +634,20 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 
 ### 6.3 新增诊断（5 条）
 
-| 触发 | 文案方向 |
-|---|---|
-| 有 `data:` URI 且解码失败 | **报错**（不能静默零几何） |
-| 文件用了 `KHR_draco_mesh_compression` / `EXT_meshopt_compression` | **报错**（crate 不支持） |
-| 无 `bufferView` 的 accessor | **提示**「按规范当全零处理」（crate 判错，我们放行） |
-| `CubicSpline` 插值 | **提示**「按线性重采样」或明确拒绝 |
-| 多网格被合并进同一个 `mstudiomodel_t` | 提示（沿用 FBX 的那条） |
+| 触发 | 文案方向 | 实现状态 |
+|---|---|---|
+| 有 `data:` URI 且解码失败 | **报错**（不能静默零几何） | ✅ `decode_data_uri` 直接 `Err`（非 base64 形态也不猜） |
+| 文件用了 `KHR_draco_mesh_compression` / `EXT_meshopt_compression` | **报错**（crate 不支持） | ✅ `check_extensions` 同时查 `extensionsRequired` 与 `extensionsUsed` |
+| 无 `bufferView` 的 accessor | **提示**「按规范当全零处理」（crate 判错，我们放行） | ✅ `GltfNotes::zero_accessors` |
+| `CubicSpline` 插值 | **提示**「按线性重采样」 | ✅ `GltfNotes::cubic_spline_channels`（取中间那个 value，切线丢弃） |
+| 多网格被合并进同一个 `mstudiomodel_t` | 提示（沿用 FBX 的那条） | ✅ 沿用 `fbx_diagnostics` 那条 |
+| 动画里有 `MorphTargetWeights` 通道 | **提示**「mdlc 不做逐帧表情权重」 | ✅ `GltfNotes::morph_weight_channels`（实现时补的第 6 条） |
+
+⭐ **两条设计约束**（实现时定死的）：
+1. **提示文案是纯函数**（`GltfNotes::lines(at) -> Vec<String>`），`diagln!` 只是逐条转发 ——
+   `diagln!` 走 stdout，测试里抓不到，文案放进纯函数才测得了。
+2. **报错的那两条不走 `GltfNotes`**（它们在 `load_document` 里就 `Err` 了）——
+   静默零几何是绝对不能接受的。
 
 ### 6.4 明确不做
 
@@ -640,6 +656,33 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 - ❌ **不读 `KHR_materials_*` 扩展**（Source 材质系统没有对应概念）。
 - ❌ **不做 glTF 导出**（mdlc 只编译，不转换）。
 
+### 6.5 ⭐ cdtexture 哨兵：glTF **不追加**（用户裁决）
+
+背景：官方 FBX 产物比 mdlc 的 glTF 产物**多一条空 cdtexture**（`numcdtextures` 2 vs 1）。
+
+**受控实验**（`target\dmxprobe\`，只换几何源格式、其余 QC 逐字相同，真 `studiomdl.exe`）：
+
+| 几何源 | 官方日志逐字 | `numcdtextures` | 最后一条 |
+|---|---|---|---|
+| `.smd` | `grabbing box.smd` | **1** | — |
+| `.obj` | `grabbing box.obj` | **1** | — |
+| `.dmx` | `DMX Model …box.dmx` | **2** | `""` |
+| `.fbx` | `DMX Model …box.fbx` | **2** | `""` |
+
+⟹ 那条哨兵是**「DMX 导入器家族」的行为，不是 FBX 专属**（`.fbx` 只是 DMX 导入器的一个前端）。
+且**无条件**：把 `box.dmx` 里唯一的材质名改成与 cd 路径匹配后，哨兵**依然追加**。
+
+**裁决（用户，2026-10）**：**不追加**。理由 —— 官方对 glTF 零支持、没有 oracle 可问；
+与其按「同族 DMX 会追加」外推，不如守「**只写能从 QC 直接读出来的条目**」这条规则，
+后者不需要用户猜 mdlc 的内部推断（对齐 `docs/fbx-support.md` §4.1 原则 3）。
+
+**代价**（记入偏离表）：同一个 Blender 场景的 `.fbx` 与 `.glb` 产物，
+cdtexture 表**差一条空串**。第三方实现（NekoMDL 的 `neko_rig.mdl` / `neko_rig_glb.mdl` /
+`nk_morphflex.mdl`）**也都只有 1 条** ⟹ 不追加与第三方一致。
+
+⚠️ 这条规则**故意不写进 `mdl_writer.rs` 的判据**（那里只认 `SourceKind::Fbx`）——
+`src\mdl_writer.rs:1678` 起有一整段注释记录了这次实验，防止将来有人「顺手」把 glTF 加进去。
+
 ---
 
 ## 7. 实现落点
@@ -647,25 +690,37 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 架构**完全复用 FBX 那一套单点分派 + 中立 IR**（`docs/fbx-support.md` §6.2），
 一行都不用改结构：
 
-| 位置 | 改动 |
-|---|---|
-| `Cargo.toml` | 加 `gltf`（见 §4.3） |
-| `src\compile.rs` `enum SourceKind` | 加 `Gltf`；`of()` 认 `.gltf` / `.glb` |
-| `src\gltf.rs`（新建） | `read()` / `read_frames()`，与 `src\fbx.rs` 同构 |
-| `src\compile.rs` `read_source*` | 加一个 `match` 臂 |
-| `src\lib.rs` | 模块表加一行 + `pub mod gltf;` |
-| `docs\` | 本文 |
+| 位置 | 改动 | 状态 |
+|---|---|---|
+| `Cargo.toml` | 加 `gltf`（见 §4.3） | ✅ `gltf = { version = "1.4", default-features = false, features = ["utils","names","extras"] }` + 独立的 `base64 = "0.13"` / `serde_json = "1"` |
+| `src\compile.rs` `enum SourceKind` | 加 `Gltf`；`of()` 认 `.gltf` / `.glb` | ✅ 三处 `SourceKind::Fbx =>` 各配一个 `Gltf` 臂 |
+| `src\gltf.rs`（新建） | `read()` / `read_frames()`，与 `src\fbx.rs` 同构 | ✅ 约 2600 行（含 28 个测试） |
+| `src\compile.rs` `read_source*` | 加一个 `match` 臂 | ✅ `read_source` / `read_source_geometry` / `read_source_frames` |
+| `src\lib.rs` | 模块表加一行 + `pub mod gltf;` | ✅ 插在 `pub mod flex;` 与 `pub mod layout;` 之间 |
+| `docs\` | 本文 | ✅ |
 
 **`src\gltf.rs` 内部要点**：
 
 1. `Gltf::from_slice_without_validation` + 手工装 buffer（`Bin` ⟹ `g.blob`；`Uri` ⟹ 文件或 `data:`）；
 2. **自顶向下递归**算世界矩阵（`scene.nodes` 是层序）；
-3. 收骨用 `skin.joints` + 祖先上溯 + `dfs_preorder`（**直接复用 `src\fbx.rs:743` 那个纯函数**，
+3. 收骨用 `skin.joints` + 祖先上溯 + `dfs_preorder`（**直接复用 `src\fbx.rs` 那个纯函数**，
    它只吃 `&[(u32, Option<u32>)]` + `&HashSet<u32>`，与格式无关）；
 4. 顶点 / 法线 / UV 直接取 accessor（**不翻 V**）；
-5. `bone_offset` 与 `quaternion_angles` **复用**（`src\bone_math.rs`）；
-6. morph target → `FbxShapeKey` 同构结构（`src\fbx.rs:212`），下游 `resolve_shape_key_flexes` 不用改；
-7. 动画：按秒轴重采样到 `srcfps`，三种插值各自求值。
+5. `bone_offset` / `normalized_translation` / `source_euler_from_quat` **复用**（`src\fbx.rs` + `src\bone_math.rs`）；
+6. morph target → `FbxShapeKey` 同构结构，下游 `resolve_shape_key_flexes` 不用改；
+7. 动画：按秒轴重采样到 `srcfps`，`Step` / `Linear` 各自求值，`CubicSpline` 取中间值降级为线性。
+
+**实现时新踩到的坑（写代码时才知道的）**：
+
+| # | 坑 | 解法 |
+|---|---|---|
+| 1 | ⚠️ **`src\lib.rs` 没加 `pub mod gltf;` 时 `cargo build` 报 EXIT=0** —— `src\gltf.rs` 根本没被编译（**假绿**） | 接线后再编译，一次暴露 18 个错误 |
+| 2 | `base64` 0.13 的 API 是**自由函数** `base64::decode(..)`，**没有** `Engine` trait / `engine::general_purpose::STANDARD`（那是 0.21+） | 直接用 `base64::decode` |
+| 3 | 闭包生命周期：`let get = move \|b: gltf::Buffer\| buffers.get(b.index()).map(Vec::as_slice);` 会被推成 `for<'x> Fn(Buffer<'x>) -> Option<&'x [u8]>`，而 `Iter::new` 要的是 `Fn(Buffer<'a>) -> Option<&'s [u8]>`（借自 **buffers**） | 抽成具名函数 `fn buffer_getter<'a,'s>(buffers: &'s [Vec<u8>]) -> impl Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]> + 's` |
+| 4 | `gltf::accessor::Iter::new` 对 `read_indices` 报 `E0283: type annotations needed`（`u32::from` 对多种整型都有实现） | 显式写 `Iter::<u8>::new(..)` / `Iter::<u16>::new(..)` / `Iter::<u32>::new(..)` |
+| 5 | `ufbx::Vec3` / `ufbx::Quat` **没实现 `PartialEq`**（C 绑定）⟹ `#[derive(PartialEq)]` 的 `LocalTrs` 报 `E0369` | 去掉 `PartialEq` |
+| 6 | `shape_key_frame` 是 **`FbxGeometry` 的关联函数**，不是 `crate::fbx` 的自由函数 | 写 `FbxGeometry::shape_key_frame(ti)` |
+| 7 | ⚠️ 夹具里把 accessor **插到数组开头**会把整张表挪位（下标就是引用编号）—— **而且不报错**，只是静默读出垃圾 | 测试夹具一律**追加**到末尾（`add_accessor` / `add_view` 的锚点取「数组收尾 + 下一节开头」，这样能连续追加） |
 
 ---
 
@@ -679,6 +734,7 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 | 4 | `CubicSpline` 插值 | 低-中。Blender 默认不写，但第三方工具会。 |
 | 5 | 两套输入差 100× | ✅ **已在 FBX 侧修掉**（`docs/fbx-support.md` §4.6 偏离 12），两套输入现在一致。⚠️ 遗留影响：带节点缩放的 FBX 其骨骼表与**官方产物数值不同** ⟹ 与 mdlc 对照时要用官方 `Apply Scalings = "FBX Units Scale"` 的产物。⚠️ 仍然**没有旋钮能补偿**（§5.2 实测：`srcscale` 是整体缩放，比值不变）。 |
 | 6 | `base64 0.13.1` 版本较老（2021） | 低。只在解 data URI 时用，且输入是本地文件。 |
+| 7 | glTF 几何源**不追加**空 cdtexture | ✅ **用户裁决，见 §6.5**。代价：同一场景 `.fbx` vs `.glb` 的 cdtexture 表差一条。 |
 
 ### 8.1 兼容两种上游的写法（风险 2 + 3）
 
@@ -779,3 +835,21 @@ master 上它仍然是 `None`（修复是在 reader 层返回全零迭代器，�
    ⟹ 那次「开/关 `import`」的 A/B 对 data URI 问题**零信息量**，
    而且两次日志**逐字节相同**这个可疑现象当时没被追下去。
    **判据：如果两组实验的输出完全一样，先怀疑实验没做对，再下结论。**
+11. **⭐ `cargo build` 报 EXIT=0 不等于新文件被编译过。** `src\gltf.rs` 写完之后第一次
+   `cargo build --release --locked` 是绿的 —— 因为 `src\lib.rs` 里还没有 `pub mod gltf;`，
+   那个文件**根本不在编译单元里**。接上模块声明后一次冒出 18 个错误。
+   **判据：新增一个 `.rs` 文件后，第一件事是把它接进 `lib.rs` 再编译**，
+   否则「0 error」证明的是「这段代码没被看过」。
+12. **⚠️ 夹具里 accessor / bufferView 的下标就是引用编号，插到数组开头会把整张表挪位。**
+   第一次写 morph 测试时把新 accessor 插在最前面，于是 `POSITION` 指向法线、`TEXCOORD_0`
+   指向索引表 —— **而且不报错**，只在读取层炸出 `size_of` 不符，看起来像代码 bug。
+   解法：夹具辅助函数一律**追加到末尾**，锚点取「数组收尾 + 下一节开头」（可连续追加）。
+
+**实现新增的探针 / 夹具**
+- `docs\_probe\dump_cd_raw.js`：把 cdtexture 槽值的三种解释并排打出来
+  （A 相对槽自身 / B 相对数组基址 / **C 绝对文件偏移** —— 官方写的是 **C**）
+- `docs\_probe\oracle_dual_anim.js`：干净的动画 oracle（`$body` 与 `$sequence` 来自**不同文件**，
+  绕开官方「同文件 ⟹ 静默 1 帧」的陷阱）
+- `docs\_probe\_oracle_dual\dual_full_glb.qc` / `dual_anim.qc` / `dual_anim_glb.qc` / `dual_nocd.qc`
+- `target\gltffirst\g_rig.qc` / `g_full.qc`：glTF 几何 + flex 的端到端夹具
+- `target\dmxprobe\`：§6.5 那组「只换几何源格式」的受控实验（`.smd` / `.obj` / `.dmx` / `.fbx`）
