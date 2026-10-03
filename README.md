@@ -716,6 +716,8 @@ QC 侧等价命令是 `$optimizevtx`（见 [mdlc 扩展的 QC 命令](#mdlc-扩�
 
 **代价**：二进制从 5.77 MB 涨到 **7.78 MB**（+2.0 MB / +35%，主要是
 `rustls` + `ring`）；`Cargo.lock` 多 27 个包；冷构建 +16 s（**增量无可测差异**）。
+Windows 上另有一个 `windows` 直接依赖（+11 个包，含两个 proc-macro crate），
+只用来在派生子进程前摘掉 std 句柄的可继承位。
 
 提示是一条诊断，所以它跟着既有规则走：**官方兼容形态落 stdout**（与官方
 `studiomdl` 一致，Crowbar 只认 stdout），mdlc 自有形态落 stderr。

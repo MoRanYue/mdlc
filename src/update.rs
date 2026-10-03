@@ -317,18 +317,23 @@ pub fn run_check() {
 /// `\\.\NUL` 并显式设 `inherit_handle(true)` 的，用的不是我们这个句柄；
 /// 而 `Stdio::inherit()` 走 `DuplicateHandle(.., bInheritHandle = TRUE, ..)`，
 /// 复制出来的新句柄的可继承性由**参数**决定，与源句柄无关。
+///
+/// 用 `windows`（而不是 `windows-sys`）的理由，正好落在本模块最容易写错的
+/// 三处：`HANDLE` 是 newtype 而非 `isize`，`HANDLE::is_invalid()` 一次覆盖
+/// `NULL` 与 `INVALID_HANDLE_VALUE` 两个哨兵（`windows-sys` 要手写
+/// `h == 0 || h == INVALID_HANDLE_VALUE`），`GetStdHandle` 直接返回
+/// `Result` 而不必比对裸 `BOOL`。
 #[cfg(windows)]
 mod no_inherit {
-    use windows_sys::Win32::Foundation::{
-        GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        SetHandleInformation,
+    use windows::Win32::Foundation::{
+        GetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation,
     };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    use windows::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     /// 要处理的三个 std 槽。
-    const STD_IDS: [u32; 3] = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    const STD_IDS: [STD_HANDLE; 3] = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
 
     /// 摘掉 std 句柄的可继承位，离开作用域时**逐句柄恢复原状**。
     ///
@@ -348,9 +353,12 @@ mod no_inherit {
             let mut restore: Vec<(HANDLE, bool)> = Vec::new();
             for id in STD_IDS {
                 // SAFETY: `GetStdHandle` 只读本进程的 std 槽，不涉及内存安全。
-                let h = unsafe { GetStdHandle(id) };
-                // 没有控制台且没有重定向时是 NULL；句柄类型不对时是 -1。
-                if h == 0 || h == INVALID_HANDLE_VALUE {
+                // 没有控制台且没有重定向时它返回 Err 或一个无效句柄。
+                let Ok(h) = (unsafe { GetStdHandle(id) }) else {
+                    continue;
+                };
+                // 一次覆盖 NULL 与 INVALID_HANDLE_VALUE 两个哨兵。
+                if h.is_invalid() {
                     continue;
                 }
                 // stdout 与 stderr 常指向同一个句柄 ⟹ 只处理一次，
@@ -359,16 +367,21 @@ mod no_inherit {
                 if restore.iter().any(|(prev, _)| *prev == h) {
                     continue;
                 }
-                let mut flags: u32 = 0;
+                let mut flags = HANDLE_FLAGS(0);
                 // SAFETY: `h` 刚由 `GetStdHandle` 返回且已排除两个哨兵值；
-                // `&mut flags` 是合法的可写指针。
-                if unsafe { GetHandleInformation(h, &mut flags) } == 0 {
+                // `&mut flags.0` 是合法的可写指针（`HANDLE_FLAGS` 是
+                // `#[repr(transparent)]` 的 `u32` newtype）。
+                if unsafe { GetHandleInformation(h, &mut flags.0) }.is_err() {
                     continue;
                 }
-                let was_inheritable = flags & HANDLE_FLAG_INHERIT != 0;
+                let was_inheritable = flags.contains(HANDLE_FLAG_INHERIT);
                 if was_inheritable {
                     // SAFETY: 同上；只清 `HANDLE_FLAG_INHERIT` 这一位。
-                    if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                    if unsafe {
+                        SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+                    }
+                    .is_err()
+                    {
                         continue; // 清不掉就当没碰过它。
                     }
                 }
@@ -385,7 +398,7 @@ mod no_inherit {
                     // SAFETY: 句柄在 `new` 里验证过且仍然有效（std 句柄的
                     // 生命周期由进程持有）；这里只是把位设回去。
                     unsafe {
-                        SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+                        let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
                     }
                 }
             }
@@ -396,28 +409,41 @@ mod no_inherit {
     mod tests {
         use super::*;
 
+        /// 下面两个测试都要改**进程级**的 std 句柄可继承位 —— 那是全局状态，
+        /// 不是每个测试私有的。并行跑时，一个测试的守卫析构会把位恢复成
+        /// `true`，正好插在另一个测试「断言已清掉」的窗口里。
+        ///
+        /// 实测：不加这把锁时 `cargo test --lib update::` 每 5 次里约 1 次失败
+        /// （`--test-threads=1` 则 10/10 通过）。锁用 `unwrap_or_else` 容忍
+        /// 中毒：一个测试 panic 之后另一个仍能跑完并报自己的结论。
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn serialize() -> std::sync::MutexGuard<'static, ()> {
+            SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         /// 读一个句柄当前的可继承位；句柄无效时 `None`。
         fn inheritable(h: HANDLE) -> Option<bool> {
-            let mut flags: u32 = 0;
-            // SAFETY: `h` 由调用方保证是本进程的有效句柄；`&mut flags`
+            let mut flags = HANDLE_FLAGS(0);
+            // SAFETY: `h` 由调用方保证是本进程的有效句柄；`&mut flags.0`
             // 是合法的可写指针。
-            if unsafe { GetHandleInformation(h, &mut flags) } == 0 {
+            if unsafe { GetHandleInformation(h, &mut flags.0) }.is_err() {
                 return None;
             }
-            Some(flags & HANDLE_FLAG_INHERIT != 0)
+            Some(flags.contains(HANDLE_FLAG_INHERIT))
         }
 
         /// 设一个句柄的可继承位。
         fn set_inheritable(h: HANDLE, yes: bool) -> bool {
-            let flags = if yes { HANDLE_FLAG_INHERIT } else { 0 };
+            let flags = if yes { HANDLE_FLAG_INHERIT } else { HANDLE_FLAGS(0) };
             // SAFETY: 同 `inheritable`，只改 `HANDLE_FLAG_INHERIT` 这一位。
-            (unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, flags) }) != 0
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, flags) }.is_ok()
         }
 
         fn stdout_handle() -> Option<HANDLE> {
             // SAFETY: 只读本进程的 std 槽，不涉及内存安全。
-            let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-            (h != 0 && h != INVALID_HANDLE_VALUE).then_some(h)
+            let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.ok()?;
+            (!h.is_invalid()).then_some(h)
         }
 
         /// 守卫要**真的**把位清掉，并且析构后**真的**恢复。
@@ -427,6 +453,7 @@ mod no_inherit {
         /// 若它失败，说明在当前环境下守卫**根本没生效**，那正是要立刻知道的事。
         #[test]
         fn guard_clears_then_restores_the_inherit_bit() {
+            let _serial = serialize();
             let Some(h) = stdout_handle() else {
                 panic!("拿不到 stdout 句柄，测试无法进行");
             };
@@ -461,10 +488,11 @@ mod no_inherit {
         /// 什么也不做，而不是 panic。
         #[test]
         fn guard_is_harmless_when_there_is_nothing_to_do() {
+            let _serial = serialize();
             let guard = NoInheritStdHandles::new();
             // 只断言「没炸」，并确认记录表里没有 NULL 之类的垃圾。
             for (h, _) in &guard.restore {
-                assert!(*h != 0 && *h != INVALID_HANDLE_VALUE, "记录表里有非法句柄");
+                assert!(!h.is_invalid(), "记录表里有非法句柄");
             }
         }
     }

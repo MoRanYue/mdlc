@@ -60,6 +60,7 @@
 |---|---|
 | 无更新检测 | 5,772,800 B |
 | **有更新检测** | **7,777,792 B**（+2,005 KB / **+34.7%**） |
+| 有更新检测 + `windows` 句柄守卫 | **7,781,888 B**（再 +4 KB） |
 
 ⚠️ 早期估算「只增大约 300 KB」**是错的** —— 那个数字来自「三种 HTTP 方案
 编出来都是 5,772,800 B」的观察，但那是 **dead-code 消除**的结果（当时
@@ -132,8 +133,10 @@ EOF 只在**所有写端都关闭**时才到达，**包括我们派生出去的�
 ### 3.5 修复
 
 在 `spawn` **之前**把自己三个 std 句柄的 `HANDLE_FLAG_INHERIT` 位清掉，
-`spawn` 之后恢复。用 `windows-sys`（**已在 `Cargo.lock` 里** —— 它是
-`ring` 的传递依赖 ⟹ 加为直接依赖**不新增任何包**，`Cargo.lock` 只多一行）。
+`spawn` 之后恢复。用 `windows` crate（`HANDLE` 是 newtype 而不是 `isize`，
+`GetStdHandle` 直接给 `Result`，`HANDLE::is_invalid()` 一次覆盖 `NULL` 与
+`INVALID_HANDLE_VALUE` 两个哨兵 —— 这几处正好都是容易写错的地方；
+代价是 +11 个包，含两个 proc-macro crate）。
 
 用 `Drop` 而不是「`spawn` 之后手动恢复」：`spawn` 可能失败，中间也可能
 panic，而**忘了恢复会让本进程后续派生的进程拿不到 stdout** —— 那种 bug
@@ -244,11 +247,18 @@ $ mdlc __update-check
 | clippy | `cargo clippy --release --all-targets --locked -- -W clippy::all -D warnings` | 0 warning |
 | 文档 | `RUSTDOCFLAGS=-D warnings cargo doc --no-deps --locked --target-dir target\doccheck` | 0 warning |
 | 回归 | `node docs\_probe\parity_snapshot.js` | 101/101 |
-| 管道 A/B | `node target\ab\pipe_ab2.js <nofix.exe> <release.exe> parity\anim.qc` | 官方形态省 ~600 ms |
-| 子进程存活 | `node target\ab\verify_grandchild.js target\release\mdlc.exe` | 孙进程写出缓存 |
-| 落点 | `node target\ab\e2e_all.js target\release\mdlc.exe parity\anim.qc` | 四种形态全过 |
+| 管道 A/B | `node docs\_probe\update_pipe_ab.js <nofix.exe> <release.exe> parity\anim.qc` | 官方形态省 ~600 ms |
+| 子进程存活 | `node docs\_probe\update_grandchild.js target\release\mdlc.exe` | 孙进程写出缓存 |
+| 落点 | `node docs\_probe\update_e2e_routing.js target\release\mdlc.exe parity\anim.qc` | 四种形态全过 |
 
-⚠️ `target\ab\` 下的探针是**实验残留**（被 `.gitignore` 忽略），不是仓库资产。
+⚠️ 上面三个探针在 `docs\_probe\` 下，被 `.gitignore` 忽略（不是仓库资产，
+但也不是一次性脚本 —— 改动 `spawn_check` 时应重跑）。
+
+⚠️ **句柄守卫的两个单测必须串行**：它们改的是**进程级**的 std 句柄状态。
+并行跑时一个测试的守卫析构会把可继承位恢复成 `true`，正好插进另一个测试
+「断言已清掉」的窗口 —— 实测不加锁时 `cargo test --lib update::`
+**每 5 次里约 1 次失败**（`--test-threads=1` 则 10/10 通过）。
+修法是 `mod tests` 里一把 `static SERIAL: Mutex<()>`。
 
 ---
 
@@ -262,4 +272,25 @@ $ mdlc __update-check
    Win32 调用，每个都带 `// SAFETY:` 注释。stable 上没有安全替代
    （`inherit_handles(false)` 是 unstable，std 也没用
    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`）。
-4. **`windows-sys` 成为直接依赖** —— 但**不新增任何包**（已在 lock 里）。
+4. **`windows` 成为 Windows 专属直接依赖** —— 真实代价 **+11 个包**
+   （含 `windows-implement` / `windows-interface` 两个 proc-macro crate）。
+
+   ⚠️ 早期版本这里写的是「`windows-sys 0.52` 已在 lock 里、**不新增任何包**」，
+   **那是错的**：`ring` 对 `windows-sys` 的依赖挂在
+   `cfg(all(all(target_arch = "aarch64", target_endian = "little"), target_os = "windows"))`
+   下（`ring-0.17.14\Cargo.toml`），x86_64 上根本不进 lock。
+   实测 `git show 32ffe0c:Cargo.lock` 搜 `windows-sys` = **0 命中**。
+
+   三种方案的实测包数（基线 135）：
+
+   | 方案 | 包数 | 新增 |
+   |---|---|---|
+   | `windows-sys = "0.52"` | 135 | +0（**当时不在 lock 里，实际是 +2**） |
+   | `windows-sys = "0.61"` | 137 | +2（`windows-sys` / `windows-link`） |
+   | **`windows = "0.62"`（采用）** | **146** | **+11** |
+
+   ⚠️ `windows-sys 0.61` 把 `HANDLE` 从 `isize` 改成了
+   `*mut core::ffi::c_void`，`if h == 0` 这类写法直接编译不过
+   （实测 `error[E0308] --> src\update.rs:353`）—— 这也是选 `windows`
+   的一个附带理由：它把「句柄有效性」收进 `HANDLE::is_invalid()`，
+   不再依赖调用方记得两个哨兵值。

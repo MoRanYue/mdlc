@@ -114,11 +114,13 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # 进程里所有**可继承句柄，包括调用方为了让 `ReadToEnd()` 拿到 EOF 而建的
 # stdout 管道。`Stdio::null()` 挡不住：它只换子进程的 0/1/2。
 #
-# `windows-sys 0.52.0` **已在 `Cargo.lock` 里**（`ring` 的传递依赖）
-# ⟹ 加为直接依赖**不新增任何包**，只多两个 feature。
-# 详细取证与实测见 `docs/update-check.md`。
+# 用 `windows`（而非 `windows-sys`）：`HANDLE` 是 newtype 而不是 `isize`，
+# `GetStdHandle` 直接给 `Result`，`HANDLE::is_invalid()` 一次覆盖 `NULL`
+# 与 `INVALID_HANDLE_VALUE` 两个哨兵 —— 这几处正好都是我们容易写错的地方。
+# 代价是 +11 个包（含两个 proc-macro crate）；详细取证与实测见
+# `docs/update-check.md`。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Console",
 ] }
