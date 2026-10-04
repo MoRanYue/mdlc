@@ -3,7 +3,7 @@
 #
 # 收录策略（2026-09 定）：**只收录核心源码与文档** ——
 #   src/  examples/  assets/  build.rs  Cargo.toml  Cargo.lock
-#   README.md  docs/*.md
+#   README.md  README.en.md  docs/*.md
 #
 # 下面每一类被排除的东西都写明了「为什么」与「怎么重建」，
 # 免得以后有人以为文件丢了或者被误删。

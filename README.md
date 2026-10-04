@@ -1,6 +1,14 @@
+<div align="center">
+
+<img src="assets/mdlc-icon.svg" width="128" height="128" alt="mdlc">
+
 # mdlc
 
 **Source 引擎模型编译器** —— Valve `studiomdl.exe` 的 Rust 独立重写。
+
+[English](README.en.md) · **简体中文**
+
+</div>
 
 把 **TOML 描述文件**或 **QC 脚本** + **SMD / FBX / glTF 网格**编译成 Source 引擎能加载的
 `.mdl` + `.vvd` + `.dx90.vtx`（带碰撞时另有 `.phy`，用 `$animblocksize` 时另有 `.ani`）。

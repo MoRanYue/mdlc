@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<defs>
+  <radialGradient id="bg" cx="50%" cy="34%" r="76%">
+    <stop offset="0" stop-color="#42301F"/>
+    <stop offset="1" stop-color="#1E1B19"/>
+  </radialGradient>
+  <clipPath id="clip"><rect x="0" y="0" width="256" height="256" rx="57.86"/></clipPath>
+</defs>
+<g clip-path="url(#clip)">
+  <rect x="0" y="0" width="256" height="256" fill="url(#bg)"/>
+  <g>
+    <polygon points="231.68,129.91 201.46,152.47 158.29,210.93 161.83,224.49 207.19,174.42" fill="#be7a44" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+    <polygon points="94.17,214.41 161.83,224.49 158.29,210.93 88.45,192.47 48.81,194.62" fill="#bd7942" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+    <polygon points="207.19,61.38 161.83,41.59 158.29,97.89 201.46,152.47 231.68,129.91" fill="#d17a33" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+    <polygon points="88.45,192.47 88.45,122.61 48.81,81.58 24.32,126.09 48.81,194.62" fill="#f9c68f" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+    <polygon points="48.81,81.58 88.45,122.61 158.29,97.89 161.83,41.59 94.17,31.51" fill="#ffdbad" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+    <polygon points="158.29,210.93 201.46,152.47 158.29,97.89 88.45,122.61 88.45,192.47" fill="#e98635" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
+
+  </g>
+</g>
+</svg>
