@@ -1,0 +1,26 @@
+// mdlc 的 Windows 资源脚本。
+//
+// 只有一个用途：把 `assets/mdlc.ico` 作为**应用程序图标**（资源类型 `ICON`，
+// 资源 ID 1）链进 exe。ID 必须是 `1`（即 `IDI_ICON1`）—— Windows 外壳取
+// 「可执行文件自己的图标」时按**最低 ID** 挑，换成别的数字会在部分位置
+// 回落成默认的白色窗口图标。
+//
+// `RT_GROUP_ICON`（把各尺寸串起来的那张目录表）由 `rc.exe` 从这一条
+// `ICON` 语句**自动生成**，不需要手写 `GROUP_ICON` —— 这也正是
+// `assets/mdlc.ico` 里的九个尺寸能一起进去的原因。
+//
+// 路径 `"mdlc.ico"` 是相对本文件所在目录的：`embed-resource` 会把
+// `rc.exe` 的工作目录设成资源文件自己的父目录（见其 `src/lib.rs:735`）。
+//
+// **故意不 `#include <windows.h>`** —— 本文件一个宏、一个常量都不用，
+// 引它只会平白依赖 Windows SDK 头文件的完整性（`rc.exe` 要靠 `INCLUDE`
+// 环境变量找到 `windows.h`）。不引就少一整类失败可能。
+//
+// 版本信息（`VERSIONINFO`）**也故意不写**：`Cargo.toml` 的 `version` /
+// `description` 已经有唯一出处，在这里再抄一份就多一个要同步的地方。
+// 等真需要「文件属性 → 详细信息」时再加，并且要从 `CARGO_PKG_*` 环境变量
+// 注入而不是硬编码。
+//
+// ⚠️ 行尾：本文件保持 **LF**（与仓库其余文件一致）。
+
+1 ICON "mdlc.ico"

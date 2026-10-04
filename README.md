@@ -14,7 +14,7 @@
 git clone https://github.com/MoRanYue/mdlc.git
 cd mdlc
 cargo build --release
-cargo test                  # 815 passed / 0 failed / 6 ignored（不需要任何外部素材）
+cargo test                  # 820 passed / 0 failed / 6 ignored（不需要任何外部素材）
 ```
 
 > ⚠️ **法律提示**：本项目是**独立重写**（clean-room reimplementation），依据的是
@@ -29,6 +29,7 @@ cargo test                  # 815 passed / 0 failed / 6 ignored（不需要任�
 
 - [快速开始](#快速开始)
 - [产物](#产物)
+- [可执行文件图标](#可执行文件图标)
 - [两套输入格式，一个 IR](#两套输入格式一个-ir)
 - [TOML 描述文件](#toml-描述文件)
 - [QC 支持与 Crowbar 直接替换](#qc-支持与-crowbar-直接替换)
@@ -122,6 +123,41 @@ cargo build --release
 也可以用 `[model].checksum` 显式指定。
 
 编译成功后 stdout 会打印一份摘要（骨骼数、材质数、顶点数、三角形数与各文件字节数）。
+
+### 可执行文件图标
+
+`target/release/mdlc.exe` 带一个图标（一个橙色的正十二面体），源码在
+`assets/`：
+
+| 文件 | 作用 |
+|---|---|
+| `assets/mdlc.ico` | 9 个尺寸（16/20/24/32/40/48/64/128/256），**每个尺寸单独渲染** |
+| `assets/mdlc.rc` | 一行 `1 ICON "mdlc.ico"`；`RT_GROUP_ICON` 由 `rc.exe` 自动生成 |
+| `build.rs` | 调 `embed-resource` 把它编成 `.res` 并发出 `cargo:rustc-link-arg-bins` |
+
+三个容易踩的点，都写进了对应文件的注释里：
+
+- **`.ico` 必须按尺寸分别出图，不能「画一张大的再缩」。** 16 px 只有
+  16×16 个像素，把 256 px 的图缩下来描边会整条消失、面与面糊成一团。
+  `.ico` 格式本来就是每尺寸存一张，天然支持这件事。
+- **`build.rs` 必须写 `cargo:rerun-if-changed`。** cargo 的规则是「只要
+  构建脚本输出了任意一条 `rerun-if-changed`，默认的全量重跑就被关掉」，
+  漏掉 `assets/mdlc.ico` 的话换图标后不会重新编译，exe 里一直留着旧图标，
+  而 `cargo build` 照样报 `Finished`。
+- **失败分三档**（见 `build.rs` 顶部注释）：目标非 Windows 静默跳过；
+  找不到 `rc.exe` 只发 `cargo:warning`（环境缺失不该拦构建）；`rc.exe`
+  在却编译失败则 **panic**（那是我们自己的资源文件写坏了，不能让图标
+  悄悄丢失）。这一档区分是必要的 —— `embed-resource` 在 MSVC 上把
+  「找不到编译器」和「编译失败」都报成 `Failed`。
+
+> ⚠️ **非 Windows 产物没有图标。** 图标是 PE 资源段里的东西，Linux/macOS
+> 的产物不带（也不该带）。CI 的 `test` job 跑在 `ubuntu-latest` 上，
+> 走的就是「静默跳过」那条路径。
+
+> ⚠️ **`.ico` 是提交进仓库的二进制，它的生成器不在仓库里**（与 `docs/_probe/`
+> 同属开发机工具：`poly.js` 生成矢量 SVG、`rasterize.js` 经无头 Edge 的 CDP
+> 接口光栅化、`ico.js` 按尺寸分别渲染后打包）。改图标 = 重跑那套脚本再替换
+> `assets/mdlc.ico`，`build.rs` 会因 `rerun-if-changed` 自动重编资源。
 
 ---
 
@@ -964,7 +1000,7 @@ cargo build --release
 
 ```powershell
 cd D:\GITHUB\mdlc
-cargo test                            # 应为 815 passed / 0 failed / 6 ignored
+cargo test                            # 应为 820 passed / 0 failed / 6 ignored
 cargo clippy --release --all-targets  # 应为 0 warning
 node docs\_probe\parity_snapshot.js   # 应为 101/101
 ```
@@ -1061,11 +1097,11 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
 ## 测试
 
 ```powershell
-cargo test                  # 815 passed / 0 failed / 6 ignored
+cargo test                  # 820 passed / 0 failed / 6 ignored
 ```
 
-**815 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 821 个单元测试 =
-815 通过 + 6 忽略；另有 1 条 `#[ignore]` 的文档测试）：
+**820 个测试默认全跑，不需要任何外部素材。** 按模块分布（共 826 个单元测试 =
+820 通过 + 6 忽略；另有 2 条文档测试，其中 1 条 `#[ignore]`）：
 
 | 模块 | 数量 | 覆盖 |
 |---|---|---|
@@ -1079,11 +1115,11 @@ cargo test                  # 815 passed / 0 failed / 6 ignored
 | `lod` | 26 | 顶点池排序、分段铺满、fixup 分组 |
 | `flex` | 24 | 就近匹配、差量、smoothstep、载荷 |
 | `model` | 23 | TOML 解析与校验（含各类非法输入） |
+| `fbx` | 20 | FBX 几何口径（R3/N3/E）、**顶点位置与骨骼位移的缩放归一化**、`src*` 选项矩阵、shape key 帧号、骨骼表 DFS 先序 |
 | `smd` | 19 | SMD 解析（含 9/10 token 顶点行） |
 | `bone_math` | 19 | 欧拉/四元数、矩阵约定 |
-| `fbx` | 20 | FBX 几何口径（R3/N3/E）、**顶点位置与骨骼位移的缩放归一化**、`src*` 选项矩阵、shape key 帧号、骨骼表 DFS 先序 |
 | `ani_writer` | 16 | `.ani` 容器与块对齐 |
-| `cli` | 16 | 官方选项归一化、Crowbar 调用形态 |
+| `cli` | 21 | 官方选项归一化、Crowbar 调用形态、clap derive 解析与退出码 |
 | `vta` | 14 | `.vta` 解析 |
 | `lib.rs` 的 `tests` | 12 | VVD 往返判据、fixup 铺满、`numLODVertexes` 单调性与 ripple |
 | `pipeline` | 10 | 编排管线：碰撞 SMD → `physicsbone`、错误分类与退出码、摘要行、`optimize_vtx` 的 `||` |
@@ -1144,6 +1180,10 @@ cargo test -- --ignored
 ## 代码结构
 
 ```text
+build.rs         构建脚本：把 assets/mdlc.rc 编成 .res 并链进 exe（图标）
+assets/
+  mdlc.ico       exe 图标，9 个尺寸各存一张（不是缩放来的）
+  mdlc.rc        一行 `1 ICON "mdlc.ico"`
 src/
   main.rs         命令行入口（参数解析 → 调 `pipeline` → 打印摘要与退出码）
   pipeline.rs     编排管线：ModelDesc → 四件套字节 → 落盘（库的对外入口）
@@ -1184,7 +1224,8 @@ src/
 **数学用现成 crate**：`parry3d`（quickhull 凸包、VHACD、质量属性）、`meshopt`
 （顶点缓存优化）、`ufbx`（FBX 解析，MIT OR Unlicense）、`gltf`（glTF / GLB 解析，
 MIT OR Apache-2.0；**关掉 `import` feature**，所以不拉图片解码链）、`clap`（CLI）、
-`toml` + `serde`（描述文件）。
+`toml` + `serde`（描述文件）。`embed-resource` 只在 `[build-dependencies]` 里，
+**不进运行时依赖树**（见 [可执行文件图标](#可执行文件图标)）。
 
 ---
 

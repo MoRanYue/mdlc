@@ -136,6 +136,33 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
 ] }
 
+[build-dependencies]
+# 把 `assets/mdlc.rc` 编成 `.res` 并链进 exe —— 也就是让产物带上图标。
+#
+# 为什么需要外部 crate：PE 的资源段（`.rsrc`）没有稳定的 Rust 内置写法，
+# 只能调 Windows SDK 的 `rc.exe` 再给链接器加参数。而「找到 `rc.exe`」
+# 本身要处理 VS 各版本安装路径、Windows Kits 注册表键、`%INCLUDE%` 要指向
+# SDK 头文件目录、非 MSVC 目标要改用 `windres` + `ar` —— 全是环境适配，
+# 与 mdlc 无关，`embed-resource` 已覆盖全。
+#
+# 只进 `build-dependencies`，**不污染运行时的依赖树**：它不会出现在
+# `cargo tree -e normal` 里，也不影响产物体积。
+#
+# 平台行为（见其 `src/non_windows.rs` 与 `src/windows_msvc.rs`）：
+# 非 Windows 目标上是**空操作**，所以 `ubuntu-latest` 的 CI job 不受影响。
+#
+# ⚠️ Windows/MSVC 上它把「找不到 `rc.exe`」与「`rc.exe` 编译失败」**都报成
+# `Failed`**（`is_supported()` 恒返回 `None`），两种情形的区别只在错误文案里。
+# 所以 `build.rs` 不靠它的返回值分类，而是自己先探一遍 `rc.exe` 在不在：
+# 不在就只发 `cargo:warning`（环境缺失不该拦构建），在却编译失败才 panic。
+#
+# MSRV 1.76 ≤ 本包声明的 1.89。`Cargo.lock` 实际变化：包数 207 → 214，
+# 其中真正新增 6 个包（`embed-resource`、`rustc_version`、`semver`、
+# `vswhom`、`vswhom-sys`、`winreg`），外加 `windows-sys` 多出 0.59.0 一个
+# 版本（仓库本来就有 0.52.0 与 0.61.2，属重复而非冲突）。`cc` 与 `toml`
+# 已在锁里（`meshopt-sys` / 本包自己）。
+embed-resource = "3.0"
+
 [features]
 # 分段计时探针。**默认关闭** —— 打开后 `measure_block!` 会在每个计时点做
 # 一次原子读，实测给单 LOD 常见路径带来约 2.5% 开销（历史数据见 `src/lod.rs`
