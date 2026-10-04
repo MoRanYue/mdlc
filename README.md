@@ -676,6 +676,12 @@ mdlc template
 mdlc --version | -V
 ```
 
+**上面这段与下面那张表都只是速查** —— 权威用法是 `mdlc --help` /
+`mdlc <子命令> --help`。CLI 由 `clap` 的 **derive** 声明（`src/cli.rs` 的
+`Cli` 结构体 + `Commands` 枚举 + 各 `Args` 结构体），所以帮助、用法行与错误
+信息都是**自动生成**的，不存在手写的 usage 常量需要同步。加一个子命令 =
+加一个枚举变体。
+
 | 子命令 | 作用 |
 |---|---|
 | `build` | TOML 描述 → `.mdl`/`.vvd`/`.vtx`（主线） |
@@ -690,6 +696,42 @@ mdlc --version | -V
 `--version` / `-V` 打印 `mdlc <版本>`。⚠️ **官方兼容形态不认它** ——
 `mdlc -game <dir> <qc>` 会把它当未知选项警告后继续（官方 `studiomdl`
 没有这个选项）。
+
+### 帮助与错误的多语言
+
+clap **自己**写死的那些英文（`Usage:` / `Options` / `Commands` / `Arguments`
+段落标题、12 类错误的措辞、`-h` / `-V` 的说明）由
+[`clap-i18n-richformatter`](https://crates.io/crates/clap-i18n-richformatter)
+换掉，**按系统显示语言自动切换**（`DesktopLanguageRequester`；未命中时回落到
+它自带的 `en-US`）。所以中文系统上 `mdlc -h` 打的是：
+
+```text
+用法: mdlc.exe <命令>
+
+命令:
+  build          TOML 描述 → .mdl/.vvd/.vtx（MVP 主线）
+  check          只校验描述文件，不写文件
+  phy            SMD 三角形 → 凸包 → .phy 碰撞文件
+  ...
+  help           打印本信息或给定子命令的帮助
+
+选项:
+  -h, --help     打印帮助信息（使用 '-h' 查看摘要）
+  -V, --version  打印版本信息
+```
+
+（`mdlc --help` 是**长帮助**：`-h` / `-V` 会展开成两行并带上完整说明；
+子命令的帮助里 `参数:` / `选项:` 段落标题同样是中文。）
+
+⚠️ **边界**：它**不翻译 mdlc 自己的命令与参数描述** —— 那些是 `src/cli.rs`
+里 doc comment / `#[arg(help = ...)]` 写的中文常量。crate 的设计如此。
+
+> 颜色：clap 用的是 `ColorChoice::Auto`（内部包 `anstream::AutoStream`），
+> **直连终端才着色**，被重定向或管道抓取时自动降级成纯文本 —— 所以不会往
+> Crowbar 之类的宿主日志里塞 ANSI 转义码。
+
+> ⚠️ **官方兼容形态不受影响**：它的帮助/错误仍走 clap 默认的英文
+> `DefaultFormatter`，与官方 `studiomdl` 的输出形态一致。
 
 `--optimize-vtx` 用 `meshopt` 对每个 strip group 重排索引以提升 GPU 后变换顶点
 缓存命中率。它**只改索引顺序**，顶点池与三角形集合都不变（写出前有守门断言校验

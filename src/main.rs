@@ -12,73 +12,16 @@
 //! `<gamedir>\models\<$modelname>` —— 用于直接替换 Crowbar 的编译器路径。
 //! 解析细节见 [`mdlc::cli`] 模块文档。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use mdlc::compile::compile;
 // 诊断输出的路由版（`eprintln!` / `eprint!` 的替代）—— 官方兼容模式下
 // 自动改走 stdout，理由见 [`mdlc::diag`] 模块文档。
-use mdlc::{diagln, diagprint};
+use mdlc::diagln;
 use mdlc::model::ModelDesc;
 use mdlc::phy::{self, PhyHull, PhyParams, PhySolid};
 use mdlc::vvd::{Vvd, check_invariants};
-
-const USAGE: &str = "\
-mdlc —— Source 引擎模型编译器（MVP：TOML 描述 → MDL/VVD）
-
-用法：
-  mdlc build <model.toml> [--out <目录>]
-      把 TOML 描述编译成 <name>.mdl 与 <name>.vvd。
-      --out 指定输出根目录（默认取当前目录），模型名里的目录结构会被创建。
-
-  mdlc check <model.toml>
-      只校验描述文件，不写任何文件。退出码 0=合法，1=有错误。
-
-  mdlc vvd-info <file.vvd>
-      解析并打印 VVD 头部、统计与自洽性检查结果。
-
-  mdlc vvd-roundtrip <file.vvd>
-      读入再写出，逐字节比对。用于验证布局理解是否正确。
-
-  mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
-      从 SMD 读三角形 → 算凸包 → 写出 Source 引擎的 .phy 碰撞文件。
-      SMD 的三角形顶点已在模型局部坐标，不做任何变换（与 studiomdl 一致）。
-      --checksum  配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0
-      --mass      $mass 等效总质量，默认 1（官方缺省；见 --automass 说明）
-      --surfaceprop  表面材质，默认 default
-      --concave   $concave：按**连通分量**拆成多个凸块（官方语义，
-                  不是 VHACD 体分解 —— 见 `phy::decompose_connected_components`）
-      --vhacd     VHACD 近似凸分解。**非官方语义**：保留凹口，
-                  而官方 $concave 是填平。仅用于需要真凹形碰撞体的场合。
-      --ragdoll   $collisionjoints：按**蒙皮权重骨骼**分组，每个骨骼一个 solid，
-                  并把 boneIndex+1 写进 ledge 的 client_data。
-                  `parent` 沿骨骼链**上溯**到第一个在碰撞列表里的祖先
-                  （官方 FixParent）。
-
-  mdlc qc2toml <model.qc> [--out <path.toml>]
-      把 QC 脚本解析成 mdlc 的 TOML 描述文件（**只写文本，不编译**）。
-      QC 里的 $include / $definevariable / $pushd 都会被展开，
-      骨骼表与材质表会**读 SMD 补全**（与官方 BuildGlobalBonetable 一致）。
-      用途：把 QC 项目迁移到 TOML，或人工核对解析结果。
-
-  mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]
-      直接从 QC 编译 —— 等价于 `qc2toml` 之后再 `build`，
-      但中间描述不落盘（与 studiomdl 的行为一致）。
-
-  mdlc template
-      打印一份带注释的最小 TOML 模板。
-
-  mdlc --version / -V
-      打印版本号。更新检测会把本地版本与 GitHub 上最新的 Release 比较，
-      有新版本时在这里提到的同一行提示里给出来。
-
-官方 studiomdl 兼容形态（用于直接替换 Crowbar 等宿主的编译器路径）：
-  mdlc -game <gamedir> [-nop4] [-verbose] <model.qc>
-      等价于 `build-qc <model.qc> --out <gamedir>\\models`
-      —— 即官方的产物规则 `<gamedir> + models/ + $modelname`
-      （见 write.cpp:1321-1331）。也可省略 -game：`mdlc <model.qc>`。
-      官方单横线选项会被归一化接受；未实现的（如 -minlod）会警告后忽略。
-";
 
 // 分段计时。`#[hotpath::main]` 在函数体最前面插入一个活到 `main` 返回的
 // guard，析构时把报告写出来 —— 所以**任何**退出路径（包括 `run_official`
@@ -147,53 +90,41 @@ fn main() -> ExitCode {
         return run_official(&argv);
     }
 
-    let matches = match mdlc::cli::build_cli().try_get_matches_from(&argv) {
-        Ok(m) => m,
+    let cli = match mdlc::cli::parse_i18n(&argv) {
+        Ok(c) => c,
         Err(e) => return cli_exit(e),
     };
 
-    match matches.subcommand() {
-        None => {
-            // 保持迁移前的契约：**无参数 = 用法错误**（usage 走 stderr、
-            // 退出码 2），而不是 clap 默认的「打印帮助、退出 0」。
-            diagprint!("{USAGE}");
-            ExitCode::from(2)
-        }
-        Some(("template", _)) => {
+    match cli.command {
+        mdlc::cli::Commands::Template => {
             print!("{}", mdlc::model::TEMPLATE_TOML);
             ExitCode::SUCCESS
         }
-        Some(("build", m)) => {
-            let (toml_path, out_root, cli_optimize_vtx) = mdlc::cli::build_args(m);
+        mdlc::cli::Commands::Build(a) => {
+            let toml_path = a.toml.clone();
+            let out_root = a.out_root();
             let desc = match load_desc(&toml_path) {
                 Ok(d) => d,
                 Err(c) => return c,
             };
             let base = toml_path.parent().unwrap_or(Path::new("."));
-            compile_and_write(&desc, base, &out_root, cli_optimize_vtx)
+            compile_and_write(&desc, base, &out_root, a.optimize_vtx)
         }
-        Some(("check", m)) => check(Path::new(m.get_one::<String>("toml").expect("required"))),
-        Some(("phy", m)) => phy_cmd(m),
-        Some(("qc2toml", m)) => qc2toml(m),
-        Some(("build-qc", m)) => {
-            let (qc, out, optimize_vtx) = mdlc::cli::build_qc_args(m);
-            build_qc_from(&qc, &out, optimize_vtx)
+        mdlc::cli::Commands::Check(a) => check(&a.toml),
+        mdlc::cli::Commands::Phy(a) => phy_cmd(&a),
+        mdlc::cli::Commands::Qc2toml(a) => qc2toml(&a),
+        mdlc::cli::Commands::BuildQc(a) => {
+            let out = a.out_root();
+            build_qc_from(&a.qc, &out, a.optimize_vtx)
         }
-        Some(("vvd-info", m)) => vvd_info(m.get_one::<String>("file").expect("required")),
-        Some(("vvd-roundtrip", m)) => {
-            vvd_roundtrip(m.get_one::<String>("file").expect("required"))
-        }
+        mdlc::cli::Commands::VvdInfo(a) => vvd_info(&a.file.to_string_lossy()),
+        mdlc::cli::Commands::VvdRoundtrip(a) => vvd_roundtrip(&a.file.to_string_lossy()),
         // 隐藏子命令：`update::spawn_check` 派生出来的子进程走这里。
         // 同步跑一次检测（写缓存），**不打印任何东西** —— 它的 stdout
         // 在派生时已被接到 NUL；手动跑时想看结果就开 `MDLC_UPDATE_DEBUG=1`。
-        Some((name, _)) if name == mdlc::update::HIDDEN_SUBCOMMAND => {
+        mdlc::cli::Commands::UpdateCheck => {
             mdlc::update::run_check();
             ExitCode::SUCCESS
-        }
-        Some((other, _)) => {
-            diagln!("错误：未知子命令 {other:?}\n");
-            diagprint!("{USAGE}");
-            ExitCode::from(2)
         }
     }
 }
@@ -204,7 +135,11 @@ fn main() -> ExitCode {
 ///   `DisplayHelp` / `DisplayVersion`）；
 /// - 其余用法错误走 **stderr、退出码 2** —— 与迁移前的**手写解析契约一致**，
 ///   既有脚本（`probe_*.js` / `cmp_*.js`）都按这个码判定。
-fn cli_exit(e: clap::Error) -> ExitCode {
+///
+/// 对 formatter 泛型：mdlc 自有形态的错误带 `ClapI18nRichFormatter`
+/// （见 [`mdlc::cli::parse_i18n`]），官方兼容形态是 clap 默认的
+/// `DefaultFormatter`。两者的 `print` / `use_stderr` 行为一致，这里不必分家。
+fn cli_exit<F: clap::error::ErrorFormatter>(e: clap::error::Error<F>) -> ExitCode {
     let _ = e.print();
     if e.use_stderr() {
         ExitCode::from(2)
@@ -353,9 +288,9 @@ fn load_qc(path: &Path) -> Result<ModelDesc, ExitCode> {
 }
 
 /// `mdlc qc2toml <model.qc> [--out <path.toml>]`。
-fn qc2toml(m: &clap::ArgMatches) -> ExitCode {
-    let qc = PathBuf::from(m.get_one::<String>("qc").expect("required"));
-    let out: Option<PathBuf> = m.get_one::<String>("out").map(PathBuf::from);
+fn qc2toml(a: &mdlc::cli::Qc2tomlArgs) -> ExitCode {
+    let qc = a.qc.clone();
+    let out = a.out.clone();
     let desc = match load_qc(&qc) {
         Ok(d) => d,
         Err(c) => return c,
@@ -533,86 +468,15 @@ fn vvd_roundtrip(path: &str) -> ExitCode {
     }
 }
 
-/// `phy` 子命令的参数。
-struct PhyArgs {
-    input: PathBuf,
-    output: PathBuf,
-    checksum: u32,
-    mass: f32,
-    surface_prop: String,
-    /// `$concave`（**官方语义**：连通分量分解）。
-    concave: bool,
-    /// VHACD 体分解（**非官方语义**，保留凹口）。
-    vhacd: bool,
-    ragdoll: bool,
-}
-
-/// 从 `phy` 的 clap 匹配结果取参数。
-///
-/// `--checksum` 同时接受十进制与 `0x` 十六进制（实测工作流里 checksum
-/// 常常是从 `.mdl` 头里以十六进制抄出来的），所以不走 clap 的数值解析，
-/// 而是取字符串后交给 [`parse_u32`]。
-fn phy_args_from(m: &clap::ArgMatches) -> Result<PhyArgs, String> {
-    let checksum = match m.get_one::<String>("checksum") {
-        Some(v) => parse_u32(v).map_err(|e| format!("--checksum {v:?}：{e}"))?,
-        None => 0,
-    };
-    // 官方缺省是 **1.0**（`CJointedModel` 构造函数 `m_totalMass = 1.0`，
-    // 而 `ComputeMass()` 首句 `if (m_totalMass >= 0) return;` 直接返回）。
-    let mass = match m.get_one::<String>("mass") {
-        Some(v) => v
-            .parse::<f32>()
-            .map_err(|_| format!("--mass 不是合法浮点数：{v:?}"))?,
-        None => 1.0,
-    };
-    // `--decompose` 是 `--vhacd` 的旧别名：保留以免破坏既有脚本，
-    // 但**语义已明确**为 VHACD（非官方），不是 `$concave`。
-    let vhacd = m.get_flag("vhacd") || m.get_flag("decompose");
-    Ok(PhyArgs {
-        input: PathBuf::from(m.get_one::<String>("input").expect("required")),
-        output: PathBuf::from(m.get_one::<String>("output").expect("required")),
-        checksum,
-        mass,
-        surface_prop: m
-            .get_one::<String>("surfaceprop")
-            .cloned()
-            .unwrap_or_else(|| "default".to_string()),
-        concave: m.get_flag("concave"),
-        vhacd,
-        ragdoll: m.get_flag("ragdoll"),
-    })
-}
-
-/// 解析 `u32`，接受十进制与 `0x` 前缀的十六进制。
-fn parse_u32(s: &str) -> Result<u32, String> {
-    let t = s.trim();
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u32::from_str_radix(hex, 16).map_err(|e| e.to_string())
-    } else if let Some(hex) = t.strip_prefix("-0x") {
-        // 允许 `-0x1234`：`.mdl` 的 checksum 是有符号 int32，
-        // 十六进制抄出来常常带负号，但 `.phy` 里按 u32 存。
-        let v = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-        Ok(v.wrapping_neg())
-    } else {
-        t.parse::<u32>()
-            .or_else(|_| t.parse::<i32>().map(|v| v as u32))
-            .map_err(|e| e.to_string())
-    }
-}
-
 /// `mdlc phy`：SMD 三角形 → 凸包 → `.phy`。
 ///
 /// 存在的意义是**让 PHY 写出能脱离完整模型编译独立测试**：只要有任意一个
 /// SMD 就能产出一个可被 `validate-final.js` 校验的碰撞文件。
-fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
-    let args = match phy_args_from(m) {
-        Ok(a) => a,
-        Err(e) => {
-            diagln!("错误：{e}");
-            return ExitCode::from(2);
-        }
-    };
-
+///
+/// 参数已在 [`mdlc::cli::PhyArgs`] 里解析完（`--checksum` 的十进制 /
+/// `0x` 十六进制两种写法由它的 `value_parser` 处理，非法值在 clap 那一层
+/// 就变成用法错误、退出码 2）。
+fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     let text = match std::fs::read_to_string(&args.input) {
         Ok(t) => t,
         Err(e) => {
@@ -681,7 +545,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
     // 渲染网格通常既不凸也不闭合（有 T 型接缝、有重复边），所以**不能**
     // 直接把面表当凸包喂进去 —— 必须先算凸包。
     let hull_of = |verts: &[[f32; 3]], face_idx: &[usize]| -> Result<Vec<PhyHull>, String> {
-        if args.vhacd {
+        if args.vhacd_enabled() {
             let sub: Vec<[u32; 3]> = face_idx.iter().map(|&i| faces[i]).collect();
             phy::decompose_concave(verts, &sub, 64, 16).map_err(|e| format!("凸分解失败：{e}"))
         } else {
@@ -804,7 +668,7 @@ fn phy_cmd(m: &clap::ArgMatches) -> ExitCode {
     params.surface_prop = &args.surface_prop;
     // 只有真的走了 `$concave` 才写 `concave "1"`，与实测的 studiomdl 行为一致
     // （VHACD 也写 —— 它同样产出了多个凸块）。
-    params.concave = args.concave || args.vhacd;
+    params.concave = args.concave || args.vhacd_enabled();
 
     // 凸分解出来的多个凸块属于**同一个 solid**（共用一份点数组与一棵 ledgetree），
     // 所以走 `write_phy_multi` 而不是 `write_phy` —— 后者的契约是

@@ -13,16 +13,27 @@ keywords = ["source-engine", "studiomdl", "mdl", "vvd", "vtx"]
 categories = ["command-line-utilities", "game-development", "parser-implementations"]
 
 [dependencies]
-# CLI 解析。`default-features = false` 关掉了彩色输出 / 终端探测
-# （`color` / `wrap_help` / `env` 等）—— 本工具的输出会被 Crowbar 之类的
-# 宿主**逐行抓取**，ANSI 转义码只会污染日志；顺带省掉 anstream/anstyle。
-clap = { version = "4.6.7", default-features = false, features = [
-    "std",
-    "help",
-    "usage",
-    "error-context",
-    "suggestions",
-] }
+# CLI 解析。**故意用 default-features**：`color` 打开的不是「永远着色」，
+# 而是 `ColorChoice::Auto` —— clap 内部把输出包进 `anstream::AutoStream`，
+# 直连终端才着色，被 Crowbar 之类的宿主重定向/管道抓取时自动降级成纯文本，
+# 所以不会往日志里塞 ANSI 转义码（实测：重定向时 `is_terminal() == false`
+# ⟹ `AutoStream` 剥掉全部转义序列）。
+#
+# `derive` 只给 mdlc **自有**子命令用（`Cli` + `Commands` 枚举 + 各 `Args`）；
+# 官方 `studiomdl` 兼容形态仍是 builder —— 它的 ~40 个 flag 由
+# `OFFICIAL_FLAGS_NO_VALUE` / `OFFICIAL_FLAGS_WITH_VALUE` 两张表循环生成，
+# 表驱动是 derive 表达不了的，硬转会把「归一化认识的」与「clap 接受的」
+# 拆成两份清单。见 `src/cli.rs` 的模块文档。
+clap = { version = "4.6.7", features = ["derive"] }
+
+# 帮助/错误文案的多语言支持：换掉 clap **自己**写死的英文
+# （`Usage:` / `Options` / `Commands` / `Arguments` 标题、12 类错误的
+# 措辞、`-h` / `-V` 的说明），按**系统显示语言**自动切换
+# （`DesktopLanguageRequester`；未命中时回落到 crate 自带的 `en-US`）。
+#
+# ⚠️ 边界：它**不翻译** mdlc 自己的命令/参数描述 —— 那些仍是下面
+# `about` / `help` 里的中文常量（crate 的设计如此，其 README 亦明示）。
+clap-i18n-richformatter = "0.3.2"
 indexmap = { version = "2.14.2", features = ["serde"] }
 meshopt = "0.6.2"
 parry3d = "0.31.1"

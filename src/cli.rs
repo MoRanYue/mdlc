@@ -31,8 +31,20 @@
 //! **它完全不看退出码，也不解析错误文本**（全源码搜 `ERROR` 抓取，命中的
 //! 全是 Crowbar 自己的消息）。所以只要参数能被接受、产物落在正确路径，
 //! 把 Crowbar 的编译器路径指向 `mdlc.exe` 就能直接替换官方编译器。
+//!
+//! # mdlc 自有形态：`clap` derive + i18n
+//!
+//! 自有子命令走 `clap` 的 derive（[`Cli`] + [`Commands`]），帮助文本由
+//! doc comment 生成 —— 不再有手写的 `USAGE` 常量，也不再有
+//! 「注册命令 + `match` 分支按键取值」。官方兼容形态**仍是 builder**，
+//! 理由见 [`Cli`] 的文档。
+//!
+//! 多语言由 `clap-i18n-richformatter` 提供：段落标题（用法/参数/选项/命令）、
+//! 帮助模板与**错误排版**按系统显示语言自动切换。⚠️ **命令与参数自身的
+//! 描述**是 mdlc 写死的中文，不在该 crate 的覆盖范围内。
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, Subcommand};
+use clap_i18n_richformatter::{ClapI18nRichFormatter, clap_i18n};
 use std::path::PathBuf;
 
 /// 官方 `studiomdl` 的**无值** flag（L4D2 `studiomdl.exe` 实测 usage）。
@@ -165,30 +177,323 @@ pub fn normalize_official_args(argv: &[String]) -> Normalized {
     Normalized { argv: out, unknown }
 }
 
-/// 构建完整 CLI 定义。
+// ---------------------------------------------------------------------------
+// mdlc 自有形态：derive
+// ---------------------------------------------------------------------------
+
+/// Source 引擎模型编译器（studiomdl 重写）
 ///
-/// 顶层同时接受两种形态：
-/// - **mdlc 自有**：`mdlc <子命令> ...`（裸词）；
-/// - **官方兼容**：`mdlc -game <gamedir> [-nop4] <model.qc>`（首参以 `-` 开头）。
+/// 把 TOML 描述或 QC 脚本编译成 Source 引擎的 `.mdl` / `.vvd` / `.vtx` /
+/// `.phy` 四件套，另带若干只读的检查与转换子命令。
 ///
-/// 分流在 `main.rs` 里做（首参是否以 `-` 开头），因为两种形态的
-/// 位置参数语义不同：官方形态的裸参数是 `.qc`，mdlc 形态的是子命令。
+/// 也能当官方 `studiomdl` 用：`mdlc -game <gamedir> <model.qc>` 会把产物写到
+/// `<gamedir>\models\<$modelname>`，可直接替换 Crowbar 的编译器路径。
+// 实现注记（不是给用户的帮助文本，所以放在 `//` 里而不是 doc comment）：
+//
+// - 子命令与参数的帮助正文由这些类型上的 doc comment 自动生成 —— 没有手写
+//   的 usage 常量，也没有「注册命令 + `match` 分支按键取值」。
+// - 官方兼容形态（`mdlc -game <gamedir> <x.qc>`）由 `main` 在解析前分流，
+//   不走这条路径；那份定义是 builder 版的 [`build_official_cli`]。
+// - 段落标题（用法 / 参数 / 选项 / 命令）与错误排版由
+//   `clap-i18n-richformatter` 按**系统显示语言**翻译；命令与参数**自身的
+//   描述**是下面的 doc comment，始终是中文。
+#[derive(Debug, Parser)]
+#[clap_i18n]
+#[command(name = "mdlc", version, propagate_version = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+/// mdlc 自有子命令。
+///
+/// ⚠️ 每个变体都显式写了 `#[command(name = ...)]`，不依赖 clap 从变体名
+/// 推断的 kebab-case —— 这些名字是脚本与探针的调用契约
+/// （`build` / `build-qc` / `vvd-info` / `vvd-roundtrip` / `qc2toml`）。
+#[derive(Debug, Subcommand)]
+pub enum Commands {
+    /// TOML 描述 → .mdl/.vvd/.vtx（MVP 主线）
+    #[command(name = "build")]
+    Build(BuildArgs),
+    /// 只校验描述文件，不写文件
+    #[command(name = "check")]
+    Check(CheckArgs),
+    /// SMD 三角形 → 凸包 → .phy 碰撞文件
+    #[command(name = "phy")]
+    Phy(PhyArgs),
+    /// QC 脚本 → TOML 描述（只写文本，不编译）
+    #[command(name = "qc2toml")]
+    Qc2toml(Qc2tomlArgs),
+    /// 直接从 QC 编译
+    #[command(name = "build-qc")]
+    BuildQc(BuildQcArgs),
+    /// 解析并打印 VVD 头部与统计
+    #[command(name = "vvd-info")]
+    VvdInfo(VvdInfoArgs),
+    /// VVD 读入再写出，逐字节比对
+    #[command(name = "vvd-roundtrip")]
+    VvdRoundtrip(VvdRoundtripArgs),
+    /// 打印一份带注释的最小 TOML 模板
+    #[command(name = "template")]
+    Template,
+    /// （内部）跑一次更新检测并写缓存
+    ///
+    /// **隐藏**子命令：更新检测的子进程入口（`mdlc __update-check`）。
+    /// 它刻意不出现在 `--help` 里（`hide`）—— 这是给 [`crate::update`]
+    /// 派生出去的子进程用的，不是给用户的功能。手动跑它只是为了排错：
+    /// 它会**同步**执行一次检测，把结果写进缓存。
+    ///
+    /// 之所以做成「真子命令」而不是内部环境变量开关：`spawn` 出去的是
+    /// **同一个可执行文件**，走同一条参数解析路径，所以「手动跑」与
+    /// 「后台跑」不可能分叉出两种行为。
+    #[command(name = crate::update::HIDDEN_SUBCOMMAND, hide = true)]
+    UpdateCheck,
+}
+
+/// `mdlc build <model.toml> [--out <目录>] [--optimize-vtx]`
+#[derive(Debug, Args)]
+pub struct BuildArgs {
+    /// 要编译的 TOML 描述文件
+    #[arg(value_name = "model.toml")]
+    pub toml: PathBuf,
+    /// 输出根目录（默认当前目录）
+    #[arg(long, value_name = "目录")]
+    pub out: Option<PathBuf>,
+    /// mdlc 扩展：打开 VTX 缓存优化
+    #[arg(long)]
+    pub optimize_vtx: bool,
+}
+
+impl BuildArgs {
+    /// 输出根目录：`--out` 缺省为当前目录。
+    pub fn out_root(&self) -> PathBuf {
+        self.out.clone().unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+/// `mdlc check <model.toml>`
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// 要校验的 TOML 描述文件
+    #[arg(value_name = "model.toml")]
+    pub toml: PathBuf,
+}
+
+/// `mdlc qc2toml <model.qc> [--out <path.toml>]`
+#[derive(Debug, Args)]
+pub struct Qc2tomlArgs {
+    /// 要转换的 QC 脚本
+    #[arg(value_name = "model.qc")]
+    pub qc: PathBuf,
+    /// 输出的 TOML 路径（缺省与 QC 同目录同名，扩展名换成 .toml）
+    #[arg(long, value_name = "path.toml")]
+    pub out: Option<PathBuf>,
+}
+
+/// `mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]`
+#[derive(Debug, Args)]
+pub struct BuildQcArgs {
+    /// 要编译的 QC 脚本
+    #[arg(value_name = "model.qc")]
+    pub qc: PathBuf,
+    /// 输出根目录（默认当前目录）
+    #[arg(long, value_name = "目录")]
+    pub out: Option<PathBuf>,
+    /// mdlc 扩展：打开 VTX 缓存优化
+    #[arg(long)]
+    pub optimize_vtx: bool,
+}
+
+impl BuildQcArgs {
+    /// 输出根目录：`--out` 缺省为当前目录。
+    pub fn out_root(&self) -> PathBuf {
+        self.out.clone().unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+/// `mdlc vvd-info <file.vvd>`
+#[derive(Debug, Args)]
+pub struct VvdInfoArgs {
+    /// 要解析并打印头部与统计的 VVD 文件
+    #[arg(value_name = "file.vvd")]
+    pub file: PathBuf,
+}
+
+/// `mdlc vvd-roundtrip <file.vvd>`
+#[derive(Debug, Args)]
+pub struct VvdRoundtripArgs {
+    /// 要往返比对的 VVD 文件
+    #[arg(value_name = "file.vvd")]
+    pub file: PathBuf,
+}
+
+/// `mdlc phy <in.smd> <out.phy> [选项]`（参数多，单独一个结构体）。
+#[derive(Debug, Args)]
+pub struct PhyArgs {
+    /// 输入 SMD（三角形顶点已在模型局部坐标，不做任何变换，与 studiomdl 一致）
+    #[arg(value_name = "in.smd")]
+    pub input: PathBuf,
+    /// 输出 .phy 路径
+    #[arg(value_name = "out.phy")]
+    pub output: PathBuf,
+    /// 配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0
+    #[arg(long, value_name = "N", default_value_t = 0, value_parser = parse_u32)]
+    pub checksum: u32,
+    /// $mass 等效总质量，默认 1（官方缺省；见 --automass 说明）
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    pub mass: f32,
+    /// 表面材质，默认 default
+    #[arg(long = "surfaceprop", value_name = "S", default_value = "default")]
+    pub surface_prop: String,
+    /// $concave：按**连通分量**拆成多个凸块（官方语义，不是 VHACD 体分解）
+    #[arg(long)]
+    pub concave: bool,
+    /// VHACD 近似凸分解。**非官方语义**：保留凹口，而官方 $concave 是填平
+    #[arg(long)]
+    pub vhacd: bool,
+    /// `--vhacd` 的旧别名（保留以免破坏既有脚本；语义已明确为 VHACD）
+    #[arg(long)]
+    pub decompose: bool,
+    /// $collisionjoints：按**蒙皮权重骨骼**分组，每个骨骼一个 solid
+    #[arg(long)]
+    pub ragdoll: bool,
+}
+
+impl PhyArgs {
+    /// 是否走 VHACD 体分解：`--vhacd` 或它的旧别名 `--decompose`。
+    pub fn vhacd_enabled(&self) -> bool {
+        self.vhacd || self.decompose
+    }
+}
+
+/// clap 自动生成的 `help` 子命令描述是**硬编码英文常量**
+/// （`clap_builder` 的 `command.rs:4842`），而 `clap-i18n-richformatter` 的词条
+/// 表里没有对应的 key（只有 `clap-subcommand-context` 这类上下文词），
+/// 所以这里直接写中文 —— 与其余所有子命令描述保持一致。
+const HELP_SUBCOMMAND_ABOUT: &str = "打印本信息或给定子命令的帮助";
+
+/// 构建 mdlc 自有形态的 CLI 定义（已做 i18n 处理）。
+///
+/// ⚠️ 会先初始化语言环境（`clap-i18n-richformatter` 按**系统显示语言**探测），
+/// 所以 [`Cli::command_i18n`] 与下面补的段落标题才是目标语言的。
+///
+/// 官方兼容形态是另一份定义，见 [`build_official_cli`]。
 pub fn build_cli() -> Command {
-    Command::new("mdlc")
-        .about("Source 引擎模型编译器（studiomdl 重写）")
-        .version(env!("CARGO_PKG_VERSION"))
-        .subcommand_required(false)
-        .arg_required_else_help(false)
-        .subcommand(build_cmd())
-        .subcommand(check_cmd())
-        .subcommand(phy_cmd())
-        .subcommand(qc2toml_cmd())
-        .subcommand(build_qc_cmd())
-        .subcommand(vvd_info_cmd())
-        .subcommand(vvd_roundtrip_cmd())
-        .subcommand(template_cmd())
-        // 隐藏：更新检测的子进程入口。见 [`crate::update`]。
-        .subcommand(update_check_cmd())
+    clap_i18n_richformatter::init_clap_rich_formatter_localizer();
+
+    // ⚠️ 顺序要紧：真实子命令必须在 `build()` **之前**本地化。
+    // `mut_arg` 是「摘掉再放回」，而 `build()` 之后参数已经被 `_build()` 处理过、
+    // 且 `Built` 标记会让 `_build_self` 变成空操作 —— 摘放会打乱那份已建好的状态，
+    // 结果是 `mdlc phy --help` 这类正常调用报「需要为 '--mass <F>' 赋值」。
+    let mut cmd = localize_subcommands(Cli::command_i18n());
+
+    // clap 的自动 `help` 子命令是在 `_build_self` 里才 push 进 `subcommands` 的
+    // （`command.rs:4840-4879`），而 `_build_self` 要等到解析或渲染时才跑 ——
+    // 所以想改它必须先显式 `build()` 一次。`build()` 会置上 `Built` 标记，
+    // 之后的 `_build_self` 就是空操作，不会重复 push。
+    cmd.build();
+
+    // `build()` 顺带用 `_copy_subtree_for_help` 把整棵子树克隆一份挂到 `help`
+    // 下面（`command.rs:4844-4858`），`mdlc help help` 渲染的就是那份克隆。
+    // 克隆体只被渲染、不被解析，所以在这里改是安全的。
+    cmd.mut_subcommand("help", |sc| {
+        localize_subcommands(localize_one_subcommand(sc))
+    })
+}
+
+/// 递归把子命令的帮助本地化。
+///
+/// [`Cli::command_i18n`] 只作用在**顶层**命令上：
+///
+/// - 它给顶层参数设了 `help_heading`（遍历的是顶层 `get_positionals()` /
+///   `get_opts()`），子命令的参数会落回 clap 硬编码的英文
+///   `Arguments` / `Options`；
+/// - 它的 `help_template`（里面才有本地化的「用法:」标题）也只在顶层生效，
+///   子命令仍用 clap 的默认模板，于是打出英文 `Usage:`；
+/// - 子命令列表的 `Commands:` 标题同理。
+///
+/// 递归是必要的：`Command::build()` 会把整棵子命令树克隆一份挂到自动生成的
+/// `help` 子命令下面（`command.rs:4844-4858`），而 `mdlc help help` 渲染的
+/// 正是那份克隆。
+fn localize_subcommands(cmd: Command) -> Command {
+    cmd.mut_subcommands(|sc| localize_subcommands(localize_one_subcommand(sc)))
+}
+
+/// 给单个子命令补上本地化的帮助模板、段落标题与子命令列表标题。
+///
+/// 自动生成的 `help` 子命令也走这里 —— 它的描述是 clap 里的英文常量，
+/// 见 [`HELP_SUBCOMMAND_ABOUT`]。
+fn localize_one_subcommand(mut sc: Command) -> Command {
+    use clap_i18n_richformatter::__private::get_translation;
+
+    // `clap::builder::Str` 没有 `From<String>`，只能从 `&'static str` 之类构造，
+    // 所以这里与 `clap-i18n-derive` 自己的做法一致：把翻译串 leak 成 `'static`。
+    // 每次进程启动只 leak 几条短串，代价可忽略。
+    let arguments: &'static str =
+        Box::leak(get_translation("clap-arguments-heading").into_boxed_str());
+    let options: &'static str = Box::leak(get_translation("clap-options-heading").into_boxed_str());
+    let commands: &'static str =
+        Box::leak(get_translation("clap-commands-heading").into_boxed_str());
+    let usage_heading: &'static str =
+        Box::leak(get_translation("clap-usage-heading").into_boxed_str());
+
+    // clap 自动生成的 `help` 子命令：换个本地化描述。
+    if sc.get_name() == "help" {
+        sc = sc.about(HELP_SUBCOMMAND_ABOUT);
+    }
+
+    // `help_template` 与 `command_i18n` 给顶层用的那份同构。
+    sc = sc
+        .help_template(format!(
+            "{{before-help}}{{about-with-newline}}\n{usage_heading} {{usage}}\n\n{{all-args}}{{after-help}}"
+        ))
+        .subcommand_help_heading(commands)
+        .subcommand_value_name(commands);
+
+    let positional_ids: Vec<_> = sc.get_positionals().map(|a| a.get_id().clone()).collect();
+    for id in positional_ids {
+        sc = sc.mut_arg(id, |a| a.help_heading(arguments));
+    }
+    let option_ids: Vec<_> = sc.get_opts().map(|a| a.get_id().clone()).collect();
+    for id in option_ids {
+        sc = sc.mut_arg(id, |a| a.help_heading(options));
+    }
+    sc
+}
+
+/// 解析 mdlc 自有形态的命令行。
+///
+/// 与 `Cli::parse_i18n()` 的区别有两点，都是为了嵌进 `main` 的现有骨架：
+///
+/// 1. 接受**显式 argv** —— `main` 要先按首参分流官方兼容形态，不能直接读
+///    `std::env::args_os()`；
+/// 2. 出错时**不退出**，把错误交回调用方 —— 退出码契约由 `main.rs` 的
+///    `cli_exit` 统一决定（`--help`/`--version` → stdout + 0，其余 → stderr + 2）。
+pub fn parse_i18n(argv: &[String]) -> Result<Cli, clap::error::Error<ClapI18nRichFormatter>> {
+    build_cli()
+        .try_get_matches_from(argv)
+        .and_then(|m| Cli::from_arg_matches(&m))
+        .map_err(|e| e.apply::<ClapI18nRichFormatter>())
+}
+
+/// 解析 `u32`，接受十进制与 `0x` 前缀的十六进制。
+///
+/// 直接当 `--checksum` 的 `value_parser` 用（实测工作流里 checksum 常常是
+/// 从 `.mdl` 头里以十六进制抄出来的），所以不走 clap 的默认数值解析。
+fn parse_u32(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else if let Some(hex) = t.strip_prefix("-0x") {
+        // 允许 `-0x1234`：`.mdl` 的 checksum 是有符号 int32，
+        // 十六进制抄出来常常带负号，但 `.phy` 里按 u32 存。
+        let v = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+        Ok(v.wrapping_neg())
+    } else {
+        t.parse::<u32>()
+            .or_else(|_| t.parse::<i32>().map(|v| v as u32))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 官方兼容模式的命令行（首参为 `-` 时走这里）。
@@ -245,151 +550,6 @@ pub fn build_official_cli() -> Command {
 
 fn flag(name: &'static str) -> Arg {
     Arg::new(name).long(name).action(ArgAction::SetTrue)
-}
-
-fn build_cmd() -> Command {
-    Command::new("build")
-        .about("TOML 描述 → .mdl/.vvd/.vtx（MVP 主线）")
-        .arg(Arg::new("toml").required(true).value_name("model.toml"))
-        .arg(
-            Arg::new("out")
-                .long("out")
-                .value_name("目录")
-                .help("输出根目录（默认当前目录）"),
-        )
-        .arg(
-            Arg::new("optimize_vtx")
-                .long("optimize-vtx")
-                .action(ArgAction::SetTrue),
-        )
-}
-
-fn check_cmd() -> Command {
-    Command::new("check")
-        .about("只校验描述文件，不写文件")
-        .arg(Arg::new("toml").required(true).value_name("model.toml"))
-}
-
-fn qc2toml_cmd() -> Command {
-    Command::new("qc2toml")
-        .about("QC 脚本 → TOML 描述（只写文本，不编译）")
-        .arg(Arg::new("qc").required(true).value_name("model.qc"))
-        .arg(Arg::new("out").long("out").value_name("path.toml"))
-}
-
-fn build_qc_cmd() -> Command {
-    Command::new("build-qc")
-        .about("直接从 QC 编译")
-        .arg(Arg::new("qc").required(true).value_name("model.qc"))
-        .arg(Arg::new("out").long("out").value_name("目录"))
-        .arg(
-            Arg::new("optimize_vtx")
-                .long("optimize-vtx")
-                .action(ArgAction::SetTrue),
-        )
-}
-
-fn vvd_info_cmd() -> Command {
-    Command::new("vvd-info")
-        .about("解析并打印 VVD 头部与统计")
-        .arg(Arg::new("file").required(true).value_name("file.vvd"))
-}
-
-fn vvd_roundtrip_cmd() -> Command {
-    Command::new("vvd-roundtrip")
-        .about("VVD 读入再写出，逐字节比对")
-        .arg(Arg::new("file").required(true).value_name("file.vvd"))
-}
-
-fn template_cmd() -> Command {
-    Command::new("template").about("打印一份带注释的最小 TOML 模板")
-}
-
-/// **隐藏**子命令：更新检测的子进程入口（`mdlc __update-check`）。
-///
-/// 它刻意不出现在 `--help` 里（`.hide(true)`）—— 这是给 `crate::update`
-/// 派生出去的子进程用的，不是给用户的功能。手动跑它只是为了排错：
-/// 它会**同步**执行一次检测，把结果写进缓存。
-///
-/// 之所以做成「真子命令」而不是内部环境变量开关：`spawn` 出去的是
-/// **同一个可执行文件**，走同一条参数解析路径，所以「手动跑」与
-/// 「后台跑」不可能分叉出两种行为。
-fn update_check_cmd() -> Command {
-    Command::new(crate::update::HIDDEN_SUBCOMMAND)
-        .about("（内部）跑一次更新检测并写缓存")
-        .hide(true)
-}
-
-/// `phy` 子命令（参数多，单独一个函数）。
-pub fn phy_cmd() -> Command {
-    Command::new("phy")
-        .about("SMD 三角形 → 凸包 → .phy 碰撞文件")
-        .arg(Arg::new("input").required(true).value_name("in.smd"))
-        .arg(Arg::new("output").required(true).value_name("out.phy"))
-        .arg(
-            Arg::new("checksum")
-                .long("checksum")
-                .value_name("N")
-                .help("配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0"),
-        )
-        .arg(
-            Arg::new("mass")
-                .long("mass")
-                .value_name("F")
-                .help("$mass 等效总质量，默认 1"),
-        )
-        .arg(
-            Arg::new("surfaceprop")
-                .long("surfaceprop")
-                .value_name("S")
-                .default_value("default"),
-        )
-        .arg(
-            Arg::new("concave")
-                .long("concave")
-                .action(ArgAction::SetTrue)
-                .help("$concave：按连通分量拆成多个凸块"),
-        )
-        .arg(
-            Arg::new("vhacd")
-                .long("vhacd")
-                .action(ArgAction::SetTrue)
-                .help("VHACD 近似凸分解（非官方语义）"),
-        )
-        .arg(
-            Arg::new("decompose")
-                .long("decompose")
-                .action(ArgAction::SetTrue)
-                .help("--vhacd 的旧别名"),
-        )
-        .arg(
-            Arg::new("ragdoll")
-                .long("ragdoll")
-                .action(ArgAction::SetTrue)
-                .help("$collisionjoints：按蒙皮权重骨骼分组"),
-        )
-}
-
-/// 从 `build` 的匹配结果取参数。
-pub fn build_args(m: &ArgMatches) -> (PathBuf, PathBuf, bool) {
-    (
-        PathBuf::from(m.get_one::<String>("toml").expect("required")),
-        m.get_one::<String>("out")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".")),
-        m.get_flag("optimize_vtx"),
-    )
-}
-
-/// 从 `build-qc` 的匹配结果取参数。
-pub fn build_qc_args(m: &ArgMatches) -> (PathBuf, PathBuf, bool) {
-    (
-        PathBuf::from(m.get_one::<String>("qc").expect("required")),
-        m.get_one::<String>("out")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".")),
-        m.get_flag("optimize_vtx"),
-    )
 }
 
 /// 官方兼容模式的输出根目录。
@@ -540,24 +700,117 @@ mod tests {
 
     #[test]
     fn mdlc_native_commands_still_parse() {
-        // 回归：clap 迁移不能弄坏既有子命令。
-        let cli = build_cli();
-        let m = cli
-            .clone()
-            .try_get_matches_from(["mdlc", "build", "x.toml", "--out", "d"])
-            .expect("build 必须可解析");
-        let (t, o, v) = build_args(m.subcommand().unwrap().1);
-        assert_eq!(t, PathBuf::from("x.toml"));
-        assert_eq!(o, PathBuf::from("d"));
-        assert!(!v);
+        // 回归：clap derive 迁移不能弄坏既有子命令。
+        let cli = parse_i18n(&[
+            "mdlc".into(),
+            "build".into(),
+            "x.toml".into(),
+            "--out".into(),
+            "d".into(),
+        ])
+        .expect("build 必须可解析");
+        match cli.command {
+            Commands::Build(a) => {
+                assert_eq!(a.toml, PathBuf::from("x.toml"));
+                assert_eq!(a.out_root(), PathBuf::from("d"));
+                assert!(!a.optimize_vtx);
+            }
+            other => panic!("期望 Build，得到 {other:?}"),
+        }
 
-        let m = cli
-            .clone()
-            .try_get_matches_from(["mdlc", "build-qc", "x.qc"])
+        let cli = parse_i18n(&["mdlc".into(), "build-qc".into(), "x.qc".into()])
             .expect("build-qc 必须可解析");
-        let (q, o, _) = build_qc_args(m.subcommand().unwrap().1);
-        assert_eq!(q, PathBuf::from("x.qc"));
-        assert_eq!(o, PathBuf::from("."), "默认输出根目录必须是当前目录");
+        match cli.command {
+            Commands::BuildQc(a) => {
+                assert_eq!(a.qc, PathBuf::from("x.qc"));
+                assert_eq!(
+                    a.out_root(),
+                    PathBuf::from("."),
+                    "默认输出根目录必须是当前目录"
+                );
+            }
+            other => panic!("期望 BuildQc，得到 {other:?}"),
+        }
+
+        // 无参数子命令（Unit 变体）必须仍可解析 —— 它没有
+        // `arg_required_else_help`，不能把 `mdlc template` 误判成用法错误。
+        let cli = parse_i18n(&["mdlc".into(), "template".into()]).expect("template 必须可解析");
+        assert!(matches!(cli.command, Commands::Template));
+
+        // 隐藏子命令必须仍是真子命令。
+        let cli = parse_i18n(&["mdlc".into(), crate::update::HIDDEN_SUBCOMMAND.into()])
+            .expect("隐藏子命令必须可解析");
+        assert!(matches!(cli.command, Commands::UpdateCheck));
+    }
+
+    #[test]
+    fn phy_flags_and_values_parse() {
+        let cli = parse_i18n(&[
+            "mdlc".into(),
+            "phy".into(),
+            "in.smd".into(),
+            "out.phy".into(),
+            "--checksum".into(),
+            "0x1a2b".into(),
+            "--mass".into(),
+            "2.5".into(),
+            "--surfaceprop".into(),
+            "metal".into(),
+            "--decompose".into(),
+            "--ragdoll".into(),
+        ])
+        .expect("phy 必须可解析");
+        match cli.command {
+            Commands::Phy(a) => {
+                assert_eq!(a.input, PathBuf::from("in.smd"));
+                assert_eq!(a.output, PathBuf::from("out.phy"));
+                assert_eq!(a.checksum, 0x1a2b);
+                assert_eq!(a.mass, 2.5);
+                assert_eq!(a.surface_prop, "metal");
+                assert!(!a.concave);
+                assert!(!a.vhacd);
+                assert!(a.decompose);
+                assert!(a.vhacd_enabled(), "--decompose 是 --vhacd 的旧别名");
+                assert!(a.ragdoll);
+            }
+            other => panic!("期望 Phy，得到 {other:?}"),
+        }
+
+        // 缺省值：checksum=0、mass=1.0、surfaceprop=default。
+        let cli = parse_i18n(&["mdlc".into(), "phy".into(), "a.smd".into(), "b.phy".into()])
+            .expect("phy 缺省参数必须可解析");
+        match cli.command {
+            Commands::Phy(a) => {
+                assert_eq!(a.checksum, 0);
+                assert_eq!(a.mass, 1.0);
+                assert_eq!(a.surface_prop, "default");
+                assert!(!a.vhacd_enabled());
+            }
+            other => panic!("期望 Phy，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phy_checksum_accepts_decimal_and_signed_hex() {
+        // checksum 常常是从 .mdl 头里以十六进制抄出来的（可能带负号）。
+        assert_eq!(parse_u32("123").unwrap(), 123);
+        assert_eq!(parse_u32("0x1a2b").unwrap(), 0x1a2b);
+        assert_eq!(parse_u32("0X1A2B").unwrap(), 0x1a2b);
+        assert_eq!(parse_u32("-0x1").unwrap(), u32::MAX);
+        assert!(parse_u32("zzz").is_err());
+
+        // 解析失败必须是 clap 的值校验错误（退出码 2），不是 panic。
+        let e = parse_i18n(&[
+            "mdlc".into(),
+            "phy".into(),
+            "a.smd".into(),
+            "b.phy".into(),
+            "--checksum".into(),
+            "zzz".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(e.use_stderr());
     }
 
     #[test]
@@ -570,13 +823,15 @@ mod tests {
     }
 
     #[test]
-    fn no_subcommand_yields_none_not_error() {
-        // 无参数时 clap 不应报错（`subcommand_required(false)`），
-        // 由 main 决定「打印 usage + 退出 2」—— 这是迁移前的契约。
-        let m = build_cli()
-            .try_get_matches_from(["mdlc"])
-            .expect("无参数不应是 clap 错误");
-        assert!(m.subcommand().is_none());
+    fn no_subcommand_is_usage_error_not_ok() {
+        // 无参数 = 用法错误：help 走 **stderr**、退出码 2。
+        //
+        // 这是迁移前 `main.rs` 里 `None => diagprint!("{USAGE}"); 2` 那条
+        // 分支的等价物 —— derive 用 `#[command(subcommand)]` 非 `Option`
+        // 生成的 `arg_required_else_help(true)` 表达的正是这个契约。
+        let e = build_cli().try_get_matches_from(["mdlc"]).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "无参数必须是用法错误（退出 2）");
+        assert!(e.use_stderr(), "无参数的用法提示必须走 stderr");
     }
 
     #[test]
@@ -589,5 +844,50 @@ mod tests {
         assert!(!e.use_stderr(), "--help 必须走 stdout");
         let e2 = build_cli().try_get_matches_from(["mdlc", "-h"]).unwrap_err();
         assert_eq!(e2.exit_code(), 0, "-h 必须仍是 mdlc 的 help");
+        // 子命令帮助同理（`update_e2e_routing.js` 断言它走 stderr 的那条
+        // 说的是**更新提示**，不是 clap 的 help）。
+        let e3 = build_cli()
+            .try_get_matches_from(["mdlc", "build-qc", "--help"])
+            .unwrap_err();
+        assert_eq!(e3.exit_code(), 0);
+        assert!(!e3.use_stderr());
+    }
+
+    #[test]
+    fn version_flag_is_display_version_not_error() {
+        let e = build_cli()
+            .try_get_matches_from(["mdlc", "--version"])
+            .unwrap_err();
+        assert_eq!(
+            e.exit_code(),
+            0,
+            "--version 必须是 DisplayVersion（退出 0）"
+        );
+        assert!(!e.use_stderr(), "--version 必须走 stdout");
+    }
+
+    #[test]
+    fn version_propagates_to_subcommands() {
+        // `propagate_version = true` 不只是为了好看：i18n 宏往顶层塞了
+        // `.global(true)` 的 `--version` 参数，global 参数会被推进每个
+        // 子命令 —— 而 clap 的 debug 断言要求「有 `ArgAction::Version`
+        // 参数的命令自己必须有 version」。少了这个设置，debug 构建
+        // （`cargo test`）会在解析子命令时 panic。
+        let e = build_cli()
+            .try_get_matches_from(["mdlc", "build", "--version"])
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 0);
+        assert!(!e.use_stderr());
+    }
+
+    #[test]
+    fn unknown_subcommand_is_usage_error() {
+        // 迁移前 main.rs 兜底分支打印「未知子命令」+ usage、退出 2；
+        // derive 下由 clap 的 `InvalidSubcommand` 表达，流与退出码一致。
+        let e = build_cli()
+            .try_get_matches_from(["mdlc", "bogus"])
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        assert!(e.use_stderr());
     }
 }
