@@ -1072,8 +1072,9 @@ node docs\_probe\parity_snapshot.js   # 应为 101/101
   > ⚠️ `macos-15-intel` 是 Actions **最后一代 x86_64 镜像**
   > （[2025-09 公告](https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/)，
   > 支持到 2027 秋）；之后 x86_64 产物只能靠交叉编译。
-- **Windows 保留动态 CRT**（不加 `+crt-static`）：与已发布的 `v0.1.0` asset 一致，
-  代价是使用者需装 VC++ 运行库。
+- **Windows 保留动态 CRT**（不加 `+crt-static`）：与已发布的 asset 一致
+  （`v0.1.0` 起就是这么编的，中途换会平白制造一个「这个版本要运行库、那个
+  版本不要」的断层），代价是使用者需装 VC++ 运行库。
 - **跨架构产物的冒烟测试不是免罪符**：x86_64 的 macOS 产物在 arm64 runner 上
   可能跑不起来（取决于 Rosetta）。这时会退化成 `file(1)` 核对架构 —— 但那条
   路径**断言** `file` 输出里真的出现了期望的架构名，否则失败。否则「无法执行」

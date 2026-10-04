@@ -29,7 +29,8 @@ name: Artifacts
 # 支持到 2027 秋）；之后 Apple Silicon 是唯一选项，x86_64 产物只能靠交叉编译。
 #
 # ⚠️ **为什么 Windows 保留动态 CRT**（不加 `+crt-static`）：与本仓库已发布的
-# `v0.1.0` asset 保持一致。代价是使用者需要装 VC++ 运行库
+# asset 保持一致（`v0.1.0` 起就是这么编的，中途换会平白制造一个「这个版本要
+# 运行库、那个版本不要」的断层）。代价是使用者需要装 VC++ 运行库
 # （`VCRUNTIME140.dll` / `api-ms-win-crt-*`）；若日后想改成单文件零依赖，
 # 只需给 Windows 那条加 `RUSTFLAGS: -C target-feature=+crt-static`。
 
