@@ -8,6 +8,7 @@
 </defs>
 <g clip-path="url(#clip)">
   <rect x="0" y="0" width="256" height="256" fill="url(#bg)"/>
+  <ellipse cx="128" cy="117.76" rx="102.4" ry="92.16" fill="#000000" opacity="0.13"/>
   <g>
     <polygon points="231.68,129.91 201.46,152.47 158.29,210.93 161.83,224.49 207.19,174.42" fill="#be7a44" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
     <polygon points="94.17,214.41 161.83,224.49 158.29,210.93 88.45,192.47 48.81,194.62" fill="#bd7942" stroke="#2A1608" stroke-width="10.75" stroke-linejoin="round"/>
