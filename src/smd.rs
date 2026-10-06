@@ -41,23 +41,15 @@
 //!    而 `skeleton` 段的行序与 `nodes` 的顺序一一对应。
 
 use std::collections::HashMap;
-use std::fmt;
 
 /// SMD 解析错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("第 {line} 行：{message}")]
 pub struct SmdError {
     /// 出错行号（1 起）。
     pub line: usize,
     pub message: String,
 }
-
-impl fmt::Display for SmdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "第 {} 行：{}", self.line, self.message)
-    }
-}
-
-impl std::error::Error for SmdError {}
 
 fn err(line: usize, message: impl Into<String>) -> SmdError {
     SmdError {

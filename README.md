@@ -780,14 +780,27 @@ if let Some(cs) = &collision_smd {
 
 ### 错误与退出码
 
-`PipelineError` 分四类，`kind()` 映射到与 `mdlc.exe` 相同的退出码：
+`PipelineError` 是**枚举**，每个失败点一个变体，`kind()` 映射到与 `mdlc.exe` 相同的退出码：
 
 | 变体 | `kind()` | 退出码 | 触发 |
 |---|---|---|---|
 | `Compile(Vec<CompileError>)` | `Build` | 1 | 描述/QC 校验失败、读不到源 SMD |
-| `Collision(String)` | `Build` | 1 | 碰撞 SMD 解析失败 |
-| `Write(String)` | `Build` | 1 | 写出或自检失败（本实现的 bug） |
-| `Io(String)` | `Io` | 2 | 路径解析、读文件、建目录、写文件失败 |
+| `ParseCollisionSmd { path, source }` | `Build` | 1 | 碰撞 SMD 解析失败 |
+| `WriteMdl(WriteError)` | `Build` | 1 | `.mdl` 写出失败 |
+| `BuildVvd` / `EncodeVvd` / `CheckVvd` | `Build` | 1 | VVD 构造 / 编码 / 自检失败 |
+| `WriteVtx` / `CheckVtx` | `Build` | 1 | VTX 写出 / 自检失败 |
+| `BuildPhy` / `CheckPhy` | `Build` | 1 | PHY 构造 / 自检失败 |
+| `ResolveCollisionSmd(SrcError)` | `Io` | 2 | 碰撞 SMD 路径解析失败 |
+| `ReadCollisionSmd { path, source }` | `Io` | 2 | 碰撞 SMD 读不到 |
+| `CreateDir { path, source }` | `Io` | 2 | 建目录失败 |
+| `WriteFile { path, source }` | `Io` | 2 | 写文件失败 |
+
+`kind()` 是**穷举**的，没有 `_ => Build` 兜底 —— 新增变体时编译器会强制你归类。
+
+底层错误**原样保留**（`#[source]`），不再被 `format!` 压成字符串：例如
+`ReadCollisionSmd` 的 `source` 是 `std::io::Error`，可以直接
+`.downcast_ref::<std::io::Error>().kind() == ErrorKind::NotFound` 判断「文件不存在」
+而不是去匹配中文文案。
 
 `lines()` 给出与 CLI 逐行相同的文案（编译失败是多行，其余是单行）；`Display`
 就是它们拼起来的。GUI 直接用 `lines()` 渲染日志即可，不必自己拼字符串。

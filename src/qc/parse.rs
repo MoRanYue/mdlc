@@ -4231,7 +4231,7 @@ impl<'a> Parser<'a> {
             let p = match crate::compile::resolve_smd_path(&self.qdir, f) {
                 Ok(p) => p,
                 Err(msg) => {
-                    self.errors.push(QcError::new(f.clone(), 0, msg));
+                    self.errors.push(QcError::new(f.clone(), 0, msg.to_string()));
                     continue;
                 }
             };
@@ -4265,7 +4265,7 @@ impl<'a> Parser<'a> {
                     self.errors.push(QcError::new(
                         p.display().to_string(),
                         0,
-                        err.message,
+                        err.to_string(),
                     ));
                     None
                 }

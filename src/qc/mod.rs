@@ -77,7 +77,8 @@ use std::path::{Path, PathBuf};
 ///
 /// 带**文件名与行号** —— 官方 `TokenError` 会打印 `GetTokenizerStatus`
 /// 给的文件/行，这里保持一致，否则用户面对一个 41 KB 的 `.qci` 无从下手。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{file}:{line}: {message}")]
 pub struct QcError {
     /// 出错位置所在文件（`$include` 进来的文件会显示它自己的名字）。
     pub file: String,
@@ -86,14 +87,6 @@ pub struct QcError {
     /// 说明。
     pub message: String,
 }
-
-impl std::fmt::Display for QcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}: {}", self.file, self.line, self.message)
-    }
-}
-
-impl std::error::Error for QcError {}
 
 impl QcError {
     /// 构造一条错误。

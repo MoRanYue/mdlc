@@ -234,9 +234,40 @@ pub fn notice(cache: &Cache, current: &str) -> Option<String> {
 
 /// 发起一次网络检测，返回最新 tag。
 ///
+/// 更新检测失败的原因。
+///
+/// # 为什么没有 `Clone` / `PartialEq`
+///
+/// [`ureq::Error`] 只有 `Debug`（`ureq-3.4.2/src/error.rs:7-9` 是
+/// `#[derive(Debug)] #[non_exhaustive]`），所以包着它的枚举也拿不到这两个
+/// trait。这不影响使用 —— 本类型只在 `run_check` 里被打印，从不参与比较。
+///
+/// # 为什么保留 `Request` 的 `#[source]`
+///
+/// 网络失败的原因（DNS、TLS、超时、代理）对排查很关键，改造前它们被
+/// `format!("请求失败：{e}")` 压成了一行字符串；现在 `source()` 能拿到
+/// 原始的 `ureq::Error` 链。
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    /// HTTP 请求本身失败（DNS / 连接 / TLS / 超时）。
+    #[error("请求失败：{0}")]
+    Request(#[from] ureq::Error),
+    /// 拿到了响应，但没有 `Location` 头 —— 仓库可能还没有 Release。
+    #[error("HTTP {status} 但没有 Location 头（仓库可能还没有 Release）")]
+    NoLocation { status: u16 },
+    /// `Location` 的末段是空的。
+    #[error("Location 里没有 tag：{location}")]
+    EmptyTag { location: String },
+    /// `Location` 的末段不像版本号。
+    #[error("Location 里的 tag 不像版本号：{tag}")]
+    NotAVersion { tag: String },
+}
+
+/// 拉取最新 release 的 tag。
+///
 /// 走 `releases/latest` 的 302：**不跟随重定向**，直接从 `Location` 头
 /// 取最后一段路径。实测本机 300~650 ms。
-pub fn fetch_latest_tag() -> Result<String, String> {
+pub fn fetch_latest_tag() -> Result<String, UpdateError> {
     let config = ureq::Agent::config_builder()
         // 不跟随重定向 —— 302 的 Location 就是答案。
         .max_redirects(0)
@@ -248,10 +279,7 @@ pub fn fetch_latest_tag() -> Result<String, String> {
         .build();
     let agent = ureq::Agent::new_with_config(config);
 
-    let resp = agent
-        .get(LATEST_URL)
-        .call()
-        .map_err(|e| format!("请求失败：{e}"))?;
+    let resp = agent.get(LATEST_URL).call()?;
     let status = resp.status().as_u16();
 
     // 200 = 没有 release（GitHub 把 /releases/latest 落到列表页）；
@@ -262,17 +290,21 @@ pub fn fetch_latest_tag() -> Result<String, String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let Some(loc) = loc else {
-        return Err(format!("HTTP {status} 但没有 Location 头（仓库可能还没有 Release）"));
+        return Err(UpdateError::NoLocation { status });
     };
     let tag = loc
         .trim_end_matches('/')
         .rsplit('/')
         .next()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("Location 里没有 tag：{loc}"))?;
+        .ok_or_else(|| UpdateError::EmptyTag {
+            location: loc.clone(),
+        })?;
     // 只接受看起来像版本号的 tag，避免把别的路径段当成版本。
     if parse_version(tag).is_none() {
-        return Err(format!("Location 里的 tag 不像版本号：{tag}"));
+        return Err(UpdateError::NotAVersion {
+            tag: tag.to_string(),
+        });
     }
     Ok(tag.to_string())
 }

@@ -25,26 +25,226 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::{
-    Bone, BodyModel, CompiledBodyPart, CompiledModel, CompiledModelDesc, MAX_BONES_PER_VERT, Mesh,
-    ModelDesc, ModelLods, Vertex,
+    Bone, BodyModel, CompiledBodyPart, CompiledModel, CompiledModelDesc, DescError,
+    MAX_BONES_PER_VERT, Mesh, ModelDesc, ModelLods, Vertex,
 };
-use crate::smd::{Smd, SmdPose, parse_smd};
+use crate::smd::{Smd, SmdError, SmdPose, parse_smd};
 
 /// 编译前端错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompileError {
-    /// 出错位置（描述文件里的路径，或 SMD 文件路径）。
-    pub at: String,
-    pub message: String,
+///
+/// # 为什么是枚举
+///
+/// 先前它是 `struct { at: String, message: String }` —— 所有失败都被压成
+/// 一句话，调用方拿到 `read_source()` 的错误后**无法分辨**是「文件读不到」
+/// 还是「SMD 语法错」还是「FBX 的某个特性不支持」，只能去正则匹配中文。
+///
+/// 现在每一类都保留**产生它的那个错误类型**，`source()` 能走到底：
+///
+/// ```no_run
+/// # use mdlc::compile::{CompileError, read_source, SrcOpts};
+/// # use std::path::Path;
+/// match read_source(Path::new("x.smd"), "model", &SrcOpts::default()) {
+///     Err(CompileError::ReadFile { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+///         println!("文件不存在，该提示用户检查路径");
+///     }
+///     Err(CompileError::ParseSmd { source, .. }) => {
+///         println!("第 {} 行语法错，可以在编辑器里跳过去", source.line);
+///     }
+///     _ => {}
+/// }
+/// ```
+///
+/// [`Self::Message`] 是兜底变体 —— 仍有约五十处只产出一句话的检查
+/// （「`name` 不能为空」这类），它们没有更细的结构可暴露。但**凡是能拿到
+/// 源错误的地方都不再用它**，所以 `match` 到 `Message` 就意味着「这条是
+/// mdlc 自己的规则判定，不是底层库的错误」。
+///
+/// ⚠️ 因此本类型**不是** `Clone` / `PartialEq` / `Eq`：它装着
+/// [`std::io::Error`]，那个类型三者都不实现。需要比较时请 `match` 变体。
+#[derive(Debug, thiserror::Error)]
+pub enum CompileError {
+    /// 读取源文件失败（`read_smd` 的 `read_to_string`）。
+    #[error("{at}: 读不到 {}：{source}", path.display())]
+    ReadFile {
+        at: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// SMD 文本解析失败（`read_smd`）。
+    #[error("{at}: {} 解析失败：{source}", path.display())]
+    ParseSmd {
+        at: String,
+        path: PathBuf,
+        #[source]
+        source: SmdError,
+    },
+    /// `.vta` 解析失败。
+    #[error("{at}: {} 解析失败：{source}", path.display())]
+    ParseVta {
+        at: String,
+        path: PathBuf,
+        #[source]
+        source: crate::vta::VtaError,
+    },
+    /// 资产引用 / `src*` 选项的问题（[`SrcError`]）。
+    #[error("{at}: {source}")]
+    Src {
+        at: String,
+        #[source]
+        source: SrcError,
+    },
+    /// FBX / glTF 读取失败（两者共用 [`crate::fbx::FbxError`]）。
+    #[error("{at}: {source}")]
+    Fbx {
+        at: String,
+        #[source]
+        source: crate::fbx::FbxError,
+    },
+    /// flex 规格解析失败。
+    #[error("{at}: {source}")]
+    Flex {
+        at: String,
+        #[source]
+        source: crate::flex::FlexError,
+    },
+    /// 描述层校验失败（[`crate::model::ModelDesc::validate`]）。
+    ///
+    /// ⚠️ 这里**不带 `at`** —— [`DescError`] 自己的 `path` 就是 `at`，
+    /// 先前那处 `at: d.path.clone()` 是把它拆成两个 `String` 再拼回去。
+    #[error("{0}")]
+    Desc(#[from] DescError),
+    /// 其余检查：只产出一句话，没有更细的结构。
+    #[error("{at}: {message}")]
+    Message { at: String, message: String },
 }
 
-impl std::fmt::Display for CompileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.at, self.message)
+impl CompileError {
+    /// 出错位置 —— 描述文件里的路径（`models[0].bones[2]`），或源文件路径。
+    ///
+    /// 先前它是 `struct` 的公开字段，调用方 `err.at` 就能拿到；改成枚举后
+    /// 由这个方法统一给出（[`Self::Desc`] 那支取的是
+    /// [`DescError::path`]，与其余变体的 `at` 语义相同）。
+    pub fn at(&self) -> &str {
+        match self {
+            Self::ReadFile { at, .. }
+            | Self::ParseSmd { at, .. }
+            | Self::ParseVta { at, .. }
+            | Self::Src { at, .. }
+            | Self::Fbx { at, .. }
+            | Self::Flex { at, .. }
+            | Self::Message { at, .. } => at,
+            Self::Desc(err) => &err.path,
+        }
+    }
+
+    /// 这条错误的说明文字，**不含** `at` 前缀。
+    ///
+    /// 先前它是 `struct` 的公开字段。想拿「位置 + 说明」的完整一行请用
+    /// [`std::fmt::Display`]（即 `err.to_string()`）。
+    pub fn message(&self) -> String {
+        match self {
+            Self::ReadFile { path, source, .. } => {
+                format!("读不到 {}：{source}", path.display())
+            }
+            Self::ParseSmd { path, source, .. } => {
+                format!("{} 解析失败：{source}", path.display())
+            }
+            Self::ParseVta { path, source, .. } => {
+                format!("{} 解析失败：{source}", path.display())
+            }
+            Self::Src { source, .. } => source.to_string(),
+            Self::Fbx { source, .. } => source.to_string(),
+            Self::Flex { source, .. } => source.to_string(),
+            Self::Desc(err) => err.kind.to_string(),
+            Self::Message { message, .. } => message.clone(),
+        }
     }
 }
 
-impl std::error::Error for CompileError {}
+/// 模块内 `e()` 辅助函数的第二个参数 —— 决定 [`CompileError`] 落到哪个变体。
+///
+/// 有这个 trait，68 个 `e(at, ...)` 调用点才**一行都不用改**：
+/// 传 `SrcError` 就得到 [`CompileError::Src`]，传 `FbxError` 就得到
+/// [`CompileError::Fbx`]，传字符串则落到 [`CompileError::Message`]。
+///
+/// ⚠️ 新写代码时**优先传具体的错误类型**，不要 `err.to_string()` ——
+/// 那正是本类型改成枚举要消灭的写法。
+pub trait IntoCompileError {
+    /// 把 `self` 与出错位置组合成一条编译错误。
+    fn at(self, at: String) -> CompileError;
+}
+
+impl IntoCompileError for String {
+    fn at(self, at: String) -> CompileError {
+        CompileError::Message { at, message: self }
+    }
+}
+
+impl IntoCompileError for &str {
+    fn at(self, at: String) -> CompileError {
+        CompileError::Message {
+            at,
+            message: self.to_string(),
+        }
+    }
+}
+
+impl IntoCompileError for SrcError {
+    fn at(self, at: String) -> CompileError {
+        CompileError::Src { at, source: self }
+    }
+}
+
+impl IntoCompileError for crate::fbx::FbxError {
+    fn at(self, at: String) -> CompileError {
+        CompileError::Fbx { at, source: self }
+    }
+}
+
+impl IntoCompileError for crate::flex::FlexError {
+    fn at(self, at: String) -> CompileError {
+        CompileError::Flex { at, source: self }
+    }
+}
+
+/// 资产引用 / `src*` 选项的错误。
+///
+/// 与 [`CompileError`] 分开，是因为这些错误**不依赖任何文件内容** ——
+/// 只由「用户写的路径字符串」与「`src*` 选项的值」决定，所以
+/// [`crate::model::ModelDesc::validate`] 那类纯校验路径也能直接用它，
+/// 不必先编出一个 `at` 定位串。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SrcError {
+    /// 资产引用没写扩展名（[`resolve_smd_path`]）。
+    #[error(
+        "资产引用 {smd:?} 没有扩展名：mdlc 要求写完整文件名（如 {smd:?}.smd）。\
+         官方会按 .vrm/.smd/.sma/.phys/.vta/.obj 依次试探（`Load_Source`），\
+         本实现不做这种猜测。"
+    )]
+    MissingExtension { smd: String },
+    /// 扩展名不在支持列表里（[`SourceKind::of`]）。
+    #[error("不认识的资产格式 {other:?}（{path}）：目前支持 .smd、.fbx 与 .gltf/.glb。")]
+    UnknownFormat {
+        other: Option<String>,
+        path: String,
+    },
+    /// `src_axis` 的值域错误（[`SrcOpts::of_model`]）。
+    #[error(
+        "src_axis 只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
+         大小写不敏感），实际 {value:?}"
+    )]
+    BadAxis { value: String },
+    /// `srcshapekey` 名单里有源文件里不存在的名字（[`SrcOpts::order_shape_keys`]）。
+    #[error(
+        "srcshapekey 里的 {} 在源文件里不存在；现有的是 {have:?}",
+        missing.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>().join(" / ")
+    )]
+    ShapeKeyMissing {
+        missing: Vec<String>,
+        have: Vec<String>,
+    },
+}
 
 /// 未配 `eyelid` 的 eyeball 用的占位 flexdesc 名（L4D2 行为，见
 /// [`resolve_flex_eyeball_mouth`] 的「0.」小节）。
@@ -59,11 +259,8 @@ const DEFAULT_SECTION_THRESHOLD: i32 = 120;
 /// （`fxr1`/`fx2`/`fxl1` 三个用例一致，且与 eyeball 的 `radius` 无关）。
 const DUMMY_LID_TARGETS: [f32; 3] = [-1.0, 0.0, 1.0];
 
-fn e(at: impl Into<String>, message: impl Into<String>) -> CompileError {
-    CompileError {
-        at: at.into(),
-        message: message.into(),
-    }
+fn e(at: impl Into<String>, message: impl IntoCompileError) -> CompileError {
+    message.at(at.into())
 }
 
 /// 浮点去重键：按位比较。
@@ -350,14 +547,12 @@ pub fn static_prop_rotate(v: [f32; 3]) -> [f32; 3] {
 ///   「用户少写了一个扩展名」。直接报错更准确。
 ///
 /// 所以这里在缺扩展名时返回错误，由调用方带上自己的定位信息上报。
-pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> Result<PathBuf, String> {
+pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> Result<PathBuf, SrcError> {
     let p = Path::new(smd);
     if !p.extension().is_some_and(|ext| !ext.is_empty()) {
-        return Err(format!(
-            "资产引用 {smd:?} 没有扩展名：mdlc 要求写完整文件名（如 {smd:?}.smd）。\
-             官方会按 .vrm/.smd/.sma/.phys/.vta/.obj 依次试探（`Load_Source`），\
-             本实现不做这种猜测。"
-        ));
+        return Err(SrcError::MissingExtension {
+            smd: smd.to_string(),
+        });
     }
     Ok(if p.is_absolute() {
         p.to_path_buf()
@@ -368,13 +563,16 @@ pub fn resolve_smd_path(base_dir: &Path, smd: &str) -> Result<PathBuf, String> {
 
 /// 读取并解析一个 SMD 文件。
 fn read_smd(path: &Path, at: &str) -> Result<Smd, CompileError> {
-    let text = std::fs::read_to_string(path).map_err(|err| {
-        e(
-            at,
-            format!("读不到 {}：{err}", path.display()),
-        )
+    let text = std::fs::read_to_string(path).map_err(|source| CompileError::ReadFile {
+        at: at.to_string(),
+        path: path.to_path_buf(),
+        source,
     })?;
-    parse_smd(&text).map_err(|err| e(at, format!("{} 解析失败：{err}", path.display())))
+    parse_smd(&text).map_err(|source| CompileError::ParseSmd {
+        at: at.to_string(),
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// 一个资产引用的**格式**，由扩展名决定。
@@ -398,7 +596,7 @@ impl SourceKind {
     ///
     /// ⚠️ 只对**几何源 / 动画源**调用。`.vta` 走 [`resolve_smd_path`] 但
     /// **不**经过这里（它有自己的解析器，见 [`crate::vta`]）。
-    pub fn of(path: &Path) -> Result<Self, String> {
+    pub fn of(path: &Path) -> Result<Self, SrcError> {
         let ext = path
             .extension()
             .and_then(|x| x.to_str())
@@ -410,10 +608,10 @@ impl SourceKind {
             // 两者走同一条读取路径（`gltf::Gltf::from_slice_without_validation`
             // 自己认头四字节 `glTF`）。
             Some("gltf" | "glb") => Ok(SourceKind::Gltf),
-            other => Err(format!(
-                "不认识的资产格式 {other:?}（{}）：目前支持 .smd、.fbx 与 .gltf/.glb。",
-                path.display()
-            )),
+            other => Err(SrcError::UnknownFormat {
+                other: other.map(str::to_string),
+                path: path.display().to_string(),
+            }),
         }
     }
 }
@@ -469,15 +667,14 @@ impl SrcOpts {
     ///
     /// `src_axis` 的值域错误在这里就报出来 —— [`crate::model::ModelDesc::validate`]
     /// 也会查一遍，但编译路径不该依赖「调用方先校验过」。
-    pub fn of_model(m: &crate::model::BodyModel) -> Result<Self, String> {
+    pub fn of_model(m: &crate::model::BodyModel) -> Result<Self, SrcError> {
         let axis = match m.src_axis.as_deref() {
             None => None,
-            Some(s) => Some(crate::fbx::ForcedAxis::parse(s).ok_or_else(|| {
-                format!(
-                    "src_axis 只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
-                     大小写不敏感），实际 {s:?}"
-                )
-            })?),
+            Some(s) => Some(
+                crate::fbx::ForcedAxis::parse(s).ok_or_else(|| SrcError::BadAxis {
+                    value: s.to_string(),
+                })?,
+            ),
         };
         Ok(Self {
             fbx: crate::fbx::FbxOpts {
@@ -533,7 +730,7 @@ impl SrcOpts {
     pub fn order_shape_keys(
         &self,
         keys: &[crate::fbx::FbxShapeKey],
-    ) -> Result<Vec<crate::fbx::FbxShapeKey>, String> {
+    ) -> Result<Vec<crate::fbx::FbxShapeKey>, SrcError> {
         if self.shape_key_ignore {
             return Ok(Vec::new());
         }
@@ -553,15 +750,10 @@ impl SrcOpts {
                 }
             }
             if !missing.is_empty() {
-                let have: Vec<&str> = keys.iter().map(|k| k.name.as_str()).collect();
-                return Err(format!(
-                    "srcshapekey 里的 {} 在源文件里不存在；现有的是 {have:?}",
-                    missing
-                        .iter()
-                        .map(|m| format!("{m:?}"))
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                ));
+                return Err(SrcError::ShapeKeyMissing {
+                    missing,
+                    have: keys.iter().map(|k| k.name.clone()).collect(),
+                });
             }
             return Ok(out);
         }
@@ -1471,7 +1663,7 @@ fn blend_grid_size(
     errs: &mut Vec<CompileError>,
 ) -> Option<(i32, i32)> {
     let n = s.blends.len() as i32;
-    let e = |msg: String| CompileError {
+    let e = |msg: String| CompileError::Message {
         at: format!("{at}.blends"),
         message: msg,
     };
@@ -1589,7 +1781,7 @@ fn load_smd_frames(
     opts: &SrcOpts,
     errs: &mut Vec<CompileError>,
 ) -> Option<(Vec<Vec<crate::smd::SmdPose>>, Smd)> {
-    let e = |msg: String| CompileError {
+    let e = |msg: String| CompileError::Message {
         at: at.to_string(),
         message: msg,
     };
@@ -2228,7 +2420,7 @@ fn apply_calc_blend_axes(
                 Some(name) => match lookup_attachment(&desc, &bone_index, name, &pose_to_bone) {
                     Some(v) => v,
                     None => {
-                        errors.push(CompileError {
+                        errors.push(CompileError::Message {
                             at: format!("sequences[{si}].blend_params[{}]", ax.axis),
                             message: format!("未知的 calcblend 附着点 {name:?}"),
                         });
@@ -2259,7 +2451,7 @@ fn apply_calc_blend_axes(
             );
             // ---- 失败判据（`simplify.cpp:5566-5569`）----
             if (start - end).abs() < 0.01 {
-                errors.push(CompileError {
+                errors.push(CompileError::Message {
                     at: format!("sequences[{si}]"),
                     message: format!(
                         "calcblend failed in {}（paramstart={start} paramend={end}，\
@@ -2422,13 +2614,7 @@ fn pose_for(smd: &Smd, node_index: usize) -> Option<&SmdPose> {
 pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, Vec<CompileError>> {
     // 先做描述层校验（能一次报出全部问题，比逐个文件报错友好）。
     if let Err(errs) = desc.validate() {
-        return Err(errs
-            .iter()
-            .map(|d| CompileError {
-                at: d.path.clone(),
-                message: d.message.clone(),
-            })
-            .collect());
+        return Err(errs.into_iter().map(CompileError::Desc).collect());
     }
 
     let mut errors: Vec<CompileError> = Vec::new();
@@ -2626,7 +2812,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     for (ai, a) in desc.animations.iter().enumerate() {
         let at = format!("animations[{ai}]");
         if anim_index.contains_key(a.name.as_str()) {
-            seq_errors.push(CompileError {
+            seq_errors.push(CompileError::Message {
                 at: format!("{at}.name"),
                 message: format!("动画名 {:?} 重复", a.name),
             });
@@ -2669,7 +2855,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             let lo = lo.clamp(0, n - 1);
             let hi = hi.clamp(0, n - 1);
             if hi < lo {
-                seq_errors.push(CompileError {
+                seq_errors.push(CompileError::Message {
                     at: format!("{at}.frames"),
                     message: format!("结束帧 {hi} 早于起始帧 {lo}（源只有 {n} 帧）"),
                 });
@@ -2791,7 +2977,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 }
             };
         let Some(src) = resolved else {
-            seq_errors.push(CompileError {
+            seq_errors.push(CompileError::Message {
                 at: format!("animations[{i}].subtract"),
                 message: format!(
                     "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
@@ -2812,7 +2998,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         };
         let bf = (*ref_frame).max(0) as usize;
         if bf >= src.len() {
-            seq_errors.push(CompileError {
+            seq_errors.push(CompileError::Message {
                 at: format!("animations[{i}].subtract_frame"),
                 message: format!("参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧", src.len()),
             });
@@ -3454,7 +3640,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         let src = anims[j].frames.clone();
                         let bf = s.subtract_frame.unwrap_or(0).max(0) as usize;
                         if bf >= src.len() {
-                            seq_errors.push(CompileError {
+                            seq_errors.push(CompileError::Message {
                                 at: format!("{at}.subtract_frame"),
                                 message: format!(
                                     "参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧",
@@ -3470,7 +3656,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         subtract_base_frames(&mut frames, &src, bf, &w);
                     }
                     None => {
-                        seq_errors.push(CompileError {
+                        seq_errors.push(CompileError::Message {
                             at: format!("{at}.subtract"),
                             message: format!(
                                 "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
@@ -6264,7 +6450,7 @@ fn resolve_vta_flexes(
                             }
                         }
                     }
-                    Err(err) => errs.push(e(&fat, err.message)),
+                    Err(err) => errs.push(e(&fat, err)),
                 }
             }
 
@@ -7412,7 +7598,7 @@ pub fn weight_list_index(desc: &ModelDesc, name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelDesc;
+    use crate::model::{DescErrorKind, ModelDesc};
 
     fn write(dir: &Path, name: &str, text: &str) -> PathBuf {
         let p = dir.join(name);
@@ -7746,7 +7932,7 @@ mod tests {
         let toml = desc_toml("bad.smd");
         let desc: ModelDesc = toml::from_str(&toml).unwrap();
         let errs = compile(&desc, &dir).unwrap_err();
-        let joined = errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+        let joined = errs.iter().map(|e| e.message()).collect::<Vec<_>>().join("\n");
         assert!(
             joined.contains("nodes 段只有 2 项"),
             "报错必须给出正确的 nodes 项数，实际：{joined}"
@@ -9447,8 +9633,16 @@ type = "mouth"
 
         o.shape_keys = vec!["b".into(), "nope".into()];
         let err = o.order_shape_keys(&keys).unwrap_err();
-        assert!(err.contains("nope"), "{err}");
-        assert!(err.contains("现有的是"), "错误信息要列出源里有什么：{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(msg.contains("现有的是"), "错误信息要列出源里有什么：{msg}");
+        // 结构化断言 —— 这才是类型化的意义：调用方能直接 `match` 出
+        // 「哪个名字缺了」，不必去正则匹配中文字符串。
+        let SrcError::ShapeKeyMissing { missing, have } = &err else {
+            panic!("应是 ShapeKeyMissing，实际：{err:?}");
+        };
+        assert_eq!(missing, &["nope"]);
+        assert_eq!(have, &["a", "b", "c"]);
     }
 
     /// `srcshapekeyorder` = **只定序**：名单里的在前，其余按源顺序跟后。
@@ -9539,8 +9733,13 @@ type = "mouth"
 
         m.src_axis = Some("sideways".into());
         let err = SrcOpts::of_model(&m).unwrap_err();
-        assert!(err.contains("sideways"), "{err}");
-        assert!(err.contains("src_axis"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("sideways"), "{msg}");
+        assert!(msg.contains("src_axis"), "{msg}");
+        let SrcError::BadAxis { value } = &err else {
+            panic!("应是 BadAxis，实际：{err:?}");
+        };
+        assert_eq!(value, "sideways");
     }
 
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----
@@ -9997,7 +10196,7 @@ $sequence \"idle\" \"myprop-ref.smd\" fps 30
         let errs = compile(&ModelDesc::from_toml(&t).unwrap(), &d)
             .expect_err("control 找不到官方是 MdlError，必须报错");
         assert!(
-            errs.iter().any(|x| x.message.contains("control 骨骼")),
+            errs.iter().any(|x| x.message().contains("control 骨骼")),
             "错误信息应点名 control 骨骼：{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -11630,7 +11829,7 @@ end
         let desc = ModelDesc::from_toml(&desc_toml("myprop-ref.smd")).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
         assert!(
-            errs.iter().any(|x| x.message.contains("找不到")),
+            errs.iter().any(|x| x.message().contains("找不到")),
             "应报材质未声明：{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -11641,7 +11840,7 @@ end
         let d = tmpdir("missing");
         let desc = ModelDesc::from_toml(&desc_toml("nope.smd")).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
-        assert!(errs.iter().any(|x| x.message.contains("读不到")), "{errs:?}");
+        assert!(errs.iter().any(|x| x.message().contains("读不到")), "{errs:?}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -11670,8 +11869,13 @@ end
         );
         // 缺扩展名 ⟹ 报错，错误串里既回显引用又点明原因。
         let err = resolve_smd_path(base, "c").unwrap_err();
-        assert!(err.contains("\"c\""), "错误串应回显引用：{err}");
-        assert!(err.contains("没有扩展名"), "错误串应点明原因：{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("\"c\""), "错误串应回显引用：{msg}");
+        assert!(msg.contains("没有扩展名"), "错误串应点明原因：{msg}");
+        let SrcError::MissingExtension { smd } = &err else {
+            panic!("应是 MissingExtension，实际：{err:?}");
+        };
+        assert_eq!(smd, "c");
         // ⚠️ 目录名里的点**不算**扩展名：`file_name()` 是 `c`，没有点。
         assert!(
             resolve_smd_path(base, "a.b/c").is_err(),
@@ -11698,7 +11902,7 @@ end
         let errs = compile(&desc, &d).unwrap_err();
         let joined = errs
             .iter()
-            .map(|x| x.message.clone())
+            .map(|x| x.message())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -12073,7 +12277,7 @@ end
         let errs = compile(&desc, &d).unwrap_err();
         // 唯一的三角形被丢弃 → 必须报错而不是产出空模型。
         assert!(
-            errs.iter().any(|x| x.message.contains("没有可用的三角形")),
+            errs.iter().any(|x| x.message().contains("没有可用的三角形")),
             "{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -12345,7 +12549,7 @@ weight = 0.5
         let errs = d.validate().unwrap_err();
         assert!(
             errs.iter().any(|e| e.path.contains("weight_lists[0].bones[0].bone")
-                && e.message.contains("nosuchbone")),
+                && matches!(&e.kind, DescErrorKind::BoneNotFound { bone, .. } if bone == "nosuchbone")),
             "{errs:?}"
         );
     }
@@ -12393,8 +12597,8 @@ weight = 0.5
         });
         let errs = d.validate().unwrap_err();
         assert!(
-            errs.iter()
-                .any(|e| e.path == "sequences[0].weight_list" && e.message.contains("NOPE")),
+            errs.iter().any(|e| e.path == "sequences[0].weight_list"
+                && matches!(&e.kind, DescErrorKind::WeightListNotFound { name } if name == "NOPE")),
             "{errs:?}"
         );
     }
@@ -12420,7 +12624,8 @@ weight = 0.25
         );
         let errs = d.validate().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.message.contains("权重表名重复")),
+            errs.iter()
+                .any(|e| matches!(e.kind, DescErrorKind::Duplicate { what: "权重表名", .. })),
             "{errs:?}"
         );
     }
@@ -12450,7 +12655,7 @@ weight = 0.25
         ));
         let errs = bad.validate().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.message.contains("条目过多")),
+            errs.iter().any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("条目过多"))),
             "{errs:?}"
         );
     }
@@ -12610,8 +12815,8 @@ smd = "dsq.smd"
         .unwrap();
         let errs = desc.validate().unwrap_err();
         assert!(
-            errs.iter()
-                .any(|e| e.path == "sequences[0].smd" && e.message.contains("不该有 smd")),
+            errs.iter().any(|e| e.path == "sequences[0].smd"
+                && matches!(&e.kind, DescErrorKind::Other { message } if message.contains("不该有 smd"))),
             "{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -13289,7 +13494,7 @@ forward_declared = true
 
         let errs = split_oversized_meshes(&mut c).expect_err("长度不一致必须报错");
         assert!(
-            errs.iter().any(|x| x.message.contains("lods.meshes")),
+            errs.iter().any(|x| x.message().contains("lods.meshes")),
             "错误信息应指明 lods.meshes 长度不对：{errs:?}"
         );
     }
@@ -14485,12 +14690,12 @@ $model \"body\" \"a.smd\" {\n\
         let _ = std::fs::remove_dir_all(&d);
 
         assert!(
-            err.iter().any(|e| e.message.contains("calcblend failed")),
+            err.iter().any(|e| e.message().contains("calcblend failed")),
             "错误信息应含 `calcblend failed`（与官方同一句），实际：{err:?}"
         );
         // 官方把**序列名**写进消息（`MdlError("calcblend failed in %s")`）。
         assert!(
-            err.iter().any(|e| e.message.contains("multi")),
+            err.iter().any(|e| e.message().contains("multi")),
             "错误信息应含序列名 `multi`，实际：{err:?}"
         );
     }
@@ -14740,7 +14945,7 @@ $model \"body\" \"a.smd\" {\n\
         let _ = std::fs::remove_dir_all(&d);
 
         assert!(
-            err.iter().any(|e| e.message.contains("nosuchatt")),
+            err.iter().any(|e| e.message().contains("nosuchatt")),
             "错误信息应含附着点名，实际：{err:?}"
         );
     }

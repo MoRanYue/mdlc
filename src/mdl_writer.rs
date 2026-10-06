@@ -883,18 +883,31 @@ mod at_off {
 /// 每个 `TooMany*` 都对应一个**二进制字段装不下**的硬约束，
 /// 并在文档里写明**是哪个字段、多少位**。**不再有**「复刻 studiomdl
 /// 人为上限」的错误 —— 见模块顶部「上限常量」一节的说明。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WriteError {
     /// 描述文件不合法（由 `validate` 产生）。
+    #[error(
+        "描述文件有 {} 处错误：\n{}",
+        .0.len(),
+        .0.iter().map(|e| format!("  - {e}\n")).collect::<String>()
+    )]
     Invalid(Vec<String>),
     /// 内部不一致（例如偏移溢出）—— 属于本实现的 bug，不应发生。
+    #[error("内部错误（请报告）：{0}")]
     Internal(String),
     /// 名字超过内联字段长度。
+    #[error("{path} 过长：{len} 字节，上限 {max}")]
     NameTooLong { path: String, len: usize, max: usize },
     /// **每 mesh 顶点数**超过 [`MAXSTUDIOVERTS_PER_MESH`]。
     ///
     /// 格式依据：VTX 的 `Vertex_t.origMeshVertID` 是 `uint16`
     /// ⟹ 下标 `0..=65535` ⟹ 上限 **65536**（判据是 `>`，不是 `>=`）。
+    #[error(
+        "{model} 的单个 mesh 有 {count} 个顶点，超过格式上限 {max}\
+         （VTX 的 `origMeshVertID` 是 uint16，下标 0..{}）—— \
+         请把该 mesh 拆成多个材质槽位",
+        max - 1
+    )]
     TooManyMeshVertices {
         model: String,
         count: usize,
@@ -907,6 +920,12 @@ pub enum WriteError {
     ///
     /// ⚠️ 这个上限是 **4473 万**，不是 studiomdl 的 65536 ——
     /// 后者是引擎运行时顶点缓存的假定，不是文件格式约束。
+    #[error(
+        "{path} 有 {count} 个顶点（跨 LOD 去重后），超过格式上限 {max}\
+         （`mstudiomodel_t.vertexindex` 是 int32 字节偏移，\
+         每顶点 {VERTEX_STRIDE} 字节）—— 请把该 model 拆成多个 \
+         `[[bodyparts.models]]`"
+    )]
     TooManyModelVertices {
         path: String,
         count: usize,
@@ -916,54 +935,16 @@ pub enum WriteError {
     ///
     /// 格式依据：skin 表是**有符号 `short`**（`hl2sdk-doi/public/studio.h:2297`）
     /// ⟹ 材质下标最大 32767 ⟹ 表最多 32768 条。
+    #[error(
+        "材质表 {count} 条，超过格式上限 {max} 条（下标 0..{}）—— \
+         skin 表 `pSkinref` 是**有符号 short**",
+        max - 1
+    )]
     TooManyTextures { count: usize, max: usize },
     /// **单个 strip group 的索引条数**超过 `int32`。
+    #[error("{model} 的单个 strip group 索引数 {count} 超出 int32")]
     TooManyIndices { model: String, count: usize },
 }
-
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Invalid(errs) => {
-                writeln!(f, "描述文件有 {} 处错误：", errs.len())?;
-                for e in errs {
-                    writeln!(f, "  - {e}")?;
-                }
-                Ok(())
-            }
-            Self::Internal(m) => write!(f, "内部错误（请报告）：{m}"),
-            Self::NameTooLong { path, len, max } => {
-                write!(f, "{path} 过长：{len} 字节，上限 {max}")
-            }
-            Self::TooManyMeshVertices { model, count, max } => write!(
-                f,
-                "{model} 的单个 mesh 有 {count} 个顶点，超过格式上限 {max}\
-                 （VTX 的 `origMeshVertID` 是 uint16，下标 0..{}）—— \
-                 请把该 mesh 拆成多个材质槽位",
-                max - 1
-            ),
-            Self::TooManyModelVertices { path, count, max } => write!(
-                f,
-                "{path} 有 {count} 个顶点（跨 LOD 去重后），超过格式上限 {max}\
-                 （`mstudiomodel_t.vertexindex` 是 int32 字节偏移，\
-                 每顶点 {VERTEX_STRIDE} 字节）—— 请把该 model 拆成多个 \
-                 `[[bodyparts.models]]`"
-            ),
-            Self::TooManyTextures { count, max } => write!(
-                f,
-                "材质表 {count} 条，超过格式上限 {max} 条（下标 0..{}）—— \
-                 skin 表 `pSkinref` 是**有符号 short**",
-                max - 1
-            ),
-            Self::TooManyIndices { model, count } => write!(
-                f,
-                "{model} 的单个 strip group 索引数 {count} 超出 int32"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WriteError {}
 
 /// 一个 model 在 VVD 顶点块里的起点（供写 VVD 时对齐使用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5563,7 +5544,7 @@ absolute_rotation = false
         let desc = crate::model::ModelDesc::from_toml(&bad).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
         assert!(
-            errs.iter().any(|e| e.at == "bones"),
+            errs.iter().any(|e| e.at() == "bones"),
             "应在 compile 阶段报「没有骨骼」：{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();

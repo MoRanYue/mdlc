@@ -2958,7 +2958,9 @@ impl Physics {
     ///   （`collisionmodel.cpp:1670`）。
     ///
     /// `friction` 省略时官方默认 **`1.0`**（`collisionmodel.cpp:1848-1851`）。
-    pub fn joint_constraints(&self) -> Result<Vec<crate::phy::JointConstraint>, String> {
+    pub fn joint_constraints(
+        &self,
+    ) -> Result<Vec<crate::phy::JointConstraint>, crate::phy::ConstraintError> {
         let mut out = Vec::with_capacity(self.constraints.len());
         for (i, c) in self.constraints.iter().enumerate() {
             let axis = c
@@ -2966,26 +2968,24 @@ impl Physics {
                 .chars()
                 .next()
                 .and_then(crate::phy::JointConstraint::axis_from_char)
-                .ok_or_else(|| {
-                    format!(
-                        "[physics.constraints][{i}] 的 axis={:?} 非法：\
-                         必须是 x / y / z（官方只取首字母）",
-                        c.axis
-                    )
+                .ok_or_else(|| crate::phy::ConstraintError::BadAxis {
+                    index: i,
+                    axis: c.axis.clone(),
                 })?;
             let kind = crate::phy::JointLimitType::parse(&c.kind).ok_or_else(|| {
-                format!(
-                    "[physics.constraints][{i}] 的 kind={:?} 非法：\
-                     必须是 free / fixed / limit",
-                    c.kind
-                )
+                crate::phy::ConstraintError::BadKind {
+                    index: i,
+                    kind: c.kind.clone(),
+                }
             })?;
             if c.min > c.max {
-                return Err(format!(
-                    "[physics.constraints][{i}]（骨骼 {:?} 轴 {}）的 min={} > max={}，\
-                     官方会以 \"Invalid joint constraint\" 中止编译",
-                    c.bone, c.axis, c.min, c.max
-                ));
+                return Err(crate::phy::ConstraintError::MinGreaterThanMax {
+                    index: i,
+                    bone: c.bone.clone(),
+                    axis: c.axis.clone(),
+                    min: c.min,
+                    max: c.max,
+                });
             }
             out.push(crate::phy::JointConstraint {
                 bone: c.bone.clone(),
@@ -5344,17 +5344,130 @@ smd = "myprop-ref.smd"
 "#;
 
 /// 校验/规范化时发现的错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # 为什么带 `kind`
+///
+/// 先前它只有 `path` + `message: String`，调用方想知道「到底是哪一类问题」
+/// 只能去 `message.contains("找不到骨骼")` —— 而 `message` 是**给终端用户看的
+/// 中文**，改一个字的措辞就会让下游的字符串匹配静默失效。
+///
+/// [`DescErrorKind`] 把**反复出现的几类**变成可 `match` 的变体，其余落到
+/// [`DescErrorKind::Other`]（它仍是字符串 —— 那些检查只产出一句话，
+/// 没有更细的结构可暴露）。
+///
+/// ⚠️ **文案逐字节未变**：每个变体的 `Display` 都复刻了原先的 `format!`，
+/// 所以 `to_string()` 与改造前完全相同。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{path}: {kind}")]
 pub struct DescError {
     /// 出错的字段路径，如 `bodyparts[0].models[1].meshes[0].triangles[3]`。
     pub path: String,
-    pub message: String,
+    /// 问题种类。
+    pub kind: DescErrorKind,
 }
 
-impl std::fmt::Display for DescError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.path, self.message)
-    }
+/// [`DescError`] 的问题种类。
+///
+/// 变体只覆盖**反复出现**的几类（实测 48 个校验点里 35 个落在前八个变体上）；
+/// 剩下的 13 个各自只有一句话，落在 [`Self::Other`]。
+///
+/// 判据：**`path` 与种类正交** —— `path` 是运行时拼出来的
+/// （`format!("{bpath}.models[{mi}]")` 之类），而**每个变体都需要它**，
+/// 所以它是 [`DescError`] 的字段而不是变体载荷。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DescErrorKind {
+    /// 必填字段为空。
+    ///
+    /// `message` 保留原文 —— 各处的措辞并不统一（「不能为空」、
+    /// 「网格名不能为空」、「不能为空 —— 必须指向一个 SMD 文件」…）。
+    /// 归一化会改动既有文案，而 `match` 看的是**变体**，原话用
+    /// `to_string()` 就能读到。
+    #[error("{message}")]
+    Empty { message: &'static str },
+
+    /// 引用了不存在的骨骼。
+    ///
+    /// `what` 是限定语（`"父"` → 「找不到父骨骼」，空串 → 「找不到骨骼」），
+    /// `note` 是少数几处额外的补充说明。
+    #[error("找不到{what}骨骼 {bone:?}{note}")]
+    BoneNotFound {
+        what: &'static str,
+        bone: String,
+        note: &'static str,
+    },
+
+    /// 父骨骼排在本骨骼之后（官方要求父骨骼必须先出现）。
+    #[error("父骨骼 {bone:?} 排在本骨骼之后；父骨骼必须先出现")]
+    ParentBoneOutOfOrder { bone: String },
+
+    /// 引用了不存在的权重表。
+    #[error("找不到权重表 {name:?}")]
+    WeightListNotFound { name: String },
+
+    /// 名字重复。
+    #[error("{what}重复：{name:?}")]
+    Duplicate { what: &'static str, name: String },
+
+    /// 数值不是有限数（NaN / ±inf）。
+    #[error("不是有限数{}", .value.as_ref().map(|v| format!("：{v}")).unwrap_or_default())]
+    NotFinite { value: Option<String> },
+
+    /// 数值必须是**正**有限数（`fps` / `src_scale` / `src_fps` 之类）。
+    ///
+    /// `detail` 是「实际」与数值之间的那个字 —— 历史上有「实际**为** x」
+    /// 与「实际 x」两种措辞，都在用，所以原样保留。
+    #[error("必须是正有限数，实际{detail} {value}")]
+    NotPositive {
+        detail: &'static str,
+        value: String,
+    },
+
+    /// 版本号不在支持范围（44 / 48 / 49）。
+    #[error("只支持 44 / 48 / 49，实际为 {version}")]
+    UnsupportedVersion { version: i32 },
+
+    /// 其余检查：只产出一句话，没有更细的结构。
+    #[error("{message}")]
+    Other { message: String },
+}
+
+/// TOML 解析 / 序列化的失败原因。
+///
+/// # 为什么不是 `String`
+///
+/// [`ModelDesc::from_toml`] 与 [`ModelDesc::to_toml`] 是 README「作为依赖使用」
+/// 一节教第三方调用的入口，而 `toml` 自己的错误对象**带出错位置的 span**
+/// （[`toml::de::Error::span`] 给出源文本里的字节区间，[`toml::de::Error::message`]
+/// 给出不含行列号的纯描述）。先前实现用 `format!("TOML 解析失败：{e}")` 把它
+/// 压成字符串，调用方就再也拿不到位置 —— GUI 想高亮出错的那一列只能去
+/// 正则匹配中文前缀。这里把源错误**原样保留**，`Display` 仍是原来的文案。
+///
+/// ```no_run
+/// # use mdlc::model::{ModelDesc, TomlError};
+/// # let text = "version = 49\n";
+/// match ModelDesc::from_toml(text) {
+///     Err(TomlError::Parse(e)) => {
+///         if let Some(span) = e.span() {
+///             println!("出错位置：{}..{}", span.start, span.end);
+///         }
+///         println!("{}", e.message());
+///     }
+///     _ => {}
+/// }
+/// ```
+///
+/// ⚠️ [`Self::Parse`] 只可能来自 [`ModelDesc::from_toml`]，[`Self::Serialize`]
+/// 只可能来自 [`ModelDesc::to_toml`] —— 两类操作各自只有一个失败分支。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TomlError {
+    /// `toml::from_str` 失败（语法错 / 未知字段 / 类型不符）。
+    ///
+    /// 源错误里保留着行列信息：`Display` 会渲染成带 `^` 指示的多行文本。
+    #[error("TOML 解析失败：{0}")]
+    Parse(#[from] toml::de::Error),
+    /// `toml::to_string_pretty` 失败。
+    #[error("TOML 序列化失败：{0}")]
+    Serialize(#[from] toml::ser::Error),
 }
 
 /// 顶点允许的最大骨骼数（`MAX_NUM_BONES_PER_VERT`）。
@@ -5362,13 +5475,16 @@ pub const MAX_BONES_PER_VERT: usize = 3;
 
 impl ModelDesc {
     /// 从 TOML 文本解析。
-    pub fn from_toml(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| format!("TOML 解析失败：{e}"))
+    ///
+    /// 失败时给出 [`TomlError`] —— 它**保留着 `toml` 的源错误**，所以调用方
+    /// 能拿到出错位置的 span，而不是只有一个字符串。
+    pub fn from_toml(text: &str) -> Result<Self, TomlError> {
+        Ok(toml::from_str(text)?)
     }
 
     /// 序列化为 TOML 文本（`mdlc qc2toml` 靠它把 QC 落成描述文件）。
-    pub fn to_toml(&self) -> Result<String, String> {
-        toml::to_string_pretty(self).map_err(|e| format!("TOML 序列化失败：{e}"))
+    pub fn to_toml(&self) -> Result<String, TomlError> {
+        Ok(toml::to_string_pretty(self)?)
     }
 
     /// MDL 版本（默认 49）。
@@ -5431,13 +5547,15 @@ impl ModelDesc {
         if self.model.name.trim().is_empty() {
             errs.push(DescError {
                 path: "model.name".into(),
-                message: "不能为空".into(),
+                kind: DescErrorKind::Empty { message: "不能为空" },
             });
         }
         if !matches!(self.version(), 44 | 48 | 49) {
             errs.push(DescError {
                 path: "model.version".into(),
-                message: format!("只支持 44 / 48 / 49，实际为 {}", self.version()),
+                kind: DescErrorKind::UnsupportedVersion {
+                    version: self.version(),
+                },
             });
         }
 
@@ -5445,7 +5563,9 @@ impl ModelDesc {
         if self.bones.is_empty() {
             errs.push(DescError {
                 path: "bones".into(),
-                message: "至少需要一根骨骼（哪怕是静态道具的单一根骨骼）".into(),
+                kind: DescErrorKind::Other {
+                    message: "至少需要一根骨骼（哪怕是静态道具的单一根骨骼）".into(),
+                },
             });
         }
         let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -5454,13 +5574,16 @@ impl ModelDesc {
             if b.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             if seen.insert(b.name.as_str(), i).is_some() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: format!("骨骼名重复：{:?}", b.name),
+                    kind: DescErrorKind::Duplicate {
+                        what: "骨骼名",
+                        name: b.name.clone(),
+                    },
                 });
             }
             if let Some(p) = &b.parent {
@@ -5470,11 +5593,15 @@ impl ModelDesc {
                     Some(&pi) if pi < i => {}
                     Some(_) => errs.push(DescError {
                         path: format!("{path}.parent"),
-                        message: format!("父骨骼 {p:?} 排在本骨骼之后；父骨骼必须先出现"),
+                        kind: DescErrorKind::ParentBoneOutOfOrder { bone: p.clone() },
                     }),
                     None => errs.push(DescError {
                         path: format!("{path}.parent"),
-                        message: format!("找不到父骨骼 {p:?}"),
+                        kind: DescErrorKind::BoneNotFound {
+                            what: "父",
+                            bone: p.clone(),
+                            note: "",
+                        },
                     }),
                 }
             }
@@ -5486,7 +5613,7 @@ impl ModelDesc {
                 if bad {
                     errs.push(DescError {
                         path: format!("{path}.{axis}"),
-                        message: "不是有限数".into(),
+                        kind: DescErrorKind::NotFinite { value: None },
                     });
                 }
             }
@@ -5515,13 +5642,15 @@ impl ModelDesc {
             if bp.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{bpath}.name"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             if bp.models.is_empty() {
                 errs.push(DescError {
                     path: format!("{bpath}.models"),
-                    message: "至少需要一个 model".into(),
+                    kind: DescErrorKind::Other {
+                        message: "至少需要一个 model".into(),
+                    },
                 });
             }
             for (mi, m) in bp.models.iter().enumerate() {
@@ -5530,7 +5659,9 @@ impl ModelDesc {
                 if m.smd.trim().is_empty() {
                     errs.push(DescError {
                         path: format!("{mpath}.smd"),
-                        message: "不能为空 —— 必须指向一个 SMD 文件".into(),
+                        kind: DescErrorKind::Empty {
+                            message: "不能为空 —— 必须指向一个 SMD 文件",
+                        },
                     });
                 }
                 if let Some(n) = &m.name
@@ -5538,7 +5669,9 @@ impl ModelDesc {
                 {
                     errs.push(DescError {
                         path: format!("{mpath}.name"),
-                        message: format!("过长：{} 字节，上限 63", n.len()),
+                        kind: DescErrorKind::Other {
+                            message: format!("过长：{} 字节，上限 63", n.len()),
+                        },
                     });
                 }
                 // ---- LOD ----
@@ -5546,11 +5679,13 @@ impl ModelDesc {
                 if m.lods.len() + 1 > crate::vvd::MAX_NUM_LODS {
                     errs.push(DescError {
                         path: format!("{mpath}.lods"),
-                        message: format!(
-                            "LOD 过多：{} 层（含 LOD 0），引擎上限 {}",
-                            m.lods.len() + 1,
-                            crate::vvd::MAX_NUM_LODS
-                        ),
+                        kind: DescErrorKind::Other {
+                            message: format!(
+                                "LOD 过多：{} 层（含 LOD 0），引擎上限 {}",
+                                m.lods.len() + 1,
+                                crate::vvd::MAX_NUM_LODS
+                            ),
+                        },
                     });
                 }
                 for (li, lod) in m.lods.iter().enumerate() {
@@ -5561,18 +5696,21 @@ impl ModelDesc {
                         if s.trim().is_empty() {
                             errs.push(DescError {
                                 path: format!("{lpath}.smd"),
-                                message: "不能为空 —— 要么省略（复用 LOD 0 的网格），\
-                                          要么指向一个 SMD 文件"
-                                    .into(),
+                                kind: DescErrorKind::Empty {
+                                    message: "不能为空 —— 要么省略（复用 LOD 0 的网格），\
+                                              要么指向一个 SMD 文件",
+                                },
                             });
                         } else if s == m.smd {
                             errs.push(DescError {
                                 path: format!("{lpath}.smd"),
-                                message: format!(
-                                    "与 LOD 0 的 smd 相同（{:?}）—— \
-                                     同一个网格请**省略** smd，只写骨骼选项",
-                                    m.smd
-                                ),
+                                kind: DescErrorKind::Other {
+                                    message: format!(
+                                        "与 LOD 0 的 smd 相同（{:?}）—— \
+                                         同一个网格请**省略** smd，只写骨骼选项",
+                                        m.smd
+                                    ),
+                                },
                             });
                         }
                     }
@@ -5587,7 +5725,11 @@ impl ModelDesc {
                         if !seen.contains_key(b.as_str()) {
                             errs.push(DescError {
                                 path: format!("{lpath}.bone_tree_collapse/replace_bone"),
-                                message: format!("找不到骨骼 {b:?}"),
+                                kind: DescErrorKind::BoneNotFound {
+                                    what: "",
+                                    bone: b.clone(),
+                                    note: "",
+                                },
                             });
                         }
                     }
@@ -5596,7 +5738,9 @@ impl ModelDesc {
                     {
                         errs.push(DescError {
                             path: format!("{lpath}.switch_point"),
-                            message: format!("不是有限数：{sp}"),
+                            kind: DescErrorKind::NotFinite {
+                                value: Some(format!("{sp}")),
+                            },
                         });
                     }
                 }
@@ -5609,14 +5753,18 @@ impl ModelDesc {
             if !seen.contains_key(hb.bone.as_str()) {
                 errs.push(DescError {
                     path: format!("{path}.bone"),
-                    message: format!("找不到骨骼 {:?}", hb.bone),
+                    kind: DescErrorKind::BoneNotFound {
+                        what: "",
+                        bone: hb.bone.clone(),
+                        note: "",
+                    },
                 });
             }
             for (k, axis) in ["x", "y", "z"].iter().enumerate() {
                 if !hb.bbmin[k].is_finite() || !hb.bbmax[k].is_finite() {
                     errs.push(DescError {
                         path: format!("{path}.{axis}"),
-                        message: "不是有限数".into(),
+                        kind: DescErrorKind::NotFinite { value: None },
                     });
                 }
             }
@@ -5624,7 +5772,9 @@ impl ModelDesc {
             if (0..3).all(|k| hb.bbmin[k] >= hb.bbmax[k]) {
                 errs.push(DescError {
                     path: format!("{path}.bbmin"),
-                    message: "包围盒退化（bbmin 每个分量都 ≥ bbmax）".into(),
+                    kind: DescErrorKind::Other {
+                        message: "包围盒退化（bbmin 每个分量都 ≥ bbmax）".into(),
+                    },
                 });
             }
         }
@@ -5636,7 +5786,7 @@ impl ModelDesc {
             if at.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             // 合成附着点（`$illumposition x y z <骨骼>`）两条都豁免：
@@ -5646,13 +5796,20 @@ impl ModelDesc {
             if !at.synthetic && at_names.insert(at.name.as_str(), i).is_some() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: format!("附着点名重复：{:?}", at.name),
+                    kind: DescErrorKind::Duplicate {
+                        what: "附着点名",
+                        name: at.name.clone(),
+                    },
                 });
             }
             if !at.synthetic && !seen.contains_key(at.bone.as_str()) {
                 errs.push(DescError {
                     path: format!("{path}.bone"),
-                    message: format!("找不到骨骼 {:?}", at.bone),
+                    kind: DescErrorKind::BoneNotFound {
+                        what: "",
+                        bone: at.bone.clone(),
+                        note: "",
+                    },
                 });
             }
         }
@@ -5668,7 +5825,7 @@ impl ModelDesc {
             if s.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             // 重名判定**只对实体序列**生效 —— 官方 `Cmd_Sequence` 走
@@ -5681,7 +5838,10 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: format!("序列名重复：{:?}", s.name),
+                    kind: DescErrorKind::Duplicate {
+                        what: "序列名",
+                        name: s.name.clone(),
+                    },
                 });
             }
             // `$declaresequence` 的空壳**没有 SMD**（官方连 `panim` 都不分配）。
@@ -5692,7 +5852,9 @@ impl ModelDesc {
                 if !s.smd.trim().is_empty() {
                     errs.push(DescError {
                         path: format!("{path}.smd"),
-                        message: "前向声明（`$declaresequence`）的空壳不该有 smd".into(),
+                        kind: DescErrorKind::Other {
+                            message: "前向声明（`$declaresequence`）的空壳不该有 smd".into(),
+                        },
                     });
                 }
                 continue;
@@ -5700,7 +5862,9 @@ impl ModelDesc {
             if s.smd.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.smd"),
-                    message: "不能为空 —— 必须指向一个含多帧 skeleton 的 SMD".into(),
+                    kind: DescErrorKind::Empty {
+                        message: "不能为空 —— 必须指向一个含多帧 skeleton 的 SMD",
+                    },
                 });
             }
             if let Some(fps) = s.fps
@@ -5708,7 +5872,10 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("{path}.fps"),
-                    message: format!("必须是正有限数，实际为 {fps}"),
+                    kind: DescErrorKind::NotPositive {
+                        detail: "为",
+                        value: format!("{fps}"),
+                    },
                 });
             }
         }
@@ -5741,12 +5908,14 @@ impl ModelDesc {
         if self.weight_lists.len() >= MAX_WEIGHT_LISTS {
             errs.push(DescError {
                 path: "weight_lists".into(),
-                message: format!(
-                    "表过多：{} 张，官方上限 {MAX_WEIGHT_LISTS}（含隐式默认表 0，\
-                     所以手写最多 {} 张）",
-                    self.weight_lists.len(),
-                    MAX_WEIGHT_LISTS - 1
-                ),
+                kind: DescErrorKind::Other {
+                    message: format!(
+                        "表过多：{} 张，官方上限 {MAX_WEIGHT_LISTS}（含隐式默认表 0，\
+                         所以手写最多 {} 张）",
+                        self.weight_lists.len(),
+                        MAX_WEIGHT_LISTS - 1
+                    ),
+                },
             });
         }
         for (i, wl) in self.weight_lists.iter().enumerate() {
@@ -5754,7 +5923,7 @@ impl ModelDesc {
             if wl.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             if wl_names
@@ -5763,7 +5932,10 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    message: format!("权重表名重复：{:?}", wl.name),
+                    kind: DescErrorKind::Duplicate {
+                        what: "权重表名",
+                        name: wl.name.clone(),
+                    },
                 });
             }
             // 官方上限 —— **实测值 128**，不是 `studiomdl.h:980` 写的 16。
@@ -5771,28 +5943,31 @@ impl ModelDesc {
             if wl.bones.len() > MAX_WEIGHT_ENTRIES {
                 errs.push(DescError {
                     path: format!("{path}.bones"),
-                    message: format!(
-                        "条目过多：{} 条，官方上限 {MAX_WEIGHT_ENTRIES}",
-                        wl.bones.len()
-                    ),
+                    kind: DescErrorKind::Other {
+                        message: format!(
+                            "条目过多：{} 条，官方上限 {MAX_WEIGHT_ENTRIES}",
+                            wl.bones.len()
+                        ),
+                    },
                 });
             }
             for (j, e) in wl.bones.iter().enumerate() {
                 if !bone_ci.contains_key(&e.bone.to_ascii_lowercase()) {
                     errs.push(DescError {
                         path: format!("{path}.bones[{j}].bone"),
-                        message: format!(
-                            "找不到骨骼 {:?} —— 官方这里是 MdlError（`unknown bone \
-                             reference`），不是 warning",
-                            e.bone
-                        ),
+                        kind: DescErrorKind::BoneNotFound {
+                            what: "",
+                            bone: e.bone.clone(),
+                            note: " —— 官方这里是 MdlError（`unknown bone \
+                                   reference`），不是 warning",
+                        },
                     });
                 }
                 for (v, what) in [(e.weight, "weight"), (e.pos_weight(), "pos_weight")] {
                     if !v.is_finite() {
                         errs.push(DescError {
                             path: format!("{path}.bones[{j}].{what}"),
-                            message: "不是有限数".into(),
+                            kind: DescErrorKind::NotFinite { value: None },
                         });
                     }
                 }
@@ -5805,7 +5980,7 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("sequences[{i}].weight_list"),
-                    message: format!("找不到权重表 {n:?}"),
+                    kind: DescErrorKind::WeightListNotFound { name: n.clone() },
                 });
             }
         }
@@ -5815,7 +5990,7 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("animations[{i}].weight_list"),
-                    message: format!("找不到权重表 {n:?}"),
+                    kind: DescErrorKind::WeightListNotFound { name: n.clone() },
                 });
             }
         }
@@ -5828,7 +6003,7 @@ impl ModelDesc {
             if j.bone.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.bone"),
-                    message: "不能为空".into(),
+                    kind: DescErrorKind::Empty { message: "不能为空" },
                 });
             }
             let has_blocks =
@@ -5836,21 +6011,25 @@ impl ModelDesc {
             if !j.writes.is_empty() && has_blocks {
                 errs.push(DescError {
                     path: path.clone(),
-                    message: "`writes` 与 `is_flexible`/`is_rigid`/`has_base_spring` \
-                              不能同时给出：`writes` 是 QC 的无损写入日志（含顺序），\
-                              三个块是按固定顺序合并的便捷语法，两者含义不同"
-                        .into(),
+                    kind: DescErrorKind::Other {
+                        message: "`writes` 与 `is_flexible`/`is_rigid`/`has_base_spring` \
+                                  不能同时给出：`writes` 是 QC 的无损写入日志（含顺序），\
+                                  三个块是按固定顺序合并的便捷语法，两者含义不同"
+                            .into(),
+                    },
                 });
             }
             for (k, w) in j.writes.iter().enumerate() {
                 if !KNOWN_JIGGLE_KEYS.contains(&w.key.as_str()) {
                     errs.push(DescError {
                         path: format!("{path}.writes[{k}].key"),
-                        message: format!(
-                            "未知的 `$jigglebone` 键 {:?}（官方会 abort：\
-                             `$jigglebone: invalid syntax`）",
-                            w.key
-                        ),
+                        kind: DescErrorKind::Other {
+                            message: format!(
+                                "未知的 `$jigglebone` 键 {:?}（官方会 abort：\
+                                 `$jigglebone: invalid syntax`）",
+                                w.key
+                            ),
+                        },
                     });
                 }
             }
@@ -5870,7 +6049,10 @@ impl ModelDesc {
                 {
                     errs.push(DescError {
                         path: format!("{path}.src_scale"),
-                        message: format!("必须是正有限数，实际 {s}"),
+                        kind: DescErrorKind::NotPositive {
+                            detail: "",
+                            value: format!("{s}"),
+                        },
                     });
                 }
                 if let Some(a) = &m.src_axis
@@ -5878,10 +6060,12 @@ impl ModelDesc {
                 {
                     errs.push(DescError {
                         path: format!("{path}.src_axis"),
-                        message: format!(
-                            "只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
-                             大小写不敏感），实际 {a:?}"
-                        ),
+                        kind: DescErrorKind::Other {
+                            message: format!(
+                                "只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
+                                 大小写不敏感），实际 {a:?}"
+                            ),
+                        },
                     });
                 }
                 if let Some(mat) = &m.src_material
@@ -5889,14 +6073,18 @@ impl ModelDesc {
                 {
                     errs.push(DescError {
                         path: format!("{path}.src_material"),
-                        message: "不能为空（省略这个字段就是官方的 debug/debugempty）".into(),
+                        kind: DescErrorKind::Empty {
+                            message: "不能为空（省略这个字段就是官方的 debug/debugempty）",
+                        },
                     });
                 }
                 for (k, p) in m.src_parts.iter().enumerate() {
                     if p.trim().is_empty() {
                         errs.push(DescError {
                             path: format!("{path}.src_parts[{k}]"),
-                            message: "网格名不能为空".into(),
+                            kind: DescErrorKind::Empty {
+                                message: "网格名不能为空",
+                            },
                         });
                     }
                 }
@@ -5904,7 +6092,9 @@ impl ModelDesc {
                     if n.trim().is_empty() {
                         errs.push(DescError {
                             path: format!("{path}.src_shape_keys[{k}]"),
-                            message: "形变目标名不能为空".into(),
+                            kind: DescErrorKind::Empty {
+                                message: "形变目标名不能为空",
+                            },
                         });
                     }
                 }
@@ -5912,7 +6102,9 @@ impl ModelDesc {
                     if n.trim().is_empty() {
                         errs.push(DescError {
                             path: format!("{path}.src_shape_key_order[{k}]"),
-                            message: "形变目标名不能为空".into(),
+                            kind: DescErrorKind::Empty {
+                                message: "形变目标名不能为空",
+                            },
                         });
                     }
                 }
@@ -5923,9 +6115,11 @@ impl ModelDesc {
                 {
                     errs.push(DescError {
                         path: format!("{path}.src_shape_key_ignore"),
-                        message: "与 `src_shape_keys` / `src_shape_key_order` 不能同时给出：\
-                                  前者是「一个形变目标都不要」，后两者是「按名单取」"
-                            .into(),
+                        kind: DescErrorKind::Other {
+                            message: "与 `src_shape_keys` / `src_shape_key_order` 不能同时给出：\
+                                      前者是「一个形变目标都不要」，后两者是「按名单取」"
+                                .into(),
+                        },
                     });
                 }
             }
@@ -5936,7 +6130,10 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("sequences[{i}].src_fps"),
-                    message: format!("必须是正有限数，实际 {f}"),
+                    kind: DescErrorKind::NotPositive {
+                        detail: "",
+                        value: format!("{f}"),
+                    },
                 });
             }
         }
@@ -5946,7 +6143,10 @@ impl ModelDesc {
             {
                 errs.push(DescError {
                     path: format!("animations[{i}].src_fps"),
-                    message: format!("必须是正有限数，实际 {f}"),
+                    kind: DescErrorKind::NotPositive {
+                        detail: "",
+                        value: format!("{f}"),
+                    },
                 });
             }
         }
@@ -6188,7 +6388,13 @@ pos_weight = 0.25
     fn rejects_unknown_fields() {
         let bad = format!("{MINIMAL_TOML}\n[nope]\nx = 1\n");
         let err = ModelDesc::from_toml(&bad).unwrap_err();
-        assert!(err.contains("TOML"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("TOML"), "{msg}");
+        // 新契约：源错误保留下来，所以**出错位置**可查（旧版被 `format!` 掉了）。
+        let TomlError::Parse(inner) = &err else {
+            panic!("from_toml 只应产生 Parse：{err:?}");
+        };
+        assert!(inner.span().is_some(), "未知字段应带出错位置：{inner}");
     }
 
     #[test]
@@ -6196,7 +6402,8 @@ pos_weight = 0.25
         // 旧的「网格内联」写法必须被拒（deny_unknown_fields）。
         let bad = format!("{MINIMAL_TOML}\n[[bodyparts.models.meshes]]\nmaterial = 0\n");
         let err = ModelDesc::from_toml(&bad).unwrap_err();
-        assert!(err.contains("TOML"), "内联 mesh 应被拒绝：{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("TOML"), "内联 mesh 应被拒绝：{msg}");
     }
 
     #[test]
@@ -6215,7 +6422,13 @@ pos_weight = 0.25
         let bad = MINIMAL_TOML.replace("parent = \"root\"", "parent = \"ghost\"");
         let d = ModelDesc::from_toml(&bad).unwrap();
         let errs = d.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("找不到父骨骼")));
+        assert!(
+            errs.iter().any(|e| matches!(
+                &e.kind,
+                DescErrorKind::BoneNotFound { what: "父", bone, .. } if bone == "ghost"
+            )),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -6237,7 +6450,11 @@ pos_weight = 0.25
         );
         let d = ModelDesc::from_toml(&bad).unwrap();
         let errs = d.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("过长")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("过长"))),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -6249,7 +6466,11 @@ pos_weight = 0.25
         // TOML 的 inf 是合法浮点；应被我们的有限性校验拦下。
         let d = ModelDesc::from_toml(&bad).unwrap();
         let errs = d.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("有限数")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, DescErrorKind::NotFinite { .. })),
+            "{errs:?}"
+        );
     }
 
     #[test]

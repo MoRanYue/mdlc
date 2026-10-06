@@ -48,11 +48,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::compile::{CompileError, bone_parents, compile, resolve_smd_path};
-use crate::mdl_writer::write_mdl;
+use crate::compile::{CompileError, SrcError, bone_parents, compile, resolve_smd_path};
+use crate::mdl_writer::{WriteError, write_mdl};
 use crate::model::{CompiledModelDesc, ModelDesc};
-use crate::phy;
-use crate::vtx_writer::{self, VtxOptions};
+use crate::phy::{self, PhyError};
+use crate::smd::SmdError;
+use crate::vtx_writer::{self, VtxOptions, VtxWriteError};
+use crate::vvd::VvdError;
 
 /// 编排选项。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,16 +68,85 @@ pub struct PipelineOptions {
 }
 
 /// 编排失败的原因。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # 为什么每个变体都带着**源错误**而不是一个 `String`
+///
+/// 先前这里只有 `Compile(Vec<CompileError>)` 与三个 `String` 变体
+/// （`Collision` / `Write` / `Io`）。调用方拿到 `Io("读不到碰撞 SMD x.smd：
+/// 系统找不到指定的文件。 (os error 2)")` 之后**只能去正则匹配中文前缀**
+/// 才能判断「是读不到文件」还是「路径写法不对」，而真正的
+/// [`std::io::Error`] —— 它带着 [`std::io::ErrorKind`] —— 已经被
+/// `format!` 扔掉了。
+///
+/// 现在每个变体各自持有**产生它的那个错误类型**，`source()` 能把整条链
+/// 走到底，调用方可以 `match` 到具体种类（例如
+/// `Err(PipelineError::ReadCollisionSmd { source, .. }) if source.kind() ==
+/// ErrorKind::NotFound`）。[`Self::lines`] 仍拼出**与改造前逐字节相同**
+/// 的文案，所以 CLI 输出与既有探针的断言都不受影响。
+///
+/// ⚠️ 因此本类型**不是** `Clone` / `PartialEq`：它内部装着
+/// [`std::io::Error`]，那个类型两者都不实现，而且「两次失败是否相等」
+/// 对 IO 错误本来也没有意义。需要比较请用 [`Self::kind`]。
+#[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     /// [`crate::compile::compile`] 失败（含 [`ModelDesc::validate`] 的失败）。
+    #[error("{}", Self::compile_lines(.0).join("\n"))]
     Compile(Vec<CompileError>),
+    /// 碰撞 SMD 的**路径字符串**不合法（缺扩展名等）。
+    #[error("错误：{}", .0)]
+    ResolveCollisionSmd(#[source] SrcError),
+    /// 碰撞 SMD 路径解析出来了，但文件读不进来。
+    #[error("错误：读不到碰撞 SMD {}：{}", path.display(), source)]
+    ReadCollisionSmd {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// 碰撞 SMD 读进来了，但解析不了。
-    Collision(String),
-    /// 写出阶段失败：`write_mdl` / VVD / VTX / PHY 的构造或自检。
-    Write(String),
-    /// 路径解析、读文件、建目录、写文件失败。
-    Io(String),
+    #[error("错误：解析碰撞 SMD {} 失败：{}", path.display(), source)]
+    ParseCollisionSmd {
+        path: PathBuf,
+        #[source]
+        source: SmdError,
+    },
+    /// [`write_mdl`] 失败（`.mdl` 字节的构造）。
+    #[error("错误：{}", .0)]
+    WriteMdl(#[source] WriteError),
+    /// `lod::build_vvd` 失败。
+    #[error("错误：构造 VVD 失败：{}", .0)]
+    BuildVvd(#[source] VvdError),
+    /// `Vvd::to_bytes` 失败。
+    #[error("错误：写出 VVD 失败：{}", .0)]
+    EncodeVvd(#[source] VvdError),
+    /// VVD 的自检没过 —— 这是**本实现的 bug**，不是用户输入的问题。
+    #[error("错误：写出的 VVD 不自洽（本实现的 bug）：{}", .0)]
+    CheckVvd(#[source] VvdError),
+    /// `vtx_writer::write_vtx_with` 失败。
+    #[error("错误：写出 VTX 失败：{}", .0)]
+    WriteVtx(#[source] VtxWriteError),
+    /// VTX 的自检没过 —— 同上，是本实现的 bug。
+    #[error("错误：写出的 VTX 不自洽（本实现的 bug）：{}", .0)]
+    CheckVtx(#[source] VtxWriteError),
+    /// `phy::build_phy_from_smd` / `build_ragdoll_phy_from_smd` 失败。
+    #[error("错误：构造 PHY 失败：{}", .0)]
+    BuildPhy(#[source] PhyError),
+    /// PHY 的自检没过 —— 同上，是本实现的 bug。
+    #[error("错误：写出的 PHY 自检失败（本实现的 bug）：{}", .0)]
+    CheckPhy(#[source] PhyError),
+    /// 建输出目录失败。
+    #[error("错误：建目录 {} 失败：{}", path.display(), source)]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// 写产物文件失败。
+    #[error("错误：写 {} 失败：{}", path.display(), source)]
+    WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// 失败的大类 —— 与 `mdlc.exe` 的退出码一一对应。
@@ -99,38 +170,57 @@ impl PipelineErrorKind {
 
 impl PipelineError {
     /// 失败的大类。
+    ///
+    /// ⚠️ 新增变体时**必须**在这里归类 —— 先前用 `_ => Build` 兜底，
+    /// 那样会把「忘了归类的 IO 失败」静默报成编译失败（退出码从 2 变 1，
+    /// 而既有探针是按退出码判定的）。写成穷举后，加变体会得到编译错误。
     pub fn kind(&self) -> PipelineErrorKind {
         match self {
-            PipelineError::Io(_) => PipelineErrorKind::Io,
-            _ => PipelineErrorKind::Build,
+            PipelineError::ResolveCollisionSmd(_)
+            | PipelineError::ReadCollisionSmd { .. }
+            | PipelineError::CreateDir { .. }
+            | PipelineError::WriteFile { .. } => PipelineErrorKind::Io,
+            PipelineError::Compile(_)
+            | PipelineError::ParseCollisionSmd { .. }
+            | PipelineError::WriteMdl(_)
+            | PipelineError::BuildVvd(_)
+            | PipelineError::EncodeVvd(_)
+            | PipelineError::CheckVvd(_)
+            | PipelineError::WriteVtx(_)
+            | PipelineError::CheckVtx(_)
+            | PipelineError::BuildPhy(_)
+            | PipelineError::CheckPhy(_) => PipelineErrorKind::Build,
         }
+    }
+
+    /// [`Self::Compile`] 的文案（首行是计数，之后每条一行）。
+    ///
+    /// 抽成关联函数是为了让 `#[error(...)]` 属性也能用它 —— 属性里写不出
+    /// 带循环的表达式，而这里需要「首行 + N 条缩进」的形态。
+    fn compile_lines(errs: &[CompileError]) -> Vec<String> {
+        let mut v = vec![format!("编译失败，{} 处错误：", errs.len())];
+        v.extend(errs.iter().map(|e| format!("  - {e}")));
+        v
     }
 
     /// 要打印给用户的**最终文案**（`mdlc.exe` 逐行原样输出；GUI 可直接显示）。
     ///
     /// 编译失败是多行（首行是计数，之后每条一行）；其余是单行。
+    ///
+    /// 与 [`std::fmt::Display`] 的关系：[`Self::Compile`] 之外**完全一致**
+    /// （`to_string()` 就是 `lines().join("\n")`），只有 `Compile` 需要
+    /// 拆成多行才好让 CLI 逐行 `diagln!`。
     pub fn lines(&self) -> Vec<String> {
         match self {
-            PipelineError::Compile(errs) => {
-                let mut v = vec![format!("编译失败，{} 处错误：", errs.len())];
-                v.extend(errs.iter().map(|e| format!("  - {e}")));
-                v
-            }
-            // ⚠️ 这里**不能**走 `Display` —— `Display` 就是本函数拼出来的。
-            PipelineError::Collision(m) | PipelineError::Write(m) | PipelineError::Io(m) => {
-                vec![format!("错误：{m}")]
-            }
+            PipelineError::Compile(errs) => Self::compile_lines(errs),
+            // 其余变体的 `Display` 已经就是那一行 —— 直接复用，
+            // 避免文案在两处各写一遍（先前注释里那条「不能走 Display」的
+            // 警告说的是旧写法：当时 `Display` 是本函数拼出来的，
+            // 现在反过来，`Display` 是各变体自己的属性）。
+            other => vec![other.to_string()],
         }
     }
 }
-
-impl std::fmt::Display for PipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.lines().join("\n"))
-    }
-}
-
-impl std::error::Error for PipelineError {}
 
 /// 一次编排的产物：各文件的**字节**，以及编译期 IR。
 ///
@@ -239,13 +329,19 @@ pub fn build(
     let collision_smd = match desc.physics.smd.as_deref() {
         None => None,
         Some(rel_smd) => {
-            let p = resolve_smd_path(base, rel_smd).map_err(PipelineError::Io)?;
-            let text = std::fs::read_to_string(&p).map_err(|e| {
-                PipelineError::Io(format!("读不到碰撞 SMD {}：{e}", p.display()))
+            let p = resolve_smd_path(base, rel_smd).map_err(PipelineError::ResolveCollisionSmd)?;
+            let text = std::fs::read_to_string(&p).map_err(|source| {
+                PipelineError::ReadCollisionSmd {
+                    path: p.clone(),
+                    source,
+                }
             })?;
-            Some(crate::smd::parse_smd(&text).map_err(|e| {
-                PipelineError::Collision(format!("解析碰撞 SMD {} 失败：{e}", p.display()))
-            })?)
+            Some(
+                crate::smd::parse_smd(&text).map_err(|source| PipelineError::ParseCollisionSmd {
+                    path: p.clone(),
+                    source,
+                })?,
+            )
         }
     };
 
@@ -262,7 +358,7 @@ pub fn build(
 
     // ---- ④ `.mdl` ----
     let out = hotpath::measure_block!("pipeline: write_mdl", {
-        write_mdl(&compiled).map_err(|e| PipelineError::Write(e.to_string()))?
+        write_mdl(&compiled).map_err(PipelineError::WriteMdl)?
     });
 
     // ---- ⑤ `.vvd`（单 / 多 LOD 自动分派）----
@@ -270,14 +366,10 @@ pub fn build(
     // `vvd` 只在块内用（自检读它的字段）；逃逸出去的只有字节。
     let vvd_bytes = hotpath::measure_block!("pipeline: build_vvd + to_bytes", {
         let vvd = crate::lod::build_vvd(&compiled, out.checksum)
-            .map_err(|e| PipelineError::Write(format!("构造 VVD 失败：{e}")))?;
-        let bytes = vvd
-            .to_bytes()
-            .map_err(|e| PipelineError::Write(format!("写出 VVD 失败：{e}")))?;
+            .map_err(PipelineError::BuildVvd)?;
+        let bytes = vvd.to_bytes().map_err(PipelineError::EncodeVvd)?;
         // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
-        crate::vvd::check_invariants(&vvd, bytes.len()).map_err(|e| {
-            PipelineError::Write(format!("写出的 VVD 不自洽（本实现的 bug）：{e}"))
-        })?;
+        crate::vvd::check_invariants(&vvd, bytes.len()).map_err(PipelineError::CheckVvd)?;
         bytes
     });
 
@@ -289,10 +381,9 @@ pub fn build(
                 optimize_vertex_cache: desc.model.optimize_vtx || opts.optimize_vtx,
             },
         )
-        .map_err(|e| PipelineError::Write(format!("写出 VTX 失败：{e}")))?
+        .map_err(PipelineError::WriteVtx)?
     });
-    vtx_writer::check_invariants(&vtx, &compiled)
-        .map_err(|e| PipelineError::Write(format!("写出的 VTX 不自洽（本实现的 bug）：{e}")))?;
+    vtx_writer::check_invariants(&vtx, &compiled).map_err(PipelineError::CheckVtx)?;
 
     // ---- ⑦ 文件名：`out_root` + 模型名（去掉 `.mdl` 换扩展名）----
     let rel = desc.output_name();
@@ -360,14 +451,12 @@ pub fn build(
                     pose_world.as_ref(),
                 )
             };
-            Some(built.map_err(|e| PipelineError::Write(format!("构造 PHY 失败：{e}")))?)
+            Some(built.map_err(PipelineError::BuildPhy)?)
         }
     };
     // 写出前自检 —— 失败说明是本实现的 bug。
     if let Some(b) = &phy_bytes {
-        phy::check_invariants(b).map_err(|e| {
-            PipelineError::Write(format!("写出的 PHY 自检失败（本实现的 bug）：{e}"))
-        })?;
+        phy::check_invariants(b).map_err(PipelineError::CheckPhy)?;
     }
 
     Ok(PipelineOutput {
@@ -396,18 +485,20 @@ pub fn write_files(out: &PipelineOutput, out_root: &Path) -> Result<OutputPaths,
         .chain(paths.phy.iter())
     {
         if let Some(dir) = p.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
+            && let Err(source) = std::fs::create_dir_all(dir)
         {
-            return Err(PipelineError::Io(format!(
-                "建目录 {} 失败：{e}",
-                dir.display()
-            )));
+            return Err(PipelineError::CreateDir {
+                path: dir.to_path_buf(),
+                source,
+            });
         }
     }
 
     let write_one = |path: &Path, bytes: &[u8]| -> Result<(), PipelineError> {
-        std::fs::write(path, bytes)
-            .map_err(|e| PipelineError::Io(format!("写 {} 失败：{e}", path.display())))
+        std::fs::write(path, bytes).map_err(|source| PipelineError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        })
     };
     write_one(&paths.mdl, &out.mdl)?;
     write_one(&paths.vvd, &out.vvd)?;
@@ -752,29 +843,87 @@ smd = "a.smd"
         assert_eq!(PipelineErrorKind::Build.exit_code(), 1);
         assert_eq!(PipelineErrorKind::Io.exit_code(), 2);
 
-        let compile = PipelineError::Compile(vec![CompileError {
+        let compile = PipelineError::Compile(vec![CompileError::Message {
             at: "x".into(),
             message: "y".into(),
         }]);
         assert_eq!(compile.kind(), PipelineErrorKind::Build);
+        // 解析碰撞 SMD 失败属 **Build**（文件读到了，内容不对）。
         assert_eq!(
-            PipelineError::Collision("c".into()).kind(),
+            PipelineError::ParseCollisionSmd {
+                path: PathBuf::from("c.smd"),
+                source: SmdError {
+                    line: 1,
+                    message: "坏".into(),
+                },
+            }
+            .kind(),
             PipelineErrorKind::Build
         );
         assert_eq!(
-            PipelineError::Write("w".into()).kind(),
+            PipelineError::WriteMdl(WriteError::Internal("w".into())).kind(),
             PipelineErrorKind::Build
         );
-        assert_eq!(PipelineError::Io("i".into()).kind(), PipelineErrorKind::Io);
+        // 读不到 / 建目录 / 写文件属 **Io**（退出码 2）。
+        assert_eq!(
+            PipelineError::ReadCollisionSmd {
+                path: PathBuf::from("i.smd"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "i"),
+            }
+            .kind(),
+            PipelineErrorKind::Io
+        );
+        assert_eq!(
+            PipelineError::CreateDir {
+                path: PathBuf::from("d"),
+                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "d"),
+            }
+            .kind(),
+            PipelineErrorKind::Io
+        );
+        assert_eq!(
+            PipelineError::WriteFile {
+                path: PathBuf::from("f"),
+                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "f"),
+            }
+            .kind(),
+            PipelineErrorKind::Io
+        );
 
         // 编译失败是多行（首行计数），其余是单行。
         let lines = compile.lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "编译失败，1 处错误：");
         assert_eq!(lines[1], "  - x: y");
-        assert_eq!(PipelineError::Io("i".into()).lines(), vec!["错误：i"]);
+        assert_eq!(
+            PipelineError::WriteMdl(WriteError::Internal("i".into())).lines(),
+            vec!["错误：内部错误（请报告）：i"]
+        );
         // `Display` 与 `lines()` 必须一致（CLI 走前者，GUI 走后者）。
         assert_eq!(compile.to_string(), lines.join("\n"));
+    }
+
+    /// ⭐ 类型化的意义：调用方能**拿到源错误本身**，而不只是一个字符串。
+    ///
+    /// 改造前这里只有 `Io(String)`，`ErrorKind::NotFound` 被 `format!` 扔掉，
+    /// 调用方只能正则匹配中文前缀。这条测试把这个能力钉住。
+    #[test]
+    fn io_failures_expose_the_source_error_kind() {
+        let err = PipelineError::ReadCollisionSmd {
+            path: PathBuf::from("nope.smd"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "系统找不到指定的文件。"),
+        };
+        // 文案与改造前逐字节相同。
+        assert_eq!(
+            err.to_string(),
+            "错误：读不到碰撞 SMD nope.smd：系统找不到指定的文件。"
+        );
+
+        let source = std::error::Error::source(&err).expect("应能拿到源错误");
+        let io = source
+            .downcast_ref::<std::io::Error>()
+            .expect("源错误应是 io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// 碰撞 SMD **读不到** ⟹ `Io`（退出码 2），不是编译错误。
@@ -790,6 +939,11 @@ smd = "a.smd"
             err.to_string().contains("读不到碰撞 SMD"),
             "文案：{err}"
         );
+        // 端到端也验证一次：源错误真的是 NotFound，而不是被压平的字符串。
+        let io = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .expect("应能 downcast 到 io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
 
         let _ = std::fs::remove_dir_all(&d);
     }

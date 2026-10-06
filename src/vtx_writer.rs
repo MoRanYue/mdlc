@@ -121,63 +121,50 @@ pub const STRIP_IS_TRILIST: u8 = 0x01;
 pub const STRIP_IS_TRISTRIP: u8 = 0x02;
 
 /// 写出错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VtxWriteError {
     /// mesh 数超过 `uint16` 能表达的范围（`origMeshVertID` 是 u16）。
+    #[error(
+        "{model} 有 {count} 个顶点，超过 VTX 的每 mesh 上限 {}\n\
+         VTX 的 `origMeshVertID` 是 `uint16`，能表达下标 0..=65535，\
+         所以**一个 mesh 最多 65536 个顶点**。\n\
+         注意粒度是 **mesh（= 一个材质）**，不是整个模型。\n\
+         \n\
+         正常情况下你不会看到这条 —— 编译期会自动把超限的 mesh\
+         按三角形拆成多个同材质的 mesh（TOML 的\
+         `[model] split_oversized_meshes`，**默认 true**）。\n\
+         看到它说明该选项被显式关掉了；把它改回 `true` 即可。\
+         也可以按材质拆成多个 mesh（QC 里给多份 `$cdmaterials`/\
+         多张贴图，或分多个 `$bodygroup` 子模型），\
+         **不需要手工拆 SMD 文件**。",
+        crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH
+    )]
     TooManyVertices { model: String, count: usize },
     /// 单个 strip 的索引数超过 `int32`。
+    #[error("{model} 的三角形索引数 {count} 超出 int32")]
     TooManyIndices { model: String, count: usize },
     /// 单个 strip 的骨骼调色板超过有符号 `char` 能表达的范围。
     ///
     /// 见 [`MAX_STRIP_BONES`]：`Vertex_t.boneID[]` 是 `char`，
     /// 槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误骨骼。
+    #[error(
+        "{model} 的某个 strip 用到 {count} 根骨骼，超过 VTX 的每 strip 上限 {}\n\
+         VTX 的 `Vertex_t.boneID[]` 是**有符号 char**（`optimize.h:51`），\
+         硬件槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误的骨骼。\n\
+         \n\
+         这是**格式**上限，不是本实现的选择，正常情况下你不会看到这条：\
+         写出器会按官方语义把调色板超标的 mesh 拆成**多条 strip**\
+         （每条 ≤ `maxBonesPerStrip` = 53 根，见 [`plan_strips`]）。\n\
+         看到它说明该 mesh 的**三角形下标越界**（输入已损坏）——\
+         那种情况写出器会退回「整组一条 strip」的兜底路径，于是整组\
+         骨骼都压进了一条 strip。请先修 SMD 里越界的顶点下标。",
+        MAX_STRIP_BONES
+    )]
     TooManyStripBones { model: String, count: usize },
     /// 内部不一致 —— 属本实现的 bug。
+    #[error("内部错误（请报告）：{0}")]
     Internal(String),
 }
-
-impl std::fmt::Display for VtxWriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooManyVertices { model, count } => write!(
-                f,
-                "{model} 有 {count} 个顶点，超过 VTX 的每 mesh 上限 {}\n\
-                 VTX 的 `origMeshVertID` 是 `uint16`，能表达下标 0..=65535，\
-                 所以**一个 mesh 最多 65536 个顶点**。\n\
-                 注意粒度是 **mesh（= 一个材质）**，不是整个模型。\n\
-                 \n\
-                 正常情况下你不会看到这条 —— 编译期会自动把超限的 mesh\
-                 按三角形拆成多个同材质的 mesh（TOML 的\
-                 `[model] split_oversized_meshes`，**默认 true**）。\n\
-                 看到它说明该选项被显式关掉了；把它改回 `true` 即可。\
-                 也可以按材质拆成多个 mesh（QC 里给多份 `$cdmaterials`/\
-                 多张贴图，或分多个 `$bodygroup` 子模型），\
-                 **不需要手工拆 SMD 文件**。",
-                crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH
-            ),
-            Self::TooManyIndices { model, count } => {
-                write!(f, "{model} 的三角形索引数 {count} 超出 int32")
-            }
-            Self::TooManyStripBones { model, count } => write!(
-                f,
-                "{model} 的某个 strip 用到 {count} 根骨骼，超过 VTX 的每 strip 上限 {}\n\
-                 VTX 的 `Vertex_t.boneID[]` 是**有符号 char**（`optimize.h:51`），\
-                 硬件槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误的骨骼。\n\
-                 \n\
-                 这是**格式**上限，不是本实现的选择，正常情况下你不会看到这条：\
-                 写出器会按官方语义把调色板超标的 mesh 拆成**多条 strip**\
-                 （每条 ≤ `maxBonesPerStrip` = 53 根，见 [`plan_strips`]）。\n\
-                 看到它说明该 mesh 的**三角形下标越界**（输入已损坏）——\
-                 那种情况写出器会退回「整组一条 strip」的兜底路径，于是整组\
-                 骨骼都压进了一条 strip。请先修 SMD 里越界的顶点下标。",
-                MAX_STRIP_BONES
-            ),
-            Self::Internal(m) => write!(f, "内部错误（请报告）：{m}"),
-        }
-    }
-}
-
-impl std::error::Error for VtxWriteError {}
 
 /// 一个 mesh 的 VTX 侧统计（供自检与日志）。
 #[derive(Debug, Clone, PartialEq, Eq)]

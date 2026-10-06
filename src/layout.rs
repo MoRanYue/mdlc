@@ -711,7 +711,7 @@ impl SectionOffsets {
     ///
     /// 这是**框架级的不变量** —— 新增段时如果顺序写错，这条会立刻抓到。
     /// 返回违反顺序的段名对。
-    pub fn check_monotonic(&self) -> Result<(), String> {
+    pub fn check_monotonic(&self) -> Result<(), LayoutError> {
         // 按权威顺序列出（同值允许 —— 空段会重叠）
         let seq: [(&str, usize); 32] = [            ("studiohdr2", self.studiohdr2),
             ("bone", self.bone),
@@ -748,19 +748,48 @@ impl SectionOffsets {
         ];
         for w in seq.windows(2) {
             if w[0].1 > w[1].1 {
-                return Err(format!(
-                    "段顺序错误：{} @{} 应在 {} @{} 之前",
-                    w[0].0, w[0].1, w[1].0, w[1].1
-                ));
+                return Err(LayoutError::OutOfOrder {
+                    earlier: w[0].0,
+                    earlier_at: w[0].1,
+                    later: w[1].0,
+                    later_at: w[1].1,
+                });
             }
         }
         for (name, off) in seq {
             if off > self.total {
-                return Err(format!("段 {name} 偏移 {off} 超出文件长度 {}", self.total));
+                return Err(LayoutError::BeyondEnd {
+                    section: name,
+                    offset: off,
+                    total: self.total,
+                });
             }
         }
         Ok(())
     }
+}
+
+/// [`SectionOffsets::check_monotonic`] 的失败原因。
+///
+/// 两种失败都表示**写出器自己的**段布局算错了（不是用户输入的问题），
+/// 所以分变体保留字段，便于断言与排查。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    /// 两个段的偏移顺序颠倒。
+    #[error("段顺序错误：{earlier} @{earlier_at} 应在 {later} @{later_at} 之前")]
+    OutOfOrder {
+        earlier: &'static str,
+        earlier_at: usize,
+        later: &'static str,
+        later_at: usize,
+    },
+    /// 段的偏移超出了文件总长度。
+    #[error("段 {section} 偏移 {offset} 超出文件长度 {total}")]
+    BeyondEnd {
+        section: &'static str,
+        offset: usize,
+        total: usize,
+    },
 }
 
 #[cfg(test)]

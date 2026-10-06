@@ -41,18 +41,11 @@ use std::path::Path;
 use crate::smd::{Smd, SmdBoneLink, SmdFrame, SmdNode, SmdPose, SmdTriangle, SmdVertex};
 
 /// FBX 读取错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct FbxError {
     pub message: String,
 }
-
-impl std::fmt::Display for FbxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for FbxError {}
 
 /// 造一个读取错误。
 ///

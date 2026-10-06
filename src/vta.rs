@@ -29,20 +29,13 @@
 //! （`simplify.cpp:2269-2313`）。匹配在 [`crate::compile`] 的 flex 解析里做。
 
 /// `.vta` 解析错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("第 {line} 行：{message}")]
 pub struct VtaError {
     /// 1-based 行号。
     pub line: usize,
     pub message: String,
 }
-
-impl std::fmt::Display for VtaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "第 {} 行：{}", self.line, self.message)
-    }
-}
-
-impl std::error::Error for VtaError {}
 
 fn err(line: usize, message: impl Into<String>) -> VtaError {
     VtaError {

@@ -60,8 +60,6 @@
 //! 另：MDL 版本 54..59 的顶点 stride 是 **64** 字节（texCoord 之后多 4 个未知 float）。
 //! L4D2 是 v49，**不适用**；这里显式拒绝该版本区间以免静默写错。
 
-use std::fmt;
-
 /// VVD 头部的字节大小。
 pub const HEADER_SIZE: usize = 64;
 /// `mstudiovertex_t` 的字节大小。
@@ -86,59 +84,34 @@ pub fn align_up(v: usize, a: usize) -> usize {
 
 
 /// 读写 VVD 时的错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VvdError {
     /// 文件不足 4 字节，读不出魔数。
+    #[error("文件只有 {len} 字节，读不出 4 字节魔数")]
     TooShortForId { len: usize },
     /// 魔数不是 `IDSV`（`IDCV` 是压缩变体，本实现不支持）。
+    #[error(
+        "魔数应为 IDSV，实际为 {:?}",
+        .found.iter().map(|b| if b.is_ascii_graphic() { *b as char } else { '?' }).collect::<String>()
+    )]
     BadId { found: [u8; 4] },
     /// 版本不受支持。
+    #[error("版本应为 {VERSION}，实际为 {found}")]
     BadVersion { found: i32 },
     /// 顶点 stride 与版本不符（v54..59 是 64 字节）。
+    #[error("MDL 版本 {mdl_version} 的顶点 stride 是 64 字节，本实现只支持 48")]
     BadVertexStride { mdl_version: i32 },
     /// 头部字段自相矛盾。
+    #[error("头部字段不一致：{detail}")]
     Inconsistent { detail: String },
     /// 文件长度不足以容纳声明的数据。
+    #[error("{what} 需要 {need} 字节，文件只有 {have} 字节")]
     Truncated {
         need: usize,
         have: usize,
         what: &'static str,
     },
 }
-
-impl fmt::Display for VvdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooShortForId { len } => {
-                write!(f, "文件只有 {len} 字节，读不出 4 字节魔数")
-            }
-            Self::BadId { found } => {
-                let s: String = found
-                    .iter()
-                    .map(|b| {
-                        if b.is_ascii_graphic() {
-                            *b as char
-                        } else {
-                            '?'
-                        }
-                    })
-                    .collect();
-                write!(f, "魔数应为 IDSV，实际为 {s:?}")
-            }
-            Self::BadVersion { found } => write!(f, "版本应为 {VERSION}，实际为 {found}"),
-            Self::BadVertexStride { mdl_version } => write!(
-                f,
-                "MDL 版本 {mdl_version} 的顶点 stride 是 64 字节，本实现只支持 48"
-            ),
-            Self::Inconsistent { detail } => write!(f, "头部字段不一致：{detail}"),
-            Self::Truncated { need, have, what } => {
-                write!(f, "{what} 需要 {need} 字节，文件只有 {have} 字节")
-            }
-        }
-    }
-}
-
-impl std::error::Error for VvdError {}
 
 /// 一个顶点（`mstudiovertex_t`）。
 ///

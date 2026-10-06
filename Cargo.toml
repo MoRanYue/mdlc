@@ -40,6 +40,20 @@ parry3d = "0.31.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
 
+# 错误类型的 derive。**理由是对外的，不是对内的**：本包同时是库
+# （README 的「作为依赖使用」教第三方用 `pipeline` 内置编译器），而
+# `Result<_, String>` 让调用方无法分辨失败种类 —— 尤其 `ModelDesc::from_toml`
+# 把 `toml::de::Error` 的**行列号** `format!` 掉了，GUI 想高亮出错位置就只能
+# 去正则匹配中文字符串。改用具体错误类型后，`match` / `source()` / `?` 都可用。
+#
+# ⚠️ 它**不改变任何既有文案**：12 个 `impl Display` 逐条搬成 `#[error(...)]`
+# 属性，已用探针验证 `to_string()` 逐字节相同（含 `writeln!` 尾换行、
+# `iter().map(if/else).collect()` 这类「属性里放表达式」的写法）。
+#
+# MSRV 1.77 ≤ 本包声明的 1.89。`thiserror` 早已在依赖树里
+# （`fluent-syntax` → 传递依赖），这里只是提为直接依赖。
+thiserror = "2.0.21"
+
 # 分段计时探针。**故意不加 `optional = true`**：调用点是裸的
 # `hotpath::measure_block!(...)`，而 optional 依赖在 feature 关掉时不在
 # extern prelude 里，那些调用点会直接解析失败。让依赖常驻之后，

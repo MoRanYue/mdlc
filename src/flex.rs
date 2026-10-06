@@ -103,18 +103,11 @@ pub struct MeshFlexes {
 }
 
 /// 解析一条 flex 规格时可能出现的错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct FlexError {
     pub message: String,
 }
-
-impl std::fmt::Display for FlexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for FlexError {}
 
 fn ferr(message: impl Into<String>) -> FlexError {
     FlexError {

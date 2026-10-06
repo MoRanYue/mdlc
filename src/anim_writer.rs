@@ -179,40 +179,25 @@ const ROT_SCALE_MIN: f32 = std::f32::consts::FRAC_PI_8;
 const POS_SCALE_MIN: f32 = 128.0;
 
 /// 写出错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnimWriteError {
     /// 帧数超出 `int32`。
+    #[error("序列 {sequence:?} 有 {count} 帧，超出 int32")]
     TooManyFrames { sequence: String, count: usize },
     /// 骨骼数超出可寻址范围。
     ///
     /// 格式依据：动画链的 `mstudioanim_t.bone` 是 `byte`
     /// （`studio.h`）⟹ 下标 `0..=255` ⟹ 骨骼**根数** ≤
     /// [`MAX_ANIM_ADDRESSABLE_BONES`]（= 256）。
+    #[error("骨骼数 {count} 超出动画记录能寻址的范围（≤255）")]
     TooManyBones { count: usize },
     /// 内部不一致 —— 属本实现的 bug。
+    #[error("内部错误（请报告）：{0}")]
     Internal(String),
     /// `$ikrule` 的声明有问题（链名 / 骨骼名找不到、参数冲突…）。
+    #[error("序列 {sequence:?} 的 ikrule：{message}")]
     IkRule { sequence: String, message: String },
 }
-
-impl std::fmt::Display for AnimWriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooManyFrames { sequence, count } => {
-                write!(f, "序列 {sequence:?} 有 {count} 帧，超出 int32")
-            }
-            Self::TooManyBones { count } => {
-                write!(f, "骨骼数 {count} 超出动画记录能寻址的范围（≤255）")
-            }
-            Self::Internal(m) => write!(f, "内部错误（请报告）：{m}"),
-            Self::IkRule { sequence, message } => {
-                write!(f, "序列 {sequence:?} 的 ikrule：{message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AnimWriteError {}
 
 /// 一根骨骼的**动画通道**：旋转/位移各 3 轴。
 ///

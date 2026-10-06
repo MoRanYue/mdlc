@@ -828,14 +828,29 @@ if let Some(cs) = &collision_smd {
 
 ### Errors and exit codes
 
-`PipelineError` has four variants, and `kind()` maps onto the same exit codes as `mdlc.exe`:
+`PipelineError` is an **enum** — one variant per failure point — and `kind()` maps onto the same
+exit codes as `mdlc.exe`:
 
 | Variant | `kind()` | Exit code | Trigger |
 |---|---|---|---|
 | `Compile(Vec<CompileError>)` | `Build` | 1 | Descriptor/QC validation failure, source SMD unreadable |
-| `Collision(String)` | `Build` | 1 | Collision SMD parse failure |
-| `Write(String)` | `Build` | 1 | Write or self-check failure (a bug in this implementation) |
-| `Io(String)` | `Io` | 2 | Path resolution, reading, creating directories, writing |
+| `ParseCollisionSmd { path, source }` | `Build` | 1 | Collision SMD parse failure |
+| `WriteMdl(WriteError)` | `Build` | 1 | `.mdl` write failure |
+| `BuildVvd` / `EncodeVvd` / `CheckVvd` | `Build` | 1 | VVD build / encode / self-check failure |
+| `WriteVtx` / `CheckVtx` | `Build` | 1 | VTX write / self-check failure |
+| `BuildPhy` / `CheckPhy` | `Build` | 1 | PHY build / self-check failure |
+| `ResolveCollisionSmd(SrcError)` | `Io` | 2 | Collision SMD path resolution failure |
+| `ReadCollisionSmd { path, source }` | `Io` | 2 | Collision SMD unreadable |
+| `CreateDir { path, source }` | `Io` | 2 | Directory creation failure |
+| `WriteFile { path, source }` | `Io` | 2 | File write failure |
+
+`kind()` is **exhaustive** — there is no `_ => Build` fallback, so adding a variant forces the
+compiler to make you classify it.
+
+Underlying errors are **preserved** (`#[source]`) instead of being flattened into a string by
+`format!`: `ReadCollisionSmd`'s `source` is a `std::io::Error`, so you can test
+`.downcast_ref::<std::io::Error>().kind() == ErrorKind::NotFound` rather than matching on
+localized text.
 
 `lines()` yields exactly the same text as the CLI line for line (a compile failure is multiple
 lines, everything else is one); `Display` is them joined together. A GUI can render `lines()`

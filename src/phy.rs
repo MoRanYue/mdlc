@@ -288,13 +288,18 @@ pub const MAX_POINTS_PER_SOLID: usize = u16::MAX as usize;
 // ---------------------------------------------------------------------------
 
 /// 写出错误。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PhyError {
     /// 凸包顶点少于 4 个，张不成体积。
+    #[error("solid[{solid}] 只有 {points} 个顶点，凸包至少要 4 个不共面的点")]
     HullTooFewPoints { solid: usize, points: usize },
     /// 凸包计算失败（共面 / 共线 / 含 NaN 等退化输入）。
+    #[error("solid[{solid}] 的凸包退化：{detail}")]
     HullDegenerate { solid: usize, detail: String },
     /// 面表引用了不存在的顶点。
+    #[error(
+        "solid[{solid}] 第 {face} 个面引用了顶点 {index}，但只有 {vertex_count} 个顶点"
+    )]
     IndexOutOfRange {
         solid: usize,
         face: usize,
@@ -302,81 +307,152 @@ pub enum PhyError {
         vertex_count: usize,
     },
     /// 同一条有向边出现了两次 —— 网格不是可定向流形。
+    #[error("solid[{solid}] 有向边 {from}->{to} 出现两次，网格不是可定向流形")]
     DuplicateEdge { solid: usize, from: u32, to: u32 },
     /// 有向边找不到反向配对 —— 网格有洞（非闭合）。
+    #[error("solid[{solid}] 有向边 {from}->{to} 没有反向边，网格不闭合")]
     OpenMesh { solid: usize, from: u32, to: u32 },
     /// 三角形太多，`opposite_index` 塞不进 15 位有符号。
+    #[error(
+        "solid[{solid}] 有 {triangles} 个三角形，超过单 hull 上限 {max}\
+         （opposite_index 只有 15 位）"
+    )]
     TooManyTriangles {
         solid: usize,
         triangles: usize,
         max: usize,
     },
     /// 顶点下标超出 `start_point_index:16`。
+    #[error("solid[{solid}] 有 {points} 个顶点，超过 16 位索引上限 {MAX_POINTS_PER_SOLID}")]
     TooManyPoints { solid: usize, points: usize },
     /// 坐标里出现 NaN 或无穷。
+    #[error("solid[{solid}] 第 {point} 个顶点含 NaN 或无穷")]
     NonFinitePoint { solid: usize, point: usize },
     /// 包围盒退化成一点或一条线（半径 0），无法量化 `box_sizes`。
+    #[error("solid[{solid}] 的包围盒半径是 0（所有顶点重合），无法量化 box_sizes")]
     DegenerateBounds { solid: usize },
     /// 参数越界。
+    #[error("参数 {what} 非法：{detail}")]
     BadParameter { what: &'static str, detail: String },
+    /// 焊接 SMD 三角形后顶点不足 4 个，张不成凸包。
+    ///
+    /// 由 [`weld_smd_triangles`] 产生 —— 碰撞 SMD 退化成一个点/一条线时
+    /// 会撞上这条，而不是等到凸包计算里才失败。
+    #[error("焊接后只有 {points} 个不同顶点，凸包至少要 4 个")]
+    WeldTooFewPoints { points: usize },
     /// 写出的字节自检失败 —— 属本实现的 bug，不是调用方的问题。
+    #[error("写出的 PHY 自检失败（本实现的 bug）：{0}")]
     SelfCheck(String),
+
+    // ---- 下面这些由 [`build_phy_from_smd`] / [`build_ragdoll_phy_from_smd`] /
+    //      [`decompose_connected_components`] 产生。它们的文案与改造前
+    //      逐字节相同，只是从 `String` 变成了可 `match` 的变体。 ----
+
+    /// 碰撞 SMD 里一个三角形都没有。
+    #[error("SMD 里没有任何三角形")]
+    NoTriangles,
+    /// 算凸包失败（退化输入：共面 / 共线 / 含 NaN）。
+    #[error("算凸包失败：{0}")]
+    HullFailed(#[source] Box<PhyError>),
+    /// `$concave` 回退成单凸包时，整体凸包也算不出来。
+    #[error("算整体凸包失败：{0}")]
+    OverallHullFailed(#[source] Box<PhyError>),
+    /// 顶点太少，连整体凸包都张不成。
+    #[error("只有 {points} 个顶点，凸包至少要 4 个")]
+    TooFewVerticesForHull { points: usize },
+    /// 单 solid 的 prop 形态写了 `[physics.joint_overrides]`。
+    #[error(
+        "[physics.joint_overrides] 有 {count} 项，但这是单 solid 的 prop 形态\
+         （`joints = false`）—— 逐 joint 参数只对 ragdoll 有意义。\
+         要么去掉它，要么把 `joints` 设为 true"
+    )]
+    JointOverridesOnProp { count: usize },
+    /// 单 solid 的 prop 形态写了 `[physics.constraints]`。
+    #[error(
+        "[physics.constraints] 有 {count} 项，但这是单 solid 的 prop 形态\
+         （`joints = false`）—— `$jointconstrain` 只对 ragdoll 有意义。\
+         要么去掉它，要么把 `joints` 设为 true"
+    )]
+    ConstraintsOnProp { count: usize },
+    /// 单 solid 的 prop 形态写了碰撞规则。
+    #[error(
+        "[physics.no_self_collisions] / [physics.collision_pairs] 只对 ragdoll 有意义\
+         （`joints = false` 时没有「多个 solid 之间碰不碰」的问题）。\
+         要么去掉它，要么把 `joints` 设为 true"
+    )]
+    CollisionPairsOnProp,
+    /// `$jointmerge` 指向了碰撞 SMD 里没有的骨骼名。
+    #[error(
+        "[physics.merge][{index}] 的骨骼对 ({a:?}, {b:?}) 里有名字不在碰撞 SMD 的 \
+         nodes 里。可用的骨骼：{available}"
+    )]
+    MergeBoneUnknown {
+        index: usize,
+        a: String,
+        b: String,
+        available: String,
+    },
+    /// `$jointmerge` 会形成归并环。
+    #[error("[physics.merge][{index}] 的 ({a:?}, {b:?}) 会形成归并环")]
+    MergeCycle { index: usize, a: String, b: String },
+    /// 碰撞 SMD 里没有任何骨骼带碰撞几何。
+    #[error("没有任何骨骼带碰撞几何")]
+    NoBoneGeometry,
+    /// `[physics.joint_overrides]` 指向了没有碰撞几何的骨骼。
+    #[error(
+        "[physics.joint_overrides] 里的骨骼 {bone:?} 没有碰撞几何。\
+         有碰撞几何的是：{available}"
+    )]
+    JointOverrideUnknownBone { bone: String, available: String },
+    /// 所有骨骼的碰撞几何都张不成凸包。
+    #[error("所有骨骼的碰撞几何都张不成凸包")]
+    NoHullFromAnyBone,
+    /// `$automass` 需要材质密度表，mdlc 没有。
+    #[error(
+        "`[physics].auto_mass`（`$automass`）需要材质密度表\
+         （`scripts/surfaceproperties_manifest.txt`）才能算出总质量，\
+         mdlc 没有该表。请显式写 `mass = <值>`"
+    )]
+    AutoMassUnsupported,
+    /// `write_phy_multi` 失败。
+    #[error("写出 PHY 失败：{0}")]
+    WriteFailed(#[source] Box<PhyError>),
+    /// `[physics.constraints]` 的逐条校验失败。
+    #[error(transparent)]
+    Constraint(#[from] ConstraintError),
 }
 
-impl std::fmt::Display for PhyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::HullTooFewPoints { solid, points } => write!(
-                f,
-                "solid[{solid}] 只有 {points} 个顶点，凸包至少要 4 个不共面的点"
-            ),
-            Self::HullDegenerate { solid, detail } => {
-                write!(f, "solid[{solid}] 的凸包退化：{detail}")
-            }
-            Self::IndexOutOfRange {
-                solid,
-                face,
-                index,
-                vertex_count,
-            } => write!(
-                f,
-                "solid[{solid}] 第 {face} 个面引用了顶点 {index}，但只有 {vertex_count} 个顶点"
-            ),
-            Self::DuplicateEdge { solid, from, to } => write!(
-                f,
-                "solid[{solid}] 有向边 {from}->{to} 出现两次，网格不是可定向流形"
-            ),
-            Self::OpenMesh { solid, from, to } => write!(
-                f,
-                "solid[{solid}] 有向边 {from}->{to} 没有反向边，网格不闭合"
-            ),
-            Self::TooManyTriangles {
-                solid,
-                triangles,
-                max,
-            } => write!(
-                f,
-                "solid[{solid}] 有 {triangles} 个三角形，超过单 hull 上限 {max}\
-                 （opposite_index 只有 15 位）"
-            ),
-            Self::TooManyPoints { solid, points } => write!(
-                f,
-                "solid[{solid}] 有 {points} 个顶点，超过 16 位索引上限 {MAX_POINTS_PER_SOLID}"
-            ),
-            Self::NonFinitePoint { solid, point } => {
-                write!(f, "solid[{solid}] 第 {point} 个顶点含 NaN 或无穷")
-            }
-            Self::DegenerateBounds { solid } => write!(
-                f,
-                "solid[{solid}] 的包围盒半径是 0（所有顶点重合），无法量化 box_sizes"
-            ),
-            Self::BadParameter { what, detail } => write!(f, "参数 {what} 非法：{detail}"),
-            Self::SelfCheck(m) => write!(f, "写出的 PHY 自检失败（本实现的 bug）：{m}"),
-        }
-    }
+/// `[physics.constraints]` 逐条校验的错误。
+///
+/// 与 [`PhyError`] 分开，是因为它由 [`crate::model::Physics::joint_constraints`]
+/// 产生 —— 那是**描述文件**层面的校验，发生在碰几何之前。
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ConstraintError {
+    /// `axis` 不是 `x` / `y` / `z`（官方只取首字母）。
+    #[error(
+        "[physics.constraints][{index}] 的 axis={axis:?} 非法：\
+         必须是 x / y / z（官方只取首字母）"
+    )]
+    BadAxis { index: usize, axis: String },
+    /// `kind` 不是 `free` / `fixed` / `limit`。
+    #[error(
+        "[physics.constraints][{index}] 的 kind={kind:?} 非法：\
+         必须是 free / fixed / limit"
+    )]
+    BadKind { index: usize, kind: String },
+    /// `min > max`。
+    #[error(
+        "[physics.constraints][{index}]（骨骼 {bone:?} 轴 {axis}）的 min={min} > max={max}，\
+         官方会以 \"Invalid joint constraint\" 中止编译"
+    )]
+    MinGreaterThanMax {
+        index: usize,
+        bone: String,
+        axis: String,
+        min: f32,
+        max: f32,
+    },
 }
-
-impl std::error::Error for PhyError {}
 
 /// 一个凸块。
 ///
@@ -1026,8 +1102,9 @@ pub type WeldedMesh = (Vec<[f32; 3]>, Vec<[u32; 3]>);
 /// 焊接后**退化的三角形**（三个下标不全不同）会被剔除：凸包计算不关心
 /// 面表，但 VHACD 会关心。
 ///
-/// 返回 `(顶点池, 面表)`；顶点数 < 4 时返回 `Err`（张不成凸包）。
-pub fn weld_smd_triangles(smd: &crate::smd::Smd) -> Result<WeldedMesh, String> {
+/// 返回 `(顶点池, 面表)`；顶点数 < 4 时返回 [`PhyError::WeldTooFewPoints`]
+/// （张不成凸包）。
+pub fn weld_smd_triangles(smd: &crate::smd::Smd) -> Result<WeldedMesh, PhyError> {
     let mut vertices: Vec<[f32; 3]> = Vec::new();
     let mut index_of: std::collections::HashMap<[u32; 3], u32> = std::collections::HashMap::new();
     let mut faces: Vec<[u32; 3]> = Vec::with_capacity(smd.triangles.len());
@@ -1046,10 +1123,9 @@ pub fn weld_smd_triangles(smd: &crate::smd::Smd) -> Result<WeldedMesh, String> {
         }
     }
     if vertices.len() < 4 {
-        return Err(format!(
-            "焊接后只有 {} 个不同顶点，凸包至少要 4 个",
-            vertices.len()
-        ));
+        return Err(PhyError::WeldTooFewPoints {
+            points: vertices.len(),
+        });
     }
     Ok((vertices, faces))
 }
@@ -1380,14 +1456,14 @@ pub fn build_phy_from_smd(
     mass: f32,
     phys: &crate::model::Physics,
     pose_world: Option<&std::collections::HashMap<String, crate::bone_math::Matrix3x4>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, PhyError> {
     let PhyIdentity {
         model_name,
         collision_smd_name,
         surface_prop,
     } = ident;
     if smd.triangles.is_empty() {
-        return Err("SMD 里没有任何三角形".to_string());
+        return Err(PhyError::NoTriangles);
     }
 
     let hulls: Vec<PhyHull> = if phys.concave {
@@ -1397,7 +1473,7 @@ pub fn build_phy_from_smd(
         let vertices = world_space_verts(smd, &vertices, pose_world);
         vec![
             PhyHull::from_points(&vertices)
-                .map_err(|e| format!("算凸包失败：{e}"))?
+                .map_err(|e| PhyError::HullFailed(Box::new(e)))?
                 // 官方 `ConvexFromVerts` 的第二段：`BuildOuterHull(hull, 0.01)`。
                 .compact_outer_hull(),
         ]
@@ -1408,28 +1484,17 @@ pub fn build_phy_from_smd(
     // `ProcessJointedModel` 里被调用）。写了却不生效是最难查的一类问题，
     // 所以**显式报错**而不是静默忽略。
     if !phys.joint_overrides.is_empty() {
-        return Err(format!(
-            "[physics.joint_overrides] 有 {} 项，但这是单 solid 的 prop 形态\
-             （`joints = false`）—— 逐 joint 参数只对 ragdoll 有意义。\
-             要么去掉它，要么把 `joints` 设为 true",
-            phys.joint_overrides.len()
-        ));
+        return Err(PhyError::JointOverridesOnProp {
+            count: phys.joint_overrides.len(),
+        });
     }
     if !phys.constraints.is_empty() {
-        return Err(format!(
-            "[physics.constraints] 有 {} 项，但这是单 solid 的 prop 形态\
-             （`joints = false`）—— `$jointconstrain` 只对 ragdoll 有意义。\
-             要么去掉它，要么把 `joints` 设为 true",
-            phys.constraints.len()
-        ));
+        return Err(PhyError::ConstraintsOnProp {
+            count: phys.constraints.len(),
+        });
     }
     if !phys.collision_pairs.is_empty() || phys.no_self_collisions {
-        return Err(
-            "[physics.no_self_collisions] / [physics.collision_pairs] 只对 ragdoll 有意义\
-             （`joints = false` 时没有「多个 solid 之间碰不碰」的问题）。\
-             要么去掉它，要么把 `joints` 设为 true"
-                .to_string(),
-        );
+        return Err(PhyError::CollisionPairsOnProp);
     }
 
     let mut params = PhyParams::new(model_name, checksum);
@@ -1456,7 +1521,7 @@ pub fn build_phy_from_smd(
     // ⚠️ prop 形态的 `name` 是**碰撞 SMD 的 basename**，不是模型名 ——
     // 见 [`PhySolid::prop`] 的文档与受控实验 `gen_phyname.js`。
     let solids = vec![PhySolid::prop(collision_smd_name)];
-    write_phy_multi(&grouped, &solids, &params).map_err(|e| format!("写出 PHY 失败：{e}"))
+    write_phy_multi(&grouped, &solids, &params).map_err(|e| PhyError::WriteFailed(Box::new(e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,14 +1840,14 @@ pub fn build_ragdoll_phy_from_smd(
     checksum: u32,
     mass: f32,
     phys: &crate::model::Physics,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, PhyError> {
     let PhyIdentity {
         model_name,
         surface_prop,
         ..
     } = ident;
     if smd.triangles.is_empty() {
-        return Err("SMD 里没有任何三角形".to_string());
+        return Err(PhyError::NoTriangles);
     }
 
     // ---- `$jointmerge`：先把骨骼归并表建出来（官方 `m_bonemap`） ----
@@ -1798,17 +1863,14 @@ pub fn build_ragdoll_phy_from_smd(
             let (Some(&parent), Some(&child)) =
                 (idx_of.get(m.a.as_str()), idx_of.get(m.b.as_str()))
             else {
-                return Err(format!(
-                    "[physics.merge][{i}] 的骨骼对 ({:?}, {:?}) 里有名字不在碰撞 SMD 的 \
-                     nodes 里。可用的骨骼：{}",
-                    m.a,
-                    m.b,
-                    {
-                        let mut v: Vec<&str> = idx_of.keys().copied().collect();
-                        v.sort_unstable();
-                        v.join(", ")
-                    }
-                ));
+                let mut v: Vec<&str> = idx_of.keys().copied().collect();
+                v.sort_unstable();
+                return Err(PhyError::MergeBoneUnknown {
+                    index: i,
+                    a: m.a.clone(),
+                    b: m.b.clone(),
+                    available: v.join(", "),
+                });
             };
             if parent == child {
                 continue;
@@ -1816,10 +1878,11 @@ pub fn build_ragdoll_phy_from_smd(
             // 官方 `MergeBones` 里带 `safety > numbones` 的死循环保护，
             // 这里也要防「互相归并」造成的环。
             if would_cycle(&merged, parent, child, smd.nodes.len()) {
-                return Err(format!(
-                    "[physics.merge][{i}] 的 ({:?}, {:?}) 会形成归并环",
-                    m.a, m.b
-                ));
+                return Err(PhyError::MergeCycle {
+                    index: i,
+                    a: m.a.clone(),
+                    b: m.b.clone(),
+                });
             }
             merged.insert(child, parent);
         }
@@ -1827,7 +1890,7 @@ pub fn build_ragdoll_phy_from_smd(
 
     let groups = group_by_bone_merged(smd, &merged);
     if groups.is_empty() {
-        return Err("没有任何骨骼带碰撞几何".to_string());
+        return Err(PhyError::NoBoneGeometry);
     }
 
     // `joint_overrides` 只对 ragdoll 有意义 —— 单 solid 的 prop 路径
@@ -1838,16 +1901,12 @@ pub fn build_ragdoll_phy_from_smd(
             groups.iter().map(|g| g.name.as_str()).collect();
         for o in &phys.joint_overrides {
             if !known.contains(o.bone.as_str()) {
-                return Err(format!(
-                    "[physics.joint_overrides] 里的骨骼 {:?} 没有碰撞几何。\
-                     有碰撞几何的是：{}",
-                    o.bone,
-                    {
-                        let mut v: Vec<&str> = known.iter().copied().collect();
-                        v.sort_unstable();
-                        v.join(", ")
-                    }
-                ));
+                let mut v: Vec<&str> = known.iter().copied().collect();
+                v.sort_unstable();
+                return Err(PhyError::JointOverrideUnknownBone {
+                    bone: o.bone.clone(),
+                    available: v.join(", "),
+                });
             }
         }
     }
@@ -1900,7 +1959,7 @@ pub fn build_ragdoll_phy_from_smd(
     }
 
     if grouped.is_empty() {
-        return Err("所有骨骼的碰撞几何都张不成凸包".to_string());
+        return Err(PhyError::NoHullFromAnyBone);
     }
 
     // 父名要指向**实际保留下来**的 solid；`FixParent` 已保证父在列表里，
@@ -1962,12 +2021,7 @@ pub fn build_ragdoll_phy_from_smd(
     // `$automass` 需要材质密度表（`scripts/surfaceproperties_manifest.txt`），
     // mdlc 没有 —— **显式报错**而不是静默写一个错的总质量。
     if phys.auto_mass {
-        return Err(
-            "`[physics].auto_mass`（`$automass`）需要材质密度表\
-             （`scripts/surfaceproperties_manifest.txt`）才能算出总质量，\
-             mdlc 没有该表。请显式写 `mass = <值>`"
-                .to_string(),
-        );
+        return Err(PhyError::AutoMassUnsupported);
     }
     // ⚠️ **`rootname` 默认是空串**，不要拿根 solid 的名去填。
     //
@@ -1983,7 +2037,7 @@ pub fn build_ragdoll_phy_from_smd(
     if let Some(r) = &phys.root_bone {
         params.root_name = r;
     }
-    write_phy_multi(&grouped, &solids, &params).map_err(|e| format!("写出 PHY 失败：{e}"))
+    write_phy_multi(&grouped, &solids, &params).map_err(|e| PhyError::WriteFailed(Box::new(e)))
 }
 
 /// 官方 `$concave` 的**凸块数上限**（`collisionmodel.cpp:1535`
@@ -2126,7 +2180,7 @@ pub fn physics_bone_table(
 pub fn decompose_connected_components(
     smd: &crate::smd::Smd,
     pose_world: Option<&std::collections::HashMap<String, crate::bone_math::Matrix3x4>>,
-) -> Result<Vec<PhyHull>, String> {
+) -> Result<Vec<PhyHull>, PhyError> {
     // 展平成「逐面顶点」：SMD 的三角形顶点是逐面独立的。
     //
     // ⚠️ 位置要先搬到**世界空间**（官方 `ProcessSingleBody:1436`
@@ -2148,7 +2202,9 @@ pub fn decompose_connected_components(
         faces.push([base, base + 1, base + 2]);
     }
     if verts.len() < 4 {
-        return Err(format!("只有 {} 个顶点，凸包至少要 4 个", verts.len()));
+        return Err(PhyError::TooFewVerticesForHull {
+            points: verts.len(),
+        });
     }
 
     let weld = build_weld_table(&verts);
@@ -2186,7 +2242,7 @@ pub fn decompose_connected_components(
         let all: Vec<[f32; 3]> = verts.iter().map(|v| v.0).collect();
         return Ok(vec![
             PhyHull::from_points(&all)
-                .map_err(|e| format!("算整体凸包失败：{e}"))?
+                .map_err(|e| PhyError::OverallHullFailed(Box::new(e)))?
                 .compact_outer_hull(),
         ]);
     }
@@ -2205,7 +2261,7 @@ pub fn decompose_connected_components(
         let all: Vec<[f32; 3]> = verts.iter().map(|v| v.0).collect();
         return Ok(vec![
             PhyHull::from_points(&all)
-                .map_err(|e| format!("算整体凸包失败：{e}"))?
+                .map_err(|e| PhyError::OverallHullFailed(Box::new(e)))?
                 .compact_outer_hull(),
         ]);
     }
