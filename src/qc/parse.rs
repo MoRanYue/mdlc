@@ -4583,8 +4583,39 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        // ⚠️⚠️ `$definebone` 声明过的骨骼**绝不回填父链**。
+        //
+        // 官方 `BuildGlobalBonetable`（`simplify.cpp:3616`）分两段：
+        //
+        //   1. `:3624-3654` 先插 `$definebone`（`bPreDefined = true`），
+        //      父由 `$definebone` 给 —— **空串显式写 `-1`**（`:3631-3634`），
+        //      即「这根本来就是根」。
+        //   2. `:3666-3712` 并入各源用到的骨骼：只有 `k == -1`
+        //      （**表里还没有**）时才从源取父（`:3671-3679`）；
+        //      已存在的走 `:3707-3711`，**只做 `flags |=`，从不碰 `parent`**
+        //      （`$unlockdefinebones` 那条 `:3688` 分支同样不碰父）。
+        //
+        // 所以「`$definebone` 声明的根骨骼」在官方产物里是**独立的根**，
+        // 不会被源树的父链收编。
+        //
+        // 这条曾经是错的：`cmd_definebone` 把空父存成 `None`（`:3302`），
+        // 与「根本没写 `$definebone`」不可区分，于是这里无条件回填，
+        // 把**显式声明的根**塞进了源树的父节点下。
+        //
+        // 实测（真工程 `v_snip_awp_processed.qc`，2026-10）：
+        // `$definebone "ValveBiped.ValveBiped" "" …` 被回填成
+        // `parent = "awp_model_Inverted_edit_skeleton"` —— 那是 FBX 的骨架
+        // 根节点，自身带 **−90° 绕 X** 与 ×100 缩放。整棵骨骼树因此被带着
+        // 转了 90°：70 根骨骼的 `poseToBone` **每一行都不同**（`[0]` 从
+        // 单位阵变成 `1,0,0,0|0,0,-1,0|0,1,0,0`），VVD 的包围盒 Y/Z 两轴
+        // 互换。官方产物里 `ValveBiped.ValveBiped` 是 `p = -1` 的独立根，
+        // 骨架根反而是**另一个**根且排在最后。
+        //
+        // 把回填去掉后（手工改 TOML 复现），骨骼表与 SMD 路径的差异
+        // **从 70 行降到 8 行**。
         for b in &mut bones {
             if b.parent.is_none()
+                && !predefined.contains(&b.name.to_ascii_lowercase())
                 && let Some(p) = parent_of.get(&b.name.to_ascii_lowercase())
             {
                 b.parent = Some(p.clone());
@@ -6459,6 +6490,76 @@ $sequence \"idle\" \"a.smd\" fps 30
              `$definebone` 上 —— 官方不这么做（用户工程的 122 根里 \
              绝大多数正是零顶点引用的 `$definebone`）。\
              顺序上 `extra` 的父是 `root`，拓扑排序必须把它排在其父之后"
+        );
+    }
+
+    /// ⭐ **核心回归**：`$definebone` 声明的**根**骨骼（空父）绝不被源 SMD 的父链收编。
+    ///
+    /// 官方 `BuildGlobalBonetable`（`simplify.cpp:3616`）分两段：
+    ///
+    ///   1. `:3624-3654` 先插 `$definebone`（`bPreDefined = true`），父由
+    ///      `$definebone` 给 —— **空串在 `:3631-3634` 显式写 `-1`**，
+    ///      即「这根本来就是根」；
+    ///   2. `:3666-3712` 并入各源用到的骨骼：只有 `k == -1`（**表里还没有**）
+    ///      才从源取父（`:3671-3679`），已存在的走 `:3707-3711`
+    ///      **只做 `flags |=`，从不碰 `parent`**。
+    ///
+    /// 回归现场（真工程 `v_snip_awp_processed.qc`，2026-10）：`bones.qci` 里
+    /// `$definebone "ValveBiped.ValveBiped" "" …` 被无条件回填成
+    /// `parent = "awp_model_Inverted_edit_skeleton"` —— 那是 FBX 的骨架根
+    /// 节点，自身带 **−90° 绕 X**。整棵骨骼树因此被带着转了 90°：70 根骨骼的
+    /// `poseToBone` **每一行都不同**，VVD 包围盒的 Y/Z 两轴互换。
+    /// 官方产物里 `ValveBiped.ValveBiped` 是 `p = -1` 的独立根。
+    #[test]
+    fn definebone_explicit_root_is_not_adopted_by_source_parent() {
+        let dir = fixture("bone_ref_defroot");
+        std::fs::write(
+            dir.join("a.smd"),
+            smd_with(
+                &[(0, "skeleton_root", -1), (1, "root", 0), (2, "bone1", 1)],
+                &[0, 1, 2],
+            ),
+        )
+        .expect("应能写 SMD");
+
+        // 基线：没有 `$definebone` 时，`root` 的父从源 SMD 的 `nodes` 段推。
+        let base = "$modelname \"t.mdl\"\n$body body \"a.smd\"\n\
+                    $sequence \"idle\" \"a.smd\" fps 30\n";
+        let d0 = parse(base, &dir);
+        let p0 = d0
+            .bones
+            .iter()
+            .find(|b| b.name == "root")
+            .expect("`root` 应在骨骼表里")
+            .parent
+            .clone();
+        assert_eq!(
+            p0.as_deref(),
+            Some("skeleton_root"),
+            "基线：没写 `$definebone` 时父链应从源 SMD 推出来"
+        );
+
+        // 显式声明 `root` 是根（空父）⟹ 父必须保持 `None`。
+        let qc = "$modelname \"t.mdl\"\n\
+                  $definebone \"root\" \"\" 0 0 0 0 0 0\n\
+                  $body body \"a.smd\"\n\
+                  $sequence \"idle\" \"a.smd\" fps 30\n";
+        let d1 = parse(qc, &dir);
+        let p1 = d1
+            .bones
+            .iter()
+            .find(|b| b.name == "root")
+            .expect("`root` 应在骨骼表里")
+            .parent
+            .clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            p1, None,
+            "`$definebone \"root\" \"\"` 的空父是**显式声明为根**\
+             （官方 `simplify.cpp:3631-3634` 写 `-1`），不是「未指定」—— \
+             绝不能被源 SMD 的父链收编。若这里变成 `Some(\"skeleton_root\")`，\
+             说明父链回填漏了 `predefined` 守卫，FBX 源的骨架根变换会\
+             把整棵树带偏（真工程里是 −90° 绕 X）"
         );
     }
 
