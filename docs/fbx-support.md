@@ -30,7 +30,7 @@
 | 最大的 UX 障碍？ | ⭐⭐⭐ **官方恒取第一条 NLA 栈、完全忽略 `$sequence` 名字**（§1.8）。多栈 FBX 在官方路径下**无解**，必须由 mdlc 提供显式选择 |
 | 表情（flex）怎么走？ | ⭐⭐⭐⭐⭐ **什么都不用写** —— FBX 的 shape key **自动注册**成 flexdesc + controller + rule + 载荷（§1.6b），与官方逐字段一致。⚠️ 但**不能在 FBX 源上写 `flexfile`/`flex`**（官方必崩） |
 | 单位/缩放对得上吗？ | ⚠️ **官方在这里有个 bug，而且是两半**：FBX 标准单位是**厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、完全忽略 `UnitScaleFactor`** ⟹ 默认导出（`All Local`）下官方编出的模型**骨骼比网格大 100 倍**（比值 0.0153），且**网格位置留在厘米、网格尺寸在米**（`be1_two_roots` 比值 0.9825）。**mdlc 有意偏离并两半都修掉**（§1.7.3 / §4.6 偏离 12）：`All Local` 与 `FBX Units Scale` 两种导出**编出逐值相同的产物**，NekoMDL 独立仲裁 8/8 逐位相同，用户不必关心 Blender 的 `Apply Scalings` 选项 |
-| **参考姿态取哪个姿态？** | ⭐⭐⭐⭐⭐ **取绑定姿态，不是节点 rest 姿态**（§1.7c）。蒙皮顶点写在绑定姿态空间，而 FBX 里 `cluster.bind_to_world`（绑定姿态）与节点 `local_transform`（rest 姿态）是**两个数据源、可以不同** —— 用户工程里人形 63 根一致、**`bow` 子树 6 根不一致**（局部平移差 13.5 / 50.2）⟹ 修复前武器网格「骨骼落在网格外 48 ~ 83 单位」，修复后 6 组**全部归零**（提交 `bcd5af6`）。⚠️ **动画流未同步改**（开放项，§1.7c.4）。⚠️ 同一分叉在 **glTF 路径**上以 `inverseBindMatrices` 的形式存在且**尚未修**（`docs/gltf-support.md` §5.1b） |
+| **参考姿态取哪个姿态？** | ⭐⭐⭐⭐⭐ **取绑定姿态，不是节点 rest 姿态**（§1.7c）。蒙皮顶点写在绑定姿态空间，而 FBX 里 `cluster.bind_to_world`（绑定姿态）与节点 `local_transform`（rest 姿态）是**两个数据源、可以不同** —— 用户工程里人形 63 根一致、**`bow` 子树 6 根不一致**（局部平移差 13.5 / 50.2）⟹ 修复前武器网格「骨骼落在网格外 48 ~ 83 单位」，修复后 6 组**全部归零**（提交 `bcd5af6`）。⚠️ **动画流未同步改**（开放项，§1.7c.4）。✅ 同一分叉在 **glTF 路径**上以 `inverseBindMatrices` 的形式存在，**已按同一口径修好**（`docs/gltf-support.md` §5.1b） |
 
 ---
 
@@ -589,10 +589,11 @@ arrow          -7.3429    4.0642    0.4246  -1.5709  -1.5607   0.0001   0.0000  
 `arrow` `dpos max=0.9080` / `drot max=3.1416`）。
 
 > ⚠️ 同一分叉在 **glTF** 路径上以另一个名字存在：glTF 的绑定姿态是
-> `skin.inverseBindMatrices`（IBM），`src\gltf.rs` 目前**完全不读它**，
+> `skin.inverseBindMatrices`（IBM），`src\gltf.rs` 曾经**完全不读它**，
 > 参考姿态同样取节点 TRS。Blender 的 glTF 导出器有
 > `Use Rest Position Armature` 开关（**默认开**，关掉就把「当前帧姿态」当关节 rest pose）
-> ⟹ 该路径有**同一个缺陷**。详见 `docs/gltf-support.md` §5.1b。
+> ⟹ 该路径有**同一个缺陷**。**已按同一口径修好**（新增 `bind_worlds` 读 IBM 求逆），
+> 详见 `docs/gltf-support.md` §5.1b。
 
 ### 1.8 ⭐⭐⭐⭐⭐ 动画栈：官方**恒取第一条**，`$sequence` 的名字完全不参与
 
@@ -1343,7 +1344,7 @@ src_stack = "run"
 | 9 | **两条 `_` 怪癖** | §4.6 偏离 7、8：官方对含 `_` 的 shape key 名做 token 重排、并静默丢掉 `flexrule`。**已裁决不复刻** | ✅ 已记入偏离表（用户 m19290 裁决） |
 | 10 | **参考姿态 = 绑定姿态** | §1.7c：`cluster.bind_to_world` ≠ 节点 rest 姿态，参考姿态必须取前者（否则武器网格错位）。判据 `fbxbug\bone_vs_verts.js` 的 `outside` | ✅ **已修复**（提交 `bcd5af6`；6 组 48~83 → 全 0；MDL 221480 → 222792；822 测试 / parity 101/101 / e2e 4/4 全过） |
 | 11 | **动画流是否同步 bind 口径** | §1.7c.4：`read_frames` 仍取节点 rest。源侧本来就分两套（网格 SMD 写 bind、动画 SMD 写 rest），mdlc 现在恰好各自对齐，但播放时 `bow` 会跳 **25.66** 单位 | ⏳ **未定案**（`probe_fbx_animref`：参考姿态 vs 动画第 0 帧，逐值相同 1 / 不同 60） |
-| 12 | **glTF 路径的同一分叉** | §1.7c.4 末注：`src\gltf.rs` **完全不读 `inverseBindMatrices`**，参考姿态取节点 TRS；Blender 的 `Use Rest Position Armature` 关掉即触发 | ⏳ **已证实存在、尚未修**（`docs/gltf-support.md` §5.1b） |
+| 12 | **glTF 路径的同一分叉** | §1.7c.4 末注：`src\gltf.rs` 曾经**完全不读 `inverseBindMatrices`**，参考姿态取节点 TRS；Blender 的 `Use Rest Position Armature` 关掉即触发 | ✅ **已按同一口径修好**（`docs/gltf-support.md` §5.1b）：新增 `bind_worlds` 读 IBM 求逆，`reference_poses` 与 FBX 侧共用 `bone_offset` / `local_rotation` |
 
 ---
 

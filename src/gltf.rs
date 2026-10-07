@@ -469,6 +469,59 @@ impl World {
         Self { m, t }
     }
 
+    /// 求逆（4×4 仿射，隐含最后一行 `[0, 0, 0, 1]`）。
+    ///
+    /// ⚠️ 返回 `Option`：导出器写了 0 缩放时矩阵**奇异**，那是**源文件**的属性
+    /// 而不是 mdlc 的 bug —— 算出 `inf`/`NaN` 一路传进 SMD 比在这里放弃糟得多。
+    /// 调用方拿到 `None` 就退回节点自己的 rest 姿态（见 [`reference_poses`]）。
+    fn invert(&self) -> Option<Self> {
+        // 行主序便于写余子式：`a[r][c] = self.m[c][r]`。
+        let a = [
+            [self.m[0][0], self.m[1][0], self.m[2][0]],
+            [self.m[0][1], self.m[1][1], self.m[2][1]],
+            [self.m[0][2], self.m[1][2], self.m[2][2]],
+        ];
+        let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if det == 0.0 || !det.is_finite() {
+            return None;
+        }
+        // 伴随矩阵 / det（= 余子式矩阵的转置），行主序。
+        let inv_det = 1.0 / det;
+        let b = [
+            [
+                (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * inv_det,
+                (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * inv_det,
+                (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * inv_det,
+            ],
+            [
+                (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * inv_det,
+                (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * inv_det,
+                (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * inv_det,
+            ],
+            [
+                (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * inv_det,
+                (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * inv_det,
+                (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det,
+            ],
+        ];
+        // 平移：`t' = -A⁻¹ · t`。
+        let t = [
+            -(b[0][0] * self.t[0] + b[0][1] * self.t[1] + b[0][2] * self.t[2]),
+            -(b[1][0] * self.t[0] + b[1][1] * self.t[1] + b[1][2] * self.t[2]),
+            -(b[2][0] * self.t[0] + b[2][1] * self.t[1] + b[2][2] * self.t[2]),
+        ];
+        Some(Self {
+            m: [
+                [b[0][0], b[1][0], b[2][0]],
+                [b[0][1], b[1][1], b[2][1]],
+                [b[0][2], b[1][2], b[2][2]],
+            ],
+            t,
+        })
+    }
+
     /// 把本节点转成 [`crate::fbx`] 的矩阵类型（那边的一整套口径都吃它）。
     ///
     /// ⚠️ `ufbx::Matrix` 是 **12 个字段、无第 4 行**，且**列主序**
@@ -1167,39 +1220,101 @@ fn weights_of(
     out
 }
 
+/// 每个 `skin` 的**绑定姿态**世界矩阵表（`inverseBindMatrices` 求逆）。
+///
+/// ⚠️ 这不是「节点自己的 rest 姿态」—— 两者可以不同，而且**导出器的一个开关
+/// 就能让它们分叉**（`docs/gltf-support.md` §5.1b）。glTF 规范里蒙皮顶点算的是
+/// `jointMatrix(j) = globalTransformOfJointNode(j) · inverseBindMatrix(j)`，
+/// 所以顶点写在**绑定姿态**空间里；参考姿态也必须取绑定姿态，否则骨骼与网格
+/// 会被放进两个不同的空间（症状：武器骨骼挂在网格之外，`outside` 几十个单位）。
+///
+/// 返回的是**按节点下标**的表：`inverseBindMatrices[i]` 对应的是
+/// `skin.joints()[i]`（**不是**节点下标），中间要过一次关节表 —— 这一点与
+/// `JOINTS_0` 的语义是同一条（见 [`read_joints`]）。
+///
+/// 没有 `inverseBindMatrices` 时规范说「每个矩阵都当单位阵」，此时绑定姿态
+/// **就是**节点自己的世界变换，这里直接返回空表让调用方退回节点 rest ——
+/// 两种情况下的取值完全一样，省一次求逆。
+///
+/// ⚠️ 这里**没有**走 `Skin::reader(...).read_inverse_bind_matrices()`：那个
+/// 方法要求 `&'a self`（`skin\mod.rs:84-92`），而 `doc.skins()` 产出的 `Skin`
+/// 是循环里的临时值，借用活不到 `'a`（`error[E0597]: 'skin' does not live
+/// long enough`）。`read_inverse_bind_matrices` 内部做的正是下面这两行
+/// （`skin\util.rs:24-28`），直接展开即可 —— 与本文件读几何 accessor 的做法
+/// 也是同一条（见 [`read_vec3`] 的注释）。
+fn bind_worlds<'a, 's, F>(doc: &'a gltf::Document, get: F) -> HashMap<usize, World>
+where
+    F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
+{
+    let mut out: HashMap<usize, World> = HashMap::new();
+    for skin in doc.skins() {
+        let Some(acc) = skin.inverse_bind_matrices() else {
+            continue;
+        };
+        // `count == 0` 时 `Iter::new` 内部算 `stride × (count − 1)` 会在 debug
+        // 下**下溢 panic**（与 [`read_vec3`] 同一条坑）。
+        if acc.count() == 0 {
+            continue;
+        }
+        let Some(ibm) = gltf::accessor::Iter::<[[f32; 4]; 4]>::new(acc, get.clone()) else {
+            continue;
+        };
+        for (joint, m) in skin.joints().zip(ibm) {
+            // 同一个节点被多个 skin 引用时先见先取（与 FBX 侧 `bind_worlds`
+            // 同一条口径）。
+            if let Some(w) = World::from_matrix(m).invert() {
+                out.entry(joint.index()).or_insert(w);
+            }
+        }
+    }
+    out
+}
+
 /// 参考姿态（= 源的第 0 帧）。
 ///
 /// 与 FBX 侧的 `reference_poses` 同构：位移取 [`crate::fbx::bone_offset`]
-/// （根骨骼取 [`crate::fbx::normalized_translation`]），旋转取节点自己的
-/// **局部**四元数。
+/// （根骨骼取 [`crate::fbx::normalized_translation`]），旋转取**子相对父**的
+/// 旋转（[`crate::fbx::local_rotation`]）。
+///
+/// ⚠️ 世界矩阵来自 [`bind_worlds`]（`inverseBindMatrices` 求逆 = 绑定姿态），
+/// **不是**节点自己的 rest 姿态 —— 导出器写了 `Use Rest Position Armature = Off`
+/// 时节点 TRS 记的是**导出时的姿态**，用它会把骨骼与网格放进两个空间
+/// （`docs/gltf-support.md` §5.1b）。绑定姿态缺失（静态道具 / 没有 IBM）时
+/// 退回节点 rest 世界矩阵：两者混用不会串空间，绑定姿态本身就是世界矩阵，
+/// 只是被拿来当父链的基。
 ///
 /// ⚠️ glTF 的节点本来就不带 FBX 那种 `localS = 100`，所以
 /// `normalized_translation` 在这里是恒等 —— 但**照样要走它**：万一某个
 /// 导出器真的写了缩放，两边用同一个判据才不会又分道扬镳。
 fn reference_poses(
-    doc: &gltf::Document,
     parent: &[Option<usize>],
     world: &[World],
+    bind: &HashMap<usize, World>,
     kept: &[usize],
     opts: &GltfOpts,
 ) -> Vec<SmdPose> {
+    // 有绑定姿态就用绑定姿态，没有就退回节点自己的 rest 世界矩阵。
+    let pose_world: Vec<World> = (0..world.len())
+        .map(|i| bind.get(&i).copied().unwrap_or(world[i]))
+        .collect();
     kept.iter()
         .enumerate()
         .map(|(i, &id)| {
-            let n = doc.nodes().nth(id).expect("下标来自 kept_joints");
-            let (_, rot, _) = n.transform().decomposed();
-            let pos = match parent[id] {
-                Some(p) => crate::fbx::bone_offset(&world[p].to_ufbx(), &world[id].to_ufbx()),
-                None => crate::fbx::normalized_translation(&world[id].to_ufbx()),
+            let (pos, rot) = match parent[id] {
+                Some(p) => (
+                    crate::fbx::bone_offset(&pose_world[p].to_ufbx(), &pose_world[id].to_ufbx()),
+                    crate::fbx::local_rotation(&pose_world[p].to_ufbx(), &pose_world[id].to_ufbx()),
+                ),
+                // 根骨骼没有父链可除，但自己那份累积缩放仍要除掉（见
+                // [`crate::fbx::normalized_translation`]）。
+                None => (
+                    crate::fbx::normalized_translation(&pose_world[id].to_ufbx()),
+                    ufbx::matrix_to_transform(&pose_world[id].to_ufbx()).rotation,
+                ),
             };
             let (pos, rot) = opts.local(ufbx::Transform {
                 translation: pos,
-                rotation: ufbx::Quat {
-                    x: f64::from(rot[0]),
-                    y: f64::from(rot[1]),
-                    z: f64::from(rot[2]),
-                    w: f64::from(rot[3]),
-                },
+                rotation: rot,
                 scale: ufbx::Vec3 {
                     x: 1.0,
                     y: 1.0,
@@ -1281,6 +1396,9 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
         crate::diagln!("{line}");
     }
 
+    // accessor → 字节 的闭包（`Iter::new` 要吃它）。按 `Buffer::index()` 取。
+    let get = buffer_getter(&buffers);
+
     let parent = parent_table(&doc);
     let kept = kept_joints(&doc, &parent, opts);
     let nodes = smd_nodes(&doc, &parent, &kept);
@@ -1290,10 +1408,8 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
         .map(|(i, &id)| (id, i as i32))
         .collect();
     let world = world_transforms(&doc, &parent);
-    let poses = reference_poses(&doc, &parent, &world, &kept, opts);
-
-    // accessor → 字节 的闭包（`Iter::new` 要吃它）。按 `Buffer::index()` 取。
-    let get = buffer_getter(&buffers);
+    let bind = bind_worlds(&doc, get.clone());
+    let poses = reference_poses(&parent, &world, &bind, &kept, opts);
 
     let mut triangles: Vec<SmdTriangle> = Vec::new();
     let mut shape_keys: Vec<FbxShapeKey> = Vec::new();
@@ -1405,7 +1521,8 @@ pub fn read_frames(
 
     // 参考姿态（= 没有动画时的姿态，也是每条通道缺省时的取值）。
     let reference_world = world_transforms(&doc, &parent);
-    let reference: Vec<SmdPose> = reference_poses(&doc, &parent, &reference_world, &kept, opts);
+    let bind = bind_worlds(&doc, get.clone());
+    let reference: Vec<SmdPose> = reference_poses(&parent, &reference_world, &bind, &kept, opts);
 
     let names = anim_names(&doc);
     let anim = match stack {
@@ -2051,6 +2168,35 @@ mod tests {
         assert_eq!(w.t, [1.0, 2.0, 3.0]);
     }
 
+    /// `World::invert` 是 4×4 仿射的逆（3×3 余子式 + `t' = -A⁻¹·t`）。
+    #[test]
+    fn invert_round_trips_an_affine_matrix() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let w = World::from_trs([1.0, 2.0, 3.0], [0.0, 0.0, s, s], [2.0, 2.0, 2.0]);
+        let i = w.invert().expect("有缩放但不是奇异的，应能求逆");
+        let id = w.mul(&i);
+        // `W · W⁻¹` 应是单位阵（3×3 部分）与零平移。
+        for (c, col) in id.m.iter().enumerate() {
+            for (r, v) in col.iter().enumerate() {
+                let want = if c == r { 1.0 } else { 0.0 };
+                assert!(
+                    (v - want).abs() < 1e-9,
+                    "W·W⁻¹ 的第 {c} 列第 {r} 行应是 {want}：{v}"
+                );
+            }
+        }
+        for (r, v) in id.t.iter().enumerate() {
+            assert!(v.abs() < 1e-9, "W·W⁻¹ 的平移第 {r} 位应是 0：{v}");
+        }
+
+        // 奇异矩阵（0 缩放）返回 `None`，不能吐 inf/NaN。
+        let flat = World::from_trs([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0]);
+        assert!(
+            flat.invert().is_none(),
+            "0 缩放的矩阵是奇异的，必须返回 None"
+        );
+    }
+
     /// ⭐ **层序陷阱**：glTF 的 `scene.nodes` 是**层序**（子可以排在父前面），
     /// 所以 `accumulate` 不能像 FBX 那样顺数组累乘，必须迭代到不动点。
     ///
@@ -2244,6 +2390,78 @@ mod tests {
         assert!(
             g.untextured_meshes.is_empty(),
             "写了材质就不该进「无材质」清单"
+        );
+    }
+
+    /// ⭐⭐⭐ **参考姿态取绑定姿态，不是节点 rest 姿态。**
+    ///
+    /// 与 FBX 侧的 `bind_worlds` 是同一条口径（`docs/gltf-support.md` §5.1b）：
+    /// Blender 把 `Use Rest Position Armature` 关掉时，节点的 TRS 写的是
+    /// **当前帧姿态**，而 `inverseBindMatrices` 仍然是 rest ⟹ 顶点（写在绑定
+    /// 姿态空间）与骨骼参考姿态分属两个空间，武器/道具骨骼整片错位。
+    ///
+    /// 夹具刻意让两者**不同**：节点 1 的 TRS 说它在 `(0,10,0)`，而 IBM 说
+    /// 绑定姿态在 `(0,20,0)`。取错了就会读到 10。
+    #[test]
+    fn reference_pose_comes_from_inverse_bind_matrices() {
+        let d = tmpdir("ibm");
+        let mut bin = tri_bytes();
+        // MAT4 是 64 B、**列主序**：平移列 = `(0, -20, 0)` ⟹ 绑定姿态在 `(0, 20, 0)`。
+        bin.extend(f32s(&[
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, -20.0, 0.0, 1.0,
+        ]));
+        // 几何 102 B ⟹ IBM 落在 102，占 64 B。
+        let body = add_accessor(
+            TRI_BODY,
+            "{\"bufferView\": 4, \"componentType\": 5126, \"count\": 1, \"type\": \"MAT4\"}",
+        );
+        let body = add_view(&body, 102, 64);
+        let body = body.replace(
+            "\"nodes\": [{\"name\": \"Body.001\", \"mesh\": 0}]",
+            "\"nodes\": [\
+             {\"name\": \"Body.001\", \"mesh\": 0, \"skin\": 0}, \
+             {\"name\": \"Joint\", \"translation\": [0.0, 10.0, 0.0]}],\n  \
+             \"skins\": [{\"joints\": [1], \"inverseBindMatrices\": 4}]",
+        );
+        let p = write_gltf(&d, "ibm.gltf", &bin, &body);
+        let g = read(&p, "ibm.gltf", &GltfOpts::default()).expect("应能读出蒙皮网格");
+
+        assert_eq!(g.smd.nodes.len(), 1, "只有 `skin.joints` 里那根被收进来");
+        assert_eq!(g.smd.nodes[0].name, "Joint");
+        let pos = g.smd.frames[0].poses[0].position;
+        assert!(
+            near3(pos, [0.0, 20.0, 0.0]),
+            "参考姿态要取 IBM⁻¹ 的平移列 (0,20,0)；取成节点 TRS 就会是 (0,10,0)：{pos:?}"
+        );
+    }
+
+    /// 没有 `inverseBindMatrices` 时退回节点 rest 姿态。
+    ///
+    /// 规范逐字：「When `None`, each matrix is assumed to be the 4x4 identity
+    /// matrix which implies that the inverse-bind matrices were pre-applied.」
+    /// —— 单位阵的逆还是单位阵，绑定姿态就**等于**节点世界变换，退回是正解
+    /// （也是绝大多数手写 / 简化 glTF 的情形）。
+    #[test]
+    fn reference_pose_falls_back_to_node_trs_without_ibm() {
+        let d = tmpdir("noibm");
+        let body = TRI_BODY.replace(
+            "\"nodes\": [{\"name\": \"Body.001\", \"mesh\": 0}]",
+            "\"nodes\": [\
+             {\"name\": \"Body.001\", \"mesh\": 0, \"skin\": 0}, \
+             {\"name\": \"Joint\", \"translation\": [0.0, 10.0, 0.0]}],\n  \
+             \"skins\": [{\"joints\": [1]}]",
+        );
+        let p = write_gltf(&d, "noibm.gltf", &tri_bytes(), &body);
+        let g = read(&p, "noibm.gltf", &GltfOpts::default()).expect("应能读出蒙皮网格");
+
+        assert_eq!(g.smd.nodes.len(), 1);
+        let pos = g.smd.frames[0].poses[0].position;
+        assert!(
+            near3(pos, [0.0, 10.0, 0.0]),
+            "没有 IBM 时退回节点 rest 姿态 (0,10,0)：{pos:?}"
         );
     }
 

@@ -38,7 +38,7 @@
 | 依赖代价多大？ | **+5 个包**（master，关 `import`）/ **+6 个**（1.4.1，关 `import`）；开 `import` 是 **+21/+22 个包**且对 mdlc 毫无用处。[实测] |
 | 要新增 QC 语法吗？ | **0 条**。九条 `src*` 语法按概念命名，一条都不用改。[读码] |
 | 两套输入会产出同一个模型吗？ | **现在会了**。曾经差 100×（Blender 的 **FBX 导出器**把 m→cm 单位换算烘进节点、**glTF 导出器不做**，而官方 studiomdl 只对顶点丢掉那个缩放、对骨骼保留）—— 已在 FBX 侧修掉（`docs/fbx-support.md` §4.6 偏离 12），两套输入现在编出**同一量级**的模型。见 §5.2。 |
-| ⭐ **参考姿态取哪个姿态？** | ⚠️ **取错了**（§5.1b，已证实、尚未修）。glTF 的绑定姿态载体是 `skin.inverseBindMatrices`（IBM），而 `src\gltf.rs` **一个字节都没读它**，参考姿态全取节点 TRS。Blender 的 `Use Rest Position Armature`（**默认开**）关掉后，节点 TRS = 当前帧姿态而 IBM 仍是 rest ⟹ 骨骼与蒙皮网格分属两个空间，**与 FBX 侧 R59 是同一个缺陷**。自造夹具实测 `outside` 达 **9.823**、包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`。⚠️ 现有三个夹具是**退化情形**（`jointWorld · IBM = I`），**测不出**这个问题。 |
+| ⭐ **参考姿态取哪个姿态？** | ✅ **已修好：取绑定姿态**（§5.1b）。glTF 的绑定姿态载体是 `skin.inverseBindMatrices`（IBM）—— 曾经**一个字节都没读它**，参考姿态全取节点 TRS。Blender 的 `Use Rest Position Armature`（**默认开**）关掉后，节点 TRS = 当前帧姿态而 IBM 仍是 rest ⟹ 骨骼与蒙皮网格分属两个空间，**与 FBX 侧 R59 是同一个缺陷**。修复前自造夹具实测 `outside` 达 **9.823**、包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`；修复后 `rest`/`posed` 的骨骼表 **70/70 逐字段相同**、`outside` 全 `0.000`。⚠️ 现有三个夹具是**退化情形**（`jointWorld · IBM = I`），**测不出**这个问题。 |
 | 建议 | **做**。按 §7 的落点实现，把「无 oracle」这件事在文档里说清楚。 |
 
 ---
@@ -476,11 +476,11 @@ gltf = { git = "https://github.com/gltf-rs/gltf", rev = "50d65229477fe5f785c2c90
 
 > ⚠️ **但「恒为单位阵」是夹具的退化性质，不是 glTF 的普遍性质** —— 见 §5.1b。
 
-### 5.1b ⭐⭐⭐⭐⭐ 参考姿态：`inverseBindMatrices` 被完全忽略（**已证实有缺陷，尚未修**）
+### 5.1b ⭐⭐⭐⭐⭐ 参考姿态：取绑定姿态（`inverseBindMatrices`），不是节点 rest 姿态（**已修**）
 
-**一句话：glTF 的 IBM 就是 FBX `bind_to_world` 的对应物，而 `src\gltf.rs` 一个字节都没读它
+**一句话：glTF 的 IBM 就是 FBX `bind_to_world` 的对应物。曾经 `src\gltf.rs` 一个字节都没读它
 —— 参考姿态全部取节点 TRS。当导出器把「当前帧姿态」当作关节 rest pose 时，
-这条路径会复现 FBX 那次一模一样的错位。**
+这条路径会复现 FBX 那次一模一样的错位。现已改为读 IBM 求逆。**
 
 #### 5.1b.1 两个姿态、两个来源（与 FBX 同构）
 
@@ -551,23 +551,47 @@ posed.glb （关）                              最大偏离 = 1.129e+1 (Head) 
 > ① 姿态必须绕骨骼**局部 X 轴**转 —— Y 是骨骼轴向，绕 Y 转只是自转、骨骼原点不动，测不出东西；
 > ② 测 `outside` 的网格必须与骨骼 head **同心** —— 加了偏移会让「正确」情形也有非零基线，把信号淹掉。
 
-#### 5.1b.4 修复落点（**尚未实施**）
+#### 5.1b.4 实现（**已落地**）
 
-- `src\gltf.rs` 的 `reference_poses`（`:1179`）：把世界矩阵基从节点 TRS 累乘换成
-  **IBM⁻¹ 累乘**（无 IBM 时退回节点 TRS，与 FBX 侧「无蒙皮簇退回 rest」同构）。
-- `src\gltf.rs` 目前 grep `inverseBindMatrices|inverse_bind|IBM` **0 命中**；
-  `gltf` crate（`Cargo.lock` 里是 **1.4.1**）通过
-  `skin.reader(..).read_inverse_bind_matrices()` 提供（§3 已记）。
+- `src\gltf.rs` 新增 `fn bind_worlds`：扫 `doc.skins()`，对每个 skin 读
+  `inverseBindMatrices` accessor，**逐关节求逆**得到绑定姿态世界矩阵，
+  返回**按节点下标**的表（`inverseBindMatrices[i]` 对应 `skin.joints()[i]`，
+  中间要过一次关节表 —— 与 `JOINTS_0` 是同一条语义）。
+- `fn reference_poses` 把世界矩阵基换成
+  `bind.get(&i).copied().unwrap_or(world[i])`（**有绑定姿态用绑定姿态，没有退回节点 rest**，
+  与 FBX 侧「无蒙皮簇退回 rest」逐字同构），随后照旧走
+  `crate::fbx::bone_offset` / `crate::fbx::local_rotation`。
+- ⚠️ **没有**走 `skin.reader(..).read_inverse_bind_matrices()`：`Skin::reader`
+  要求 `&'a self`（`skin\mod.rs:82-92`），而 `doc.skins()` 产出的 `Skin` 是循环里的
+  临时值，借用活不到 `'a` ⟹ `error[E0597]: 'skin' does not live long enough`。
+  改为直接展开 `skin\util.rs:24-28` 那两行（用公开的
+  `gltf::accessor::Iter::<[[f32;4];4]>::new(acc, get)`），与本文件读几何 accessor 的做法一致。
+- ⚠️ `accessor.count() == 0` 必须提前跳过：`Iter::new` 内部算 `stride × (count − 1)`，
+  debug 下会下溢 panic（与 `read_vec3` 注释里的同一条坑）。
+- `World::invert` 对**奇异矩阵**（导出器写了 0 缩放）返回 `None`，调用方退回节点 rest ——
+  算出 `inf`/`NaN` 一路传进 SMD 比在这里放弃糟得多。
 - 下游**不需要再改**：`CompiledModel.source_world`（`src\model.rs:3913`）与
-  `remap_vertices_to_reference_pose`（`src\compile.rs:4870-4978`）已经通了 ——
+  `remap_vertices_to_reference_pose`（`src\compile.rs:4870-4978`）本来就通了 ——
   glTF 侧也是经 `read()` 产出 `FbxGeometry`（含 `reference_frame`）再走同一条 `compile()`。
-  换句话说，`source_world` 只需在 glTF 路径上填成 `IBM⁻¹` 而不是节点 TRS 累乘。
 - `read_frames`（动画流）与 FBX 侧同状态：**未同步改**（见 `docs/fbx-support.md` §1.7c.4）。
 
-> ✅ **零回归风险**：仓库里 **parity 夹具没有任何 `.glb`/`.gltf`**
+**验收**（`fbxbug\cmp3\`，同一二进制、只换导出开关）：
+
+| | `rest`（开关=开） | `posed`（关，缺陷态） |
+|---|---|---|
+| `bone_vs_verts` 的 `outside > 1` 组数 | 0 / 6 | **0 / 6**（修复前 6 / 6，值 39.363~67.674） |
+| 骨骼表（按名字对齐） | — | **`A=70 B=70 identical=70 differing=0`** |
+| 模型空间顶点包围盒 | `[14.845, 53.018, 8.084]` | 同值 |
+
+用户真实资产（`fbxbug\cmp2\`，`未命名.glb` 走 `srcpart`）重编译：骨骼 70 / 顶点 8959 /
+三角形 10760；与 FBX 路径的骨骼表 **`identical=69 differing=1`**（唯一差异是骨架根的
+坐标轴约定，glTF Y-up vs FBX 骨架根带 −90° 绕 X），**修复前那条 `arrow` 的 1e-4 浮点噪声差异已消失**。
+FBX 路径产物尺寸**逐字节不变**（MDL 223580 / VVD 573440 / VTX 145762）。
+
+> ✅ **零回归风险（已实测）**：仓库里 **parity 夹具没有任何 `.glb`/`.gltf`**
 > （`parity\*.qc` grep `.glb|.gltf` 0 命中，`parity\` 下无 glTF 文件）；
 > 仅有的三个 glb 都在 `docs\_probe\_oracle_dual\` 且**恰好是退化情形**（IBM = 节点 TRS），
-> 所以改与不改在这三个文件上产物**逐字节相同**。
+> 所以改与不改在这三个文件上产物**逐字节相同** —— 实测 `parity_snapshot.js` 101/101 全过。
 
 ### 5.2 ⭐⭐⭐⭐⭐ 骨骼位移：两套输入曾经差 100×（已在 FBX 侧修掉）
 
@@ -833,7 +857,7 @@ cdtexture 表**差一条空串**。第三方实现（NekoMDL 的 `neko_rig.mdl` 
 | 5 | 两套输入差 100× | ✅ **已在 FBX 侧修掉**（`docs/fbx-support.md` §4.6 偏离 12），两套输入现在一致。⚠️ 遗留影响：带节点缩放的 FBX 其骨骼表与**官方产物数值不同** ⟹ 与 mdlc 对照时要用官方 `Apply Scalings = "FBX Units Scale"` 的产物。⚠️ 仍然**没有旋钮能补偿**（§5.2 实测：`srcscale` 是整体缩放，比值不变）。 |
 | 6 | `base64 0.13.1` 版本较老（2021） | 低。只在解 data URI 时用，且输入是本地文件。 |
 | 7 | glTF 几何源**不追加**空 cdtexture | ✅ **用户裁决，见 §6.5**。代价：同一场景 `.fbx` vs `.glb` 的 cdtexture 表差一条。 |
-| 8 | ⭐⭐⭐⭐⭐ **`inverseBindMatrices` 被完全忽略** | **高**（已证实、尚未修，§5.1b）。`src\gltf.rs` 参考姿态全取节点 TRS；Blender 的 `Use Rest Position Armature` 关掉后节点 TRS = 当前帧姿态、IBM 仍 = rest ⟹ 骨骼与蒙皮网格分属两个空间，与 FBX 侧 R59 是**同一个缺陷**。自造夹具实测 `posed.glb` 的 `outside` 达 **9.823**、模型空间包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`。修复只需把世界矩阵基换成 IBM⁻¹ 累乘（下游 `source_world` 已通）。✅ **零回归风险**：parity 夹具无任何 `.glb`/`.gltf`，仅有的三个 glb 恰好是退化情形。 |
+| 8 | ⭐⭐⭐⭐⭐ **`inverseBindMatrices` 被完全忽略** | ✅ **已修**（§5.1b）。`src\gltf.rs` 新增 `bind_worlds` 读 IBM 求逆，`reference_poses` 的世界矩阵基改成「有绑定姿态用绑定姿态、没有退回节点 TRS」。修复前 `posed.glb` 的 `outside` 达 **9.823**、模型空间包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`；修复后 `rest`/`posed` 骨骼表 **70/70 逐字段相同**、`outside` 全 `0.000`，用户真实资产与 FBX 路径只差骨架根的坐标轴约定。✅ **零回归风险已实测**：parity 夹具无任何 `.glb`/`.gltf`，101/101 全过。 |
 | 9 | **动画流是否同步 bind 口径** | 中（未定案，§5.1b.4 末）。与 FBX 侧同状态：`read_frames` 取节点 TRS。 |
 
 ### 8.1 兼容两种上游的写法（风险 2 + 3）

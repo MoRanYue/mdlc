@@ -692,7 +692,14 @@ fn bind_worlds(scene: &ufbx::Scene) -> HashMap<u32, ufbx::Matrix> {
 ///
 /// 两个矩阵都带 100 倍缩放，`matrix_invert` 会把它约掉；与 [`bone_offset`] 同一套
 /// 口径（后者取同一个相对矩阵的平移列）。
-fn local_rotation(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Quat {
+///
+/// ⚠️ **`pub(crate)` 是给 [`crate::gltf`] 用的** —— glTF 侧的参考姿态走的是
+/// 同一套「绑定姿态世界矩阵 → 子相对父」口径，两条路径必须用**同一个**函数，
+/// 否则又会分道扬镳（`docs/gltf-support.md` §5.1b）。
+pub(crate) fn local_rotation(
+    parent_world: &ufbx::Matrix,
+    child_world: &ufbx::Matrix,
+) -> ufbx::Quat {
     let rel = ufbx::matrix_mul(&ufbx::matrix_invert(parent_world), child_world);
     ufbx::matrix_to_transform(&rel).rotation
 }
