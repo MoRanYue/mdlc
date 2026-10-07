@@ -657,10 +657,50 @@ fn accumulate_worlds(scene: &ufbx::Scene, locals: &[ufbx::Matrix]) -> Vec<ufbx::
     world
 }
 
-/// 参考姿态（= 源的第 0 帧）：旋转取节点自己的局部旋转，位移取 [`bone_offset`]。
+/// 每根骨骼的**绑定姿态**世界矩阵（`ufbx_skin_cluster::bind_to_world`）。
+///
+/// ⚠️ 这不是「节点自己的 rest 姿态」—— 两者可以不同。实测用户工程（`未命名.fbx`）：
+/// 人形 63 根两者一致，`bow` 子树 6 根不一致（`bow` 的局部平移差 **13.5 单位**，
+/// `ring_*`/`string_*` 差 50.2）。原因是 FBX 的节点 TRS 记的是**导出时的姿态**，
+/// 而绑定姿态来自骨架的 rest pose。
+///
+/// 网格顶点写在**绑定姿态**空间里（见 [`from_scene`] 的顶点口径，`probe_fbx_bind`
+/// 实测现行顶点口径的包围盒恰好把绑定姿态的骨骼原点包在里面、`outside = 0`），
+/// 所以骨骼的参考姿态也必须取绑定姿态 —— 用节点 rest 会得到另一套空间，武器网格
+/// 就会挂在骨骼原点之外。
+///
+/// 同一根骨骼挂在多个网格上时这些矩阵**逐位相同**（实测 7 处一致），先见先取即可。
+/// 文件里没有任何蒙皮簇时返回空表，调用方退回节点 rest 姿态。
+fn bind_worlds(scene: &ufbx::Scene) -> HashMap<u32, ufbx::Matrix> {
+    let mut out: HashMap<u32, ufbx::Matrix> = HashMap::new();
+    for n in &scene.nodes {
+        let Some(mesh) = n.mesh.as_ref() else {
+            continue;
+        };
+        for d in &mesh.skin_deformers {
+            for c in &d.clusters {
+                if let Some(b) = c.bone_node.as_ref() {
+                    out.entry(b.element.element_id).or_insert(c.bind_to_world);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 子相对父的旋转：`R_norm(parent)ᵀ · R_norm(child)`。
+///
+/// 两个矩阵都带 100 倍缩放，`matrix_invert` 会把它约掉；与 [`bone_offset`] 同一套
+/// 口径（后者取同一个相对矩阵的平移列）。
+fn local_rotation(parent_world: &ufbx::Matrix, child_world: &ufbx::Matrix) -> ufbx::Quat {
+    let rel = ufbx::matrix_mul(&ufbx::matrix_invert(parent_world), child_world);
+    ufbx::matrix_to_transform(&rel).rotation
+}
+
+/// 参考姿态（= 源的第 0 帧）：旋转取子相对父的旋转，位移取 [`bone_offset`]。
 ///
 /// 官方 `Build_Reference()`（`studiomdl.cpp:728-762`）用源的第 0 帧；FBX 源的
-/// 「第 0 帧」就是节点自己的局部 TRS。
+/// 「第 0 帧」是**绑定姿态**（见 [`bind_worlds`]），不是节点自己的 rest 姿态。
 fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) -> Vec<SmdPose> {
     let ix: HashMap<u32, usize> = (0..scene.nodes.len())
         .map(|i| (scene.nodes[i].element.element_id, i))
@@ -669,22 +709,38 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
         .map(|i| ufbx::transform_to_matrix(&scene.nodes[i].local_transform))
         .collect();
     let world = accumulate_worlds(scene, &locals);
+    // 有绑定姿态就用绑定姿态，没有（静态道具 / 合成根）就退回节点自己的 rest 世界
+    // 矩阵 —— 两者混用不会串空间：绑定姿态本身就是世界矩阵，只是被拿来当父链的基。
+    let bind = bind_worlds(scene);
+    let pose_world: Vec<ufbx::Matrix> = (0..scene.nodes.len())
+        .map(|i| {
+            bind.get(&scene.nodes[i].element.element_id)
+                .copied()
+                .unwrap_or(world[i])
+        })
+        .collect();
     kept.iter()
         .enumerate()
         .map(|(i, n)| {
             let mi = ix.get(&n.element.element_id).copied();
-            let pos = match mi {
+            let (pos, rot) = match mi {
                 Some(mi) => match n.parent.as_ref().and_then(|p| ix.get(&p.element.element_id)) {
-                    Some(&pi) => bone_offset(&world[pi], &world[mi]),
+                    Some(&pi) => (
+                        bone_offset(&pose_world[pi], &pose_world[mi]),
+                        local_rotation(&pose_world[pi], &pose_world[mi]),
+                    ),
                     // 根骨骼没有父链可除，但自己那份累积缩放仍要除掉（见
                     // [`normalized_translation`]）。
-                    None => normalized_translation(&world[mi]),
+                    None => (
+                        normalized_translation(&pose_world[mi]),
+                        ufbx::matrix_to_transform(&pose_world[mi]).rotation,
+                    ),
                 },
-                None => n.local_transform.translation,
+                None => (n.local_transform.translation, n.local_transform.rotation),
             };
             let (pos, rot) = opts.local(ufbx::Transform {
                 translation: pos,
-                rotation: n.local_transform.rotation,
+                rotation: rot,
                 scale: ufbx::Vec3 {
                     x: 1.0,
                     y: 1.0,

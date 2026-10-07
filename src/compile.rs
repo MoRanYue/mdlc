@@ -2724,32 +2724,76 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                 // 查不到时走官方的父链上溯（`MapSourcesToGlobalBonetable()`，
                 // `simplify.cpp:4148-4217`），整条链都不在表里则退到根骨骼 0。
                 let bone_map = VertexBoneMap::new(&smd, desc);
-                let poses: Vec<SmdPose> = smd
-                    .reference_frame()
-                    .map(|f| {
-                        f.poses
-                            .iter()
-                            .filter_map(|p| {
-                                let node_ix = usize::try_from(p.bone).ok()?;
-                                if node_ix >= smd.nodes.len() {
-                                    return None;
-                                }
-                                let di = bone_map.map_bone(node_ix)?;
-                                Some(SmdPose {
-                                    bone: di as i32,
-                                    position: p.position,
-                                    rotation: p.rotation,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+
+                // ---- 源骨架第 0 帧的世界矩阵（官方 `BuildRawTransforms(psource, 0, …)`）----
+                //
+                // ⚠️ **必须用源自己的父链**（`smd.nodes[].parent`），不能用描述文件的
+                // 父链。官方 `simplify.cpp:1432-1492` 逐骨骼走的是
+                // `psource->localBone[k].parent`，与 `g_bonetable` 无关。
+                //
+                // 两条父链会分叉的典型场景：`$definebone "X" "" …` 把 `X` 重新声明为
+                // 根 —— 骨骼表里 `X.parent == -1`，源里 `X` 却仍有祖先。用描述文件的
+                // 父链重建会丢掉那个祖先，于是「源世界矩阵」与 `boneToPose` 恰好相等
+                // ⟹ 顶点重映射被判成恒等 ⟹ 顶点原地不动而骨骼表已搬 ⟹ 网格与骨骼错开。
+                let node_count = smd.nodes.len();
+                let src_node_world: Vec<crate::bone_math::Matrix3x4> = match smd.reference_frame() {
+                    None => Vec::new(),
+                    Some(f) => {
+                        let mut src_pos = vec![[0.0f32; 3]; node_count];
+                        let mut src_rot = vec![[0.0f32; 3]; node_count];
+                        for p in &f.poses {
+                            if let Ok(ni) = usize::try_from(p.bone)
+                                && ni < node_count
+                            {
+                                src_pos[ni] = p.position;
+                                src_rot[ni] = p.rotation;
+                            }
+                        }
+                        let src_parents: Vec<i32> = smd.nodes.iter().map(|n| n.parent).collect();
+                        crate::bone_math::compute_world(&src_pos, &src_rot, &src_parents)
+                    }
+                };
+
+                let mut poses: Vec<SmdPose> = Vec::new();
+                // 骨骼表下标 → 源骨架第 0 帧世界矩阵。
+                //
+                // ⚠️ 只有**名字精确命中**时才填 —— 官方 `MapSourcesToGlobalBonetable()`
+                // （`simplify.cpp:4148-4217`）只在 `k != -1` 的分支里写
+                // `boneGlobalToLocal[k] = j`（`:4212`）；走父链上溯或退到根骨骼 0 的
+                // 那些**不写** ⟹ 官方 `TranslateAnimations()` 那边 `q == -1`，
+                // 改走 `g_bonetable` 的局部姿态沿全局父链累乘（`:1512-1524`）。
+                let mut source_world: Vec<Option<crate::bone_math::Matrix3x4>> =
+                    vec![None; desc.bones.len()];
+                if let Some(f) = smd.reference_frame() {
+                    for p in &f.poses {
+                        let Ok(node_ix) = usize::try_from(p.bone) else {
+                            continue;
+                        };
+                        if node_ix >= node_count {
+                            continue;
+                        }
+                        if let Some(&di) = bone_map.desc_index.get(smd.nodes[node_ix].name.as_str())
+                            && let Some(slot) = source_world.get_mut(di)
+                        {
+                            *slot = Some(src_node_world[node_ix]);
+                        }
+                        let Some(di) = bone_map.map_bone(node_ix) else {
+                            continue;
+                        };
+                        poses.push(SmdPose {
+                            bone: di as i32,
+                            position: p.position,
+                            rotation: p.rotation,
+                        });
+                    }
+                }
                 let _ = pose_for; // 保留该辅助函数供后续「按名取姿态」使用
 
                 models.push(CompiledModel {
                     smd_path,
                     name,
                     poses,
+                    source_world,
                     meshes,
                     lods,
                     eyeballs: Vec::new(),
@@ -4818,7 +4862,37 @@ fn remap_vertices_to_reference_pose(compiled: &mut CompiledModelDesc) -> bool {
         &parents,
     );
 
-    // `destBoneToWorld[k]`：**源骨架** ∘ `srcRealign`（`simplify.cpp:1527`）。
+    // `g_bonetable[k].srcRealign` —— 与源无关，先算好。
+    //
+    // `compiled.realigned.src_realign` 已把 `$definebone` 的显式值覆盖进去了
+    // （`compute_realigned_poses` 末尾的 `explicit` 循环），所以有它就优先用；
+    // 否则退回骨骼自己声明的 `srcRealign`（12 数字形式，或
+    // `$unlockdefinebones` 下 `$definebone` 仍在骨骼表里的情形）。
+    let src_realign: Vec<crate::bone_math::Matrix3x4> = (0..n)
+        .map(|k| {
+            compiled
+                .realigned
+                .as_ref()
+                .map(|r| r.src_realign[k])
+                .or_else(|| desc.bones[k].explicit_src_realign())
+                .unwrap_or(crate::bone_math::IDENTITY)
+        })
+        .collect();
+
+    // `destBoneToWorld[k]`：官方 `TranslateAnimations()`（`simplify.cpp:1498-1564`）。
+    //
+    // ⚠️ **逐 model（= 逐源）算一套**，与官方「`for (i = 0; i < g_numsources; i++)`
+    // 里各自 `BuildRawTransforms` + `TranslateAnimations`」一一对应 —— 每个源的
+    // 骨架可以不同，用同一个 `m` 的顶点配另一个源的骨架是错的。
+    //
+    // 两根分支：
+    //
+    // * `source_world[k] == Some(src)`（官方 `boneGlobalToLocal[k] != -1`，即
+    //   **名字精确命中**）⟹ `dest[k] = src ∘ srcRealign[k]`（`:1527`）。
+    //   这里的 `src` 是**源自己的第 0 帧世界矩阵**（源父链），不是骨骼表父链。
+    // * `None`（官方 `q == -1`）⟹ `dest[k] = dest[g_bonetable[k].parent] ∘
+    //   local(g_bonetable[k])`（`:1512-1524`），即用**骨骼表**的局部姿态沿
+    //   **骨骼表**的父链累乘。
     //
     // ⚠️ **不能用 [`internal_bone_world`]** —— 那个函数的口径是官方的
     // `g_bonetable[k].boneToPose`（hitbox / 姿态包围盒用），它对
@@ -4830,32 +4904,7 @@ fn remap_vertices_to_reference_pose(compiled: &mut CompiledModelDesc) -> bool {
     // `ValveBiped.ValveBiped`。`weapon` 自己没被重排（`srcRealign = I`），
     // 但它的**源**世界矩阵带着根骨骼的 `z = −62.886765`，而骨骼表里根骨骼
     // 被 `$definebone` 挪到了原点 —— 两者不同，顶点必须跟着挪。
-    //
-    // 官方定义对**每根**骨骼都是 `srcBoneToWorld[q] ∘ srcRealign[k]`，
-    // 与 `realign_sequence_frames`（`compile.rs:2315-2319`）是同一个式子。
-    let src: Vec<([f32; 3], [f32; 3])> =
-        (0..n).map(|i| source_bone_pose(compiled, i)).collect();
-    let src_world = crate::bone_math::compute_world(
-        &src.iter().map(|p| p.0).collect::<Vec<_>>(),
-        &src.iter().map(|p| p.1).collect::<Vec<_>>(),
-        &parents,
-    );
-    let dest: Vec<crate::bone_math::Matrix3x4> = (0..n)
-        .map(|k| {
-            // `compiled.realigned.src_realign` 已把 `$definebone` 的显式值
-            // 覆盖进去了（`compute_realigned_poses` 末尾的 `explicit` 循环），
-            // 所以有它就优先用；否则退回骨骼自己声明的 `srcRealign`
-            // （12 数字形式，或 `$unlockdefinebones` 下 `$definebone` 仍在
-            // 骨骼表里的情形）。
-            let sr = compiled
-                .realigned
-                .as_ref()
-                .map(|r| r.src_realign[k])
-                .or_else(|| desc.bones[k].explicit_src_realign())
-                .unwrap_or(crate::bone_math::IDENTITY);
-            crate::bone_math::concat(&src_world[k], &sr)
-        })
-        .collect();
+    let identity = crate::bone_math::IDENTITY;
 
     // `M_k = boneToPose[k] ∘ destBoneToWorld[k]⁻¹`。
     //
@@ -4869,31 +4918,49 @@ fn remap_vertices_to_reference_pose(compiled: &mut CompiledModelDesc) -> bool {
     // 判据用 `dest[k]` 与 `table_world[k]` 的**逐位相等**（而不是判 `M_k`
     // 是否接近单位阵）—— 前者是「官方这一步对这根骨骼确实是恒等」的
     // 充分条件，且与浮点误差无关。
-    let identity = crate::bone_math::IDENTITY;
-    let mats: Vec<crate::bone_math::Matrix3x4> = (0..n)
-        .map(|k| {
-            let same = dest[k]
-                .iter()
-                .zip(table_world[k].iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits());
-            if same {
-                identity
-            } else {
-                crate::bone_math::concat(&table_world[k], &crate::bone_math::invert(&dest[k]))
-            }
-        })
-        .collect();
+    let mats_for = |source_world: &[Option<crate::bone_math::Matrix3x4>]| {
+        let mut dest: Vec<crate::bone_math::Matrix3x4> = Vec::with_capacity(n);
+        for k in 0..n {
+            let d = match source_world.get(k).copied().flatten() {
+                Some(sw) => crate::bone_math::concat(&sw, &src_realign[k]),
+                None => {
+                    let local = crate::bone_math::local_transform(table[k].0, table[k].1);
+                    match parents[k] {
+                        p if p >= 0 => crate::bone_math::concat(&dest[p as usize], &local),
+                        _ => local,
+                    }
+                }
+            };
+            dest.push(d);
+        }
+        dest.iter()
+            .zip(table_world.iter())
+            .map(|(d, t)| {
+                let same = d.iter().zip(t.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+                if same {
+                    identity
+                } else {
+                    crate::bone_math::concat(t, &crate::bone_math::invert(d))
+                }
+            })
+            .collect::<Vec<crate::bone_math::Matrix3x4>>()
+    };
 
-    // 全是精确单位阵 ⟹ 官方这一步是恒等变换，直接跳过（产物逐字节不变）。
-    if mats
-        .iter()
-        .all(|m| m.iter().zip(identity.iter()).all(|(a, b)| a.to_bits() == b.to_bits()))
-    {
-        return false;
-    }
-
+    let mut moved = false;
     for bp in &mut compiled.bodyparts {
         for m in &mut bp.models {
+            let mats = mats_for(&m.source_world);
+
+            // 全是精确单位阵 ⟹ 官方这一步对**这个源**是恒等变换，跳过
+            // （产物逐字节不变）。
+            if mats
+                .iter()
+                .all(|mm| mm.iter().zip(identity.iter()).all(|(a, b)| a.to_bits() == b.to_bits()))
+            {
+                continue;
+            }
+            moved = true;
+
             for mesh in &mut m.meshes {
                 remap_vertex_slice(&mut mesh.vertices, &mats, n);
             }
@@ -4907,7 +4974,7 @@ fn remap_vertices_to_reference_pose(compiled: &mut CompiledModelDesc) -> bool {
             }
         }
     }
-    true
+    moved
 }
 
 /// 把一组顶点按 `M_k` 重映射（[`remap_vertices_to_reference_pose`] 的内层）。

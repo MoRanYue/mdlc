@@ -3881,6 +3881,36 @@ pub struct CompiledModel {
     pub name: String,
     /// 参考姿态（来自 SMD 的 `skeleton` 第 0 帧）。
     pub poses: Vec<crate::smd::SmdPose>,
+    /// **源骨架第 0 帧的世界矩阵**，下标 = **骨骼表下标**。
+    ///
+    /// `None` = 该骨骼在源里**没有精确同名**的节点（官方
+    /// `boneGlobalToLocal[k] == -1`）。
+    ///
+    /// # 为什么必须存下来
+    ///
+    /// 官方 `RemapVerticesToGlobalBones()`（`simplify.cpp:5156-5241`）把顶点
+    /// 从「源空间」搬进「参考姿态空间」用的 `destBoneToWorld[k]` 是
+    /// `TranslateAnimations()`（`:1498-1564`）给的：
+    ///
+    /// ```c
+    /// int q = psource->boneGlobalToLocal[k];
+    /// if (q == -1) { ...用 g_bonetable 的局部姿态沿**全局**父链累乘... }
+    /// else         { ConcatTransforms( srcBoneToWorld[q], g_bonetable[k].srcRealign, destBoneToWorld[k] ); }
+    /// ```
+    ///
+    /// 而 `srcBoneToWorld` 来自 `BuildRawTransforms(psource, 0, …)`
+    /// （`:1432-1492`），它走的是 **`psource->localBone[k].parent`（源文件自己的
+    /// 父链）**，与 `g_bonetable` 的父链**无关**。
+    ///
+    /// ⚠️ 两条父链会分叉的典型场景：`$definebone "X" "" …` 把 `X` **重新声明为根**。
+    /// 此时骨骼表里 `X.parent == -1`，源里 `X` 却仍有祖先（例如 FBX 的骨架根
+    /// `Skeleton`，带 −90° 绕 X）。用骨骼表的父链重建 `srcBoneToWorld` 会**丢掉**
+    /// 那个祖先 ⟹ `srcBoneToWorld` 与 `boneToPose` 恰好相等 ⟹ `M_k` 被判成单位阵
+    /// ⟹ **顶点完全不被搬动**，而骨骼表已经搬了 ⟹ 网格与骨骼错开一个 90°。
+    ///
+    /// ⚠️ 源父链信息在 `compile()` 之后就没了（`poses` 已改写成骨骼表下标，
+    /// 且只含命中的骨骼），所以必须在这里存下算好的世界矩阵。
+    pub source_world: Vec<Option<crate::bone_math::Matrix3x4>>,
     pub meshes: Vec<Mesh>,
     /// **多 LOD 数据**。`None` 表示单 LOD —— 此时写出器走原来的路径，
     /// 产物与加这个字段之前**逐字节相同**（有测试钉住）。
