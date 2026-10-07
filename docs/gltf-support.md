@@ -38,6 +38,7 @@
 | 依赖代价多大？ | **+5 个包**（master，关 `import`）/ **+6 个**（1.4.1，关 `import`）；开 `import` 是 **+21/+22 个包**且对 mdlc 毫无用处。[实测] |
 | 要新增 QC 语法吗？ | **0 条**。九条 `src*` 语法按概念命名，一条都不用改。[读码] |
 | 两套输入会产出同一个模型吗？ | **现在会了**。曾经差 100×（Blender 的 **FBX 导出器**把 m→cm 单位换算烘进节点、**glTF 导出器不做**，而官方 studiomdl 只对顶点丢掉那个缩放、对骨骼保留）—— 已在 FBX 侧修掉（`docs/fbx-support.md` §4.6 偏离 12），两套输入现在编出**同一量级**的模型。见 §5.2。 |
+| ⭐ **参考姿态取哪个姿态？** | ⚠️ **取错了**（§5.1b，已证实、尚未修）。glTF 的绑定姿态载体是 `skin.inverseBindMatrices`（IBM），而 `src\gltf.rs` **一个字节都没读它**，参考姿态全取节点 TRS。Blender 的 `Use Rest Position Armature`（**默认开**）关掉后，节点 TRS = 当前帧姿态而 IBM 仍是 rest ⟹ 骨骼与蒙皮网格分属两个空间，**与 FBX 侧 R59 是同一个缺陷**。自造夹具实测 `outside` 达 **9.823**、包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`。⚠️ 现有三个夹具是**退化情形**（`jointWorld · IBM = I`），**测不出**这个问题。 |
 | 建议 | **做**。按 §7 的落点实现，把「无 oracle」这件事在文档里说清楚。 |
 
 ---
@@ -465,12 +466,108 @@ gltf = { git = "https://github.com/gltf-rs/gltf", rev = "50d65229477fe5f785c2c90
 | 顶点位置 | **直接用 `POSITION` accessor 的值** | FBX 要 `rot_norm(geometry_to_world)·p + t` |
 | 法线 | **直接用 `NORMAL` accessor 的值** | FBX 要 `rot_norm(geometry_to_world)·v` |
 | UV | **直接用 `TEXCOORD_0` 的值，不翻 V** | FBX **要**翻一次（`1 − v`） |
-| 蒙皮 | `jointWorld · IBM` —— 实测**恒为单位阵**，可跳过 | FBX 无 IBM，靠簇推断 |
+| 蒙皮 | `jointWorld · IBM` —— **在现有夹具上恒为单位阵**，但**不能据此跳过 IBM**（§5.1b） | FBX 无 IBM，靠簇推断 |
 
 ⭐ **为什么不需要 FBX 那两条公式**：glTF 的 `POSITION` 是**网格自己的局部空间**，
 而 FBX 的 `vertex_position` 要经过 `geometry_to_world` 才是同一空间。
 `probe7` 实测 `dual\rig.glb` 的原始 accessor 包围盒 = `[-3,-3,0]..[3,3,45]`
-**与官方 VVD 完全相同**，且三个关节的 `jointWorld · IBM` 全是单位阵 ⟹ 蒙皮不改变顶点。
+**与官方 VVD 完全相同**，且三个关节的 `jointWorld · IBM` 全是单位阵 ⟹ **在这三个夹具上**
+蒙皮不改变顶点。
+
+> ⚠️ **但「恒为单位阵」是夹具的退化性质，不是 glTF 的普遍性质** —— 见 §5.1b。
+
+### 5.1b ⭐⭐⭐⭐⭐ 参考姿态：`inverseBindMatrices` 被完全忽略（**已证实有缺陷，尚未修**）
+
+**一句话：glTF 的 IBM 就是 FBX `bind_to_world` 的对应物，而 `src\gltf.rs` 一个字节都没读它
+—— 参考姿态全部取节点 TRS。当导出器把「当前帧姿态」当作关节 rest pose 时，
+这条路径会复现 FBX 那次一模一样的错位。**
+
+#### 5.1b.1 两个姿态、两个来源（与 FBX 同构）
+
+| 姿态 | glTF 里的载体 | FBX 里的对应物 |
+|---|---|---|
+| **绑定姿态**（bind pose） | `skin.inverseBindMatrices`（IBM）的**逆** | `cluster.bind_to_world` |
+| **节点 rest 姿态** | `node.translation/rotation/scale`（TRS）沿父链累乘 | `node.local_transform` 沿父链累乘 |
+
+glTF 规范把 IBM 定义为「关节**初始配置**下全局变换的逆」
+（`jointMatrix(j) = globalTransformOfJointNode(j) · inverseBindMatrixForJoint(j)`）；
+蒙皮顶点写在绑定姿态空间，所以**参考姿态必须取 IBM⁻¹**，不能取节点 TRS。
+
+#### 5.1b.2 为什么会分叉：Blender 的一个开关
+
+Blender glTF 导出器（本机 **5.2.2 LTS**，`addons_core\io_scene_gltf2\`）的
+Export → Data - Armature 有 **`Use Rest Position Armature`**，**默认 `True`**
+（`__init__.py:902-909`）。
+
+两条码路径**来自两个不同的数据源**：
+
+- **IBM 永远取 rest**（`exp\skins.py:70-125`）：
+  `inverse_bind_matrix = (axis_basis_change @ (armature.matrix_world @ bone.bone.matrix_local)).inverted_safe()`
+  —— `bone.bone.matrix_local` 是 **edit bone = rest 姿态**，**与开关无关**。
+- **节点 TRS 受开关控制**（`exp\tree.py:314-326`）：
+  `gltf_rest_position_armature is False` ⟹ 用 `blender_bone.matrix`（**pose bone = 当前帧姿态**）；
+  `True` ⟹ 用 `blender_bone.bone.matrix_local`（rest）。
+
+⟹ 关掉这个开关，IBM 仍是 rest、节点 TRS 变成 pose ⟹ `jointWorld · IBM ≠ I`
+—— **这正是 FBX 侧 `bind_to_world` 与 `local_transform` 分叉的 glTF 版本**。
+
+#### 5.1b.3 决定性实证（自造夹具，`fbxbug\gltfbind\`）
+
+现有三个夹具（`_oracle_dual\rig.glb` / `zup.glb` / `full.glb`）**测不出这个问题**
+—— 它们的 `jointWorld · IBM` 最大偏离只有 `1.3e-7`（= 浮点噪声）：
+
+```
+rig.glb   最大偏离 = 1.344e-7 (Pelvis)   >1e-4 的有 0/3
+zup.glb   最大偏离 = 1.001e-7 (Pelvis)   >1e-4 的有 0/3
+full.glb  最大偏离 = 1.344e-7 (Pelvis)   >1e-4 的有 0/3
+```
+
+`make_fixture.py`（Blender `--background`）造出一对**只有导出开关不同**的 GLB
+（3 根骨骼 `Pelvis`/`Spine`/`Head`，3 个立方体各以骨骼 head 为中心、权重 1.0，
+姿态绕骨骼**局部 X 轴**转 20°/25°/30°）：
+
+```
+rest.glb  （Use Rest Position Armature = 开）  最大偏离 = 3.423e-8 (Pelvis)   >1e-4 的有 0/3
+posed.glb （关）                              最大偏离 = 1.129e+1 (Head)     >1e-4 的有 3/3
+              ⚠ Pelvis: dev=0.34202 / Spine: dev=3.65087 / Head: dev=11.29162
+```
+
+两个文件的 **IBM 逐值完全相同**（`n=48`，最大逐值差 `0`）⟹ 证实「开关只改节点 TRS」。
+`IBM⁻¹` 的平移列 = 绑定姿态的骨骼原点（两文件相同）：
+`Pelvis [0,0,0]` / `Spine [0,0,-10]` / `Head [0,0,-20]`（glTF Y-up 后）。
+
+**mdlc A/B 实测**（`fbxbug\gltfbind\case\`，同一二进制、只换源文件）：
+
+| | `Head` `outside` | `Spine` `outside` | `Pelvis` `outside` | 模型空间顶点包围盒尺寸 |
+|---|---|---|---|---|
+| `rest.mdl` | 0.000 | 0.000 | 0.000 | `[2.000, 2.000, 2.000]` ✅ 三个立方体各自叠在骨骼上 |
+| `posed.mdl` | **9.823** | **2.420** | 0.000 | `[2.000, 11.726, 8.633]` ❌ 网格被拉成一条 |
+
+骨骼表也印证：`posed.mdl` 的 `Pelvis quat=-0.5736,0,0,0.8192`（= −20° 绕 X，
+**这就是摆的姿势**），`ptb` 平移列变成 `Spine [.., -9.0631, 4.2262]` /
+`Head [.., -14.3960, 13.1915]` ⟹ **mdlc 把 pose 当成了 rest**。
+
+> ⚠️ **夹具设计两条教训**（第一版两个都踩了）：
+> ① 姿态必须绕骨骼**局部 X 轴**转 —— Y 是骨骼轴向，绕 Y 转只是自转、骨骼原点不动，测不出东西；
+> ② 测 `outside` 的网格必须与骨骼 head **同心** —— 加了偏移会让「正确」情形也有非零基线，把信号淹掉。
+
+#### 5.1b.4 修复落点（**尚未实施**）
+
+- `src\gltf.rs` 的 `reference_poses`（`:1179`）：把世界矩阵基从节点 TRS 累乘换成
+  **IBM⁻¹ 累乘**（无 IBM 时退回节点 TRS，与 FBX 侧「无蒙皮簇退回 rest」同构）。
+- `src\gltf.rs` 目前 grep `inverseBindMatrices|inverse_bind|IBM` **0 命中**；
+  `gltf` crate（`Cargo.lock` 里是 **1.4.1**）通过
+  `skin.reader(..).read_inverse_bind_matrices()` 提供（§3 已记）。
+- 下游**不需要再改**：`CompiledModel.source_world`（`src\model.rs:3913`）与
+  `remap_vertices_to_reference_pose`（`src\compile.rs:4870-4978`）已经通了 ——
+  glTF 侧也是经 `read()` 产出 `FbxGeometry`（含 `reference_frame`）再走同一条 `compile()`。
+  换句话说，`source_world` 只需在 glTF 路径上填成 `IBM⁻¹` 而不是节点 TRS 累乘。
+- `read_frames`（动画流）与 FBX 侧同状态：**未同步改**（见 `docs/fbx-support.md` §1.7c.4）。
+
+> ✅ **零回归风险**：仓库里 **parity 夹具没有任何 `.glb`/`.gltf`**
+> （`parity\*.qc` grep `.glb|.gltf` 0 命中，`parity\` 下无 glTF 文件）；
+> 仅有的三个 glb 都在 `docs\_probe\_oracle_dual\` 且**恰好是退化情形**（IBM = 节点 TRS），
+> 所以改与不改在这三个文件上产物**逐字节相同**。
 
 ### 5.2 ⭐⭐⭐⭐⭐ 骨骼位移：两套输入曾经差 100×（已在 FBX 侧修掉）
 
@@ -736,6 +833,8 @@ cdtexture 表**差一条空串**。第三方实现（NekoMDL 的 `neko_rig.mdl` 
 | 5 | 两套输入差 100× | ✅ **已在 FBX 侧修掉**（`docs/fbx-support.md` §4.6 偏离 12），两套输入现在一致。⚠️ 遗留影响：带节点缩放的 FBX 其骨骼表与**官方产物数值不同** ⟹ 与 mdlc 对照时要用官方 `Apply Scalings = "FBX Units Scale"` 的产物。⚠️ 仍然**没有旋钮能补偿**（§5.2 实测：`srcscale` 是整体缩放，比值不变）。 |
 | 6 | `base64 0.13.1` 版本较老（2021） | 低。只在解 data URI 时用，且输入是本地文件。 |
 | 7 | glTF 几何源**不追加**空 cdtexture | ✅ **用户裁决，见 §6.5**。代价：同一场景 `.fbx` vs `.glb` 的 cdtexture 表差一条。 |
+| 8 | ⭐⭐⭐⭐⭐ **`inverseBindMatrices` 被完全忽略** | **高**（已证实、尚未修，§5.1b）。`src\gltf.rs` 参考姿态全取节点 TRS；Blender 的 `Use Rest Position Armature` 关掉后节点 TRS = 当前帧姿态、IBM 仍 = rest ⟹ 骨骼与蒙皮网格分属两个空间，与 FBX 侧 R59 是**同一个缺陷**。自造夹具实测 `posed.glb` 的 `outside` 达 **9.823**、模型空间包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`。修复只需把世界矩阵基换成 IBM⁻¹ 累乘（下游 `source_world` 已通）。✅ **零回归风险**：parity 夹具无任何 `.glb`/`.gltf`，仅有的三个 glb 恰好是退化情形。 |
+| 9 | **动画流是否同步 bind 口径** | 中（未定案，§5.1b.4 末）。与 FBX 侧同状态：`read_frames` 取节点 TRS。 |
 
 ### 8.1 兼容两种上游的写法（风险 2 + 3）
 

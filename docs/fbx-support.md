@@ -30,6 +30,7 @@
 | 最大的 UX 障碍？ | ⭐⭐⭐ **官方恒取第一条 NLA 栈、完全忽略 `$sequence` 名字**（§1.8）。多栈 FBX 在官方路径下**无解**，必须由 mdlc 提供显式选择 |
 | 表情（flex）怎么走？ | ⭐⭐⭐⭐⭐ **什么都不用写** —— FBX 的 shape key **自动注册**成 flexdesc + controller + rule + 载荷（§1.6b），与官方逐字段一致。⚠️ 但**不能在 FBX 源上写 `flexfile`/`flex`**（官方必崩） |
 | 单位/缩放对得上吗？ | ⚠️ **官方在这里有个 bug，而且是两半**：FBX 标准单位是**厘米**、Blender 默认把 m→cm 的 ×100 烘进节点 `LclS`，而官方**只认 `LclS`、完全忽略 `UnitScaleFactor`** ⟹ 默认导出（`All Local`）下官方编出的模型**骨骼比网格大 100 倍**（比值 0.0153），且**网格位置留在厘米、网格尺寸在米**（`be1_two_roots` 比值 0.9825）。**mdlc 有意偏离并两半都修掉**（§1.7.3 / §4.6 偏离 12）：`All Local` 与 `FBX Units Scale` 两种导出**编出逐值相同的产物**，NekoMDL 独立仲裁 8/8 逐位相同，用户不必关心 Blender 的 `Apply Scalings` 选项 |
+| **参考姿态取哪个姿态？** | ⭐⭐⭐⭐⭐ **取绑定姿态，不是节点 rest 姿态**（§1.7c）。蒙皮顶点写在绑定姿态空间，而 FBX 里 `cluster.bind_to_world`（绑定姿态）与节点 `local_transform`（rest 姿态）是**两个数据源、可以不同** —— 用户工程里人形 63 根一致、**`bow` 子树 6 根不一致**（局部平移差 13.5 / 50.2）⟹ 修复前武器网格「骨骼落在网格外 48 ~ 83 单位」，修复后 6 组**全部归零**（提交 `bcd5af6`）。⚠️ **动画流未同步改**（开放项，§1.7c.4）。⚠️ 同一分叉在 **glTF 路径**上以 `inverseBindMatrices` 的形式存在且**尚未修**（`docs/gltf-support.md` §5.1b） |
 
 ---
 
@@ -483,6 +484,115 @@ Blender 场景是两块 1 米见方的立方体，分别在 `y=0.5` 与 `x=5`；
 > `flags@0xa0` / `proctype@0xa4` / `procindex@0xa8` / `physicsbone@0xac` /
 > `surfacepropidx@0xb0` / `contents@0xb4` / `unused[8]@0xb8`，步长 216）。
 > 首版读 `@0x80` 得到 `parent=-2147483648` / `859553070` / `-1082130432` 这种垃圾值。
+
+### 1.7c ⭐⭐⭐⭐⭐ 参考姿态：**绑定姿态 ≠ 节点 rest 姿态**（R59）
+
+**一句话：蒙皮网格的顶点写在「绑定姿态」空间里，所以骨骼的参考姿态也必须取绑定姿态；
+而 FBX 里这两个姿态来自不同的数据源，可以不同。**
+
+#### 1.7c.1 两个姿态、两个来源
+
+| 姿态 | 数据源 | 谁写进去的 |
+|---|---|---|
+| **绑定姿态**（bind pose） | 蒙皮簇 `Deformer/Cluster` 的 `bind_to_world` 矩阵 | 导出器在**绑定那一刻**记下的骨骼世界变换 |
+| **节点 rest 姿态** | `Model` 节点的 `LclT`/`LclR`/`LclS` 沿父链累乘 | 导出器写的**节点局部变换** |
+
+`ufbx` 把两者分别交到 `cluster.bind_to_world` 与 `node.local_transform`。
+
+⚠️ **常规情况下两者碰巧一致**（导出时骨架正好停在 rest 姿态），这就是它长期没被发现的原因。
+只有当骨架**被摆过姿势之后才绑定**（或导出器有意把「当前帧姿态」当作关节 rest pose）时才会分叉。
+
+#### 1.7c.2 症状与决定性判据
+
+用户工程 `flawless_benediction_replaces_awp`（`v_snip_awp_processed.qc`，13 条 `srcpart`
+走 `未命名.fbx`）实测：**人物 63 根骨骼两者一致**（所以「人物骨骼正确」—— 这是症状的半边），
+**`bow` 子树 6 根不一致** —— `bow` 的局部平移差 **13.5**，`ring_*`/`string_*`/`arrow`
+差 **50.21**（≈ 父链上 `ValveBiped.ValveBiped` 的 `localS = 100` 放大的结果）。
+
+判据 `fbxbug\bone_vs_verts.js`：「骨骼的模型空间原点（`inv34(poseToBone)` 的平移列）
+落在自己主骨骼顶点包围盒外的距离」`outside`：
+
+| | `bow` | `ring_1` | `ring_2` | `string_top` | `string_bottom` | `arrow` |
+|---|---|---|---|---|---|---|
+| 修复前 | **48.352** | **83.096** | **82.847** | **74.743** | **54.855** | **65.062** |
+| 修复后 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+修复前 `bow` 的世界位置是 `[4.829, -24.601, 52.600]`（**Y 为负**，在网格的另一侧），
+修复后是 `[11.957, 1.059, 50.209]`。模型空间顶点包围盒（= HLMV 参考姿态所见）尺寸
+`[119.731, 105.594, 163.966]` → `[14.845, 53.018, 8.093]`（后者与 SMD 路径**逐值相同**）。
+
+> 决定性对照：**同一个 mdlc 二进制、只换几何来源**（`$model {... srcpart ...}` vs
+> `$bodygroup { studio "bow.smd" }`）—— SMD 路径 `outside` 全 0，FBX 路径全 > 48
+> ⟹ 缺陷在 FBX 读取侧，既不在 QC 也不在源数据。
+
+`examples\probe_fbx_bindchain.rs` 把 `bind_to_world` 折算成 SMD 局部姿态，
+与 `bow.smd` 的 `nodes` 段真值逐值对照：
+
+```
+bone            pos.x     pos.y     pos.z    rot.x    rot.y    rot.z     dpos     drot
+bow            11.9570   50.2094   -1.0593   0.0000  -0.0000   0.0000   0.0000   0.0000  ✅
+  ↳（现行：节点 rest）11.9570  50.2094  -1.0593  -0.2729  -1.5033   1.5708   0.0000   1.5708
+ring_1          2.6414   13.5096    0.4425  -0.1118   1.0370   0.1929   0.0000   0.0000  ✅
+  ↳（现行：节点 rest）14.5984  63.7191  -0.6168  -0.1118   1.0370   0.1929  50.2095   0.0000
+arrow          -7.3429    4.0642    0.4246  -1.5709  -1.5607   0.0001   0.0000   0.0000  ✅
+  ↳（现行：节点 rest）4.6140  54.2736  -0.6347  -1.5707   1.5607  -3.1415  50.2094   3.1416
+```
+
+⟹ 「bind 折算」列与 `bow.smd` 真值逐值相同，「节点 rest」列的 `ring_*`/`arrow` 偏 **50.21**。
+
+#### 1.7c.3 mdlc 的处置
+
+`src\fbx.rs`：
+
+1. 新增 `fn bind_worlds(scene) -> HashMap<u32, ufbx::Matrix>` —— 遍历
+   `scene.nodes → n.mesh → mesh.skin_deformers → d.clusters`，
+   `out.entry(b.element.element_id).or_insert(c.bind_to_world)`
+   （同一根骨骼挂在多个网格上时这些矩阵**逐位相同**，实测 7 处一致，先见先取即可）。
+2. 新增 `fn local_rotation(parent_world, child_world) -> ufbx::Quat`
+   —— `matrix_to_transform(&matrix_mul(&matrix_invert(parent), child))?.rotation`，
+   与 `bone_offset` 同一套口径（后者取同一个相对矩阵的平移列）。
+3. `reference_poses()` 里把「世界矩阵基」从节点 rest 换成绑定姿态：
+   `pose_world[i] = bind.get(&element_id).copied().unwrap_or(world[i])`
+   —— **有绑定簇就用 `bind_to_world`，没有（静态道具 / 合成根）就退回节点 rest**，
+   `pos` 与 `rot` 双双改走 `pose_world`。两者混用不会串空间：绑定姿态本身就是世界矩阵，
+   只是被拿来当父链的基。
+
+`src\model.rs` 的 `CompiledModel` 新增
+`pub source_world: Vec<Option<crate::bone_math::Matrix3x4>>`（下标 = **骨骼表下标**，
+`None` = 源里没有精确同名节点，即官方 `boneGlobalToLocal[k] == -1`）；
+`src\compile.rs` 的 `compile()` 用 **SMD 源父链**（`smd.nodes[].parent` +
+`bone_math::compute_world`）填它（**只按名字精确命中才填**，依据 `simplify.cpp:4212`），
+`remap_vertices_to_reference_pose()` 再据此把顶点搬进参考姿态。
+
+验收（提交 `bcd5af6`）：
+
+- 6 组 `outside` 由 48.35 ~ 83.10 **全部归零**；`bow` 世界位置回到网格同侧；
+  模型空间包围盒尺寸与 SMD 路径**逐值相同**
+- 用户原目录**原地重编译** exit 0：骨骼 70 / 顶点 8949 / 三角形 10760，
+  MDL 221480 → **222792** 字节
+- 822 个测试 / clippy `-D warnings` / `cargo doc` / parity **101/101** / e2e **4/4** 全过
+
+#### 1.7c.4 ⚠️ 动画流**未**同步改（开放项）
+
+`read_frames`（动画流）仍取节点 rest 姿态。源侧本来就分两套口径 ——
+`node dump_smd_skeleton.js <file> 0 bow` 实测：
+
+| 源文件 | `bow` 的 `pos` / `rot` | 口径 |
+|---|---|---|
+| `bow.smd`（**网格** SMD） | `[11.9570, 50.2094, -1.0593]` / `[0,0,0]` | **绑定姿态** |
+| `anims\a_idle.smd`（**动画** SMD） | `[4.8294, 52.5998, 24.6012]` / `[-0.2729,-1.5033,1.5708]` | **节点 rest** |
+
+⟹ mdlc 现在「参考姿态取 bind、动画取 rest」**恰好各自与对应的源文件一致**。
+但播放动画时武器骨骼会从 bind 位置「跳」回 rest 位置（`bow` 差 **25.66** 单位）。
+**是否该改仍未定案**（`examples\probe_fbx_animref.rs` 实测「参考姿态 vs 动画第 0 帧」
+逐值相同 **1** / 不同 **60**，`bow` `dpos max=25.6605` / `drot max=1.5708`，
+`arrow` `dpos max=0.9080` / `drot max=3.1416`）。
+
+> ⚠️ 同一分叉在 **glTF** 路径上以另一个名字存在：glTF 的绑定姿态是
+> `skin.inverseBindMatrices`（IBM），`src\gltf.rs` 目前**完全不读它**，
+> 参考姿态同样取节点 TRS。Blender 的 glTF 导出器有
+> `Use Rest Position Armature` 开关（**默认开**，关掉就把「当前帧姿态」当关节 rest pose）
+> ⟹ 该路径有**同一个缺陷**。详见 `docs/gltf-support.md` §5.1b。
 
 ### 1.8 ⭐⭐⭐⭐⭐ 动画栈：官方**恒取第一条**，`$sequence` 的名字完全不参与
 
@@ -1231,6 +1341,9 @@ src_stack = "run"
 | 7 | **影响数 4 → 3** | `ufbx` 给最多 4 组权重，mdlc 上限 3（`src\model.rs:5265`）⟹ 重排 + 截断 + 重归一化 | ✅ **已复用**既有 `MAX_BONES_PER_VERT` 路径 |
 | 8 | **`startloop` 官方 bug** | §1.11 陷阱 3：官方在 FBX 路径上把 `startloop` 的 token 当成文件名。mdlc 应正常解析（并记入「有意偏离」） | ✅ mdlc 正常解析（QC 前端与源格式无关） |
 | 9 | **两条 `_` 怪癖** | §4.6 偏离 7、8：官方对含 `_` 的 shape key 名做 token 重排、并静默丢掉 `flexrule`。**已裁决不复刻** | ✅ 已记入偏离表（用户 m19290 裁决） |
+| 10 | **参考姿态 = 绑定姿态** | §1.7c：`cluster.bind_to_world` ≠ 节点 rest 姿态，参考姿态必须取前者（否则武器网格错位）。判据 `fbxbug\bone_vs_verts.js` 的 `outside` | ✅ **已修复**（提交 `bcd5af6`；6 组 48~83 → 全 0；MDL 221480 → 222792；822 测试 / parity 101/101 / e2e 4/4 全过） |
+| 11 | **动画流是否同步 bind 口径** | §1.7c.4：`read_frames` 仍取节点 rest。源侧本来就分两套（网格 SMD 写 bind、动画 SMD 写 rest），mdlc 现在恰好各自对齐，但播放时 `bow` 会跳 **25.66** 单位 | ⏳ **未定案**（`probe_fbx_animref`：参考姿态 vs 动画第 0 帧，逐值相同 1 / 不同 60） |
+| 12 | **glTF 路径的同一分叉** | §1.7c.4 末注：`src\gltf.rs` **完全不读 `inverseBindMatrices`**，参考姿态取节点 TRS；Blender 的 `Use Rest Position Armature` 关掉即触发 | ⏳ **已证实存在、尚未修**（`docs/gltf-support.md` §5.1b） |
 
 ---
 
