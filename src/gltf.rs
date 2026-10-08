@@ -88,7 +88,8 @@ pub type GltfError = FbxError;
 /// 读一个 glTF 文件时收集到的**提示**（全部是「官方也会静默通过」的情形）。
 ///
 /// 与 `compile.rs` 的 `fbx_diagnostics` 一样是**纯函数**（返回文案而不是直接
-/// 打印），这样这条路径才测得了 —— `diagln!` 走 stdout/stderr，测试里抓不到。
+/// 打印），这样这条路径才测得了 —— `log` 的 logger 是进程级全局的，测试里
+/// 装不了第二个。
 ///
 /// ⚠️ **报错的那几条不走这里**（data URI 解码失败 / Draco / meshopt 都在
 /// 读文件那一步直接返回 `Err`）—— 静默零几何是绝对不能接受的。
@@ -1383,7 +1384,7 @@ fn buffer_getter<'a, 's>(
 ///
 /// # 诊断
 ///
-/// [`GltfNotes`] 里的每一条都在这里 `diagln!` 出去（与 `compile.rs` 的
+/// [`GltfNotes`] 里的每一条都在这里 `log::info!` 出去（与 `compile.rs` 的
 /// `emit_fbx_diagnostics` 一个路数）。**报错的那几条不在这里** —— data URI
 /// 解码失败 / Draco / meshopt 都在读文件那一步就返回 `Err` 了。
 ///
@@ -1393,7 +1394,7 @@ fn buffer_getter<'a, 's>(
 pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, GltfError> {
     let (doc, buffers, notes) = load_document(path, at)?;
     for line in notes.lines(at) {
-        crate::diagln!("{line}");
+        log::info!("{line}");
     }
 
     // accessor → 字节 的闭包（`Iter::new` 要吃它）。按 `Buffer::index()` 取。
@@ -1511,7 +1512,7 @@ pub fn read_frames(
 ) -> Result<Smd, GltfError> {
     let (doc, buffers, notes) = load_document(path, at)?;
     for line in notes.lines(at) {
-        crate::diagln!("{line}");
+        log::info!("{line}");
     }
 
     let parent = parent_table(&doc);
@@ -1530,7 +1531,7 @@ pub fn read_frames(
             // ⭐ 多栈而用户没点名时发提示。**与 FBX 不同**：glTF 的栈有名字，
             // 而 `srcstack` 就是按名字选的，所以这条提示只是告知默认值。
             if names.len() > 1 {
-                crate::diagln!(
+                log::info!(
                     "提示：{} 有 {} 条动画 {:?}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
                     path.display(),
                     names.len(),
@@ -1580,7 +1581,7 @@ pub fn read_frames(
         ..GltfNotes::default()
     };
     for line in morph_notes.lines(at) {
-        crate::diagln!("{line}");
+        log::info!("{line}");
     }
     let (begin, end) = time_range(&channels);
     let n_frames = ((end - begin) * f64::from(fps)).round().max(0.0) as usize + 1;
@@ -2800,7 +2801,7 @@ mod tests {
         }
     }
 
-    /// 提示文案是**纯函数**（`diagln!` 走 stdout，测试里抓不到）。
+    /// 提示文案是**纯函数**（`log` 的 logger 是进程级全局的，测试里装不了第二个）。
     #[test]
     fn notes_render_every_kind_of_hint() {
         let n = GltfNotes {

@@ -765,8 +765,8 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 | 动画里有 `MorphTargetWeights` 通道 | **提示**「mdlc 不做逐帧表情权重」 | ✅ `GltfNotes::morph_weight_channels`（实现时补的第 6 条） |
 
 ⭐ **两条设计约束**（实现时定死的）：
-1. **提示文案是纯函数**（`GltfNotes::lines(at) -> Vec<String>`），`diagln!` 只是逐条转发 ——
-   `diagln!` 走 stdout，测试里抓不到，文案放进纯函数才测得了。
+1. **提示文案是纯函数**（`GltfNotes::lines(at) -> Vec<String>`），`log::info!` 只是逐条转发 ——
+   `log` 的 logger 是**进程级全局**的，测试里装不了第二个，文案放进纯函数才测得了。
 2. **报错的那两条不走 `GltfNotes`**（它们在 `load_document` 里就 `Err` 了）——
    静默零几何是绝对不能接受的。
 

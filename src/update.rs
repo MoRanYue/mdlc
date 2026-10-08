@@ -320,6 +320,12 @@ pub fn run_check() {
                 last_check: now_unix(),
                 latest: tag.clone(),
             });
+            // ⚠️ 下面三处（含 `startup` 里那处）**故意留 `eprintln!`**，不换成
+            // `log::debug!`：它们由显式的开发者开关 `MDLC_UPDATE_DEBUG` 打开，
+            // 而 `log` 的默认级别是 `Info`（见 [`crate::diag::init`]），换成
+            // `debug!` 会被直接过滤掉、等于把这个开关废掉。且它们**必须**留在
+            // stderr —— 走 `log::info!` 的话官方兼容形态下会落到 stdout，
+            // 往 Crowbar 的日志里塞与编译无关的行。
             if is_debug() {
                 eprintln!("mdlc 更新检测：最新 tag = {tag}");
             }
@@ -582,7 +588,7 @@ pub fn startup() {
     if let Some(c) = &cache
         && let Some(msg) = notice(c, env!("CARGO_PKG_VERSION"))
     {
-        crate::diagln!("{msg}");
+        log::info!("{msg}");
     }
     let spawned = should_check(cache.as_ref(), now_unix());
     if spawned {

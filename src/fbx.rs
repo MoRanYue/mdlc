@@ -324,7 +324,7 @@ pub fn read_frames(
                     .iter()
                     .map(|s| s.element.name.to_string())
                     .collect();
-                crate::diagln!(
+                log::info!(
                     "提示：{} 有 {} 条动画栈 {:?}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
                     path.display(),
                     names.len(),

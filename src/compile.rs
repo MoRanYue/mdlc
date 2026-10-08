@@ -876,7 +876,7 @@ pub fn read_source_geometry(
 /// 诊断要说的是「这次编译实际注册了几个 flex」，用过滤前的那份会骗人。
 ///
 /// ⚠️ 纯函数（返回文案而不是直接打印）—— 直接打印的话这条路径就没法测了
-/// （`diagln!` 走 stderr/stdout，测试里抓不到）。打印由
+/// （`log` 的 logger 是**进程级全局**的，测试里装不了第二个）。打印由
 /// [`emit_fbx_diagnostics`] 负责。
 fn fbx_diagnostics(
     at: &str,
@@ -935,7 +935,7 @@ fn fbx_diagnostics(
 /// 把 [`fbx_diagnostics`] 的文案逐条打到诊断流上。
 fn emit_fbx_diagnostics(at: &str, geom: &SourceGeometry, shape_keys: &[crate::fbx::FbxShapeKey]) {
     for line in fbx_diagnostics(at, geom, shape_keys) {
-        crate::diagln!("{line}");
+        log::info!("{line}");
     }
 }
 
@@ -2911,7 +2911,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // 判据要 `n_frames`，所以先读帧（并应用 `frames` 区间）再判。
         // ✅ **只提示、不拒绝**：FBX 本来就是网格与动画合一的容器。
         if let Some(msg) = same_fbx_geometry_note(&p, &fbx_geometry, frames.len()) {
-            crate::diagln!("{msg}");
+            log::info!("{msg}");
         }
         pending_subtract.push(a.subtract.as_deref().map(|s| (s.to_owned(), a.subtract_frame.unwrap_or(0))));
         anim_index.insert(a.name.as_str(), anims.len());
@@ -3434,7 +3434,7 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     if let Some(msg) =
                         same_fbx_geometry_note(&smd_path, &fbx_geometry, frames.len())
                     {
-                        crate::diagln!("{msg}");
+                        log::info!("{msg}");
                     }
                     let i = anims.len();
                     let name = format!("@{}", s.name);
@@ -7265,7 +7265,7 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
         // （`Missing control bone "%s" for procedural bone "%s"`），
         // 见 `resolve_quat_interp_bones` 里的 control 段。
         let Some(&bone) = desc.bone_index().get(j.bone.as_str()) else {
-            crate::diagln!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", j.bone);
+            log::info!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", j.bone);
             continue;
         };
 
@@ -7433,7 +7433,7 @@ fn resolve_quat_interp_bones(
         // 后 `continue; // optimized out, don't complain`。L4D2 exe 里该串在
         // @0x5764a4。修前 mdlc 在这里报「骨骼 {:?} 找不到」并中止编译。
         let Some(&bone) = bone_index.get(q.bone.as_str()) else {
-            crate::diagln!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", q.bone);
+            log::info!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", q.bone);
             continue;
         };
         let bone = bone as i32;

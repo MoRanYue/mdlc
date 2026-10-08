@@ -3794,7 +3794,7 @@ impl<'a> Parser<'a> {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // 与官方一致：文件不在 ⟹ 没有程序化骨骼。
-                crate::diagln!(
+                log::info!(
                     "提示：$proceduralbones 指向的 VRD 不存在，按官方行为跳过：{}",
                     path.display()
                 );
@@ -5041,7 +5041,7 @@ impl<'a> Parser<'a> {
         if !skipped.is_empty() {
             skipped.sort();
             skipped.dedup();
-            crate::diagln!(
+            log::info!(
                 "提示：$lod 里有 {} 个不存在的骨骼，已按官方行为跳过：{}",
                 skipped.len(),
                 skipped.join(", ")

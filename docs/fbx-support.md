@@ -1186,7 +1186,7 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 > **实现说明**（提交 `8b0b2e0`）：前三条走 `src\compile.rs` 的
 > `fn fbx_diagnostics`（纯函数，返回 `Vec<String>`）+ `fn emit_fbx_diagnostics`
 > （打印）；多栈那条在 `src\fbx.rs` 的 `read_frames` 里（几何侧看不到动画栈
-> 的使用时机）。四条全部是**提示**（`diagln!`）而非错误 —— 官方在这些情形下
+> 的使用时机）。四条全部是**提示**（`log::info!`）而非错误 —— 官方在这些情形下
 > 都静默通过，模型也确实编译得出来，只是结果可能不是用户想要的。
 >
 > ⚠️ **对 `.smd` 工程零影响**：`SourceGeometry` 的三个诊断字段在 SMD 分支恒为

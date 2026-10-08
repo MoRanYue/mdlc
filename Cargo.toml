@@ -35,6 +35,28 @@ clap = { version = "4.6.7", features = ["derive"] }
 # `about` / `help` 里的中文常量（crate 的设计如此，其 README 亦明示）。
 clap-i18n-richformatter = "0.3.2"
 indexmap = { version = "2.14.2", features = ["serde"] }
+
+# 日志门面。**故意不加任何 feature**：只需要 `set_logger`（`&'static dyn Log`），
+# 它不要求 `std` / `alloc`（只有 `set_boxed_logger` 要求 `alloc`），所以这里
+# 用一个 `static` logger 就够了，零分配、零泄漏。
+#
+# 它本来就在依赖树里（`ena` → `parry3d`、`i18n-embed` 系列、`ureq` / `rustls`），
+# 提为直接依赖**不新增任何包**：`Cargo.lock` 里 `log` 的 `[[package]]` 条目原样
+# 不动，只在 `mdlc` 的 `dependencies` 列表里多一行。实测（各建独立 crate、
+# `lto="thin"` + `codegen-units=1`，相对零依赖基线 130048 B）：`log` 门面本身
+# +1.0 KB，加上手写 logger 一共 **+6.7 KB** —— 而 `tracing-subscriber` 最省
+# 形态也要 +143 KB，带 `env-filter` 则是 +846 KB。
+#
+# ⚠️ 选它而不是 `tracing` 的决定性理由有两条，都是**契约**不是偏好：
+# ① `tracing-subscriber` 的默认 `fmt::Layer` 把输出写 **stdout** 且 ANSI
+#    只认 `NO_COLOR`、**不做终端检测**（`fmt_layer.rs:743`），会同时砸掉
+#    `diag` 的 stdout/stderr 分流与「不往重定向文件写转义码」两条硬约束；
+#    `log` 门面**自己不写任何字节**，流与格式全由下面的 `Log` 实现决定。
+# ② `log` 是全局门面：库侧直接 `log::info!` 即可，**不需要在库里装任何
+#    东西**，bin 独占「装 logger + 选流 + 选级别」；`rust_i18n::t!` 被
+#    `crate::` 钉死、`tracing` 要处理 subscriber 单例，两者都没这么干净。
+log = "0.4.34"
+
 meshopt = "0.6.2"
 parry3d = "0.31.1"
 serde = { version = "1.0.229", features = ["derive"] }

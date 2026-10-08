@@ -209,7 +209,7 @@ impl PipelineError {
     ///
     /// 与 [`std::fmt::Display`] 的关系：[`Self::Compile`] 之外**完全一致**
     /// （`to_string()` 就是 `lines().join("\n")`），只有 `Compile` 需要
-    /// 拆成多行才好让 CLI 逐行 `diagln!`。
+    /// 拆成多行才好让 CLI 逐行 `log::error!`。
     pub fn lines(&self) -> Vec<String> {
         match self {
             PipelineError::Compile(errs) => Self::compile_lines(errs),
