@@ -63,6 +63,20 @@ fn main() -> ExitCode {
         None => false,
     };
 
+    // ---- 语言 ----
+    //
+    // 自有文案的语言（`locales/app.yml`）。**必须早于 `cli::build_cli()`** ——
+    // `about` / `help` 属性里的 `tr(...)` 是在 `command_i18n()` 被求值时
+    // 执行的（不是编译期）。官方兼容形态不读这张表，调了也无害。
+    mdlc::cli::init_locale();
+
+    // 装 logger、定路由。**必须早于任何诊断输出** —— 既包括下面的更新
+    // 检测，也包括 `run_official`（它自己不再改路由）。
+    //
+    // 先定路由再检测：否则官方形态下的提示会落到 stderr 上，而 Crowbar
+    // 只认 stdout（见 [`mdlc::diag`]）。
+    mdlc::diag::init(official_form);
+
     // ---- 更新检测（后台静默，永不阻塞）----
     //
     // 放在**最前面**、早于 clap 解析：这样 mdlc 自有形态与官方兼容形态
@@ -73,13 +87,6 @@ fn main() -> ExitCode {
     //
     // ⚠️ `__update-check` 正是那个被派生出来的子进程 —— 它**不能**再
     // 触发一次检测，否则每次运行都会裂变成两个进程。
-    // 装 logger、定路由。**必须早于任何诊断输出** —— 既包括下面的更新
-    // 检测，也包括 `run_official`（它自己不再改路由）。
-    //
-    // 先定路由再检测：否则官方形态下的提示会落到 stderr 上，而 Crowbar
-    // 只认 stdout（见 [`mdlc::diag`]）。
-    mdlc::diag::init(official_form);
-
     let is_update_probe = rest
         .first()
         .is_some_and(|a| a == mdlc::update::HIDDEN_SUBCOMMAND);

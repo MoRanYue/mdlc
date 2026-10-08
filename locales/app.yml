@@ -1,0 +1,166 @@
+# mdlc 的译文表。
+#
+# ⚠️ **源语言是英文** —— 键就是英文原文本身（`rust-i18n` 的 `minify_key`
+# 默认关，键不压缩），所以这里**只写译文**：
+#
+#   * 英文用户 / 系统语言不在下表里 ⟹ `t!` 未命中，回退到键本身（英文）；
+#   * 中文用户 ⟹ 命中下面的 `zh-CN`；
+#   * 以后加德语 ⟹ 加一列 `de-DE` 即可，未覆盖的条目自动回退英文。
+#
+# 这与 `clap-i18n-richformatter` 的 ftl 约定一致（它的 `i18n.toml` 是
+# `fallback_language = "en-US"`，`zh-CN` 是译文）。也正因为英文就是键，
+# `i18n!` 不需要 `fallback = "en"` —— 未命中时的回退目标天然是英文。
+#
+# ⚠️ 这个文件是在**编译期**由 proc-macro 读盘生成代码的（`i18n!` 展开成
+# 一个 `SimpleBackend`），所以它不进二进制；但 cargo **不跟踪**它
+# （`rust-i18n` 只为它自己的 `locales/` 发 `rerun-if-changed`）。改完这里
+# 必须碰一下某个 `.rs` 才会重编，否则拿到旧译文。
+#
+# ⚠️ 键与值都写成**双引号**标量：键里含 `:` / `$` / `` ` `` / `→` / `#`
+# 这类 YAML 有特殊含义的字符，不加引号会被解析成别的东西；反斜杠在双引号
+# 里要写成 `\\`（所以 `<gamedir>\models\` 在源文里是 `<gamedir>\\models\\`）。
+#
+# ⚠️ 键里的 `\n` 是**真的换行**（YAML 双引号标量的转义），与 Rust 字面量
+# 里的 `\n` 一致 —— `Cli` 的 `long_about` 就是把三段用空行拼起来的。
+_version: 2
+
+# ---------------------------------------------------------------------------
+# 顶层（`mdlc -h` 与 `mdlc --help`）
+#
+# `-h` 只打第一段（`about`），`--help` 打三段（`long_about` = 三段用空行
+# 拼接）—— 这正是 clap 对 `about` / `long_about` 的用法。
+# ---------------------------------------------------------------------------
+
+"Source engine model compiler (a studiomdl rewrite)":
+  zh-CN: "Source 引擎模型编译器（studiomdl 重写）"
+
+"Compiles a TOML description or a QC script into the Source engine `.mdl` / `.vvd` / `.vtx` / `.phy` set, plus a few read-only inspection and conversion subcommands.":
+  zh-CN: "把 TOML 描述或 QC 脚本编译成 Source 引擎的 `.mdl` / `.vvd` / `.vtx` / `.phy` 四件套，另带若干只读的检查与转换子命令。"
+
+"It also works as the official `studiomdl`: `mdlc -game <gamedir> <model.qc>` writes the output under `<gamedir>\\models\\<$modelname>`, so it can be dropped in as Crowbar's compiler path.":
+  zh-CN: "也能当官方 `studiomdl` 用：`mdlc -game <gamedir> <model.qc>` 会把产物写到 `<gamedir>\\models\\<$modelname>`，可直接替换 Crowbar 的编译器路径。"
+
+# ---------------------------------------------------------------------------
+# 子命令（`mdlc --help` 的命令表 / `mdlc <cmd> --help` 的首行）
+# ---------------------------------------------------------------------------
+
+"TOML description → .mdl/.vvd/.vtx (main path)":
+  zh-CN: "TOML 描述 → .mdl/.vvd/.vtx（MVP 主线）"
+
+"Validate a description file without writing anything":
+  zh-CN: "只校验描述文件，不写文件"
+
+"SMD triangles → convex hulls → .phy collision file":
+  zh-CN: "SMD 三角形 → 凸包 → .phy 碰撞文件"
+
+"QC script → TOML description (text only, no compile)":
+  zh-CN: "QC 脚本 → TOML 描述（只写文本，不编译）"
+
+"Compile straight from a QC script":
+  zh-CN: "直接从 QC 编译"
+
+"Parse a VVD and print its header and statistics":
+  zh-CN: "解析并打印 VVD 头部与统计"
+
+"Read a VVD and write it back, comparing byte for byte":
+  zh-CN: "VVD 读入再写出，逐字节比对"
+
+"Print a minimal, commented TOML template":
+  zh-CN: "打印一份带注释的最小 TOML 模板"
+
+"(internal) run one update check and write the cache":
+  zh-CN: "（内部）跑一次更新检测并写缓存"
+
+# clap 自动生成的 `help` 子命令：它的描述是 `clap_builder` 里的**英文常量**
+# （`command.rs:4842`），`clap-i18n-richformatter` 的词条表里没有对应 key，
+# 所以在这里补一条。见 `src/cli.rs` 的 `localize_one_subcommand`。
+"Print this message or the help of the given subcommand(s)":
+  zh-CN: "打印本信息或给定子命令的帮助"
+
+# ---------------------------------------------------------------------------
+# 位置参数与选项的 `help`
+# ---------------------------------------------------------------------------
+
+"TOML description to compile":
+  zh-CN: "要编译的 TOML 描述文件"
+
+"TOML description to validate":
+  zh-CN: "要校验的 TOML 描述文件"
+
+"QC script to convert":
+  zh-CN: "要转换的 QC 脚本"
+
+"QC script to compile":
+  zh-CN: "要编译的 QC 脚本"
+
+"VVD file to parse and print the header and statistics of":
+  zh-CN: "要解析并打印头部与统计的 VVD 文件"
+
+"VVD file to round-trip":
+  zh-CN: "要往返比对的 VVD 文件"
+
+"Root output directory (defaults to the current directory)":
+  zh-CN: "输出根目录（默认当前目录）"
+
+"Output TOML path (defaults to the QC's own directory and name, with a .toml extension)":
+  zh-CN: "输出的 TOML 路径（缺省与 QC 同目录同名，扩展名换成 .toml）"
+
+"mdlc extension: enable the VTX cache optimization":
+  zh-CN: "mdlc 扩展：打开 VTX 缓存优化"
+
+"Input SMD (triangle vertices are already in model-local coordinates; no transform is applied, matching studiomdl)":
+  zh-CN: "输入 SMD（三角形顶点已在模型局部坐标，不做任何变换，与 studiomdl 一致）"
+
+"Output .phy path":
+  zh-CN: "输出 .phy 路径"
+
+"Checksum of the paired .mdl (decimal or 0x hex), default 0":
+  zh-CN: "配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0"
+
+"$mass equivalent total mass, default 1 (the official default; see the --automass note)":
+  zh-CN: "$mass 等效总质量，默认 1（官方缺省；见 --automass 说明）"
+
+"Surface material, default default":
+  zh-CN: "表面材质，默认 default"
+
+"$concave: split into convex pieces by connected component (the official semantics, not a VHACD decomposition)":
+  zh-CN: "$concave：按连通分量拆成多个凸块（官方语义，不是 VHACD 体分解）"
+
+"VHACD approximate convex decomposition. Non-official semantics: concavities are preserved, whereas the official $concave fills them in":
+  zh-CN: "VHACD 近似凸分解。非官方语义：保留凹口，而官方 $concave 是填平"
+
+"Legacy alias of --vhacd (kept so existing scripts keep working; its meaning is now unambiguously VHACD)":
+  zh-CN: "--vhacd 的旧别名（保留以免破坏既有脚本；语义已明确为 VHACD）"
+
+"$collisionjoints: group by skin-weight bone, one solid per bone":
+  zh-CN: "$collisionjoints：按蒙皮权重骨骼分组，每个骨骼一个 solid"
+
+# ---------------------------------------------------------------------------
+# `value_name`：也会打给用户看（`mdlc build --help` 里的 `<dir>` / `<目录>`）
+#
+# 只有这两个是**词**；其余 `value_name`（`model.toml` / `in.smd` / `N` / …）
+# 是格式占位符，不翻译。
+# ---------------------------------------------------------------------------
+
+"dir":
+  zh-CN: "目录"
+
+"value":
+  zh-CN: "值"
+
+# ---------------------------------------------------------------------------
+# 官方 `studiomdl` 兼容形态（`mdlc -game <gamedir> --help`）
+#
+# ⚠️ 它的**段落标题**仍是英文（`Usage:` / `Arguments:` / `Options:`）——
+# 那份定义走 builder + clap 默认的 `DefaultFormatter`，不经
+# `clap-i18n-richformatter`。但描述文字与 mdlc 自有形态共用这张表。
+# ---------------------------------------------------------------------------
+
+"Source engine model compiler (studiomdl compatibility mode)":
+  zh-CN: "Source 引擎模型编译器（studiomdl 兼容模式）"
+
+"mdlc extension: explicit output root directory (takes precedence over the path derived from -game)":
+  zh-CN: "mdlc 扩展：显式输出根目录（优先于 -game 推出的路径）"
+
+"Game directory (the official -game); output goes to <gamedir>/models/":
+  zh-CN: "游戏目录（官方 -game）；产物写到 <gamedir>\\models\\"

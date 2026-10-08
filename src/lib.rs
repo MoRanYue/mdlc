@@ -81,6 +81,38 @@ pub mod vta;
 pub mod vtx_writer;
 pub mod vvd;
 
+// ---------------------------------------------------------------------------
+// 自有文案的 i18n
+// ---------------------------------------------------------------------------
+
+// ⚠️ 这个宏**必须在模块作用域调用，且每个 crate 只能调一次** —— 它展开成
+// 一组 `pub fn`（`_rust_i18n_backend()` / `_rust_i18n_try_translate()` / …）
+// 和一个 `static _RUST_I18N_BACKEND`，没有自己的 `mod` 包着。
+//
+// **源语言是英文**，`locales/app.yml` 里只写译文：`minify_key` 默认关，
+// 键就是英文原文本身，所以英文用户（或任何未覆盖的语言）拿到的是
+// `t!` 未命中时回退的键本身。这也是这里不写 `fallback = "en"` 的原因 ——
+// 回退目标天然就是英文。
+rust_i18n::i18n!("locales");
+
+/// 取一条译文（自有文案）。
+///
+/// `key` 是**英文源文本身**（不是助记 id）—— `minify_key` 默认关，
+/// 键不压缩。命中的是 `locales/app.yml` 里对应语言的译文；未命中则
+/// 原样返回 `key`（英文），**不 panic、不报错**。
+///
+/// 之所以包一层而不是让调用方直接 `rust_i18n::t!`：`t!` 展开成
+/// `crate::_rust_i18n_try_translate(...)`，`crate::` 解析到**调用方**
+/// 那个 crate —— 在 `src/main.rs`（独立的 bin crate）里用会报
+/// `error[E0433]: cannot find `_rust_i18n_t` in `crate``。包一层之后
+/// bin 走 `mdlc::tr` 即可。
+///
+/// 返回 `String` 而不是 `Cow`：调用点都是把它喂给 clap 的
+/// `about` / `help` / `value_name`（要 owned）或 `log::info!` 的格式串。
+pub fn tr(key: &str) -> String {
+    rust_i18n::t!(key).into_owned()
+}
+
 /// 往返比对的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundTrip {

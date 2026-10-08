@@ -747,15 +747,28 @@ to English when there is no match). So on a Chinese system `mdlc -h` prints:
   -V, --version  打印版本信息
 ```
 
-(`mdlc --help` is the **long help**: `-h` / `-V` expand to two lines with full descriptions; the
-`参数:` / `选项:` section headings inside subcommand help are localized too.)
+(The `mdlc --help` **long help** is similar: `-h` / `-V` expand to two lines with full
+descriptions; the `参数:` / `选项:` section headings inside subcommand help are localized too.)
+
+**Translations for mdlc's own text live in [`locales/app.yml`](locales/app.yml)**, using the
+`_version: 2` single-file multi-locale format. The source language is **English** (the key *is* the
+English text), so English users — and any language not covered — get the source string as-is, and
+adding a language means adding one column:
+
+```yaml
+_version: 2
+"Output .phy path":
+  zh-CN: "输出 .phy 路径"
+  de-DE: "Pfad der .phy-Ausgabe"    # a newly added language
+```
 
 > Colour **only appears on a direct terminal** and degrades to plain text when redirected or
 > captured through a pipe — so no ANSI escape codes are ever pushed into host logs such as
 > Crowbar's.
 
-> ⚠️ **The official-compatible form is unaffected**: its help/errors stay English, matching the
-> output shape of official `studiomdl`.
+> ⚠️ **The official-compatible form's section headings are unaffected** (they stay `Usage:` /
+> `Arguments:` / `Options:`, matching the output shape of official `studiomdl`); its **descriptive
+> text**, however, shares the same translation table as mdlc's own form.
 
 `--optimize-vtx` uses `meshopt` to reorder the indices of each strip group to improve the GPU's
 post-transform vertex cache hit rate. It **only changes index order**; the vertex pool and the

@@ -35,17 +35,43 @@
 //! # mdlc 自有形态：`clap` derive + i18n
 //!
 //! 自有子命令走 `clap` 的 derive（[`Cli`] + [`Commands`]），帮助文本由
-//! doc comment 生成 —— 不再有手写的 `USAGE` 常量，也不再有
+//! **显式属性**给出 —— 不再有手写的 `USAGE` 常量，也不再有
 //! 「注册命令 + `match` 分支按键取值」。官方兼容形态**仍是 builder**，
 //! 理由见 [`Cli`] 的文档。
 //!
-//! 多语言由 `clap-i18n-richformatter` 提供：段落标题（用法/参数/选项/命令）、
-//! 帮助模板与**错误排版**按系统显示语言自动切换。⚠️ **命令与参数自身的
-//! 描述**是 mdlc 写死的中文，不在该 crate 的覆盖范围内。
+//! # 两套 i18n 是分开的
+//!
+//! 1. **框架词**由 `clap-i18n-richformatter` 提供：段落标题
+//!    （用法/参数/选项/命令）、帮助模板与**错误排版**按系统显示语言自动切换。
+//! 2. **自有文案**（命令与参数自身的描述、`value_name` 里的词）走
+//!    [`crate::tr`] —— 键是**英文原文**，译文在 `locales/app.yml`。
+//!
+//! ⚠️ 为什么自有文案要写成 `about = crate::tr("...")` 这样的**显式属性**，
+//! 而不是惯用的 doc comment：`clap_derive` 在**编译期**把 doc comment
+//! 烧成 `about` / `help`（`clap_derive/src/item.rs:909-947`），运行时
+//! 没有插手的余地。带值的 `about = <expr>` 则原样转发成
+//! `Command::about(<expr>)`（同文件 `:850-863`），于是可以放函数调用。
+//!
+//! ⚠️ 另外，doc comment 会**同时**产出 `about` 与 `long_about` 两条
+//! （第一段进前者、全文进后者），所以这里把 doc comment 全部删掉、
+//! 两个都显式写 —— 否则会剩下一段没被覆盖的旧文案。
 
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, Subcommand};
 use clap_i18n_richformatter::{ClapI18nRichFormatter, clap_i18n};
 use std::path::PathBuf;
+
+/// 把若干段英文源文翻好再用空行拼起来。
+///
+/// 用来构造 `long_about` / `long_help`：clap 对 `about` 只显示第一段，
+/// 对 `long_about` 显示全文，而 `locales/app.yml` 里是按**段**存的，
+/// 所以这里按段取译文再拼。
+fn paragraphs(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| crate::tr(p))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
 /// 官方 `studiomdl` 的**无值** flag（L4D2 `studiomdl.exe` 实测 usage）。
 ///
@@ -181,86 +207,85 @@ pub fn normalize_official_args(argv: &[String]) -> Normalized {
 // mdlc 自有形态：derive
 // ---------------------------------------------------------------------------
 
-/// Source 引擎模型编译器（studiomdl 重写）
-///
-/// 把 TOML 描述或 QC 脚本编译成 Source 引擎的 `.mdl` / `.vvd` / `.vtx` /
-/// `.phy` 四件套，另带若干只读的检查与转换子命令。
-///
-/// 也能当官方 `studiomdl` 用：`mdlc -game <gamedir> <model.qc>` 会把产物写到
-/// `<gamedir>\models\<$modelname>`，可直接替换 Crowbar 的编译器路径。
-// 实现注记（不是给用户的帮助文本，所以放在 `//` 里而不是 doc comment）：
+// 帮助正文用显式属性而不是 doc comment：doc comment 在编译期就被
+// `clap_derive` 烧成 `about` / `long_about`，运行时翻不了（见模块文档）。
 //
-// - 子命令与参数的帮助正文由这些类型上的 doc comment 自动生成 —— 没有手写
-//   的 usage 常量，也没有「注册命令 + `match` 分支按键取值」。
+// 实现注记（不是给用户的帮助文本，所以放在 `//` 里）：
+//
+// - 子命令与参数的帮助正文由下面的属性给出 —— 没有手写的 usage 常量，
+//   也没有「注册命令 + `match` 分支按键取值」。
 // - 官方兼容形态（`mdlc -game <gamedir> <x.qc>`）由 `main` 在解析前分流，
 //   不走这条路径；那份定义是 builder 版的 [`build_official_cli`]。
 // - 段落标题（用法 / 参数 / 选项 / 命令）与错误排版由
 //   `clap-i18n-richformatter` 按**系统显示语言**翻译；命令与参数**自身的
-//   描述**是下面的 doc comment，始终是中文。
+//   描述**走 [`crate::tr`]，译文在 `locales/app.yml`。
 #[derive(Debug, Parser)]
 #[clap_i18n]
 #[command(name = "mdlc", version, propagate_version = true)]
+#[command(about = crate::tr("Source engine model compiler (a studiomdl rewrite)"))]
+#[command(long_about = paragraphs(&[
+    "Source engine model compiler (a studiomdl rewrite)",
+    "Compiles a TOML description or a QC script into the Source engine `.mdl` / `.vvd` / `.vtx` / `.phy` set, plus a few read-only inspection and conversion subcommands.",
+    "It also works as the official `studiomdl`: `mdlc -game <gamedir> <model.qc>` writes the output under `<gamedir>\\models\\<$modelname>`, so it can be dropped in as Crowbar's compiler path.",
+]))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 }
 
-/// mdlc 自有子命令。
-///
-/// ⚠️ 每个变体都显式写了 `#[command(name = ...)]`，不依赖 clap 从变体名
-/// 推断的 kebab-case —— 这些名字是脚本与探针的调用契约
-/// （`build` / `build-qc` / `vvd-info` / `vvd-roundtrip` / `qc2toml`）。
+// ⚠️ 每个变体都显式写了 `#[command(name = ...)]`，不依赖 clap 从变体名
+// 推断的 kebab-case —— 这些名字是脚本与探针的调用契约
+// （`build` / `build-qc` / `vvd-info` / `vvd-roundtrip` / `qc2toml`）。
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// TOML 描述 → .mdl/.vvd/.vtx（MVP 主线）
     #[command(name = "build")]
+    #[command(about = crate::tr("TOML description → .mdl/.vvd/.vtx (main path)"))]
     Build(BuildArgs),
-    /// 只校验描述文件，不写文件
     #[command(name = "check")]
+    #[command(about = crate::tr("Validate a description file without writing anything"))]
     Check(CheckArgs),
-    /// SMD 三角形 → 凸包 → .phy 碰撞文件
     #[command(name = "phy")]
+    #[command(about = crate::tr("SMD triangles → convex hulls → .phy collision file"))]
     Phy(PhyArgs),
-    /// QC 脚本 → TOML 描述（只写文本，不编译）
     #[command(name = "qc2toml")]
+    #[command(about = crate::tr("QC script → TOML description (text only, no compile)"))]
     Qc2toml(Qc2tomlArgs),
-    /// 直接从 QC 编译
     #[command(name = "build-qc")]
+    #[command(about = crate::tr("Compile straight from a QC script"))]
     BuildQc(BuildQcArgs),
-    /// 解析并打印 VVD 头部与统计
     #[command(name = "vvd-info")]
+    #[command(about = crate::tr("Parse a VVD and print its header and statistics"))]
     VvdInfo(VvdInfoArgs),
-    /// VVD 读入再写出，逐字节比对
     #[command(name = "vvd-roundtrip")]
+    #[command(about = crate::tr("Read a VVD and write it back, comparing byte for byte"))]
     VvdRoundtrip(VvdRoundtripArgs),
-    /// 打印一份带注释的最小 TOML 模板
     #[command(name = "template")]
+    #[command(about = crate::tr("Print a minimal, commented TOML template"))]
     Template,
-    /// （内部）跑一次更新检测并写缓存
-    ///
-    /// **隐藏**子命令：更新检测的子进程入口（`mdlc __update-check`）。
-    /// 它刻意不出现在 `--help` 里（`hide`）—— 这是给 [`crate::update`]
-    /// 派生出去的子进程用的，不是给用户的功能。手动跑它只是为了排错：
-    /// 它会**同步**执行一次检测，把结果写进缓存。
-    ///
-    /// 之所以做成「真子命令」而不是内部环境变量开关：`spawn` 出去的是
-    /// **同一个可执行文件**，走同一条参数解析路径，所以「手动跑」与
-    /// 「后台跑」不可能分叉出两种行为。
+    // **隐藏**子命令：更新检测的子进程入口（`mdlc __update-check`）。
+    // 它刻意不出现在 `--help` 里（`hide`）—— 这是给 [`crate::update`]
+    // 派生出去的子进程用的，不是给用户的功能。手动跑它只是为了排错：
+    // 它会**同步**执行一次检测，把结果写进缓存。
+    //
+    // 之所以做成「真子命令」而不是内部环境变量开关：`spawn` 出去的是
+    // **同一个可执行文件**，走同一条参数解析路径，所以「手动跑」与
+    // 「后台跑」不可能分叉出两种行为。
     #[command(name = crate::update::HIDDEN_SUBCOMMAND, hide = true)]
+    #[command(about = crate::tr("(internal) run one update check and write the cache"))]
     UpdateCheck,
 }
 
-/// `mdlc build <model.toml> [--out <目录>] [--optimize-vtx]`
+/// `mdlc build <model.toml> [--out <dir>] [--optimize-vtx]`
 #[derive(Debug, Args)]
 pub struct BuildArgs {
-    /// 要编译的 TOML 描述文件
     #[arg(value_name = "model.toml")]
+    #[arg(help = crate::tr("TOML description to compile"))]
     pub toml: PathBuf,
-    /// 输出根目录（默认当前目录）
-    #[arg(long, value_name = "目录")]
+    #[arg(long, value_name = crate::tr("dir"))]
+    #[arg(help = crate::tr("Root output directory (defaults to the current directory)"))]
     pub out: Option<PathBuf>,
-    /// mdlc 扩展：打开 VTX 缓存优化
     #[arg(long)]
+    #[arg(help = crate::tr("mdlc extension: enable the VTX cache optimization"))]
     pub optimize_vtx: bool,
 }
 
@@ -274,33 +299,35 @@ impl BuildArgs {
 /// `mdlc check <model.toml>`
 #[derive(Debug, Args)]
 pub struct CheckArgs {
-    /// 要校验的 TOML 描述文件
     #[arg(value_name = "model.toml")]
+    #[arg(help = crate::tr("TOML description to validate"))]
     pub toml: PathBuf,
 }
 
 /// `mdlc qc2toml <model.qc> [--out <path.toml>]`
 #[derive(Debug, Args)]
 pub struct Qc2tomlArgs {
-    /// 要转换的 QC 脚本
     #[arg(value_name = "model.qc")]
+    #[arg(help = crate::tr("QC script to convert"))]
     pub qc: PathBuf,
-    /// 输出的 TOML 路径（缺省与 QC 同目录同名，扩展名换成 .toml）
     #[arg(long, value_name = "path.toml")]
+    #[arg(help = crate::tr(
+        "Output TOML path (defaults to the QC's own directory and name, with a .toml extension)"
+    ))]
     pub out: Option<PathBuf>,
 }
 
-/// `mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]`
+/// `mdlc build-qc <model.qc> [--out <dir>] [--optimize-vtx]`
 #[derive(Debug, Args)]
 pub struct BuildQcArgs {
-    /// 要编译的 QC 脚本
     #[arg(value_name = "model.qc")]
+    #[arg(help = crate::tr("QC script to compile"))]
     pub qc: PathBuf,
-    /// 输出根目录（默认当前目录）
-    #[arg(long, value_name = "目录")]
+    #[arg(long, value_name = crate::tr("dir"))]
+    #[arg(help = crate::tr("Root output directory (defaults to the current directory)"))]
     pub out: Option<PathBuf>,
-    /// mdlc 扩展：打开 VTX 缓存优化
     #[arg(long)]
+    #[arg(help = crate::tr("mdlc extension: enable the VTX cache optimization"))]
     pub optimize_vtx: bool,
 }
 
@@ -314,48 +341,58 @@ impl BuildQcArgs {
 /// `mdlc vvd-info <file.vvd>`
 #[derive(Debug, Args)]
 pub struct VvdInfoArgs {
-    /// 要解析并打印头部与统计的 VVD 文件
     #[arg(value_name = "file.vvd")]
+    #[arg(help = crate::tr("VVD file to parse and print the header and statistics of"))]
     pub file: PathBuf,
 }
 
 /// `mdlc vvd-roundtrip <file.vvd>`
 #[derive(Debug, Args)]
 pub struct VvdRoundtripArgs {
-    /// 要往返比对的 VVD 文件
     #[arg(value_name = "file.vvd")]
+    #[arg(help = crate::tr("VVD file to round-trip"))]
     pub file: PathBuf,
 }
 
 /// `mdlc phy <in.smd> <out.phy> [选项]`（参数多，单独一个结构体）。
 #[derive(Debug, Args)]
 pub struct PhyArgs {
-    /// 输入 SMD（三角形顶点已在模型局部坐标，不做任何变换，与 studiomdl 一致）
     #[arg(value_name = "in.smd")]
+    #[arg(help = crate::tr(
+        "Input SMD (triangle vertices are already in model-local coordinates; no transform is applied, matching studiomdl)"
+    ))]
     pub input: PathBuf,
-    /// 输出 .phy 路径
     #[arg(value_name = "out.phy")]
+    #[arg(help = crate::tr("Output .phy path"))]
     pub output: PathBuf,
-    /// 配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0
     #[arg(long, value_name = "N", default_value_t = 0, value_parser = parse_u32)]
+    #[arg(help = crate::tr("Checksum of the paired .mdl (decimal or 0x hex), default 0"))]
     pub checksum: u32,
-    /// $mass 等效总质量，默认 1（官方缺省；见 --automass 说明）
     #[arg(long, value_name = "F", default_value_t = 1.0)]
+    #[arg(help = crate::tr(
+        "$mass equivalent total mass, default 1 (the official default; see the --automass note)"
+    ))]
     pub mass: f32,
-    /// 表面材质，默认 default
     #[arg(long = "surfaceprop", value_name = "S", default_value = "default")]
+    #[arg(help = crate::tr("Surface material, default default"))]
     pub surface_prop: String,
-    /// $concave：按**连通分量**拆成多个凸块（官方语义，不是 VHACD 体分解）
     #[arg(long)]
+    #[arg(help = crate::tr(
+        "$concave: split into convex pieces by connected component (the official semantics, not a VHACD decomposition)"
+    ))]
     pub concave: bool,
-    /// VHACD 近似凸分解。**非官方语义**：保留凹口，而官方 $concave 是填平
     #[arg(long)]
+    #[arg(help = crate::tr(
+        "VHACD approximate convex decomposition. Non-official semantics: concavities are preserved, whereas the official $concave fills them in"
+    ))]
     pub vhacd: bool,
-    /// `--vhacd` 的旧别名（保留以免破坏既有脚本；语义已明确为 VHACD）
     #[arg(long)]
+    #[arg(help = crate::tr(
+        "Legacy alias of --vhacd (kept so existing scripts keep working; its meaning is now unambiguously VHACD)"
+    ))]
     pub decompose: bool,
-    /// $collisionjoints：按**蒙皮权重骨骼**分组，每个骨骼一个 solid
     #[arg(long)]
+    #[arg(help = crate::tr("$collisionjoints: group by skin-weight bone, one solid per bone"))]
     pub ragdoll: bool,
 }
 
@@ -369,13 +406,42 @@ impl PhyArgs {
 /// clap 自动生成的 `help` 子命令描述是**硬编码英文常量**
 /// （`clap_builder` 的 `command.rs:4842`），而 `clap-i18n-richformatter` 的词条
 /// 表里没有对应的 key（只有 `clap-subcommand-context` 这类上下文词），
-/// 所以这里直接写中文 —— 与其余所有子命令描述保持一致。
-const HELP_SUBCOMMAND_ABOUT: &str = "打印本信息或给定子命令的帮助";
+/// 所以在 `locales/app.yml` 里补了一条 —— 与其余所有子命令描述同源。
+fn help_subcommand_about() -> String {
+    crate::tr("Print this message or the help of the given subcommand(s)")
+}
+
+/// 初始化自有文案的语言（与 clap 侧共用同一个真相源）。
+///
+/// **必须在 [`build_cli`] 之前调用** —— `about` / `help` 这些属性里的
+/// [`crate::tr`] 是在 `Cli::command_i18n()` 被求值时执行的（不是编译期），
+/// 那一步发生在 `build_cli` 里面。设晚了就拿到上一门语言。
+///
+/// 探测用 `sys-locale`（与 `clap-i18n-richformatter` → `i18n-embed` 内部
+/// 用的是同一个 crate），而不是 `rust-i18n` 自己的默认值（硬编码 `"en"`）。
+/// 取第一个可用项；探测不到就保持默认的 `en`（即英文源文）。
+///
+/// ⚠️ 它只管**自有文案**。框架词（`用法:` / `参数:` / `选项:` / `-h` 的说明）
+/// 是 `clap-i18n-richformatter` 用自己的 `FluentLanguageLoader` 探测的，
+/// 与 `rust_i18n` 的 locale **是两套独立状态** —— 显式
+/// `rust_i18n::set_locale("en")` 并不会把框架词变回英文。想让两边一致，
+/// 只能让它们各自探测同一次系统语言（这正是本函数存在的意义）。
+///
+/// ⚠️ Windows 上 `sys-locale` 走 `GetUserPreferredUILanguages`，**不读
+/// `LC_ALL` / `LANG`**（那两个只在它的 `unix.rs` 里）—— 想在 Windows 上
+/// 测英文路径，只能改系统语言，或显式 `rust_i18n::set_locale("en")`
+/// （但那样只有自有文案会变，见上一条）。
+pub fn init_locale() {
+    if let Some(tag) = sys_locale::get_locales().next() {
+        rust_i18n::set_locale(&tag);
+    }
+}
 
 /// 构建 mdlc 自有形态的 CLI 定义（已做 i18n 处理）。
 ///
-/// ⚠️ 会先初始化语言环境（`clap-i18n-richformatter` 按**系统显示语言**探测），
-/// 所以 [`Cli::command_i18n`] 与下面补的段落标题才是目标语言的。
+/// ⚠️ 会先初始化**框架词**的语言环境（`clap-i18n-richformatter` 按系统显示
+/// 语言探测），所以 [`Cli::command_i18n`] 与下面补的段落标题才是目标语言的。
+/// **自有文案**的语言由 [`init_locale`] 负责，调用方要在这之前调它。
 ///
 /// 官方兼容形态是另一份定义，见 [`build_official_cli`]。
 pub fn build_cli() -> Command {
@@ -422,24 +488,24 @@ fn localize_subcommands(cmd: Command) -> Command {
 /// 给单个子命令补上本地化的帮助模板、段落标题与子命令列表标题。
 ///
 /// 自动生成的 `help` 子命令也走这里 —— 它的描述是 clap 里的英文常量，
-/// 见 [`HELP_SUBCOMMAND_ABOUT`]。
+/// 见 [`help_subcommand_about`]。
 fn localize_one_subcommand(mut sc: Command) -> Command {
     use clap_i18n_richformatter::__private::get_translation;
 
-    // `clap::builder::Str` 没有 `From<String>`，只能从 `&'static str` 之类构造，
-    // 所以这里与 `clap-i18n-derive` 自己的做法一致：把翻译串 leak 成 `'static`。
-    // 每次进程启动只 leak 几条短串，代价可忽略。
-    let arguments: &'static str =
-        Box::leak(get_translation("clap-arguments-heading").into_boxed_str());
-    let options: &'static str = Box::leak(get_translation("clap-options-heading").into_boxed_str());
-    let commands: &'static str =
-        Box::leak(get_translation("clap-commands-heading").into_boxed_str());
-    let usage_heading: &'static str =
-        Box::leak(get_translation("clap-usage-heading").into_boxed_str());
+    // 这些是**框架词**（不是 mdlc 的文案），所以取自 crate 自带的词条表，
+    // 而不是 `locales/app.yml`。
+    //
+    // 它们能直接吃 `String` 是因为 `Cargo.toml` 给 clap 开了 `string`
+    // feature（`Str: From<String>` 在那个 feature 后面）；不开的话只能
+    // 像 `clap-i18n-derive` 自己那样把串 `Box::leak` 成 `'static`。
+    let arguments = get_translation("clap-arguments-heading");
+    let options = get_translation("clap-options-heading");
+    let commands = get_translation("clap-commands-heading");
+    let usage_heading = get_translation("clap-usage-heading");
 
     // clap 自动生成的 `help` 子命令：换个本地化描述。
     if sc.get_name() == "help" {
-        sc = sc.about(HELP_SUBCOMMAND_ABOUT);
+        sc = sc.about(help_subcommand_about());
     }
 
     // `help_template` 与 `command_i18n` 给顶层用的那份同构。
@@ -447,16 +513,16 @@ fn localize_one_subcommand(mut sc: Command) -> Command {
         .help_template(format!(
             "{{before-help}}{{about-with-newline}}\n{usage_heading} {{usage}}\n\n{{all-args}}{{after-help}}"
         ))
-        .subcommand_help_heading(commands)
+        .subcommand_help_heading(commands.clone())
         .subcommand_value_name(commands);
 
     let positional_ids: Vec<_> = sc.get_positionals().map(|a| a.get_id().clone()).collect();
     for id in positional_ids {
-        sc = sc.mut_arg(id, |a| a.help_heading(arguments));
+        sc = sc.mut_arg(id, |a| a.help_heading(arguments.clone()));
     }
     let option_ids: Vec<_> = sc.get_opts().map(|a| a.get_id().clone()).collect();
     for id in option_ids {
-        sc = sc.mut_arg(id, |a| a.help_heading(options));
+        sc = sc.mut_arg(id, |a| a.help_heading(options.clone()));
     }
     sc
 }
@@ -505,26 +571,30 @@ fn parse_u32(s: &str) -> Result<u32, String> {
 /// 不会出现归一化放行、clap 却报 `UnknownArgument` 的裂缝。
 pub fn build_official_cli() -> Command {
     let mut cmd = Command::new("mdlc")
-        .about("Source 引擎模型编译器（studiomdl 兼容模式）")
+        .about(crate::tr(
+            "Source engine model compiler (studiomdl compatibility mode)",
+        ))
         .disable_version_flag(true)
         .arg_required_else_help(false)
         .arg(
             Arg::new("qc")
                 .value_name("file.qc")
                 .num_args(1)
-                .help("要编译的 QC 脚本"),
+                .help(crate::tr("QC script to compile")),
         )
         .arg(
             Arg::new("optimize_vtx")
                 .long("optimize-vtx")
                 .action(ArgAction::SetTrue)
-                .help("mdlc 扩展：打开 VTX 缓存优化"),
+                .help(crate::tr("mdlc extension: enable the VTX cache optimization")),
         )
         .arg(
             Arg::new("out")
                 .long("out")
-                .value_name("目录")
-                .help("mdlc 扩展：显式输出根目录（优先于 -game 推出的路径）"),
+                .value_name(crate::tr("dir"))
+                .help(crate::tr(
+                    "mdlc extension: explicit output root directory (takes precedence over the path derived from -game)",
+                )),
         );
 
     // ⚠️ `-h` 在官方是「dump hboxes」，在 mdlc 是 help。归一化后是 `--h`
@@ -537,13 +607,15 @@ pub fn build_official_cli() -> Command {
         Arg::new("game")
             .long("game")
             .value_name("gamedir")
-            .help("游戏目录（官方 -game）；产物写到 <gamedir>\\models\\"),
+            .help(crate::tr(
+                "Game directory (the official -game); output goes to <gamedir>/models/",
+            )),
     );
     for name in OFFICIAL_FLAGS_WITH_VALUE {
         if *name == "game" {
             continue;
         }
-        cmd = cmd.arg(Arg::new(name).long(name).value_name("值"));
+        cmd = cmd.arg(Arg::new(name).long(name).value_name(crate::tr("value")));
     }
     cmd
 }
@@ -889,5 +961,151 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.exit_code(), 2);
         assert!(e.use_stderr());
+    }
+
+    // -----------------------------------------------------------------------
+    // 自有文案的 i18n
+    // -----------------------------------------------------------------------
+
+    /// 改语言是**进程级全局状态**（`rust_i18n` 里的 `static CURRENT_LOCALE`），
+    /// 而 `cargo test` 默认多线程 —— 这几条测试必须串行，且跑完要还原。
+    static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 在指定语言下跑一段代码，跑完还原原语言。
+    ///
+    /// 还原不只是卫生问题：`cargo test` 里同一个进程还跑着几百条别的测试，
+    /// 留下改过的语言会影响它们的输出（虽然目前没有测试断言文案）。
+    fn with_locale<R>(locale: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = (*rust_i18n::locale()).to_string();
+        rust_i18n::set_locale(locale);
+        let out = f();
+        rust_i18n::set_locale(&saved);
+        out
+    }
+
+    /// 渲染一个 `DisplayHelp` / `DisplayVersion` 错误的正文。
+    ///
+    /// clap 对这两类错误**预渲染**了 message，`to_string()` 拿到的就是
+    /// 用户看到的那份帮助。
+    fn render_help(argv: &[&str]) -> String {
+        build_cli()
+            .try_get_matches_from(argv)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn tr_falls_back_to_the_english_source_when_untranslated() {
+        // 键就是英文源文，所以**没被翻译的语言**拿到的正是源文本身。
+        // 这也是 `locales/app.yml` 里只写 `zh-CN` 一列的原因。
+        with_locale("de-DE", || {
+            assert_eq!(crate::tr("Output .phy path"), "Output .phy path");
+        });
+    }
+
+    #[test]
+    fn tr_returns_the_translation_for_chinese() {
+        with_locale("zh-CN", || {
+            assert_eq!(crate::tr("Output .phy path"), "输出 .phy 路径");
+        });
+    }
+
+    #[test]
+    fn tr_falls_back_from_a_region_tag_to_its_language() {
+        // `zh-TW` 不在表里，但 `rust-i18n` 会逐级剥离 `-` 后缀再找，
+        // 于是命中 `zh-CN`？—— 不会：`zh-TW` → `zh`，而表里只有 `zh-CN`。
+        // 这条断言把真实行为钉下来，免得日后误以为「繁体也会自动命中」。
+        with_locale("zh-TW", || {
+            assert_eq!(crate::tr("Output .phy path"), "Output .phy path");
+        });
+    }
+
+    #[test]
+    fn help_text_follows_the_locale() {
+        // ⭐ 这条是「显式属性而不是 doc comment」这个改造**唯一存在理由**的
+        // 回归测试：doc comment 是 `clap_derive` 在**编译期**烧进
+        // `about` / `help` 的，换语言不会变；显式属性里的 `tr(...)` 是在
+        // `command_i18n()` 被求值时执行的，所以会跟着语言走。
+        let en = with_locale("en", || render_help(&["mdlc", "phy", "--help"]));
+        let zh = with_locale("zh-CN", || render_help(&["mdlc", "phy", "--help"]));
+
+        assert!(en.contains("Output .phy path"), "英文下应打源文：{en}");
+        assert!(!en.contains("输出 .phy 路径"), "英文下不该有中文：{en}");
+        assert!(zh.contains("输出 .phy 路径"), "中文下应打译文：{zh}");
+        assert!(
+            !zh.contains("Output .phy path"),
+            "中文下不该有英文源文：{zh}"
+        );
+    }
+
+    #[test]
+    fn top_level_about_is_localized_and_split_into_two_levels() {
+        // `-h` 只打 `about`（第一段），`--help` 打 `long_about`（三段）。
+        // 两者都要翻到，且 `-h` 的输出必须是 `--help` 的真前缀。
+        let short = with_locale("zh-CN", || render_help(&["mdlc", "-h"]));
+        let long = with_locale("zh-CN", || render_help(&["mdlc", "--help"]));
+
+        assert!(short.contains("Source 引擎模型编译器（studiomdl 重写）"));
+        assert!(!short.contains("四件套"), "-h 只该有第一段：{short}");
+        assert!(long.contains("四件套"), "--help 该有三段：{long}");
+        assert!(long.contains("Crowbar"), "--help 该有三段：{long}");
+
+        let en_long = with_locale("en", || render_help(&["mdlc", "--help"]));
+        assert!(en_long.contains("Source engine model compiler (a studiomdl rewrite)"));
+        assert!(
+            !en_long.contains("引擎模型编译器"),
+            "英文下不该有中文：{en_long}"
+        );
+    }
+
+    #[test]
+    fn value_name_is_localized_too() {
+        // 这条单独拎出来，因为 `value_name` 与 `help` 走的**不是**同一个
+        // `IntoResettable` 实现：`help` 吃 `StyledStr`（`From<String>` 无门），
+        // 而 `value_name` 吃 `Str`（`From<String>` 在 clap 的 `string`
+        // feature 后面）。少了那个 feature，这个文件根本编不过。
+        let zh = with_locale("zh-CN", || render_help(&["mdlc", "build", "--help"]));
+        assert!(zh.contains("<目录>"), "value_name 也要翻译：{zh}");
+
+        let en = with_locale("en", || render_help(&["mdlc", "build", "--help"]));
+        assert!(en.contains("<dir>"), "英文下应是 <dir>：{en}");
+        assert!(!en.contains("<目录>"), "英文下不该有中文：{en}");
+    }
+
+    #[test]
+    fn subcommand_about_is_localized() {
+        let zh = with_locale("zh-CN", || render_help(&["mdlc", "--help"]));
+        assert!(
+            zh.contains("只校验描述文件，不写文件"),
+            "命令表要翻译：{zh}"
+        );
+        assert!(
+            zh.contains("VVD 读入再写出，逐字节比对"),
+            "命令表要翻译：{zh}"
+        );
+
+        let en = with_locale("en", || render_help(&["mdlc", "--help"]));
+        assert!(
+            en.contains("Validate a description file without writing anything"),
+            "英文下应是源文：{en}"
+        );
+    }
+
+    #[test]
+    fn hidden_subcommand_stays_hidden_in_both_languages() {
+        // `__update-check` 有 `about` 属性，但它绝不能因此出现在帮助里 ——
+        // 它同时带 `hide = true`。
+        for locale in ["en", "zh-CN"] {
+            let help = with_locale(locale, || render_help(&["mdlc", "--help"]));
+            assert!(
+                !help.contains("__update-check"),
+                "{locale} 下隐藏子命令不该出现：{help}"
+            );
+            assert!(
+                !help.contains("run one update check"),
+                "{locale} 下隐藏子命令不该出现：{help}"
+            );
+        }
     }
 }

@@ -24,17 +24,55 @@ categories = ["command-line-utilities", "game-development", "parser-implementati
 # `OFFICIAL_FLAGS_NO_VALUE` / `OFFICIAL_FLAGS_WITH_VALUE` 两张表循环生成，
 # 表驱动是 derive 表达不了的，硬转会把「归一化认识的」与「clap 接受的」
 # 拆成两份清单。见 `src/cli.rs` 的模块文档。
-clap = { version = "4.6.7", features = ["derive"] }
+#
+# `string` 是给 `value_name` 用的：`about` / `long_about` / `help` /
+# `long_help` 吃的是 `IntoResettable<StyledStr>`，而 `StyledStr: From<String>`
+# **没有** feature 门，直接传 `tr(...)` 返回的 `String` 就行；但
+# `value_name` 吃的是 `IntoResettable<Str>`，而 `Str: From<String>` 被
+# `#[cfg(feature = "string")]` 挡着（`clap_builder/src/builder/str.rs:54-59`），
+# 不开这个 feature 时 `Str` 只能装 `&'static str`。开了它，
+# `value_name = tr("dir")` 才编得过，不必到处 `Box::leak`。
+clap = { version = "4.6.7", features = ["derive", "string"] }
 
 # 帮助/错误文案的多语言支持：换掉 clap **自己**写死的英文
 # （`Usage:` / `Options` / `Commands` / `Arguments` 标题、12 类错误的
 # 措辞、`-h` / `-V` 的说明），按**系统显示语言**自动切换
 # （`DesktopLanguageRequester`；未命中时回落到 crate 自带的 `en-US`）。
 #
-# ⚠️ 边界：它**不翻译** mdlc 自己的命令/参数描述 —— 那些仍是下面
+# ⚠️ 边界：它**不翻译** mdlc 自己的命令/参数描述 —— 那些是下面
 # `about` / `help` 里的中文常量（crate 的设计如此，其 README 亦明示）。
 clap-i18n-richformatter = "0.3.2"
 indexmap = { version = "2.14.2", features = ["serde"] }
+
+# 自有文案的 i18n。**源语言是英文**：`minify_key` 默认关，键就是英文原文，
+# `locales/app.yml` 里只写译文（`zh-CN`），英文/第三语言靠 `t!` 未命中
+# 回退到键本身。见该文件头部的说明。
+#
+# ⚠️ `rust_i18n::t!` 展开成 `crate::_rust_i18n_try_translate(...)`
+# （`rust-i18n-macro/src/tr.rs:438`），`crate::` 解析到**调用方** ——
+# 所以 `t!` 不能跨 crate。`i18n!` 在本 crate（lib）里调一次，bin 走
+# `mdlc::tr` 包一层；`set_locale` 是 rust_i18n 里的全局 static，两边共享。
+#
+# ⚠️ `locales/` 是在**编译期**由 proc-macro 读盘生成 `SimpleBackend` 的
+# （不进二进制）。`rust-i18n` 自己的 `build.rs` 会对 `**/locales/**/*`
+# 发 `rerun-if-changed`，所以改译文会触发重编。
+#
+# 体积实测（独立 crate、`lto="thin"` + `codegen-units=1`，基线 130048 B）：
+# **+39936 B**。它的 build-dependencies 会拉进 `globwalk` / `regex` /
+# `serde-saphyr` / `toml_edit`，但**一个都不出现在二进制里**（已扫过
+# 符号表），只影响构建时间。
+rust-i18n = "4.2.2"
+
+# 系统显示语言探测，给上面的 `set_locale` 用。选它而不是让 rust-i18n
+# 用自己的默认值（硬编码 `"en"`），是为了与 clap 侧**共用同一个真相源**：
+# `clap-i18n-richformatter` → `i18n-embed` → 也是 `sys-locale`
+# （`i18n-embed/src/requester.rs:288-302` 的 `requested_languages()`）。
+#
+# 它**本来就在依赖树里**（`Cargo.lock` 有 `sys-locale 0.3.2`），提为直接
+# 依赖不新增任何包。⚠️ Windows 侧走 `GetUserPreferredUILanguages`，
+# **不读 `LC_ALL` / `LANG`**（那些只在 `unix.rs` 里）—— 所以想在
+# Windows 上测英文路径，只能显式 `set_locale("en")` 或改系统语言。
+sys-locale = "0.3.2"
 
 # 日志门面。**故意不加任何 feature**：只需要 `set_logger`（`&'static dyn Log`），
 # 它不要求 `std` / `alloc`（只有 `set_boxed_logger` 要求 `alloc`），所以这里
