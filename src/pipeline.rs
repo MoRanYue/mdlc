@@ -322,26 +322,47 @@ impl PipelineOutput {
     /// 编译摘要（`mdlc.exe` 逐行原样输出；GUI 可直接显示在日志面板）。
     pub fn summary_lines(&self, paths: &OutputPaths) -> Vec<String> {
         let d = &self.compiled.desc;
+        // ⚠️ 对齐宽度（`{:>10}`）与格式规格都要在**传参时**用 `format!` 做好：
+        // `tr_fmt!` 的占位符只认 `%{名}`，写成 `%{n:>10}` 不会被替换（见 §103.2）。
         let mut v = vec![
-            format!("模型        {}", d.model.name),
-            format!("版本        {}", d.version()),
-            format!("checksum    {}  （已写入各文件，配对一致）", self.checksum),
+            crate::tr_fmt!("model       %{name}", name = d.model.name),
+            crate::tr_fmt!("version     %{version}", version = d.version()),
+            crate::tr_fmt!(
+                "checksum    %{sum}  (written into every file, they agree)",
+                sum = self.checksum
+            ),
             String::new(),
-            format!("骨骼        {}", d.bones.len()),
-            format!("材质        {}", d.materials.textures.len()),
-            format!("body part   {}", d.bodyparts.len()),
-            format!("顶点        {}", self.compiled.total_vertices()),
-            format!("三角形      {}", self.compiled.total_triangles()),
+            crate::tr_fmt!("bones       %{n}", n = d.bones.len()),
+            crate::tr_fmt!("materials   %{n}", n = d.materials.textures.len()),
+            crate::tr_fmt!("body part   %{n}", n = d.bodyparts.len()),
+            crate::tr_fmt!("vertices    %{n}", n = self.compiled.total_vertices()),
+            crate::tr_fmt!("triangles   %{n}", n = self.compiled.total_triangles()),
             String::new(),
-            format!("MDL         {:>10} 字节  {}", self.mdl.len(), paths.mdl.display()),
-            format!("VVD         {:>10} 字节  {}", self.vvd.len(), paths.vvd.display()),
-            format!("VTX         {:>10} 字节  {}", self.vtx.len(), paths.vtx.display()),
+            crate::tr_fmt!(
+                "MDL         %{size} bytes  %{path}",
+                size = format!("{:>10}", self.mdl.len()),
+                path = paths.mdl.display()
+            ),
+            crate::tr_fmt!(
+                "VVD         %{size} bytes  %{path}",
+                size = format!("{:>10}", self.vvd.len()),
+                path = paths.vvd.display()
+            ),
+            crate::tr_fmt!(
+                "VTX         %{size} bytes  %{path}",
+                size = format!("{:>10}", self.vtx.len()),
+                path = paths.vtx.display()
+            ),
         ];
         if let (Some(p), Some(b)) = (&paths.phy, &self.phy) {
-            v.push(format!("PHY         {:>10} 字节  {}", b.len(), p.display()));
+            v.push(crate::tr_fmt!(
+                "PHY         %{size} bytes  %{path}",
+                size = format!("{:>10}", b.len()),
+                path = p.display()
+            ));
         }
         v.push(String::new());
-        v.push("**编译成功**（各文件布局自检均通过）".to_string());
+        v.push(crate::tr("**compiled successfully** (every file passed its layout self-check)").to_string());
         v
     }
 }
@@ -861,22 +882,28 @@ smd = "a.smd"
         let out = build(&desc, &d, PipelineOptions::default()).expect("应编译成功");
         let paths = out.paths(Path::new("out"));
 
-        let lines = out.summary_lines(&paths);
+        let lines = crate::test_locale::with_english(|| out.summary_lines(&paths));
         assert_eq!(lines.len(), 15, "没有 .phy 时 15 行：{lines:?}");
-        assert_eq!(lines[0], "模型        models/test/minimal.mdl");
+        assert_eq!(lines[0], "model       models/test/minimal.mdl");
         assert!(lines[3].is_empty(), "第 4 行是空行");
         assert!(lines[9].is_empty(), "第 10 行是空行");
-        assert_eq!(lines[14], "**编译成功**（各文件布局自检均通过）");
+        assert_eq!(
+            lines[14],
+            "**compiled successfully** (every file passed its layout self-check)"
+        );
 
         // 有 `.phy` 时多一行，插在 VTX 之后、空行之前。
         write(&d, "phys.smd", &collision_smd());
         let with_phy = parse(&desc_toml("phys.smd"));
         let out = build(&with_phy, &d, PipelineOptions::default()).expect("应编译成功");
-        let lines = out.summary_lines(&out.paths(Path::new("out")));
+        let lines = crate::test_locale::with_english(|| out.summary_lines(&out.paths(Path::new("out"))));
         assert_eq!(lines.len(), 16, "有 .phy 时 16 行：{lines:?}");
         assert!(lines[13].starts_with("PHY "), "第 14 行应是 PHY：{lines:?}");
         assert!(lines[14].is_empty());
-        assert_eq!(lines[15], "**编译成功**（各文件布局自检均通过）");
+        assert_eq!(
+            lines[15],
+            "**compiled successfully** (every file passed its layout self-check)"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -941,16 +968,27 @@ smd = "a.smd"
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "Compilation failed with 1 error(s):");
         assert_eq!(lines[1], "  - x: y");
-        // ⚠️ 外层前缀已是英文（本轮），内层 `WriteError` 的文案还没迁
-        // （那是第三期的事），所以断言里两段语言不一致 —— 这正是当前状态。
+        // 第三期把 `WriteError` 也迁完了 ⟹ 内外两层现在都是英文源文。
         assert_eq!(
             crate::test_locale::with_english(
                 || PipelineError::WriteMdl(WriteError::Internal("i".into())).lines()
             ),
-            vec!["Error: 内部错误（请报告）：i"]
+            vec!["Error: Internal error (please report): i"]
+        );
+        // 中文系统上内外两层都走译文表。
+        assert_eq!(
+            crate::test_locale::with_locale("zh-CN", || {
+                PipelineError::WriteMdl(WriteError::Internal("i".into())).lines()
+            }),
+            vec!["错误：内部错误（请报告）：i"]
         );
         // `Display` 与 `lines()` 必须一致（CLI 走前者，GUI 走后者）。
-        assert_eq!(compile.to_string(), lines.join("\n"));
+        // ⚠️ 两边必须在**同一把锁里**算：`to_string()` 吃的是当前全局语言，
+        // 锁外调它就等于把这条断言交给「别的测试刚好把语言留成什么」。
+        let (display, joined) = crate::test_locale::with_english(|| {
+            (compile.to_string(), compile.lines().join("\n"))
+        });
+        assert_eq!(display, joined);
     }
 
     /// ⭐ 类型化的意义：调用方能**拿到源错误本身**，而不只是一个字符串。
@@ -965,8 +1003,10 @@ smd = "a.smd"
         };
         // ⚠️ 外层前缀已是英文（本轮），内层 `io::Error` 的文案来自操作系统
         // （中文系统上就是中文），所以断言里两段语言不一致 —— 这正是当前状态。
+        // ⚠️ 外层前缀要过译文表，所以必须锁语言：别的测试把全局 locale 切成
+        // zh-CN 的那一瞬间，这条就会渲染成「错误：读不到碰撞 SMD …」。
         assert_eq!(
-            err.to_string(),
+            crate::test_locale::with_english(|| err.to_string()),
             "Error: cannot read collision SMD nope.smd: 系统找不到指定的文件。"
         );
 

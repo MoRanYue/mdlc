@@ -125,44 +125,64 @@ pub const STRIP_IS_TRISTRIP: u8 = 0x02;
 pub enum VtxWriteError {
     /// mesh 数超过 `uint16` 能表达的范围（`origMeshVertID` 是 u16）。
     #[error(
-        "{model} 有 {count} 个顶点，超过 VTX 的每 mesh 上限 {}\n\
-         VTX 的 `origMeshVertID` 是 `uint16`，能表达下标 0..=65535，\
-         所以**一个 mesh 最多 65536 个顶点**。\n\
-         注意粒度是 **mesh（= 一个材质）**，不是整个模型。\n\
-         \n\
-         正常情况下你不会看到这条 —— 编译期会自动把超限的 mesh\
-         按三角形拆成多个同材质的 mesh（TOML 的\
-         `[model] split_oversized_meshes`，**默认 true**）。\n\
-         看到它说明该选项被显式关掉了；把它改回 `true` 即可。\
-         也可以按材质拆成多个 mesh（QC 里给多份 `$cdmaterials`/\
-         多张贴图，或分多个 `$bodygroup` 子模型），\
-         **不需要手工拆 SMD 文件**。",
-        crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH
+        "{}",
+        crate::tr_fmt!(
+            "The mesh %{model} has %{count} vertices, over the VTX per-mesh limit of %{max}\n\
+             `origMeshVertID` in VTX is `uint16`, which can express indices 0..=65535, \
+             so **a mesh can have at most 65536 vertices**.\n\
+             Note the granularity is **mesh (= one material)**, not the whole model.\n\
+             \n\
+             You should not normally see this: the compiler automatically splits \
+             an oversized mesh into several meshes of the same material by triangles \
+             (TOML's `[model] split_oversized_meshes`, **default true**).\n\
+             Seeing it means that option was explicitly turned off; set it back to `true`.\n\
+             You can also split by material (give several `$cdmaterials`/several \
+             textures in the QC, or several `$bodygroup` submodels), \
+             **no need to split the SMD file by hand**.",
+            model = model,
+            count = count,
+            max = crate::mdl_writer::MAXSTUDIOVERTS_PER_MESH
+        )
     )]
     TooManyVertices { model: String, count: usize },
     /// 单个 strip 的索引数超过 `int32`。
-    #[error("{model} 的三角形索引数 {count} 超出 int32")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The triangle index count %{count} of %{model} overflows int32",
+            model = model,
+            count = count
+        )
+    )]
     TooManyIndices { model: String, count: usize },
     /// 单个 strip 的骨骼调色板超过有符号 `char` 能表达的范围。
     ///
     /// 见 [`MAX_STRIP_BONES`]：`Vertex_t.boneID[]` 是 `char`，
     /// 槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误骨骼。
     #[error(
-        "{model} 的某个 strip 用到 {count} 根骨骼，超过 VTX 的每 strip 上限 {}\n\
-         VTX 的 `Vertex_t.boneID[]` 是**有符号 char**（`optimize.h:51`），\
-         硬件槽位下标 ≥128 会被引擎读成负数 ⟹ 顶点蒙皮到错误的骨骼。\n\
-         \n\
-         这是**格式**上限，不是本实现的选择，正常情况下你不会看到这条：\
-         写出器会按官方语义把调色板超标的 mesh 拆成**多条 strip**\
-         （每条 ≤ `maxBonesPerStrip` = 53 根，见 [`plan_strips`]）。\n\
-         看到它说明该 mesh 的**三角形下标越界**（输入已损坏）——\
-         那种情况写出器会退回「整组一条 strip」的兜底路径，于是整组\
-         骨骼都压进了一条 strip。请先修 SMD 里越界的顶点下标。",
-        MAX_STRIP_BONES
+        "{}",
+        crate::tr_fmt!(
+            "A strip of %{model} uses %{count} bones, over the VTX per-strip limit of %{max}\n\
+             `Vertex_t.boneID[]` in VTX is a **signed char** (`optimize.h:51`); \
+             hardware slot indices >=128 are read as negative by the engine \
+             ==> vertices are skinned to the wrong bones.\n\
+             \n\
+             This is a **format** limit, not a choice of this implementation, and you \
+             should not normally see it: the writer splits a mesh whose palette is over \
+             the limit into **several strips** following the official semantics \
+             (each <= `maxBonesPerStrip` = 53 bones, see [`plan_strips`]).\n\
+             Seeing it means the mesh has **out-of-range triangle indices** (the input \
+             is already broken) -- in that case the writer falls back to \"the whole \
+             group as one strip\", so all the bones of the group are squeezed into one \
+             strip. Fix the out-of-range vertex indices in the SMD first.",
+            model = model,
+            count = count,
+            max = MAX_STRIP_BONES
+        )
     )]
     TooManyStripBones { model: String, count: usize },
     /// 内部不一致 —— 属本实现的 bug。
-    #[error("内部错误（请报告）：{0}")]
+    #[error("{}", crate::tr_fmt!("Internal error (please report): %{err}", err = .0))]
     Internal(String),
 }
 
@@ -254,10 +274,10 @@ fn optimize_group_indices(
     let optimized = meshopt::optimize_vertex_cache(&flat, vertex_count);
 
     if optimized.len() != flat.len() {
-        return Err(VtxWriteError::Internal(format!(
-            "meshopt 返回的索引数 {} 与输入 {} 不符",
-            optimized.len(),
-            flat.len()
+        return Err(VtxWriteError::Internal(crate::tr_fmt!(
+            "meshopt returned %{got} indices but the input has %{want}",
+            got = optimized.len(),
+            want = flat.len()
         )));
     }
 
@@ -293,9 +313,9 @@ fn optimize_group_indices(
     a.sort_unstable();
     b.sort_unstable();
     if a != b {
-        return Err(VtxWriteError::Internal(
-            "meshopt 改变了三角形集合（应只重排顺序）—— 拒绝写出".into(),
-        ));
+        return Err(VtxWriteError::Internal(crate::tr(
+            "meshopt changed the triangle set (it should only reorder them) -- refusing to write",
+        )));
     }
     // 绕序检查：**未排序**的三元组多重集也必须一致。
     let mut ra: Vec<[u16; 3]> = tris.to_vec();
@@ -303,9 +323,9 @@ fn optimize_group_indices(
     ra.sort_unstable();
     rb.sort_unstable();
     if ra != rb {
-        return Err(VtxWriteError::Internal(
-            "meshopt 改变了三角形绕序（背面剔除会反过来）—— 拒绝写出".into(),
-        ));
+        return Err(VtxWriteError::Internal(crate::tr(
+            "meshopt changed the triangle winding (backface culling would be inverted) -- refusing to write",
+        )));
     }
     Ok(out)
 }
@@ -998,9 +1018,10 @@ fn write_vtx_single(
     put_i32(&mut buf, mat_repl_off + 4, 0);
 
     if buf.len() != total_len {
-        return Err(VtxWriteError::Internal(format!(
-            "写入长度 {} 与预算 {total_len} 不符",
-            buf.len()
+        return Err(VtxWriteError::Internal(crate::tr_fmt!(
+            "the written length %{got} does not match the budget %{want}",
+            got = buf.len(),
+            want = total_len
         )));
     }
     Ok(VtxWriteOutcome {
@@ -1392,9 +1413,11 @@ fn write_vtx_multi(
                 let local = layout
                     .mesh_local_id(it.unified_mesh, u)
                     .ok_or_else(|| {
-                        VtxWriteError::Internal(format!(
-                            "mesh {} 的统一顶点 {u} 不在布局里（LOD {}）",
-                            it.unified_mesh, it.lod
+                        VtxWriteError::Internal(crate::tr_fmt!(
+                            "the unified vertex %{u} of mesh %{mesh} is not in the layout (LOD %{lod})",
+                            u = u,
+                            mesh = it.unified_mesh,
+                            lod = it.lod
                         ))
                     })?;
                 if local > u16::MAX as u32 {
@@ -1453,9 +1476,10 @@ fn write_vtx_multi(
     }
 
     if buf.len() != total_len {
-        return Err(VtxWriteError::Internal(format!(
-            "写入长度 {} 与预算 {total_len} 不符",
-            buf.len()
+        return Err(VtxWriteError::Internal(crate::tr_fmt!(
+            "the written length %{got} does not match the budget %{want}",
+            got = buf.len(),
+            want = total_len
         )));
     }
     Ok(VtxWriteOutcome {
@@ -1481,24 +1505,25 @@ pub fn check_invariants(
         .map(|m| m.meshes.len())
         .sum();
     if vtx.mesh_stats.len() != expect_meshes {
-        return Err(VtxWriteError::Internal(format!(
-            "mesh 数不符：VTX 有 {}，MDL 有 {expect_meshes}",
-            vtx.mesh_stats.len()
+        return Err(VtxWriteError::Internal(crate::tr_fmt!(
+            "mesh count mismatch: the VTX has %{vtx}, the MDL has %{mdl}",
+            vtx = vtx.mesh_stats.len(),
+            mdl = expect_meshes
         )));
     }
     let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
     // 头部
     if g(0x00) != VERSION {
-        return Err(VtxWriteError::Internal("version 不是 7".into()));
+        return Err(VtxWriteError::Internal(crate::tr("version is not 7")));
     }
     if g(0x10) != vtx.checksum {
-        return Err(VtxWriteError::Internal("checksum 与 MDL 不一致".into()));
+        return Err(VtxWriteError::Internal(crate::tr("the checksum does not match the MDL")));
     }
     // 每个 body part / model / LOD / mesh / strip group 的偏移都要在文件内。
     let bp_count = g(0x1C).max(0) as usize;
     let bp_off = g(0x20).max(0) as usize;
     if bp_off + bp_count * BODY_PART_SIZE > b.len() {
-        return Err(VtxWriteError::Internal("body part 表越界".into()));
+        return Err(VtxWriteError::Internal(crate::tr("the body part table is out of range")));
     }
     for i in 0..bp_count {
         let at = bp_off + i * BODY_PART_SIZE;
@@ -1507,7 +1532,7 @@ pub fn check_invariants(
         for k in 0..mc {
             let ma = m_base + k * MODEL_SIZE;
             if ma + MODEL_SIZE > b.len() {
-                return Err(VtxWriteError::Internal(format!("model[{k}] 越界")));
+                return Err(VtxWriteError::Internal(crate::tr_fmt!("model[%{k}] is out of range", k = k)));
             }
             let lc = g(ma).max(0) as usize;
             let l_base = ma + g(ma + 4).max(0) as usize;
@@ -1522,7 +1547,7 @@ pub fn check_invariants(
                     for gg in 0..gc {
                         let ga = g_base + gg * STRIP_GROUP_SIZE;
                         if ga + STRIP_GROUP_SIZE > b.len() {
-                            return Err(VtxWriteError::Internal("strip group 越界".into()));
+                            return Err(VtxWriteError::Internal(crate::tr("the strip group is out of range")));
                         }
                         // 顶点/索引/strip 数组也必须在文件内。
                         let nv = g(ga).max(0) as usize;
@@ -1530,10 +1555,10 @@ pub fn check_invariants(
                         let ni = g(ga + 8).max(0) as usize;
                         let io = ga + g(ga + 12).max(0) as usize;
                         if vo + nv * VERTEX_SIZE > b.len() {
-                            return Err(VtxWriteError::Internal("顶点数组越界".into()));
+                            return Err(VtxWriteError::Internal(crate::tr("the vertex array is out of range")));
                         }
                         if io + ni * 2 > b.len() {
-                            return Err(VtxWriteError::Internal("索引数组越界".into()));
+                            return Err(VtxWriteError::Internal(crate::tr("the index array is out of range")));
                         }
                     }
                 }

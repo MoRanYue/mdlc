@@ -376,16 +376,21 @@ mod tests {
         v.header.num_lod_vertexes = [6, 2, 4, 4, 4, 4, 4, 4];
         v.recompute_offsets();
         let bytes = v.to_bytes().unwrap();
-        let err = check_invariants(&v, bytes.len()).unwrap_err();
+        let err = crate::test_locale::with_english(|| check_invariants(&v, bytes.len()).unwrap_err());
         assert!(
             matches!(err, crate::vvd::VvdError::Inconsistent { .. }),
             "单调性被破坏时必须报错，实际：{err:?}"
         );
         // 报错信息应指向单调性，而不是别的检查。
+        // ⚠️ `detail` 在 `check_invariants()` 那一刻就渲染好了（`crate::tr_fmt!`），
+        // 所以语言必须在**调用**那一刻生效。
         let crate::vvd::VvdError::Inconsistent { detail } = err else {
             unreachable!()
         };
-        assert!(detail.contains("单调不增"), "应报单调性：{detail}");
+        assert!(
+            detail.contains("monotonically non-increasing"),
+            "应报单调性：{detail}"
+        );
     }
 
     /// `numLODVertexes` 的尾部槽位必须 ripple 成最后一个有效值 ——

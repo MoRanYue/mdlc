@@ -182,20 +182,40 @@ const POS_SCALE_MIN: f32 = 128.0;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnimWriteError {
     /// 帧数超出 `int32`。
-    #[error("序列 {sequence:?} 有 {count} 帧，超出 int32")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Sequence %{sequence} has %{count} frames, which overflows int32",
+            sequence = format!("{sequence:?}"),
+            count = count
+        )
+    )]
     TooManyFrames { sequence: String, count: usize },
     /// 骨骼数超出可寻址范围。
     ///
     /// 格式依据：动画链的 `mstudioanim_t.bone` 是 `byte`
     /// （`studio.h`）⟹ 下标 `0..=255` ⟹ 骨骼**根数** ≤
     /// [`MAX_ANIM_ADDRESSABLE_BONES`]（= 256）。
-    #[error("骨骼数 {count} 超出动画记录能寻址的范围（≤255）")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{count} bones exceed what an animation record can address (<=255)",
+            count = count
+        )
+    )]
     TooManyBones { count: usize },
     /// 内部不一致 —— 属本实现的 bug。
-    #[error("内部错误（请报告）：{0}")]
+    #[error("{}", crate::tr_fmt!("Internal error (please report): %{err}", err = .0))]
     Internal(String),
     /// `$ikrule` 的声明有问题（链名 / 骨骼名找不到、参数冲突…）。
-    #[error("序列 {sequence:?} 的 ikrule：{message}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "ikrule of the sequence %{sequence}: %{message}",
+            sequence = format!("{sequence:?}"),
+            message = message
+        )
+    )]
     IkRule { sequence: String, message: String },
 }
 
@@ -836,7 +856,9 @@ fn write_axis(
         AxisData::Constant(v) => {
             let off = anim_data.len() - ptr_pos;
             let off_i16 = i16::try_from(off)
-                .map_err(|_| AnimWriteError::Internal("通道偏移超出 i16（动画过大）".into()))?;
+                .map_err(|_| AnimWriteError::Internal(crate::tr(
+                    "the channel offset overflows i16 (the animation is too large)",
+                )))?;
             anim_data[at..at + 2].copy_from_slice(&off_i16.to_le_bytes());
             // ⚠️ **`total` 是 `u8`，所以超过 255 帧必须拆成多条 run。**
             //
@@ -880,7 +902,9 @@ fn write_axis(
             }
             let off = anim_data.len() - ptr_pos;
             let off_i16 = i16::try_from(off)
-                .map_err(|_| AnimWriteError::Internal("通道偏移超出 i16（动画过大）".into()))?;
+                .map_err(|_| AnimWriteError::Internal(crate::tr(
+                    "the channel offset overflows i16 (the animation is too large)",
+                )))?;
             anim_data[at..at + 2].copy_from_slice(&off_i16.to_le_bytes());
             for (valid, total, vals) in &runs {
                 anim_data.push(*valid);
@@ -1787,7 +1811,7 @@ fn write_chain_body(
         if !is_last {
             let next_start = anim_data.len();
             let rel = i16::try_from(next_start - rec_start)
-                .map_err(|_| AnimWriteError::Internal("nextoffset 超出 i16".into()))?;
+                .map_err(|_| AnimWriteError::Internal(crate::tr("nextoffset overflows i16")))?;
             anim_data[next_pos..next_pos + 2].copy_from_slice(&rel.to_le_bytes());
         }
     }
@@ -2211,12 +2235,12 @@ fn build_ik_rules(
             .position(|c| c.name == r.chain)
             .ok_or_else(|| AnimWriteError::IkRule {
                 sequence: seq.name.clone(),
-                message: format!("未知的 IK 链名 {:?}", r.chain),
+                message: crate::tr_fmt!("unknown ikchain name %{chain}", chain = format!("{:?}", r.chain)),
             })? as i32;
         if r.radius.is_some() && r.pad.is_some() {
             return Err(AnimWriteError::IkRule {
                 sequence: seq.name.clone(),
-                message: "radius 与 pad 互斥（官方 pad 就是 radius/2）".into(),
+                message: crate::tr("radius and pad are mutually exclusive (the official pad is radius/2)"),
             });
         }
         // 初值（`s_ikrule_t` 是 `calloc` 出来的，所以全 0）：
@@ -2253,9 +2277,9 @@ fn build_ik_rules(
                 // 静默写出一条与官方不同的曲线。
                 return Err(AnimWriteError::IkRule {
                     sequence: seq.name.clone(),
-                    message: format!(
-                        "range 的第 1/4 项写成 `.` 需要官方 FindPrev/NextIKRule 插值，尚未实现（chain {:?}）",
-                        r.chain
+                    message: crate::tr_fmt!(
+                        "the 1st/4th entry of `range` is `.`, which needs the official FindPrev/NextIKRule interpolation; not implemented yet (chain %{chain})",
+                        chain = format!("{:?}", r.chain)
                     ),
                 });
             }
@@ -2271,7 +2295,7 @@ fn build_ik_rules(
                     Some(name) => {
                         *bone_index.get(name).ok_or_else(|| AnimWriteError::IkRule {
                             sequence: seq.name.clone(),
-                            message: format!("touch 引用了不存在的骨骼 {name:?}"),
+                            message: crate::tr_fmt!("`touch` references a bone that does not exist: %{bone}", bone = format!("{name:?}")),
                         })? as i32
                     }                };
             }
@@ -2279,7 +2303,7 @@ fn build_ik_rules(
                 if p.attachment.is_empty() {
                     return Err(AnimWriteError::IkRule {
                         sequence: seq.name.clone(),
-                        message: "attachment 规则必须写 attachment 名".into(),
+                        message: crate::tr("an attachment rule must name the attachment"),
                     });
                 }
                 // `simplify.cpp:6057-6063`：`bonename` 为空时
@@ -2292,9 +2316,10 @@ fn build_ik_rules(
             crate::model::IkRuleType::Footstep => {
                 return Err(AnimWriteError::IkRule {
                     sequence: seq.name.clone(),
-                    message: "footstep（IK_GROUND）需要 $ikchain 的 center/height/floor/radius，\
-                              尚未实现；而且它在 L4D2 语料里出现 0 次"
-                        .into(),
+                    message: crate::tr(
+                        "footstep (IK_GROUND) needs center/height/floor/radius of `$ikchain`, \
+                         which is not implemented yet; it also appears 0 times in the L4D2 corpus",
+                    ),
                 });
             }
         }
@@ -2621,7 +2646,7 @@ fn compute_ik_errors(
         other => {
             return Err(AnimWriteError::IkRule {
                 sequence: seq.name.clone(),
-                message: format!("type = {other} 的误差计算尚未实现"),
+                message: crate::tr_fmt!("the error computation for type = %{ty} is not implemented yet", ty = other),
             });
         }
     }
@@ -2665,9 +2690,11 @@ fn frame_worlds_for(
     if f < 0 || f as usize >= num_frames {
         return Err(AnimWriteError::IkRule {
             sequence: seq.name.clone(),
-            message: format!(
-                "ikrule 请求了越界帧 {f}（动画 \"{}\" 有 {num_frames} 帧，非 LOOPING）",
-                seq.name
+            message: crate::tr_fmt!(
+                "ikrule asked for the out-of-range frame %{frame} (the animation %{name} has %{frames} frames and is not LOOPING)",
+                frame = f,
+                name = format!("{:?}", seq.name),
+                frames = num_frames
             ),
         });
     }
@@ -2681,7 +2708,7 @@ fn frame_worlds_for(
         let Some(row) = row else {
             return Err(AnimWriteError::IkRule {
                 sequence: seq.name.clone(),
-                message: format!("ikrule 取帧 {f} 时源帧表为空（\"{}\"）", seq.name),
+                message: crate::tr_fmt!("the source frame table is empty when ikrule takes frame %{frame} (%{name})", frame = f, name = format!("{:?}", seq.name)),
             });
         };
         return Ok(crate::compile::frame_worlds(&compiled.desc, parents, row));
@@ -2691,7 +2718,7 @@ fn frame_worlds_for(
     let Some(row) = row else {
         return Err(AnimWriteError::IkRule {
             sequence: seq.name.clone(),
-            message: format!("ikrule 取帧 {f} 时帧表为空（\"{}\"）", seq.name),
+            message: crate::tr_fmt!("the frame table is empty when ikrule takes frame %{frame} (%{name})", frame = f, name = format!("{:?}", seq.name)),
         });
     };
     // `STUDIO_DELTA` 动画必须**重建**（官方 `simplify.cpp:4562-4578`）。
@@ -3148,9 +3175,10 @@ pub fn write_animations(
         return Err(AnimWriteError::TooManyBones { count: bone_count });
     }
     if ref_poses.len() != bone_count {
-        return Err(AnimWriteError::Internal(format!(
-            "参考姿态数 {} 与骨骼数 {bone_count} 不一致",
-            ref_poses.len()
+        return Err(AnimWriteError::Internal(crate::tr_fmt!(
+            "the reference pose count %{got} does not match the bone count %{want}",
+            got = ref_poses.len(),
+            want = bone_count
         )));
     }
 
@@ -3999,9 +4027,11 @@ pub fn write_animations(
                 .iter()
                 .position(|c| c.name == lk.chain)
                 .ok_or_else(|| {
-                    AnimWriteError::Internal(format!(
-                        "序列 \"{}\" 的 iklocks[{li}] 引用了不存在的链 \"{}\"",
-                        seq.name, lk.chain
+                    AnimWriteError::Internal(crate::tr_fmt!(
+                        "iklocks[%{lock}] of the sequence %{sequence} references an ikchain that does not exist: %{chain}",
+                        lock = li,
+                        sequence = format!("{:?}", seq.name),
+                        chain = format!("{:?}", lk.chain)
                     ))
                 })?;
             let mut rec = vec![0u8; IK_LOCK_SIZE];
@@ -4518,7 +4548,7 @@ fn put_cstr_into(buf: &mut [u8], at: usize, len: usize, s: &str) {
 /// 一个纯函数，让调用方传入每个名字的绝对位置后算出相对值。
 pub fn relative_name_offset(name_abs: usize, struct_abs: usize) -> Result<i32, AnimWriteError> {
     let rel = name_abs as i64 - struct_abs as i64;
-    i32::try_from(rel).map_err(|_| AnimWriteError::Internal("名字相对偏移超出 i32".into()))
+    i32::try_from(rel).map_err(|_| AnimWriteError::Internal(crate::tr("the name relative offset overflows i32")))
 }
 
 /// 一个便于调用方使用的索引结构（避免在 `write_mdl` 里重算）。

@@ -255,16 +255,31 @@ pub fn notice(cache: &Cache, current: &str) -> Option<String> {
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// HTTP 请求本身失败（DNS / 连接 / TLS / 超时）。
-    #[error("请求失败：{0}")]
+    #[error("{}", crate::tr_fmt!("Request failed: %{err}", err = .0))]
     Request(#[from] ureq::Error),
     /// 拿到了响应，但没有 `Location` 头 —— 仓库可能还没有 Release。
-    #[error("HTTP {status} 但没有 Location 头（仓库可能还没有 Release）")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "HTTP %{status} but there is no Location header (the repository may not have a release yet)",
+            status = status
+        )
+    )]
     NoLocation { status: u16 },
     /// `Location` 的末段是空的。
-    #[error("Location 里没有 tag：{location}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("No tag in the Location header: %{location}", location = location)
+    )]
     EmptyTag { location: String },
     /// `Location` 的末段不像版本号。
-    #[error("Location 里的 tag 不像版本号：{tag}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The tag in the Location header does not look like a version: %{tag}",
+            tag = tag
+        )
+    )]
     NotAVersion { tag: String },
 }
 

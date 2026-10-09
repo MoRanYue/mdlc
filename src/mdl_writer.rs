@@ -546,9 +546,11 @@ fn write_mesh_flexes(
         for (v, a) in f.vertanims.iter().enumerate() {
             let vo = cur + v * stride;
             if vo + stride > buf.len() {
-                return Err(WriteError::Internal(format!(
-                    "flex vertanim 写出越界（{vo}+{stride} > {}）",
-                    buf.len()
+                return Err(WriteError::Internal(crate::tr_fmt!(
+                    "the flex vertanim write is out of range (%{vo} + %{stride} > %{len})",
+                    vo = vo,
+                    stride = stride,
+                    len = buf.len()
                 )));
             }
             buf[vo..vo + 2].copy_from_slice(&a.index.to_le_bytes());
@@ -887,26 +889,43 @@ mod at_off {
 pub enum WriteError {
     /// 描述文件不合法（由 `validate` 产生）。
     #[error(
-        "描述文件有 {} 处错误：\n{}",
-        .0.len(),
-        .0.iter().map(|e| format!("  - {e}\n")).collect::<String>()
+        "{}",
+        crate::tr_fmt!(
+            "The description file has %{count} error(s):\n%{list}",
+            count = .0.len(),
+            list = .0.iter().map(|e| format!("  - {e}\n")).collect::<String>()
+        )
     )]
     Invalid(Vec<String>),
     /// 内部不一致（例如偏移溢出）—— 属于本实现的 bug，不应发生。
-    #[error("内部错误（请报告）：{0}")]
+    #[error("{}", crate::tr_fmt!("Internal error (please report): %{err}", err = .0))]
     Internal(String),
     /// 名字超过内联字段长度。
-    #[error("{path} 过长：{len} 字节，上限 {max}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The path %{path} is too long: %{len} bytes, limit %{max}",
+            path = path,
+            len = len,
+            max = max
+        )
+    )]
     NameTooLong { path: String, len: usize, max: usize },
     /// **每 mesh 顶点数**超过 [`MAXSTUDIOVERTS_PER_MESH`]。
     ///
     /// 格式依据：VTX 的 `Vertex_t.origMeshVertID` 是 `uint16`
     /// ⟹ 下标 `0..=65535` ⟹ 上限 **65536**（判据是 `>`，不是 `>=`）。
     #[error(
-        "{model} 的单个 mesh 有 {count} 个顶点，超过格式上限 {max}\
-         （VTX 的 `origMeshVertID` 是 uint16，下标 0..{}）—— \
-         请把该 mesh 拆成多个材质槽位",
-        max - 1
+        "{}",
+        crate::tr_fmt!(
+            "The mesh %{model} has %{count} vertices, over the format limit of %{max} \
+             (`origMeshVertID` in VTX is uint16, indices 0..%{last}) -- \
+             please split that mesh into several material slots",
+            model = model,
+            count = count,
+            max = max,
+            last = max - 1
+        )
     )]
     TooManyMeshVertices {
         model: String,
@@ -921,10 +940,17 @@ pub enum WriteError {
     /// ⚠️ 这个上限是 **4473 万**，不是 studiomdl 的 65536 ——
     /// 后者是引擎运行时顶点缓存的假定，不是文件格式约束。
     #[error(
-        "{path} 有 {count} 个顶点（跨 LOD 去重后），超过格式上限 {max}\
-         （`mstudiomodel_t.vertexindex` 是 int32 字节偏移，\
-         每顶点 {VERTEX_STRIDE} 字节）—— 请把该 model 拆成多个 \
-         `[[bodyparts.models]]`"
+        "{}",
+        crate::tr_fmt!(
+            "The path %{path} has %{count} vertices (deduplicated across LODs), over the \
+             format limit of %{max} (`mstudiomodel_t.vertexindex` is an int32 byte offset, \
+             %{stride} bytes per vertex) -- please split that model into several \
+             `[[bodyparts.models]]`",
+            path = path,
+            count = count,
+            max = max,
+            stride = VERTEX_STRIDE
+        )
     )]
     TooManyModelVertices {
         path: String,
@@ -936,13 +962,25 @@ pub enum WriteError {
     /// 格式依据：skin 表是**有符号 `short`**（`hl2sdk-doi/public/studio.h:2297`）
     /// ⟹ 材质下标最大 32767 ⟹ 表最多 32768 条。
     #[error(
-        "材质表 {count} 条，超过格式上限 {max} 条（下标 0..{}）—— \
-         skin 表 `pSkinref` 是**有符号 short**",
-        max - 1
+        "{}",
+        crate::tr_fmt!(
+            "The material table has %{count} entries, over the format limit of %{max} \
+             (indices 0..%{last}) -- the skin table `pSkinref` is a **signed short**",
+            count = count,
+            max = max,
+            last = max - 1
+        )
     )]
     TooManyTextures { count: usize, max: usize },
     /// **单个 strip group 的索引条数**超过 `int32`。
-    #[error("{model} 的单个 strip group 索引数 {count} 超出 int32")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The index count %{count} of a single strip group of %{model} overflows int32",
+            model = model,
+            count = count
+        )
+    )]
     TooManyIndices { model: String, count: usize },
 }
 
@@ -1848,7 +1886,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         ..Default::default()
     });
     let anim = anim_writer::write_animations(compiled, &bone_parents, &ref_poses, anim_data_abs)
-        .map_err(|e| WriteError::Internal(format!("动画写出失败：{e}")))?;
+        .map_err(|e| WriteError::Internal(crate::tr_fmt!("failed to write the animation: %{err}", err = e)))?;
 
     // 字符串池长度要先知道才能算布局，所以先收集字符串。
     // （`build_string_pool` 返回池内容与各项的池内偏移。）
@@ -2006,7 +2044,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 框架级自检：顺序写错会在这里立刻暴露，而不是产出畸形文件。
     layout
         .check_monotonic()
-        .map_err(|e| WriteError::Internal(format!("段布局自检失败：{e}")))?;
+        .map_err(|e| WriteError::Internal(crate::tr_fmt!("the section layout self-check failed: %{err}", err = e)))?;
 
     // 解出本函数后面要用的名字（保持下面的代码可读）。
     let studiohdr2_off = layout.studiohdr2;
@@ -2140,8 +2178,8 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     let abs = |rel: usize| -> Result<i32, WriteError> {
         let v = strings_off
             .checked_add(rel)
-            .ok_or_else(|| WriteError::Internal("字符串偏移溢出".into()))?;
-        i32::try_from(v).map_err(|_| WriteError::Internal("字符串偏移超出 i32".into()))
+            .ok_or_else(|| WriteError::Internal(crate::tr("the string offset overflows")))?;
+        i32::try_from(v).map_err(|_| WriteError::Internal(crate::tr("the string offset overflows i32")))
     };
     let _ = &abs;
 
@@ -2544,16 +2582,17 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         put_i32(&mut buf, base + 12, (link_cursor - base) as i32);
         // 三段链的骨骼下标：末端、父、祖父。
         let tip = *ik_bone_index.get(ch.bone.as_str()).ok_or_else(|| {
-            WriteError::Internal(format!(
-                "ikchain \"{}\" 引用了不存在的骨骼 \"{}\"",
-                ch.name, ch.bone
+            WriteError::Internal(crate::tr_fmt!(
+                "the ikchain %{chain} references a bone that does not exist: %{bone}",
+                chain = format!("{:?}", ch.name),
+                bone = format!("{:?}", ch.bone)
             ))
         })?;
         let mid = usize::try_from(bone_parents[tip]).map_err(|_| {
-            WriteError::Internal(format!("ikchain \"{}\" 太靠近根骨骼，没有膝/肘", ch.name))
+            WriteError::Internal(crate::tr_fmt!("the ikchain %{name} is too close to the root bone; there is no knee/elbow", name = format!("{:?}", ch.name)))
         })?;
         let root = usize::try_from(bone_parents[mid]).map_err(|_| {
-            WriteError::Internal(format!("ikchain \"{}\" 太靠近根骨骼，没有胯/肩", ch.name))
+            WriteError::Internal(crate::tr_fmt!("the ikchain %{name} is too close to the root bone; there is no hip/shoulder", name = format!("{:?}", ch.name)))
         })?;
         // 写出顺序是 `link[0]`（胯/肩）→ `link[1]`（膝/肘）→ `link[2]`（末端）。
         // 只有 `link[0]` 会拿到 `kneeDir`（`studiomdl.cpp:4521-4529`）。
@@ -2586,9 +2625,9 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             .iter()
             .position(|c| c.name == lk.chain)
             .ok_or_else(|| {
-                WriteError::Internal(format!(
-                    "ikautoplaylock 引用了不存在的链 \"{}\"",
-                    lk.chain
+                WriteError::Internal(crate::tr_fmt!(
+                    "ikautoplaylock references an ikchain that does not exist: %{chain}",
+                    chain = format!("{:?}", lk.chain)
                 ))
             })?;
         put_i32(&mut buf, base, chain_idx as i32);
@@ -2811,7 +2850,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         let parent = match b.parent.as_deref() {
             Some(p) => *bone_index
                 .get(p)
-                .ok_or_else(|| WriteError::Internal(format!("父骨骼 {p:?} 未通过校验")))? as i32,
+                .ok_or_else(|| WriteError::Internal(crate::tr_fmt!("the parent bone %{bone} did not pass validation", bone = format!("{p:?}"))))? as i32,
             None => -1,
         };
         // **相对骨骼自身**的名字偏移：绝对位置（strings_off + 池内偏移）减去骨骼起点。
@@ -2820,7 +2859,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + bone_off::NAME_INDEX,
             i32::try_from(name_rel)
-                .map_err(|_| WriteError::Internal("骨骼名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the bone name relative offset overflows i32")))?,
         );
         put_i32(&mut buf, base + bone_off::PARENT, parent);
         // 6 个 `bonecontroller` 槽：**默认全 `-1`**，不是 0。
@@ -2877,11 +2916,11 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         let bone_sp = match bone_sp_offsets[i] {
             Some(rel) => {
                 i32::try_from((strings_off + rel) as i64 - base as i64)
-                    .map_err(|_| WriteError::Internal("surfaceprop 相对偏移超出 i32".into()))?
+                    .map_err(|_| WriteError::Internal(crate::tr("the surfaceprop relative offset overflows i32")))?
             }
             None if !surface_prop.is_empty() => {
                 i32::try_from((strings_off + header_sp_offset) as i64 - base as i64)
-                    .map_err(|_| WriteError::Internal("继承 surfaceprop 偏移超出 i32".into()))?
+                    .map_err(|_| WriteError::Internal(crate::tr("the inherited surfaceprop offset overflows i32")))?
             }
             None => 0,
         };
@@ -3065,7 +3104,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             parents.push(match b.parent.as_deref() {
                 Some(name) => *bone_index
                     .get(name)
-                    .ok_or_else(|| WriteError::Internal(format!("父骨骼 {name:?} 未通过校验")))?
+                    .ok_or_else(|| WriteError::Internal(crate::tr_fmt!("the parent bone %{bone} did not pass validation", bone = format!("{name:?}"))))?
                     as i32,
                 None => -1,
             });
@@ -3089,7 +3128,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + tex_off::NAME_INDEX,
             i32::try_from(rel)
-                .map_err(|_| WriteError::Internal("材质名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the material name relative offset overflows i32")))?,
         );
         put_i32(&mut buf, base + tex_off::FLAGS, t.flags.unwrap_or(0));
     }
@@ -3111,7 +3150,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + bp_off::NAME_INDEX,
             i32::try_from(name_rel)
-                .map_err(|_| WriteError::Internal("body part 名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the body part name relative offset overflows i32")))?,
         );
         put_i32(&mut buf, base + bp_off::NUM_MODELS, bp.models.len() as i32);
         put_i32(&mut buf, base + bp_off::BASE, bp.base);
@@ -3170,9 +3209,11 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             // 是同一个算术，这里显式再查一次以防将来改动 `VERTEX_STRIDE`。
             let vertex_byte_offset = span.start * VERTEX_STRIDE;
             if vertex_byte_offset > i32::MAX as usize {
-                return Err(WriteError::Internal(format!(
-                    "bodyparts[{bi}].models[{model_cursor}] 的 vertexindex \
-                     字节偏移 {vertex_byte_offset} 超出 int32"
+                return Err(WriteError::Internal(crate::tr_fmt!(
+                    "the vertexindex byte offset %{offset} of bodyparts[%{bi}].models[%{mi}] overflows int32",
+                    offset = vertex_byte_offset,
+                    bi = bi,
+                    mi = model_cursor
                 )));
             }
             // `tangentsindex` 是同一个算术、更小的 stride（16 < 48），
@@ -3180,9 +3221,11 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             // `TANGENT_STRIDE` 被改大。
             let tangent_byte_offset = span.start * TANGENT_STRIDE;
             if tangent_byte_offset > i32::MAX as usize {
-                return Err(WriteError::Internal(format!(
-                    "bodyparts[{bi}].models[{model_cursor}] 的 tangentsindex \
-                     字节偏移 {tangent_byte_offset} 超出 int32"
+                return Err(WriteError::Internal(crate::tr_fmt!(
+                    "the tangentsindex byte offset %{offset} of bodyparts[%{bi}].models[%{mi}] overflows int32",
+                    offset = tangent_byte_offset,
+                    bi = bi,
+                    mi = model_cursor
                 )));
             }
             put_i32(&mut buf, mbase + model_off::NUM_VERTICES, span.count as i32);
@@ -3422,7 +3465,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + hbset_off::NAME_INDEX,
             i32::try_from(rel)
-                .map_err(|_| WriteError::Internal("hitbox set 名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the hitbox set name relative offset overflows i32")))?,
         );
         put_i32(&mut buf, base + hbset_off::NUM_HITBOXES, hb_count as i32);
         // `hitboxindex` 实测是**相对 hitbox set 自身**的偏移
@@ -3437,7 +3480,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         let base = hb_boxes_off + i * HITBOX_SIZE;
         let bone = *bone_index
             .get(hb.bone.as_str())
-            .ok_or_else(|| WriteError::Internal(format!("hitbox 骨骼 {:?} 未通过校验", hb.bone)))?
+            .ok_or_else(|| WriteError::Internal(crate::tr_fmt!("the hitbox bone %{bone} did not pass validation", bone = format!("{:?}", hb.bone))))?
             as i32;
         put_i32(&mut buf, base + hbox_off::BONE, bone);
         put_i32(&mut buf, base + hbox_off::GROUP, hb.group.unwrap_or(0));
@@ -3449,7 +3492,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + hbox_off::NAME_INDEX,
             i32::try_from(rel)
-                .map_err(|_| WriteError::Internal("hitbox 名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the hitbox name relative offset overflows i32")))?,
         );
         // unused[8] 保持 0（buf 已零初始化）。
     }
@@ -3461,7 +3504,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             &mut buf,
             base + at_off::NAME_INDEX,
             i32::try_from(rel)
-                .map_err(|_| WriteError::Internal("附着点名相对偏移超出 i32".into()))?,
+                .map_err(|_| WriteError::Internal(crate::tr("the attachment name relative offset overflows i32")))?,
         );
         put_i32(&mut buf, base + at_off::FLAGS, at.flags.unwrap_or(0));
         // ⚠️ 合成附着点（`$illumposition x y z <骨骼>`）绑的骨骼**可能被收骨判据
@@ -3492,9 +3535,9 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                     Some(b) => *b,
                     None if at.synthetic => 0,
                     None => {
-                        return Err(WriteError::Internal(format!(
-                            "附着点骨骼 {:?} 未通过校验",
-                            at.bone
+                        return Err(WriteError::Internal(crate::tr_fmt!(
+                            "the attachment bone %{bone} did not pass validation",
+                            bone = format!("{:?}", at.bone)
                         )));
                     }
                 },
@@ -3569,7 +3612,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             let str_rel = event_name_offsets
                 .get(name.as_str())
                 .copied()
-                .ok_or_else(|| WriteError::Internal("事件名未进字符串池".into()))?;
+                .ok_or_else(|| WriteError::Internal(crate::tr("the event name did not make it into the string pool")))?;
             // `field_off` 指向 `szeventindex` 字段（记录 + 0x4C），
             // 所以记录起点是它减去 0x4C。
             let rec_abs = seq_sub_off + field_off - anim_writer::EVENT_NAME_FIELD_OFFSET;
@@ -3578,7 +3621,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 &mut buf,
                 seq_sub_off + field_off,
                 i32::try_from(name_abs as i64 - rec_abs as i64)
-                    .map_err(|_| WriteError::Internal("事件名相对偏移超出 i32".into()))?,
+                    .map_err(|_| WriteError::Internal(crate::tr("the event name relative offset overflows i32")))?,
             );
         }
 
@@ -4007,13 +4050,13 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             let str_rel = bone_name_offsets
                 .get(i)
                 .copied()
-                .ok_or_else(|| WriteError::Internal("骨骼名未进字符串池".into()))?;
+                .ok_or_else(|| WriteError::Internal(crate::tr("the bone name did not make it into the string pool")))?;
             let name_abs = strings_off + str_rel;
             put_i32(
                 &mut buf,
                 rec,
                 i32::try_from(name_abs as i64 - rec as i64)
-                    .map_err(|_| WriteError::Internal("srcbonetransform 名字偏移超出 i32".into()))?,
+                    .map_err(|_| WriteError::Internal(crate::tr("the srcbonetransform name offset overflows i32")))?,
             );
             let parent = bone_parents.get(i).copied().unwrap_or(-1);
             let parent_realign = if parent >= 0 {
@@ -4088,8 +4131,10 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 (108, 12) => bone_off::ROTATION_SCALE,
                 (120, 16) => bone_off::Q_ALIGNMENT,
                 _ => {
-                    return Err(WriteError::Internal(format!(
-                        "linearbone 数组 (coeff={coeff}, elem={elem_size}) 无对应骨骼字段"
+                    return Err(WriteError::Internal(crate::tr_fmt!(
+                        "the linearbone array (coeff=%{coeff}, elem=%{elem}) has no matching bone field",
+                        coeff = coeff,
+                        elem = elem_size
                     )));
                 }
             };
@@ -4191,7 +4236,9 @@ fn put_cstr(
 ) -> Result<(), WriteError> {
     if s.len() >= len {
         return Err(WriteError::NameTooLong {
-            path: format!("偏移 0x{off:X} 的内联字符串"),
+            // ⚠️ 格式规格（`X`）必须在传参时用 `format!` 做好：`tr_fmt!` 的
+            // 占位符只认 `%{名}`，写成 `%{off:X}` 不会被替换（见 §103.2）。
+            path: crate::tr_fmt!("the inline string at offset %{off}", off = format!("0x{off:X}")),
             len: s.len(),
             max: len - 1,
         });
@@ -6985,10 +7032,11 @@ motionflags = 7
         );
 
         // 128：非法 —— 会被 `char` 读成 −128
-        let err = mk(128).to_bytes().unwrap_err();
-        let msg = format!("{err}");
+        // ⚠️ 文案在 `to_bytes()` 那一刻就渲染好了（`crate::tr_fmt!`），
+        // 所以语言必须在**调用**那一刻生效 —— 事后包 `with_english` 是空操作。
+        let msg = crate::test_locale::with_english(|| format!("{}", mk(128).to_bytes().unwrap_err()));
         assert!(
-            msg.contains("128") && msg.contains("有符号 char"),
+            msg.contains("128") && msg.contains("signed char"),
             "应当拒绝下标 128 并说明原因，实际：{msg}"
         );
 

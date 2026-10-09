@@ -87,25 +87,61 @@ pub fn align_up(v: usize, a: usize) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VvdError {
     /// 文件不足 4 字节，读不出魔数。
-    #[error("文件只有 {len} 字节，读不出 4 字节魔数")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The file is only %{len} bytes; cannot read the 4-byte magic",
+            len = len
+        )
+    )]
     TooShortForId { len: usize },
     /// 魔数不是 `IDSV`（`IDCV` 是压缩变体，本实现不支持）。
     #[error(
-        "魔数应为 IDSV，实际为 {:?}",
-        .found.iter().map(|b| if b.is_ascii_graphic() { *b as char } else { '?' }).collect::<String>()
+        "{}",
+        crate::tr_fmt!(
+            "The magic should be IDSV but is %{found}",
+            found = format!(
+                "{:?}",
+                .found.iter().map(|b| if b.is_ascii_graphic() { *b as char } else { '?' }).collect::<String>()
+            )
+        )
     )]
     BadId { found: [u8; 4] },
     /// 版本不受支持。
-    #[error("版本应为 {VERSION}，实际为 {found}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The version should be %{expected} but is %{found}",
+            expected = VERSION,
+            found = found
+        )
+    )]
     BadVersion { found: i32 },
     /// 顶点 stride 与版本不符（v54..59 是 64 字节）。
-    #[error("MDL 版本 {mdl_version} 的顶点 stride 是 64 字节，本实现只支持 48")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The vertex stride of MDL version %{mdl_version} is 64 bytes; this implementation only supports 48",
+            mdl_version = mdl_version
+        )
+    )]
     BadVertexStride { mdl_version: i32 },
     /// 头部字段自相矛盾。
-    #[error("头部字段不一致：{detail}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("Header fields are inconsistent: %{detail}", detail = detail)
+    )]
     Inconsistent { detail: String },
     /// 文件长度不足以容纳声明的数据。
-    #[error("{what} 需要 {need} 字节，文件只有 {have} 字节")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{what} needs %{need} bytes but the file only has %{have}",
+            what = crate::tr(what),
+            need = need,
+            have = have
+        )
+    )]
     Truncated {
         need: usize,
         have: usize,
@@ -228,7 +264,7 @@ impl Vvd {
             return Err(VvdError::Truncated {
                 need: HEADER_SIZE,
                 have: buf.len(),
-                what: "VVD 头部",
+                what: "VVD header",
             });
         }
         let i32_at = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
@@ -263,7 +299,7 @@ impl Vvd {
                 return Err(VvdError::Truncated {
                     need,
                     have: buf.len(),
-                    what: "fixup 表",
+                    what: "fixup table",
                 });
             }
             (0..header.num_fixups as usize)
@@ -285,7 +321,7 @@ impl Vvd {
             return Err(VvdError::Truncated {
                 need: vstart + vbytes,
                 have: buf.len(),
-                what: "顶点块",
+                what: "vertex block",
             });
         }
         let tbytes = count * TANGENT_SIZE;
@@ -293,7 +329,7 @@ impl Vvd {
             return Err(VvdError::Truncated {
                 need: tstart + tbytes,
                 have: buf.len(),
-                what: "切线块",
+                what: "tangent block",
             });
         }
 
@@ -341,15 +377,19 @@ impl Vvd {
         let count = self.vertices.len();
         if self.tangents.len() != count {
             return Err(VvdError::Inconsistent {
-                detail: format!("顶点 {} 条但切线 {} 条", count, self.tangents.len()),
+                detail: crate::tr_fmt!(
+                    "there are %{count} vertices but %{tangents} tangents",
+                    count = count,
+                    tangents = self.tangents.len()
+                ),
             });
         }
         if self.fixups.len() != self.header.num_fixups.max(0) as usize {
             return Err(VvdError::Inconsistent {
-                detail: format!(
-                    "numFixups 声明 {} 条但实际有 {} 条",
-                    self.header.num_fixups,
-                    self.fixups.len()
+                detail: crate::tr_fmt!(
+                    "numFixups declares %{declared} entries but there are actually %{actual}",
+                    declared = self.header.num_fixups,
+                    actual = self.fixups.len()
                 ),
             });
         }
@@ -357,9 +397,10 @@ impl Vvd {
         // 否则写出的文件长度与头部声明对不上，引擎会读到别的块里去。
         if self.header.vertex_count() != count {
             return Err(VvdError::Inconsistent {
-                detail: format!(
-                    "numLODVertexes[0] 声明 {} 个顶点但实际有 {count} 个",
-                    self.header.vertex_count()
+                detail: crate::tr_fmt!(
+                    "numLODVertexes[0] declares %{declared} vertices but there are actually %{actual}",
+                    declared = self.header.vertex_count(),
+                    actual = count
                 ),
             });
         }
@@ -384,11 +425,13 @@ impl Vvd {
                 let b = v.bone[k];
                 if b > crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX as u8 {
                     return Err(VvdError::Inconsistent {
-                        detail: format!(
-                            "顶点 {i} 引用了骨骼下标 {b}，超过格式上限 {} —— \
-                             VVD 的 `mstudioboneweight_t.bone[]` 是**有符号 char**，\
-                             下标 ≥128 会被引擎读成负数",
-                            crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
+                        detail: crate::tr_fmt!(
+                            "vertex %{vertex} references the bone index %{bone}, over the format limit %{max} -- \
+                             `mstudioboneweight_t.bone[]` in VVD is a **signed char**, \
+                             so an index >=128 is read as negative by the engine",
+                            vertex = i,
+                            bone = b,
+                            max = crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
                         ),
                     });
                 }
@@ -492,7 +535,11 @@ impl Vvd {
             Some(t) if t.len() == count => t,
             Some(t) => {
                 return Err(VvdError::Inconsistent {
-                    detail: format!("顶点 {count} 个但切线 {} 个", t.len()),
+                    detail: crate::tr_fmt!(
+                        "there are %{count} vertices but %{tangents} tangents",
+                        count = count,
+                        tangents = t.len()
+                    ),
                 });
             }
             None => vertices
@@ -593,20 +640,24 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
 
     if !(1..=MAX_NUM_LODS).contains(&(h.num_lods.max(1) as usize)) {
         return Err(VvdError::Inconsistent {
-            detail: format!("numLODs 应在 1..={MAX_NUM_LODS}，实际为 {}", h.num_lods),
+            detail: crate::tr_fmt!(
+                "numLODs should be in 1..=%{max}, but is %{got}",
+                max = MAX_NUM_LODS,
+                got = h.num_lods
+            ),
         });
     }
     if h.num_fixups < 0 {
         return Err(VvdError::Inconsistent {
-            detail: format!("numFixups 不能为负：{}", h.num_fixups),
+            detail: crate::tr_fmt!("numFixups must not be negative: %{got}", got = h.num_fixups),
         });
     }
     if vvd.fixups.len() != h.num_fixups as usize {
         return Err(VvdError::Inconsistent {
-            detail: format!(
-                "numFixups 声明 {} 条但表里有 {} 条",
-                h.num_fixups,
-                vvd.fixups.len()
+            detail: crate::tr_fmt!(
+                "numFixups declares %{declared} entries but the table has %{actual}",
+                declared = h.num_fixups,
+                actual = vvd.fixups.len()
             ),
         });
     }
@@ -622,7 +673,12 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
     ] {
         if got != want as i32 {
             return Err(VvdError::Inconsistent {
-                detail: format!("{name} 应为 {want}，实际为 {got}"),
+                detail: crate::tr_fmt!(
+                    "%{name} should be %{want}, but is %{got}",
+                    name = name,
+                    want = want,
+                    got = got
+                ),
             });
         }
     }
@@ -630,15 +686,20 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
     let expect_len = h.tangent_data_start.max(0) as usize + count * TANGENT_SIZE;
     if file_len != expect_len {
         return Err(VvdError::Inconsistent {
-            detail: format!("文件长度应为 {expect_len}，实际为 {file_len}"),
+            detail: crate::tr_fmt!(
+                "the file length should be %{expect}, but is %{got}",
+                expect = expect_len,
+                got = file_len
+            ),
         });
     }
     if vvd.vertices.len() != count || vvd.tangents.len() != count {
         return Err(VvdError::Inconsistent {
-            detail: format!(
-                "顶点/切线数应为 {count}，实际为 {}/{}",
-                vvd.vertices.len(),
-                vvd.tangents.len()
+            detail: crate::tr_fmt!(
+                "there should be %{count} vertices/tangents, but there are %{vertices}/%{tangents}",
+                count = count,
+                vertices = vvd.vertices.len(),
+                tangents = vvd.tangents.len()
             ),
         });
     }
@@ -649,7 +710,13 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
         if b > a {
             let prev = i - 1;
             return Err(VvdError::Inconsistent {
-                detail: format!("numLODVertexes 必须单调不增，但 [{prev}]={a} < [{i}]={b}"),
+                detail: crate::tr_fmt!(
+                    "numLODVertexes must be monotonically non-increasing, but [%{prev}]=%{a} < [%{i}]=%{b}",
+                    prev = prev,
+                    a = a,
+                    i = i,
+                    b = b
+                ),
             });
         }
     }
@@ -657,16 +724,22 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
     for i in num_lods..MAX_NUM_LODS {
         if h.num_lod_vertexes[i] != last {
             return Err(VvdError::Inconsistent {
-                detail: format!(
-                    "numLODVertexes[{i}] 应 ripple 为 {last}（最后一个有效 LOD），实际为 {}",
-                    h.num_lod_vertexes[i]
+                detail: crate::tr_fmt!(
+                    "numLODVertexes[%{i}] should ripple to %{last} (the last valid LOD), but is %{got}",
+                    i = i,
+                    last = last,
+                    got = h.num_lod_vertexes[i]
                 ),
             });
         }
     }
     if h.num_lod_vertexes[0] != count as i32 {
         return Err(VvdError::Inconsistent {
-            detail: format!("numLODVertexes[0] 应为顶点总数 {count}，实际为 {}", h.num_lod_vertexes[0]),
+            detail: crate::tr_fmt!(
+                "numLODVertexes[0] should be the vertex total %{count}, but is %{got}",
+                count = count,
+                got = h.num_lod_vertexes[0]
+            ),
         });
     }
 
@@ -676,14 +749,21 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
         for (i, f) in vvd.fixups.iter().enumerate() {
             if f.lod < 0 || f.lod as usize >= num_lods {
                 return Err(VvdError::Inconsistent {
-                    detail: format!("fixup[{i}].lod = {} 越界（numLODs = {num_lods}）", f.lod),
+                    detail: crate::tr_fmt!(
+                        "fixup[%{i}].lod = %{lod} is out of range (numLODs = %{num_lods})",
+                        i = i,
+                        lod = f.lod,
+                        num_lods = num_lods
+                    ),
                 });
             }
             if f.num_vertexes < 0 || f.source_vertex_id < 0 {
                 return Err(VvdError::Inconsistent {
-                    detail: format!(
-                        "fixup[{i}] 有负值：src={} n={}",
-                        f.source_vertex_id, f.num_vertexes
+                    detail: crate::tr_fmt!(
+                        "fixup[%{i}] has negative values: src=%{src} n=%{n}",
+                        i = i,
+                        src = f.source_vertex_id,
+                        n = f.num_vertexes
                     ),
                 });
             }
@@ -691,23 +771,30 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
             // 该 LOD 的顶点必须落在它自己的前缀里。
             if s + n > h.num_lod_vertexes[f.lod as usize].max(0) as usize {
                 return Err(VvdError::Inconsistent {
-                    detail: format!(
-                        "fixup[{i}] 区间 [{s},{}) 超出 LOD {} 的顶点数 {}",
-                        s + n,
-                        f.lod,
-                        h.num_lod_vertexes[f.lod as usize]
+                    detail: crate::tr_fmt!(
+                        "the fixup[%{i}] range [%{start},%{end}) goes past the %{count} vertices of LOD %{lod}",
+                        i = i,
+                        start = s,
+                        end = s + n,
+                        count = h.num_lod_vertexes[f.lod as usize],
+                        lod = f.lod
                     ),
                 });
             }
             for (k, slot) in covered.iter_mut().enumerate().skip(s).take(n) {
                 if k >= count {
                     return Err(VvdError::Inconsistent {
-                        detail: format!("fixup[{i}] 区间越界：{k} >= {count}"),
+                        detail: crate::tr_fmt!(
+                            "the fixup[%{i}] range is out of range: %{k} >= %{count}",
+                            i = i,
+                            k = k,
+                            count = count
+                        ),
                     });
                 }
                 if *slot {
                     return Err(VvdError::Inconsistent {
-                        detail: format!("fixup 区间重叠 @{k}"),
+                        detail: crate::tr_fmt!("overlapping fixup ranges @%{k}", k = k),
                     });
                 }
                 *slot = true;
@@ -715,7 +802,10 @@ pub fn check_invariants(vvd: &Vvd, file_len: usize) -> Result<(), VvdError> {
         }
         if let Some(gap) = covered.iter().position(|c| !c) {
             return Err(VvdError::Inconsistent {
-                detail: format!("fixup 表没有覆盖顶点 {gap}（有空洞）"),
+                detail: crate::tr_fmt!(
+                    "the fixup table does not cover the vertex %{gap} (there is a hole)",
+                    gap = gap
+                ),
             });
         }
     }

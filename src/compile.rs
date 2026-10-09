@@ -64,7 +64,15 @@ use crate::smd::{Smd, SmdError, SmdPose, parse_smd};
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     /// 读取源文件失败（`read_smd` 的 `read_to_string`）。
-    #[error("{at}: 读不到 {}：{source}", path.display())]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{at}: cannot read %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = source
+        )
+    )]
     ReadFile {
         at: String,
         path: PathBuf,
@@ -72,7 +80,15 @@ pub enum CompileError {
         source: std::io::Error,
     },
     /// SMD 文本解析失败（`read_smd`）。
-    #[error("{at}: {} 解析失败：{source}", path.display())]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{at}: failed to parse %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = source
+        )
+    )]
     ParseSmd {
         at: String,
         path: PathBuf,
@@ -80,7 +96,15 @@ pub enum CompileError {
         source: SmdError,
     },
     /// `.vta` 解析失败。
-    #[error("{at}: {} 解析失败：{source}", path.display())]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{at}: failed to parse %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = source
+        )
+    )]
     ParseVta {
         at: String,
         path: PathBuf,
@@ -142,17 +166,26 @@ impl CompileError {
     ///
     /// 先前它是 `struct` 的公开字段。想拿「位置 + 说明」的完整一行请用
     /// [`std::fmt::Display`]（即 `err.to_string()`）。
+    ///
+    /// ⚠️ 这里的文案与 [`std::fmt::Display`] 的那份**是两条独立的路径**
+    /// （属性宏里写不出 `match`），改一处必须同时改另一处。
     pub fn message(&self) -> String {
         match self {
-            Self::ReadFile { path, source, .. } => {
-                format!("读不到 {}：{source}", path.display())
-            }
-            Self::ParseSmd { path, source, .. } => {
-                format!("{} 解析失败：{source}", path.display())
-            }
-            Self::ParseVta { path, source, .. } => {
-                format!("{} 解析失败：{source}", path.display())
-            }
+            Self::ReadFile { path, source, .. } => crate::tr_fmt!(
+                "cannot read %{path}: %{err}",
+                path = path.display(),
+                err = source
+            ),
+            Self::ParseSmd { path, source, .. } => crate::tr_fmt!(
+                "failed to parse %{path}: %{err}",
+                path = path.display(),
+                err = source
+            ),
+            Self::ParseVta { path, source, .. } => crate::tr_fmt!(
+                "failed to parse %{path}: %{err}",
+                path = path.display(),
+                err = source
+            ),
             Self::Src { source, .. } => source.to_string(),
             Self::Fbx { source, .. } => source.to_string(),
             Self::Flex { source, .. } => source.to_string(),
@@ -218,27 +251,48 @@ impl IntoCompileError for crate::flex::FlexError {
 pub enum SrcError {
     /// 资产引用没写扩展名（[`resolve_smd_path`]）。
     #[error(
-        "资产引用 {smd:?} 没有扩展名：mdlc 要求写完整文件名（如 {smd:?}.smd）。\
-         官方会按 .vrm/.smd/.sma/.phys/.vta/.obj 依次试探（`Load_Source`），\
-         本实现不做这种猜测。"
+        "{}",
+        crate::tr_fmt!(
+            "the asset reference %{smd} has no extension: mdlc requires a full file name \
+             (such as %{smd}.smd). The official code probes .vrm/.smd/.sma/.phys/.vta/.obj \
+             in order (`Load_Source`); this implementation does not guess",
+            smd = format!("{smd:?}")
+        )
     )]
     MissingExtension { smd: String },
     /// 扩展名不在支持列表里（[`SourceKind::of`]）。
-    #[error("不认识的资产格式 {other:?}（{path}）：目前支持 .smd、.fbx 与 .gltf/.glb。")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "unrecognized asset format %{other} (%{path}): only .smd, .fbx and .gltf/.glb \
+             are supported",
+            other = other.as_deref().map_or_else(|| "None".to_string(), |o| format!("{o:?}")),
+            path = path
+        )
+    )]
     UnknownFormat {
         other: Option<String>,
         path: String,
     },
     /// `src_axis` 的值域错误（[`SrcOpts::of_model`]）。
     #[error(
-        "src_axis 只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
-         大小写不敏感），实际 {value:?}"
+        "{}",
+        crate::tr_fmt!(
+            "src_axis only accepts \"y\" / \"z\" (yup / y-up / zup / z-up are also accepted, \
+             case-insensitively), but got %{value}",
+            value = format!("{value:?}")
+        )
     )]
     BadAxis { value: String },
     /// `srcshapekey` 名单里有源文件里不存在的名字（[`SrcOpts::order_shape_keys`]）。
     #[error(
-        "srcshapekey 里的 {} 在源文件里不存在；现有的是 {have:?}",
-        missing.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>().join(" / ")
+        "{}",
+        crate::tr_fmt!(
+            "the %{missing} in srcshapekey do not exist in the source file; \
+             the available ones are %{have}",
+            missing = missing.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>().join(" / "),
+            have = format!("{have:?}")
+        )
     )]
     ShapeKeyMissing {
         missing: Vec<String>,
@@ -1201,9 +1255,12 @@ fn build_model_lods(
                 let Some(lod_mesh) = by_material.remove(mat) else {
                     errs.push(e(
                         &lpath,
-                        format!(
-                            "LOD {lod_no} 缺少材质下标 {mat} 的 mesh（LOD 0 的 mesh[{ki}] 用了它）—— \
-                             各 LOD 的材质集合必须一致"
+                        crate::tr_fmt!(
+                            "LOD %{lod} has no mesh with the material index %{mat} (mesh[%{ki}] of LOD 0 uses it) -- \
+                             every LOD must use the same set of materials",
+                            lod = lod_no,
+                            mat = mat,
+                            ki = ki
                         ),
                     ));
                     continue;
@@ -1214,7 +1271,11 @@ fn build_model_lods(
                 let extra: Vec<usize> = by_material.keys().copied().collect();
                 errs.push(e(
                     &lpath,
-                    format!("LOD {lod_no} 多出 LOD 0 没有的材质下标 {extra:?}"),
+                    crate::tr_fmt!(
+                        "LOD %{lod} has material indices that LOD 0 does not have: %{extra}",
+                        lod = lod_no,
+                        extra = format!("{extra:?}")
+                    ),
                 ));
             }
         }
@@ -1399,7 +1460,13 @@ fn build_meshes(
 ) -> Result<(Vec<Mesh>, Vec<Vec<u32>>), CompileError> {
     let names = smd.materials_in_order();
     if names.is_empty() {
-        return Err(e(at, format!("{} 里没有任何三角形", smd_path.display())));
+        return Err(e(
+            at,
+            crate::tr_fmt!(
+                "there is not a single triangle in %{path}",
+                path = smd_path.display()
+            ),
+        ));
     }
 
     let cd: Vec<String> = desc.materials.search_paths.clone();
@@ -1425,8 +1492,10 @@ fn build_meshes(
         let Some(&mi) = lookup.get(&key) else {
             return Err(e(
                 at,
-                format!(
-                    "SMD 里的材质名 {n:?} 在 [materials].textures 里找不到（匹配键为 {key:?}）"
+                crate::tr_fmt!(
+                    "the material name %{name} in the SMD was not found in [materials].textures (the lookup key is %{key})",
+                    name = format!("{n:?}"),
+                    key = format!("{key:?}")
                 ),
             ));
         };
@@ -1516,9 +1585,10 @@ fn build_meshes(
     if meshes.is_empty() {
         return Err(e(
             at,
-            format!(
-                "{} 里没有可用的三角形（{dropped} 个材质的三角形全部退化）",
-                smd_path.display()
+            crate::tr_fmt!(
+                "%{path} has no usable triangle left (%{dropped} materials had every triangle degenerate)",
+                path = smd_path.display(),
+                dropped = dropped
             ),
         ));
     }
@@ -1575,11 +1645,11 @@ fn smd_vertex_to_ir(
         if node_ix >= bone_map.node_count {
             return Err(e(
                 at,
-                format!(
-                    "{} 里顶点引用了骨骼下标 {}，但 nodes 段只有 {} 项",
-                    smd_path.display(),
-                    l.bone,
-                    bone_map.node_count
+                crate::tr_fmt!(
+                    "a vertex of %{path} references the bone index %{bone}, but the nodes section only has %{nodes} entries",
+                    path = smd_path.display(),
+                    bone = l.bone,
+                    nodes = bone_map.node_count
                 ),
             ));
         }
@@ -1591,23 +1661,31 @@ fn smd_vertex_to_ir(
         let Some(di) = bone_map.map_bone(node_ix) else {
             return Err(e(
                 at,
-                format!(
-                    "{} 里的骨骼下标 {node_ix} 无法映射到 [[bones]]（骨骼表为空）",
-                    smd_path.display()
+                crate::tr_fmt!(
+                    "the bone index %{bone} of %{path} cannot be mapped to [[bones]] (the bone table is empty)",
+                    bone = node_ix,
+                    path = smd_path.display()
                 ),
             ));
         };
         if di >= bone_count {
-            return Err(e(at, format!("骨骼下标 {di} 越界（共 {bone_count} 根）")));
+            return Err(e(
+                at,
+                crate::tr_fmt!(
+                    "the bone index %{bone} is out of range (there are %{count} bones)",
+                    bone = di,
+                    count = bone_count
+                ),
+            ));
         }
         bones.push([di as f32, l.weight]);
     }
     if bones.is_empty() {
         return Err(e(
             at,
-            format!(
-                "{} 里有顶点的蒙皮权重全为 0 或没有绑定",
-                smd_path.display()
+            crate::tr_fmt!(
+                "%{path} has a vertex whose skin weights are all 0, or which has no binding at all",
+                path = smd_path.display()
             ),
         ));
     }
@@ -1670,15 +1748,20 @@ fn blend_grid_size(
     match s.blend_width {
         Some(w) if w > 0 => {
             if n % w != 0 {
-                errs.push(e(format!(
-                    "blend 格数 {n} 不能被 blend_width {w} 整除（groupsize[0]*groupsize[1] 必须等于格数）"
+                errs.push(e(crate::tr_fmt!(
+                    "the blend cell count %{cells} is not divisible by blend_width %{width} (groupsize[0]*groupsize[1] must equal the cell count)",
+                    cells = n,
+                    width = w
                 )));
                 return None;
             }
             Some((w, n / w))
         }
         Some(w) => {
-            errs.push(e(format!("blend_width 必须是正数，实际 {w}")));
+            errs.push(e(crate::tr_fmt!(
+                "blend_width must be positive, but is %{width}",
+                width = w
+            )));
             None
         }
         None => {
@@ -1689,9 +1772,10 @@ fn blend_grid_size(
                 if r * r == n {
                     Some((r, r))
                 } else {
-                    errs.push(e(format!(
-                        "blend 格数 {n} 不是完全平方数，且没有给 blend_width —— \
-                         官方会报 non-square number of blends（simplify.cpp:3011）"
+                    errs.push(e(crate::tr_fmt!(
+                        "the blend cell count %{cells} is not a perfect square and no blend_width was given -- \
+                         the official code raises non-square number of blends (simplify.cpp:3011)",
+                        cells = n
                     )));
                     None
                 }
@@ -1794,7 +1878,10 @@ fn load_smd_frames(
         }
     };
     if smd.frames.is_empty() {
-        errs.push(e(format!("{} 的 skeleton 段没有任何帧", smd_path.display())));
+        errs.push(e(crate::tr_fmt!(
+            "the skeleton section of %{path} has no frame at all",
+            path = smd_path.display()
+        )));
         return None;
     }
     // ⚠️ **不要**因为「SMD 里有 `[[bones]]` 没有的骨骼」而报错。
@@ -2422,7 +2509,10 @@ fn apply_calc_blend_axes(
                     None => {
                         errors.push(CompileError::Message {
                             at: format!("sequences[{si}].blend_params[{}]", ax.axis),
-                            message: format!("未知的 calcblend 附着点 {name:?}"),
+                            message: crate::tr_fmt!(
+                                "unknown calcblend attachment point %{name}",
+                                name = format!("{name:?}")
+                            ),
                         });
                         continue;
                     }
@@ -2453,10 +2543,12 @@ fn apply_calc_blend_axes(
             if (start - end).abs() < 0.01 {
                 errors.push(CompileError::Message {
                     at: format!("sequences[{si}]"),
-                    message: format!(
-                        "calcblend failed in {}（paramstart={start} paramend={end}，\
-                         差值 < 0.01；官方在这里直接中止编译）",
-                        seq.name
+                    message: crate::tr_fmt!(
+                        "calcblend failed in %{name} (paramstart=%{start} paramend=%{end}, \
+                         the difference is < 0.01; the official code aborts the compile here)",
+                        name = seq.name,
+                        start = start,
+                        end = end
                     ),
                 });
                 continue;
@@ -2858,7 +2950,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         if anim_index.contains_key(a.name.as_str()) {
             seq_errors.push(CompileError::Message {
                 at: format!("{at}.name"),
-                message: format!("动画名 {:?} 重复", a.name),
+                message: crate::tr_fmt!(
+                    "the animation name %{name} is duplicated",
+                    name = format!("{:?}", a.name)
+                ),
             });
             continue;
         }
@@ -2901,7 +2996,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             if hi < lo {
                 seq_errors.push(CompileError::Message {
                     at: format!("{at}.frames"),
-                    message: format!("结束帧 {hi} 早于起始帧 {lo}（源只有 {n} 帧）"),
+                    message: crate::tr_fmt!(
+                        "the end frame %{hi} is earlier than the start frame %{lo} (the source only has %{n} frames)",
+                        hi = hi,
+                        lo = lo,
+                        n = n
+                    ),
                 });
                 continue;
             }
@@ -3000,15 +3100,21 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                                     &p,
                                     desc,
                                     &bone_index,
-                                    &format!("animations[{i}].subtract（序列 {ref_name:?}）"),
+                                    &crate::tr_fmt!(
+                                        "animations[%{i}].subtract (sequence %{name})",
+                                        i = i,
+                                        name = format!("{ref_name:?}")
+                                    ),
                                     &sopts,
                                     &mut seq_errors,
                                 )
                                 .map(|(frames, _smd)| frames),
                                 Err(msg) => {
                                     seq_errors.push(e(
-                                        format!(
-                                            "animations[{i}].subtract（序列 {ref_name:?}）"
+                                        crate::tr_fmt!(
+                                            "animations[%{i}].subtract (sequence %{name})",
+                                            i = i,
+                                            name = format!("{ref_name:?}")
                                         ),
                                         msg,
                                     ));
@@ -3023,19 +3129,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         let Some(src) = resolved else {
             seq_errors.push(CompileError::Message {
                 at: format!("animations[{i}].subtract"),
-                message: format!(
-                    "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
-                     现有动画：{}；现有序列：{}）",
-                    desc.animations
-                        .iter()
-                        .map(|a| a.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    desc.sequences
-                        .iter()
-                        .map(|s| s.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                message: crate::tr_fmt!(
+                    "cannot find the reference animation %{name} (subtract takes an **animation or sequence name**; \
+                     existing animations: %{anims}; existing sequences: %{seqs})",
+                    name = format!("{ref_name:?}"),
+                    anims = desc.animations.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+                    seqs = desc.sequences.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
                 ),
             });
             continue;
@@ -3044,7 +3143,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         if bf >= src.len() {
             seq_errors.push(CompileError::Message {
                 at: format!("animations[{i}].subtract_frame"),
-                message: format!("参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧", src.len()),
+                message: crate::tr_fmt!(
+                    "the reference animation %{name} only has %{n} frames; frame %{frame} is out of reach",
+                    name = format!("{ref_name:?}"),
+                    n = src.len(),
+                    frame = bf
+                ),
             });
             continue;
         }
@@ -3150,14 +3254,11 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         None => {
                             seq_errors.push(e(
                                 format!("{at}.blends[{ci}]"),
-                                format!(
-                                    "找不到动画 {nm:?}（blend 的每一格都必须是 [[animations]] 里声明过的名字；\
-                                     现有：{}）",
-                                    desc.animations
-                                        .iter()
-                                        .map(|a| a.name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
+                                crate::tr_fmt!(
+                                    "cannot find the animation %{name} (every blend cell must be a name declared in [[animations]]; \
+                                     existing: %{anims})",
+                                    name = format!("{nm:?}"),
+                                    anims = desc.animations.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
                                 ),
                             ));
                             ok = false;
@@ -3179,11 +3280,11 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         None => {
                             seq_errors.push(e(
                                 format!("{at}.blend_params[{pi}].parameter"),
-                                format!(
-                                    "找不到姿势参数 {:?}（[[model.pose_parameters]] 里有 {} 个：{}）",
-                                    bp.parameter,
-                                    desc.model.pose_parameters.len(),
-                                    desc.model
+                                crate::tr_fmt!(
+                                    "cannot find the pose parameter %{name} ([[model.pose_parameters]] has %{n}: %{list})",
+                                    name = format!("{:?}", bp.parameter),
+                                    n = desc.model.pose_parameters.len(),
+                                    list = desc.model
                                         .pose_parameters
                                         .iter()
                                         .map(|p| p.name.as_str())
@@ -3209,8 +3310,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         if find_attachment(desc, &bone_index, att).is_none() {
                             seq_errors.push(e(
                                 format!("{at}.blend_params[{pi}].attachment"),
-                                format!(
-                                    "未知的 calcblend 附着点 {att:?}（官方是 Unknown calcblend attachment）"
+                                crate::tr_fmt!(
+                                    "unknown calcblend attachment point %{name} (the official code says Unknown calcblend attachment)",
+                                    name = format!("{att:?}")
                                 ),
                             ));
                             bad = true;
@@ -3299,7 +3401,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     else {
                         seq_errors.push(e(
                             format!("{at}.auto_layers[{li}].sequence"),
-                            format!("找不到序列 {:?}", al.sequence),
+                            crate::tr_fmt!(
+                                "cannot find the sequence %{name}",
+                                name = format!("{:?}", al.sequence)
+                            ),
                         ));
                         bad = true;
                         continue;
@@ -3686,9 +3791,11 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         if bf >= src.len() {
                             seq_errors.push(CompileError::Message {
                                 at: format!("{at}.subtract_frame"),
-                                message: format!(
-                                    "参考动画 {ref_name:?} 只有 {} 帧，取不到第 {bf} 帧",
-                                    src.len()
+                                message: crate::tr_fmt!(
+                                    "the reference animation %{name} only has %{n} frames; frame %{frame} is out of reach",
+                                    name = format!("{ref_name:?}"),
+                                    n = src.len(),
+                                    frame = bf
                                 ),
                             });
                             continue;
@@ -3702,19 +3809,12 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     None => {
                         seq_errors.push(CompileError::Message {
                             at: format!("{at}.subtract"),
-                            message: format!(
-                                "找不到参考动画 {ref_name:?}（subtract 引用的是**动画名或序列名**，\
-                                 现有动画：{}；现有序列：{}）",
-                                desc.animations
-                                    .iter()
-                                    .map(|a| a.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                desc.sequences
-                                    .iter()
-                                    .map(|x| x.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
+                            message: crate::tr_fmt!(
+                                "cannot find the reference animation %{name} (subtract takes an **animation or sequence name**; \
+                                 existing animations: %{anims}; existing sequences: %{seqs})",
+                                name = format!("{ref_name:?}"),
+                                anims = desc.animations.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+                                seqs = desc.sequences.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ")
                             ),
                         });
                         continue;
@@ -3751,7 +3851,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     let Some(seq_idx) = desc.sequences.iter().position(|x| x.name == al.sequence) else {
                         seq_errors.push(e(
                             format!("{at}.auto_layers[{li}].sequence"),
-                            format!("找不到序列 {:?}", al.sequence),
+                            crate::tr_fmt!(
+                                "cannot find the sequence %{name}",
+                                name = format!("{:?}", al.sequence)
+                            ),
                         ));
                         continue;
                     };
@@ -4081,11 +4184,11 @@ fn split_oversized_meshes(
             {
                 errs.push(e(
                     &at,
-                    format!(
-                        "内部错误：lods.meshes 有 {} 项，但 meshes 有 {} 项\
-                         （两者必须一一对应）—— 拆分无法保证下标对齐",
-                        ls.meshes.len(),
-                        model.meshes.len()
+                    crate::tr_fmt!(
+                        "internal error: lods.meshes has %{lods} entries, but meshes has %{meshes} \
+                         (the two must correspond one to one) -- the split cannot guarantee index alignment",
+                        lods = ls.meshes.len(),
+                        meshes = model.meshes.len()
                     ),
                 ));
                 continue;
@@ -4363,12 +4466,15 @@ fn split_oversized_meshes(
                 if worst > LIMIT {
                     errs.push(e(
                         &at,
-                        format!(
-                            "mesh[{k}]（材质下标 {}）拆分后仍有一块含 {worst} 个顶点\
-                             （上限 {LIMIT}）：该 mesh 的多个 LOD 共享顶点，归块时把\
-                             顶点挤进了同一块。请减少该材质的 LOD 档数，或把该材质\
-                             拆成多个 SMD 材质。",
-                            mesh.material
+                        crate::tr_fmt!(
+                            "mesh[%{k}] (material index %{mat}) still has a block with %{worst} vertices after the split \
+                             (the limit is %{limit}): several LODs of this mesh share vertices, and the grouping pushed \
+                             them into the same block. Reduce the number of LOD levels for this material, or split the \
+                             material into several SMD materials.",
+                            k = k,
+                            mat = mesh.material,
+                            worst = worst,
+                            limit = LIMIT
                         ),
                     ));
                 }
@@ -4386,20 +4492,20 @@ fn split_oversized_meshes(
             if old_lods.is_some() && new_lods.len() != new_meshes.len() {
                 errs.push(e(
                     &at,
-                    format!(
-                        "内部错误：拆分后 lods.meshes 有 {} 项，但 meshes 有 {} 项",
-                        new_lods.len(),
-                        new_meshes.len()
+                    crate::tr_fmt!(
+                        "internal error: after the split lods.meshes has %{lods} entries, but meshes has %{meshes}",
+                        lods = new_lods.len(),
+                        meshes = new_meshes.len()
                     ),
                 ));
             }
             if new_flexes.len() != new_meshes.len() {
                 errs.push(e(
                     &at,
-                    format!(
-                        "内部错误：拆分后 mesh_flexes 有 {} 项，但 meshes 有 {} 项",
-                        new_flexes.len(),
-                        new_meshes.len()
+                    crate::tr_fmt!(
+                        "internal error: after the split mesh_flexes has %{flexes} entries, but meshes has %{meshes}",
+                        flexes = new_flexes.len(),
+                        meshes = new_meshes.len()
                     ),
                 ));
             }
@@ -6333,7 +6439,7 @@ fn resolve_vta_flexes(
             for (fi, f) in m.iter().enumerate() {
                 let at = format!("bodyparts[{bi}].models[{mi}].flexes[{fi}]");
                 if f.name.is_empty() {
-                    errs.push(e(&at, "name 不能为空".to_string()));
+                    errs.push(e(&at, crate::tr("the name must not be empty")));
                     row.push((0, 0));
                     continue;
                 }
@@ -6471,7 +6577,11 @@ fn resolve_vta_flexes(
                             Err(err) => {
                                 errs.push(e(
                                     &fat,
-                                    format!("读不到 {}：{err}", vta_path.display()),
+                                    crate::tr_fmt!(
+                                        "cannot read %{path}: %{err}",
+                                        path = vta_path.display(),
+                                        err = err
+                                    ),
                                 ));
                                 continue;
                             }
@@ -6486,7 +6596,11 @@ fn resolve_vta_flexes(
                             Err(err) => {
                                 errs.push(e(
                                     &fat,
-                                    format!("{} 解析失败：{err}", vta_path.display()),
+                                    crate::tr_fmt!(
+                                        "failed to parse %{path}: %{err}",
+                                        path = vta_path.display(),
+                                        err = err
+                                    ),
                                 ));
                                 continue;
                             }
@@ -6531,10 +6645,12 @@ fn resolve_vta_flexes(
                         if a.index as usize >= n {
                             errs.push(e(
                                 &at,
-                                format!(
-                                    "内部错误：mesh {k} 的 vertanim 下标 {} 超出顶点数 {n}\
-                                     （顶点池口径与写出器不一致）",
-                                    a.index
+                                crate::tr_fmt!(
+                                    "internal error: the vertanim index %{index} of mesh %{k} is past the %{n} vertices \
+                                     (the vertex pool does not agree with the writer)",
+                                    index = a.index,
+                                    k = k,
+                                    n = n
                                 ),
                             ));
                         }
@@ -6644,7 +6760,7 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
                 if k.name.is_empty() {
                     errs.push(e(
                         &at,
-                        "shape key 的名字是空的，不能注册成 flexdesc".to_string(),
+                        crate::tr("the shape key name is empty and cannot be registered as a flexdesc"),
                     ));
                     row.push(0);
                     continue;
@@ -6859,7 +6975,13 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
     for (ri, r) in desc.flex_rules.iter().enumerate() {
         let at = format!("flex_rules[{ri}]");
         let Some(&flex) = flexdesc_index.get(r.flex.as_str()) else {
-            errs.push(e(&at, format!("flex {:?} 在 [[flex_descriptors]] 里找不到", r.flex)));
+            errs.push(e(
+                &at,
+                crate::tr_fmt!(
+                    "the flex %{name} was not found in [[flex_descriptors]]",
+                    name = format!("{:?}", r.flex)
+                ),
+            ));
             continue;
         };
         let mut ops = Vec::with_capacity(r.ops.len());
@@ -6869,7 +6991,13 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
             let d = match kind.operand() {
                 crate::model::FlexOperand::Value => {
                     let Some(v) = op.value else {
-                        errs.push(e(&oat, format!("op {:?} 需要 value", kind.code())));
+                        errs.push(e(
+                            &oat,
+                            crate::tr_fmt!(
+                                "the op %{op} needs a value",
+                                op = format!("{:?}", kind.code())
+                            ),
+                        ));
                         continue;
                     };
                     crate::model::FlexOpData::Value(v)
@@ -6877,13 +7005,16 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
                 crate::model::FlexOperand::Index => match kind {
                     crate::model::FlexOpKind::Fetch1 => {
                         let Some(name) = op.controller.as_deref() else {
-                            errs.push(e(&oat, "fetch1 需要 controller".to_string()));
+                            errs.push(e(&oat, crate::tr("fetch1 needs a controller")));
                             continue;
                         };
                         let Some(&idx) = fc_index.get(name) else {
                             errs.push(e(
                                 &oat,
-                                format!("fetch1 的 controller {name:?} 在 [[flex_controllers]] 里找不到"),
+                                crate::tr_fmt!(
+                                    "the controller %{name} of fetch1 was not found in [[flex_controllers]]",
+                                    name = format!("{name:?}")
+                                ),
                             ));
                             continue;
                         };
@@ -6891,13 +7022,16 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
                     }
                     crate::model::FlexOpKind::Fetch2 => {
                         let Some(name) = op.flexdesc.as_deref() else {
-                            errs.push(e(&oat, "fetch2 需要 flexdesc".to_string()));
+                            errs.push(e(&oat, crate::tr("fetch2 needs a flexdesc")));
                             continue;
                         };
                         let Some(&idx) = flexdesc_index.get(name) else {
                             errs.push(e(
                                 &oat,
-                                format!("fetch2 的 flexdesc {name:?} 在 [[flex_descriptors]] 里找不到"),
+                                crate::tr_fmt!(
+                                    "the flexdesc %{name} of fetch2 was not found in [[flex_descriptors]]",
+                                    name = format!("{name:?}")
+                                ),
                             ));
                             continue;
                         };
@@ -6986,7 +7120,11 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
             {
                 errs.push(e(
                     &at,
-                    format!("{which} 的 flexcontroller {n:?} 在 [[flex_controllers]] 里找不到"),
+                    crate::tr_fmt!(
+                        "the flexcontroller %{name} of %{which} was not found in [[flex_controllers]]",
+                        name = format!("{n:?}"),
+                        which = which
+                    ),
                 ));
             }
         }
@@ -6998,7 +7136,10 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
             (Some(a), None) => (a as i32, None),
             (None, Some(b)) => (b as i32, None),
             (None, None) => {
-                errs.push(e(&at, "stereo ui 需要 left/right 至少一个".to_string()));
+                errs.push(e(
+                    &at,
+                    crate::tr("a stereo ui needs at least one of left/right"),
+                ));
                 continue;
             }
         };
@@ -7015,7 +7156,7 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
     if !desc.mouths.is_empty() {
         let max_index = desc.mouths.iter().map(|m| m.index).max().unwrap_or(0);
         if max_index < 0 {
-            errs.push(e("mouths", "index 不能为负".to_string()));
+            errs.push(e("mouths", crate::tr("the index must not be negative")));
         } else {
             let n = (max_index + 1) as usize;
             // 空洞写全 0（与官方 g_mouth[index] 未初始化一致）。
@@ -7031,22 +7172,34 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
             for (mi, m) in desc.mouths.iter().enumerate() {
                 let at = format!("mouths[{mi}]");
                 if m.index < 0 {
-                    errs.push(e(&at, format!("index {} 不能为负", m.index)));
+                    errs.push(e(
+                        &at,
+                        crate::tr_fmt!("the index %{index} must not be negative", index = m.index),
+                    ));
                     continue;
                 }
                 let slot = m.index as usize;
                 if filled[slot] {
-                    errs.push(e(&at, format!("index {} 被写了两次", m.index)));
+                    errs.push(e(
+                        &at,
+                        crate::tr_fmt!("the index %{index} was written twice", index = m.index),
+                    ));
                     continue;
                 }
                 let Some(&bone) = bone_index.get(m.bone.as_str()) else {
-                    errs.push(e(&at, format!("骨骼 {:?} 找不到", m.bone)));
+                    errs.push(e(
+                        &at,
+                        crate::tr_fmt!("cannot find the bone %{bone}", bone = format!("{:?}", m.bone)),
+                    ));
                     continue;
                 };
                 let Some(&fd) = flexdesc_index.get(m.flexdesc.as_str()) else {
                     errs.push(e(
                         &at,
-                        format!("flexdesc {:?} 在 [[flex_descriptors]] 里找不到", m.flexdesc),
+                        crate::tr_fmt!(
+                            "the flexdesc %{name} was not found in [[flex_descriptors]]",
+                            name = format!("{:?}", m.flexdesc)
+                        ),
                     ));
                     continue;
                 };
@@ -7090,7 +7243,10 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
                 for (ej, eb) in dmodel.eyeballs.iter().enumerate() {
                     let eat = format!("{at}[{ej}]");
                     let Some(&bone) = bone_index.get(eb.bone.as_str()) else {
-                        errs.push(e(&eat, format!("骨骼 {:?} 找不到", eb.bone)));
+                        errs.push(e(
+                            &eat,
+                            crate::tr_fmt!("cannot find the bone %{bone}", bone = format!("{:?}", eb.bone)),
+                        ));
                         continue;
                     };
                     // org：世界空间 → 骨骼空间（`VectorITransform` 对内部
@@ -7154,7 +7310,10 @@ fn resolve_flex_eyeball_mouth(compiled: &mut CompiledModelDesc) -> Result<(), Ve
                         Some(mesh_k) => cm.meshes[mesh_k].eyeball_tag = Some(ej),
                         None => errs.push(e(
                             &eat,
-                            format!("材质 {:?} 在该 model 的 mesh 里找不到", eb.material),
+                            crate::tr_fmt!(
+                                "the material %{name} was not found among the meshes of this model",
+                                name = format!("{:?}", eb.material)
+                            ),
                         )),
                     }
                     out_eb.push(crate::model::CompiledEyeball {
@@ -7364,7 +7523,10 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
                     // （官方是 `$jigglebone: invalid syntax` + abort）。
                     errs.push(e(
                         format!("{at}.writes[{k}]"),
-                        format!("未知的 `$jigglebone` 键 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown `$jigglebone` key %{key}",
+                            key = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -7456,7 +7618,11 @@ fn resolve_quat_interp_bones(
         let Some(&control) = bone_index.get(q.control.as_str()) else {
             errs.push(e(
                 &at,
-                format!("control 骨骼 {:?} 找不到（目标骨骼 {:?}）", q.control, q.bone),
+                crate::tr_fmt!(
+                    "cannot find the control bone %{control} (the target bone is %{bone})",
+                    control = format!("{:?}", q.control),
+                    bone = format!("{:?}", q.bone)
+                ),
             ));
             continue;
         };
@@ -7511,7 +7677,12 @@ fn resolve_lid(
         flexdesc_index
             .get(name)
             .map(|&i| i as i32)
-            .ok_or_else(|| format!("flexdesc {name:?} 在 [[flex_descriptors]] 里找不到"))
+            .ok_or_else(|| {
+                crate::tr_fmt!(
+                    "the flexdesc %{name} was not found in [[flex_descriptors]]",
+                    name = format!("{name:?}")
+                )
+            })
     };
     *lid_base = get(&lid.lid_flexdesc)?;
     fd[0] = get(&lid.lowerer.flexdesc)?;
@@ -8012,10 +8183,12 @@ mod tests {
         write(&dir, "bad.smd", &smd);
         let toml = desc_toml("bad.smd");
         let desc: ModelDesc = toml::from_str(&toml).unwrap();
-        let errs = compile(&desc, &dir).unwrap_err();
+        // ⚠️ 文案在 `compile()` 那一刻就渲染好了（`crate::tr_fmt!`），
+        // 所以语言必须在**调用**那一刻生效 —— 事后包 `with_english` 是空操作。
+        let errs = crate::test_locale::with_english(|| compile(&desc, &dir).unwrap_err());
         let joined = errs.iter().map(|e| e.message()).collect::<Vec<_>>().join("\n");
         assert!(
-            joined.contains("nodes 段只有 2 项"),
+            joined.contains("the nodes section only has 2 entries"),
             "报错必须给出正确的 nodes 项数，实际：{joined}"
         );
     }
@@ -9732,9 +9905,10 @@ type = "mouth"
 
         o.shape_keys = vec!["b".into(), "nope".into()];
         let err = o.order_shape_keys(&keys).unwrap_err();
-        let msg = err.to_string();
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let msg = crate::test_locale::with_english(|| err.to_string());
         assert!(msg.contains("nope"), "{msg}");
-        assert!(msg.contains("现有的是"), "错误信息要列出源里有什么：{msg}");
+        assert!(msg.contains("available ones"), "错误信息要列出源里有什么：{msg}");
         // 结构化断言 —— 这才是类型化的意义：调用方能直接 `match` 出
         // 「哪个名字缺了」，不必去正则匹配中文字符串。
         let SrcError::ShapeKeyMissing { missing, have } = &err else {
@@ -10292,10 +10466,14 @@ $sequence \"idle\" \"myprop-ref.smd\" fps 30
 
         // ② control 不存在 ⟹ **硬错误**（官方 `Missing control bone`）。
         let t = format!("{base}\n[[quat_interp_bones]]\nbone = \"tip\"\ncontrol = \"nosuchbone\"\n");
-        let errs = compile(&ModelDesc::from_toml(&t).unwrap(), &d)
-            .expect_err("control 找不到官方是 MdlError，必须报错");
+        // ⚠️ 文案在 `compile()` 里就渲染好了，所以语言必须在那一刻生效。
+        let errs = crate::test_locale::with_english(|| {
+            compile(&ModelDesc::from_toml(&t).unwrap(), &d)
+                .expect_err("control 找不到官方是 MdlError，必须报错")
+        });
         assert!(
-            errs.iter().any(|x| x.message().contains("control 骨骼")),
+            errs.iter()
+                .any(|x| x.message().contains("cannot find the control bone")),
             "错误信息应点名 control 骨骼：{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -11926,9 +12104,11 @@ end
         let smd = SMD.replace("myprop\n", "not_declared\n");
         write(&d, "myprop-ref.smd", &smd);
         let desc = ModelDesc::from_toml(&desc_toml("myprop-ref.smd")).unwrap();
-        let errs = compile(&desc, &d).unwrap_err();
+        // ⚠️ 文案在 `compile()` 里就渲染好了，所以语言必须在那一刻生效。
+        let errs = crate::test_locale::with_english(|| compile(&desc, &d).unwrap_err());
         assert!(
-            errs.iter().any(|x| x.message().contains("找不到")),
+            errs.iter()
+                .any(|x| x.message().contains("was not found in [materials].textures")),
             "应报材质未声明：{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -11939,7 +12119,24 @@ end
         let d = tmpdir("missing");
         let desc = ModelDesc::from_toml(&desc_toml("nope.smd")).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
-        assert!(errs.iter().any(|x| x.message().contains("读不到")), "{errs:?}");
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let msgs = crate::test_locale::with_english(|| {
+            errs.iter().map(|x| x.message()).collect::<Vec<_>>()
+        });
+        assert!(msgs.iter().any(|m| m.contains("cannot read")), "{msgs:?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 同一条诊断在中文系统上确实走译文表（不是只有英文源文）。
+    #[test]
+    fn reports_missing_smd_file_is_translated_for_chinese() {
+        let d = tmpdir("missing-zh");
+        let desc = ModelDesc::from_toml(&desc_toml("nope.smd")).unwrap();
+        let errs = compile(&desc, &d).unwrap_err();
+        let msgs = crate::test_locale::with_locale("zh-CN", || {
+            errs.iter().map(|x| x.message()).collect::<Vec<_>>()
+        });
+        assert!(msgs.iter().any(|m| m.contains("读不到")), "{msgs:?}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -11968,9 +12165,10 @@ end
         );
         // 缺扩展名 ⟹ 报错，错误串里既回显引用又点明原因。
         let err = resolve_smd_path(base, "c").unwrap_err();
-        let msg = err.to_string();
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let msg = crate::test_locale::with_english(|| err.to_string());
         assert!(msg.contains("\"c\""), "错误串应回显引用：{msg}");
-        assert!(msg.contains("没有扩展名"), "错误串应点明原因：{msg}");
+        assert!(msg.contains("no extension"), "错误串应点明原因：{msg}");
         let SrcError::MissingExtension { smd } = &err else {
             panic!("应是 MissingExtension，实际：{err:?}");
         };
@@ -11999,17 +12197,19 @@ end
         let d = tmpdir("noext");
         let desc = ModelDesc::from_toml(&desc_toml("nope")).unwrap();
         let errs = compile(&desc, &d).unwrap_err();
-        let joined = errs
-            .iter()
-            .map(|x| x.message())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let joined = crate::test_locale::with_english(|| {
+            errs.iter()
+                .map(|x| x.message())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
         assert!(
-            joined.contains("没有扩展名"),
+            joined.contains("no extension"),
             "缺扩展名必须报「没有扩展名」，实际：{joined}"
         );
         assert!(
-            !joined.contains("读不到"),
+            !joined.contains("cannot read"),
             "不该退化成「读不到」（那意味着仍然去猜了扩展名）：{joined}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -12376,10 +12576,13 @@ end
         );
         write(&d, "myprop-ref.smd", &smd);
         let desc = ModelDesc::from_toml(&desc_toml("myprop-ref.smd")).unwrap();
-        let errs = compile(&desc, &d).unwrap_err();
+        // ⚠️ 文案在 `compile()` 那一刻就渲染好了（`crate::tr_fmt!`），
+        // 所以语言必须在**调用**那一刻生效 —— 事后包 `with_english` 是空操作。
+        let errs = crate::test_locale::with_english(|| compile(&desc, &d).unwrap_err());
         // 唯一的三角形被丢弃 → 必须报错而不是产出空模型。
         assert!(
-            errs.iter().any(|x| x.message().contains("没有可用的三角形")),
+            errs.iter()
+                .any(|x| x.message().contains("has no usable triangle left")),
             "{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -12727,7 +12930,7 @@ weight = 0.25
         let errs = d.validate().unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| matches!(e.kind, DescErrorKind::Duplicate { what: "权重表名", .. })),
+                .any(|e| matches!(e.kind, DescErrorKind::Duplicate { what: "weight list name", .. })),
             "{errs:?}"
         );
     }
@@ -12755,9 +12958,9 @@ weight = 0.25
                 .map(|_| "[[weight_lists.bones]]\nbone = \"mid\"\nweight = 0.5\n")
                 .collect::<String>()
         ));
-        let errs = bad.validate().unwrap_err();
+        let errs = crate::test_locale::with_english(|| bad.validate().unwrap_err());
         assert!(
-            errs.iter().any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("条目过多"))),
+            errs.iter().any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("too many entries"))),
             "{errs:?}"
         );
     }
@@ -12915,10 +13118,13 @@ smd = "dsq.smd"
 "#,
         ))
         .unwrap();
-        let errs = desc.validate().unwrap_err();
+        // ⚠️ `DescErrorKind::Other` 的 message 是**构造时**就渲染好的
+        // （`crate::tr_fmt!`），所以语言必须在 `validate()` 那一刻就是英文 ——
+        // 事后把 `contains` 包进 `with_english` 是没用的。
+        let errs = crate::test_locale::with_english(|| desc.validate().unwrap_err());
         assert!(
             errs.iter().any(|e| e.path == "sequences[0].smd"
-                && matches!(&e.kind, DescErrorKind::Other { message } if message.contains("不该有 smd"))),
+                && matches!(&e.kind, DescErrorKind::Other { message } if message.contains("must not have an smd"))),
             "{errs:?}"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -14788,7 +14994,12 @@ blendwidth 3\n\
 $model \"body\" \"a.smd\" {\n\
 }\n";
         let desc = crate::qc::parse_qc_str(qc, &d).expect("QC 应解析成功");
-        let err = compile(&desc, &d).expect_err("官方拒绝的 QC，mdlc 也必须拒绝");
+        // ⚠️ 文案在 `compile()` 里就渲染好了，所以语言必须在那一刻生效。
+        // 本条是 locale 竞态的**受害者**：`calcblend failed` 是英文源文的记号，
+        // 但别的测试把全局 locale 切成 zh-CN 之后它就变成中文了。
+        let err = crate::test_locale::with_english(|| {
+            compile(&desc, &d).expect_err("官方拒绝的 QC，mdlc 也必须拒绝")
+        });
         let _ = std::fs::remove_dir_all(&d);
 
         assert!(

@@ -291,14 +291,35 @@ pub const MAX_POINTS_PER_SOLID: usize = u16::MAX as usize;
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PhyError {
     /// 凸包顶点少于 4 个，张不成体积。
-    #[error("solid[{solid}] 只有 {points} 个顶点，凸包至少要 4 个不共面的点")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "solid[%{solid}] has only %{points} vertices; a convex hull needs at least 4 non-coplanar points",
+            solid = solid,
+            points = points
+        )
+    )]
     HullTooFewPoints { solid: usize, points: usize },
     /// 凸包计算失败（共面 / 共线 / 含 NaN 等退化输入）。
-    #[error("solid[{solid}] 的凸包退化：{detail}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "the convex hull of solid[%{solid}] is degenerate: %{detail}",
+            solid = solid,
+            detail = detail
+        )
+    )]
     HullDegenerate { solid: usize, detail: String },
     /// 面表引用了不存在的顶点。
     #[error(
-        "solid[{solid}] 第 {face} 个面引用了顶点 {index}，但只有 {vertex_count} 个顶点"
+        "{}",
+        crate::tr_fmt!(
+            "face %{face} of solid[%{solid}] references vertex %{index}, but there are only %{vertex_count} vertices",
+            solid = solid,
+            face = face,
+            index = index,
+            vertex_count = vertex_count
+        )
     )]
     IndexOutOfRange {
         solid: usize,
@@ -307,15 +328,37 @@ pub enum PhyError {
         vertex_count: usize,
     },
     /// 同一条有向边出现了两次 —— 网格不是可定向流形。
-    #[error("solid[{solid}] 有向边 {from}->{to} 出现两次，网格不是可定向流形")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "solid[%{solid}] has the directed edge %{from}->%{to} twice; the mesh is not an orientable manifold",
+            solid = solid,
+            from = from,
+            to = to
+        )
+    )]
     DuplicateEdge { solid: usize, from: u32, to: u32 },
     /// 有向边找不到反向配对 —— 网格有洞（非闭合）。
-    #[error("solid[{solid}] 有向边 {from}->{to} 没有反向边，网格不闭合")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "solid[%{solid}] has no opposite edge for %{from}->%{to}; the mesh is not closed",
+            solid = solid,
+            from = from,
+            to = to
+        )
+    )]
     OpenMesh { solid: usize, from: u32, to: u32 },
     /// 三角形太多，`opposite_index` 塞不进 15 位有符号。
     #[error(
-        "solid[{solid}] 有 {triangles} 个三角形，超过单 hull 上限 {max}\
-         （opposite_index 只有 15 位）"
+        "{}",
+        crate::tr_fmt!(
+            "solid[%{solid}] has %{triangles} triangles, over the per-hull limit %{max} \
+             (opposite_index is only 15 bits)",
+            solid = solid,
+            triangles = triangles,
+            max = max
+        )
     )]
     TooManyTriangles {
         solid: usize,
@@ -323,25 +366,65 @@ pub enum PhyError {
         max: usize,
     },
     /// 顶点下标超出 `start_point_index:16`。
-    #[error("solid[{solid}] 有 {points} 个顶点，超过 16 位索引上限 {MAX_POINTS_PER_SOLID}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "solid[%{solid}] has %{points} vertices, over the 16-bit index limit %{max}",
+            solid = solid,
+            points = points,
+            max = MAX_POINTS_PER_SOLID
+        )
+    )]
     TooManyPoints { solid: usize, points: usize },
     /// 坐标里出现 NaN 或无穷。
-    #[error("solid[{solid}] 第 {point} 个顶点含 NaN 或无穷")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "vertex %{point} of solid[%{solid}] contains NaN or infinity",
+            solid = solid,
+            point = point
+        )
+    )]
     NonFinitePoint { solid: usize, point: usize },
     /// 包围盒退化成一点或一条线（半径 0），无法量化 `box_sizes`。
-    #[error("solid[{solid}] 的包围盒半径是 0（所有顶点重合），无法量化 box_sizes")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "the bounding box of solid[%{solid}] has radius 0 (all vertices coincide); cannot quantize box_sizes",
+            solid = solid
+        )
+    )]
     DegenerateBounds { solid: usize },
     /// 参数越界。
-    #[error("参数 {what} 非法：{detail}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "invalid parameter %{what}: %{detail}",
+            what = what,
+            detail = detail
+        )
+    )]
     BadParameter { what: &'static str, detail: String },
     /// 焊接 SMD 三角形后顶点不足 4 个，张不成凸包。
     ///
     /// 由 [`weld_smd_triangles`] 产生 —— 碰撞 SMD 退化成一个点/一条线时
     /// 会撞上这条，而不是等到凸包计算里才失败。
-    #[error("焊接后只有 {points} 个不同顶点，凸包至少要 4 个")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "only %{points} distinct vertices after welding; a convex hull needs at least 4",
+            points = points
+        )
+    )]
     WeldTooFewPoints { points: usize },
     /// 写出的字节自检失败 —— 属本实现的 bug，不是调用方的问题。
-    #[error("写出的 PHY 自检失败（本实现的 bug）：{0}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "the written PHY failed its self-check (a bug in this implementation): %{err}",
+            err = .0
+        )
+    )]
     SelfCheck(String),
 
     // ---- 下面这些由 [`build_phy_from_smd`] / [`build_ragdoll_phy_from_smd`] /
@@ -349,42 +432,72 @@ pub enum PhyError {
     //      逐字节相同，只是从 `String` 变成了可 `match` 的变体。 ----
 
     /// 碰撞 SMD 里一个三角形都没有。
-    #[error("SMD 里没有任何三角形")]
+    #[error("{}", crate::tr_fmt!("the SMD has no triangles"))]
     NoTriangles,
     /// 算凸包失败（退化输入：共面 / 共线 / 含 NaN）。
-    #[error("算凸包失败：{0}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("cannot compute the convex hull: %{err}", err = .0)
+    )]
     HullFailed(#[source] Box<PhyError>),
     /// `$concave` 回退成单凸包时，整体凸包也算不出来。
-    #[error("算整体凸包失败：{0}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("cannot compute the overall convex hull: %{err}", err = .0)
+    )]
     OverallHullFailed(#[source] Box<PhyError>),
     /// 顶点太少，连整体凸包都张不成。
-    #[error("只有 {points} 个顶点，凸包至少要 4 个")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "only %{points} vertices; not even the overall convex hull can be formed (at least 4 are needed)",
+            points = points
+        )
+    )]
     TooFewVerticesForHull { points: usize },
     /// 单 solid 的 prop 形态写了 `[physics.joint_overrides]`。
     #[error(
-        "[physics.joint_overrides] 有 {count} 项，但这是单 solid 的 prop 形态\
-         （`joints = false`）—— 逐 joint 参数只对 ragdoll 有意义。\
-         要么去掉它，要么把 `joints` 设为 true"
+        "{}",
+        crate::tr_fmt!(
+            "[physics.joint_overrides] has %{count} entries, but this is the single-solid prop form \
+             (`joints = false`) -- per-joint parameters only make sense for a ragdoll. \
+             Either remove it or set `joints` to true",
+            count = count
+        )
     )]
     JointOverridesOnProp { count: usize },
     /// 单 solid 的 prop 形态写了 `[physics.constraints]`。
     #[error(
-        "[physics.constraints] 有 {count} 项，但这是单 solid 的 prop 形态\
-         （`joints = false`）—— `$jointconstrain` 只对 ragdoll 有意义。\
-         要么去掉它，要么把 `joints` 设为 true"
+        "{}",
+        crate::tr_fmt!(
+            "[physics.constraints] has %{count} entries, but this is the single-solid prop form \
+             (`joints = false`) -- `$jointconstrain` only makes sense for a ragdoll. \
+             Either remove it or set `joints` to true",
+            count = count
+        )
     )]
     ConstraintsOnProp { count: usize },
     /// 单 solid 的 prop 形态写了碰撞规则。
     #[error(
-        "[physics.no_self_collisions] / [physics.collision_pairs] 只对 ragdoll 有意义\
-         （`joints = false` 时没有「多个 solid 之间碰不碰」的问题）。\
-         要么去掉它，要么把 `joints` 设为 true"
+        "{}",
+        crate::tr_fmt!(
+            "[physics.no_self_collisions] / [physics.collision_pairs] only make sense for a ragdoll \
+             (with `joints = false` there is no \"do the multiple solids collide\" question). \
+             Either remove it or set `joints` to true"
+        )
     )]
     CollisionPairsOnProp,
     /// `$jointmerge` 指向了碰撞 SMD 里没有的骨骼名。
     #[error(
-        "[physics.merge][{index}] 的骨骼对 ({a:?}, {b:?}) 里有名字不在碰撞 SMD 的 \
-         nodes 里。可用的骨骼：{available}"
+        "{}",
+        crate::tr_fmt!(
+            "the bone pair (%{a}, %{b}) of [physics.merge][%{index}] has a name that is not in the \
+             nodes of the collision SMD. Available bones: %{available}",
+            index = index,
+            a = format!("{a:?}"),
+            b = format!("{b:?}"),
+            available = available
+        )
     )]
     MergeBoneUnknown {
         index: usize,
@@ -393,29 +506,51 @@ pub enum PhyError {
         available: String,
     },
     /// `$jointmerge` 会形成归并环。
-    #[error("[physics.merge][{index}] 的 ({a:?}, {b:?}) 会形成归并环")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "(%{a}, %{b}) of [physics.merge][%{index}] would form a merge cycle",
+            index = index,
+            a = format!("{a:?}"),
+            b = format!("{b:?}")
+        )
+    )]
     MergeCycle { index: usize, a: String, b: String },
     /// 碰撞 SMD 里没有任何骨骼带碰撞几何。
-    #[error("没有任何骨骼带碰撞几何")]
+    #[error("{}", crate::tr_fmt!("no bone has collision geometry"))]
     NoBoneGeometry,
     /// `[physics.joint_overrides]` 指向了没有碰撞几何的骨骼。
     #[error(
-        "[physics.joint_overrides] 里的骨骼 {bone:?} 没有碰撞几何。\
-         有碰撞几何的是：{available}"
+        "{}",
+        crate::tr_fmt!(
+            "the bone %{bone} in [physics.joint_overrides] has no collision geometry. \
+             Bones with collision geometry: %{available}",
+            bone = format!("{bone:?}"),
+            available = available
+        )
     )]
     JointOverrideUnknownBone { bone: String, available: String },
     /// 所有骨骼的碰撞几何都张不成凸包。
-    #[error("所有骨骼的碰撞几何都张不成凸包")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("the collision geometry of every bone fails to form a convex hull")
+    )]
     NoHullFromAnyBone,
     /// `$automass` 需要材质密度表，mdlc 没有。
     #[error(
-        "`[physics].auto_mass`（`$automass`）需要材质密度表\
-         （`scripts/surfaceproperties_manifest.txt`）才能算出总质量，\
-         mdlc 没有该表。请显式写 `mass = <值>`"
+        "{}",
+        crate::tr_fmt!(
+            "`[physics].auto_mass` (`$automass`) needs the material density table \
+             (`scripts/surfaceproperties_manifest.txt`) to compute the total mass, \
+             and mdlc does not have that table. Please write `mass = <value>` explicitly"
+        )
     )]
     AutoMassUnsupported,
     /// `write_phy_multi` 失败。
-    #[error("写出 PHY 失败：{0}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!("cannot write the PHY: %{err}", err = .0)
+    )]
     WriteFailed(#[source] Box<PhyError>),
     /// `[physics.constraints]` 的逐条校验失败。
     #[error(transparent)]
@@ -430,20 +565,38 @@ pub enum PhyError {
 pub enum ConstraintError {
     /// `axis` 不是 `x` / `y` / `z`（官方只取首字母）。
     #[error(
-        "[physics.constraints][{index}] 的 axis={axis:?} 非法：\
-         必须是 x / y / z（官方只取首字母）"
+        "{}",
+        crate::tr_fmt!(
+            "the axis=%{axis} of [physics.constraints][%{index}] is invalid: \
+             it must be x / y / z (the official code only reads the first letter)",
+            index = index,
+            axis = format!("{axis:?}")
+        )
     )]
     BadAxis { index: usize, axis: String },
     /// `kind` 不是 `free` / `fixed` / `limit`。
     #[error(
-        "[physics.constraints][{index}] 的 kind={kind:?} 非法：\
-         必须是 free / fixed / limit"
+        "{}",
+        crate::tr_fmt!(
+            "the kind=%{kind} of [physics.constraints][%{index}] is invalid: \
+             it must be free / fixed / limit",
+            index = index,
+            kind = format!("{kind:?}")
+        )
     )]
     BadKind { index: usize, kind: String },
     /// `min > max`。
     #[error(
-        "[physics.constraints][{index}]（骨骼 {bone:?} 轴 {axis}）的 min={min} > max={max}，\
-         官方会以 \"Invalid joint constraint\" 中止编译"
+        "{}",
+        crate::tr_fmt!(
+            "min=%{min} > max=%{max} for [physics.constraints][%{index}] (bone %{bone}, axis %{axis}); \
+             the official compiler aborts with \"Invalid joint constraint\"",
+            index = index,
+            bone = format!("{bone:?}"),
+            axis = axis,
+            min = min,
+            max = max
+        )
     )]
     MinGreaterThanMax {
         index: usize,
@@ -2340,29 +2493,35 @@ pub fn write_phy_multi(
     if hulls.is_empty() {
         return Err(PhyError::BadParameter {
             what: "hulls",
-            detail: "至少需要一个 solid".into(),
+            detail: crate::tr("at least one solid is required"),
         });
     }
     if hulls.len() != solids.len() {
         return Err(PhyError::BadParameter {
             what: "solids",
-            detail: format!(
-                "{} 个 solid 凸块组但 {} 个 solid 参数",
-                hulls.len(),
-                solids.len()
+            detail: crate::tr_fmt!(
+                "%{hulls} solid hull groups but %{solids} solid parameters",
+                hulls = hulls.len(),
+                solids = solids.len()
             ),
         });
     }
     if !params.total_mass.is_finite() || params.total_mass <= 0.0 {
         return Err(PhyError::BadParameter {
             what: "total_mass",
-            detail: format!("必须是正的有限数，实际 {}", params.total_mass),
+            detail: crate::tr_fmt!(
+                "must be a positive finite number, but got %{value}",
+                value = params.total_mass
+            ),
         });
     }
     if !params.inertia_scale.is_finite() || params.inertia_scale < 0.0 {
         return Err(PhyError::BadParameter {
             what: "inertia_scale",
-            detail: format!("必须是非负有限数，实际 {}", params.inertia_scale),
+            detail: crate::tr_fmt!(
+                "must be a non-negative finite number, but got %{value}",
+                value = params.inertia_scale
+            ),
         });
     }
     // text section 里任何字段混进 NUL 都会把它截断，引擎只会读到半截。
@@ -2374,7 +2533,11 @@ pub fn write_phy_multi(
             if v.as_bytes().contains(&0) {
                 return Err(PhyError::BadParameter {
                     what: "solids[].name/parent",
-                    detail: format!("solid[{i}] 的 {what} 里有 NUL 字节"),
+                    detail: crate::tr_fmt!(
+                        "the %{what} of solid[%{solid}] contains a NUL byte",
+                        what = what,
+                        solid = i
+                    ),
                 });
             }
         }
@@ -2405,7 +2568,7 @@ pub fn write_phy_multi(
         &mut out,
         i32::try_from(prepared.len()).map_err(|_| PhyError::BadParameter {
             what: "hulls",
-            detail: "solid 数超出 i32".into(),
+            detail: crate::tr("the solid count overflows i32"),
         })?,
     );
     put_u32(&mut out, params.checksum);
@@ -2605,7 +2768,7 @@ fn prepare_solid(
     if hulls.is_empty() {
         return Err(PhyError::BadParameter {
             what: "hulls",
-            detail: format!("solid[{solid}] 一个凸块都没有"),
+            detail: crate::tr_fmt!("solid[%{solid}] has no hull at all", solid = solid),
         });
     }
 
@@ -2638,7 +2801,7 @@ fn prepare_solid(
         if hull.faces.is_empty() {
             return Err(PhyError::HullDegenerate {
                 solid,
-                detail: format!("第 {hi} 个凸块的面表是空的"),
+                detail: crate::tr_fmt!("the face list of hull %{hull} is empty", hull = hi),
             });
         }
         if hull.faces.len() > MAX_TRIANGLES_PER_HULL {
@@ -2773,7 +2936,7 @@ fn prepare_solid(
         COMPACT_SURFACE_SIZE + ledge_region_size + LEDGETREE_NODE_SIZE * nodes.len();
     let surface_size = i32::try_from(surface_size_usize).map_err(|_| PhyError::BadParameter {
         what: "surfaceSize",
-        detail: format!("{surface_size_usize} 超出 i32"),
+        detail: crate::tr_fmt!("%{size} overflows i32", size = surface_size_usize),
     })?;
 
     // ---- 整个 solid 的质量属性 ----
@@ -2948,7 +3111,10 @@ fn drag_axis_areas(
             else {
                 return Err(PhyError::BadParameter {
                     what: "dragAxisAreas",
-                    detail: format!("solid[{solid}] 三角形引用了越界的点下标"),
+                    detail: crate::tr_fmt!(
+                        "a triangle of solid[%{solid}] references an out-of-range vertex index",
+                        solid = solid
+                    ),
                 });
             };
             let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
@@ -3194,11 +3360,11 @@ fn build_solid_body(
         Some(b) => {
             let plus_one = b.checked_add(1).ok_or_else(|| PhyError::BadParameter {
                 what: "bone_index",
-                detail: format!("骨骼下标 {b} +1 溢出 u32"),
+                detail: crate::tr_fmt!("bone index %{bone} +1 overflows u32", bone = b),
             })?;
             i32::try_from(plus_one).map_err(|_| PhyError::BadParameter {
                 what: "bone_index",
-                detail: format!("骨骼下标 {b} +1 后超出 i32"),
+                detail: crate::tr_fmt!("bone index %{bone} +1 overflows i32", bone = b),
             })?
         }
         None => 0,
@@ -3375,7 +3541,7 @@ fn aabb_of(
 ) -> Result<([f32; 3], [f32; 3]), PhyError> {
     let first = used.first().ok_or(PhyError::HullDegenerate {
         solid,
-        detail: "凸包没有引用任何顶点".into(),
+        detail: crate::tr("the hull references no vertex at all"),
     })?;
     let mut mn = points[*first as usize];
     let mut mx = mn;
@@ -3570,20 +3736,32 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
     let bad = |m: String| Err(PhyError::SelfCheck(m));
 
     if bytes.len() < PHY_HEADER_SIZE {
-        return bad(format!("文件只有 {} 字节，连 16 字节头都放不下", bytes.len()));
+        return bad(crate::tr_fmt!(
+            "the file is only %{len} bytes; not even the 16-byte header fits",
+            len = bytes.len()
+        ));
     }
     // 约束 12：phyheader.size == 16、id == 0。
     let header_size = read_i32(bytes, 0);
     if header_size != PHY_HEADER_SIZE as i32 {
-        return bad(format!("phyheader.size 应为 16，实际 {header_size}"));
+        return bad(crate::tr_fmt!(
+            "phyheader.size should be 16, but is %{got}",
+            got = header_size
+        ));
     }
     let header_id = read_i32(bytes, 4);
     if header_id != 0 {
-        return bad(format!("phyheader.id 应为 0，实际 {header_id}"));
+        return bad(crate::tr_fmt!(
+            "phyheader.id should be 0, but is %{got}",
+            got = header_id
+        ));
     }
     let solid_count = read_i32(bytes, 8);
     if solid_count < 0 {
-        return bad(format!("phyheader.solidCount 为负：{solid_count}"));
+        return bad(crate::tr_fmt!(
+            "phyheader.solidCount is negative: %{got}",
+            got = solid_count
+        ));
     }
     let solid_count = solid_count as usize;
 
@@ -3594,7 +3772,7 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
 
     for si in 0..solid_count {
         if base + SOLID_HEADER_SIZE > bytes.len() {
-            return bad(format!("solid[{si}] 的头超出文件末尾"));
+            return bad(crate::tr_fmt!("the header of solid[%{solid}] goes past the end of the file", solid = si));
         }
         let size = read_i32(bytes, base);
         let vphysics_id = read_u32(bytes, base + 4);
@@ -3605,35 +3783,42 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
 
         // 约束 11。
         if vphysics_id != VPHYSICS_ID {
-            return bad(format!(
-                "solid[{si}] vphysicsID 应为 'VPHY'，实际 {vphysics_id:#010x}"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] vphysicsID should be 'VPHY', but is %{got}",
+                solid = si,
+                got = format!("{vphysics_id:#010x}")
             ));
         }
         if version != VPHYSICS_COLLISION_VERSION {
-            return bad(format!("solid[{si}] version 应为 0x0100，实际 {version:#06x}"));
+            return bad(crate::tr_fmt!("solid[%{solid}] version should be 0x0100, but is %{got}", solid = si, got = format!("{version:#06x}")));
         }
         if model_type != COLLIDE_POLY {
-            return bad(format!("solid[{si}] modelType 应为 0，实际 {model_type}"));
+            return bad(crate::tr_fmt!("solid[%{solid}] modelType should be 0, but is %{got}", solid = si, got = model_type));
         }
         if axis_map_size != 0 {
-            return bad(format!("solid[{si}] axisMapSize 应为 0，实际 {axis_map_size}"));
+            return bad(crate::tr_fmt!("solid[%{solid}] axisMapSize should be 0, but is %{got}", solid = si, got = axis_map_size));
         }
         // 约束 2。
         if size - surface_size != 28 {
-            return bad(format!(
-                "solid[{si}] size - surfaceSize 应为 28，实际 {size} - {surface_size}"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] size - surfaceSize should be 28, but is %{size} - %{surface}",
+                solid = si,
+                size = size,
+                surface = surface_size
             ));
         }
         if surface_size < (COMPACT_SURFACE_SIZE + LEDGETREE_NODE_SIZE) as i32 {
-            return bad(format!("solid[{si}] surfaceSize 太小：{surface_size}"));
+            return bad(crate::tr_fmt!("solid[%{solid}] surfaceSize is too small: %{size}", solid = si, size = surface_size));
         }
 
         let body = base + SOLID_HEADER_SIZE;
         let solid_end = body + surface_size as usize;
         if solid_end > bytes.len() {
-            return bad(format!(
-                "solid[{si}] 越过文件末尾（需要 {solid_end}，只有 {}）",
-                bytes.len()
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] goes past the end of the file (needs %{need}, only %{have})",
+                solid = si,
+                need = solid_end,
+                have = bytes.len()
             ));
         }
         let region = body + COMPACT_SURFACE_SIZE;
@@ -3641,19 +3826,23 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
         // 约束 3：offset_ledgetree_root 相对 IVP_Compact_Surface 起点。
         let offset_ledgetree_root = read_i32(bytes, body + 32);
         if offset_ledgetree_root < COMPACT_SURFACE_SIZE as i32 {
-            return bad(format!(
-                "solid[{si}] offset_ledgetree_root={offset_ledgetree_root} 落在 surface 内部"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] offset_ledgetree_root=%{offset} falls inside the surface",
+                solid = si,
+                offset = offset_ledgetree_root
             ));
         }
         let node_off = body + offset_ledgetree_root as usize;
         if node_off + LEDGETREE_NODE_SIZE > solid_end {
-            return bad(format!(
-                "solid[{si}] offset_ledgetree_root={offset_ledgetree_root} 让树越过 solid 末尾"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] offset_ledgetree_root=%{offset} makes the tree go past the end of the solid",
+                solid = si,
+                offset = offset_ledgetree_root
             ));
         }
         let node_len = solid_end - node_off;
         if !node_len.is_multiple_of(LEDGETREE_NODE_SIZE) {
-            return bad(format!("solid[{si}] 树区长度 {node_len} 不是 28 的倍数"));
+            return bad(crate::tr_fmt!("solid[%{solid}] the tree region length %{len} is not a multiple of 28", solid = si, len = node_len));
         }
         let node_count = node_len / LEDGETREE_NODE_SIZE;
 
@@ -3662,29 +3851,34 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
         if surface_size as usize
             != COMPACT_SURFACE_SIZE + ledge_region_size + LEDGETREE_NODE_SIZE * node_count
         {
-            return bad(format!(
-                "solid[{si}] surfaceSize={surface_size} != 48 + {ledge_region_size} + 28×{node_count}"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] surfaceSize=%{size} != 48 + %{ledge} + 28×%{nodes}",
+                solid = si,
+                size = surface_size,
+                ledge = ledge_region_size,
+                nodes = node_count
             ));
         }
         if ledge_region_size == 0 {
-            return bad(format!("solid[{si}] ledge 区长度为 0"));
+            return bad(crate::tr_fmt!("solid[%{solid}] the ledge region length is 0", solid = si));
         }
 
         // byte_size == surfaceSize、max_factor_surface_deviation > 0、dummy[2] == 'IVPS'。
         let packed = read_u32(bytes, body + 28);
         if ((packed >> 8) & 0x00FF_FFFF) != surface_size as u32 {
-            return bad(format!(
-                "solid[{si}] IVP_Compact_Surface::byte_size != surfaceSize"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] IVP_Compact_Surface::byte_size != surfaceSize",
+                solid = si
             ));
         }
         if (packed & 0xFF) == 0 {
-            return bad(format!("solid[{si}] max_factor_surface_deviation 为 0"));
+            return bad(crate::tr_fmt!("solid[%{solid}] max_factor_surface_deviation is 0", solid = si));
         }
         if read_u32(bytes, body + 44) != IVP_COMPACT_SURFACE_ID {
-            return bad(format!("solid[{si}] dummy[2] 应为 'IVPS'"));
+            return bad(crate::tr_fmt!("solid[%{solid}] dummy[2] should be 'IVPS'", solid = si));
         }
         if read_i32(bytes, body + 36) != 0 || read_i32(bytes, body + 40) != 0 {
-            return bad(format!("solid[{si}] dummy[0]/dummy[1] 应为 0"));
+            return bad(crate::tr_fmt!("solid[%{solid}] dummy[0]/dummy[1] should be 0", solid = si));
         }
 
         // ---- 走一遍树，收集 hull ----
@@ -3697,11 +3891,11 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
         let mut stack = vec![node_off];
         while let Some(off) = stack.pop() {
             if off < node_off || off + LEDGETREE_NODE_SIZE > solid_end {
-                return bad(format!("solid[{si}] 树节点 @{off} 越界"));
+                return bad(crate::tr_fmt!("solid[%{solid}] the tree node @%{off} is out of range", solid = si, off = off));
             }
             let idx = (off - node_off) / LEDGETREE_NODE_SIZE;
             if visited[idx] {
-                return bad(format!("solid[{si}] 树里有环 @{off}"));
+                return bad(crate::tr_fmt!("solid[%{solid}] the tree has a cycle @%{off}", solid = si, off = off));
             }
             visited[idx] = true;
             let right = read_i32(bytes, off);
@@ -3709,7 +3903,7 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             if rel != 0 {
                 let lo = off as i64 + rel as i64;
                 if lo < region as i64 || lo + LEDGE_HEADER_SIZE as i64 > node_off as i64 {
-                    return bad(format!("solid[{si}] hull @{lo} 落在 ledge 区之外"));
+                    return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} falls outside the ledge region", solid = si, off = lo));
                 }
                 let lo = lo as usize;
                 if !hull_offsets.contains(&lo) {
@@ -3718,27 +3912,30 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             }
             if right != 0 {
                 if right % LEDGETREE_NODE_SIZE as i32 != 0 {
-                    return bad(format!(
-                        "solid[{si}] offset_right_node={right} 不是 28 的倍数"
+                    return bad(crate::tr_fmt!(
+                        "solid[%{solid}] offset_right_node=%{right} is not a multiple of 28",
+                        solid = si,
+                        right = right
                     ));
                 }
                 // 左子恒为 this + 28。
                 stack.push(off + LEDGETREE_NODE_SIZE);
                 let r = off as i64 + right as i64;
                 if r < node_off as i64 || r + LEDGETREE_NODE_SIZE as i64 > solid_end as i64 {
-                    return bad(format!("solid[{si}] 右子节点 @{r} 越界"));
+                    return bad(crate::tr_fmt!("solid[%{solid}] the right child node @%{right} is out of range", solid = si, right = r));
                 }
                 stack.push(r as usize);
             }
         }
         if visited.iter().any(|v| !v) {
-            return bad(format!(
-                "solid[{si}] 有 {} 个树节点没被走到",
-                visited.iter().filter(|v| !**v).count()
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] %{count} tree nodes were not reached",
+                solid = si,
+                count = visited.iter().filter(|v| !**v).count()
             ));
         }
         if hull_offsets.is_empty() {
-            return bad(format!("solid[{si}] 没有任何 hull"));
+            return bad(crate::tr_fmt!("solid[%{solid}] has no hull at all", solid = si));
         }
         hull_offsets.sort_unstable();
 
@@ -3746,26 +3943,26 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
         let mut cursor = region;
         for &lo in &hull_offsets {
             if lo != cursor {
-                return bad(format!("solid[{si}] ledge 有空隙：期望 {cursor}，实际 {lo}"));
+                return bad(crate::tr_fmt!("solid[%{solid}] the ledge has a gap: expected %{want}, got %{got}", solid = si, want = cursor, got = lo));
             }
             let n_tri = read_i16(bytes, lo + 12);
             if n_tri <= 0 {
-                return bad(format!("solid[{si}] hull @{lo} 的 n_triangles={n_tri}"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} has n_triangles=%{n}", solid = si, off = lo, n = n_tri));
             }
             cursor = lo + LEDGE_HEADER_SIZE + TRIANGLE_SIZE * n_tri as usize;
             if cursor > node_off {
-                return bad(format!("solid[{si}] hull @{lo} 的三角形越过树起点"));
+                return bad(crate::tr_fmt!("solid[%{solid}] the triangles of hull @%{off} go past the start of the tree", solid = si, off = lo));
             }
         }
         // ---- 共享点数组正好填满 [最后一个 ledge 结束, 树起点) ----
         let shared_base = cursor;
         // 约束 10：16 字节对齐。
         if !(node_off - shared_base).is_multiple_of(POINT_SIZE) {
-            return bad(format!("solid[{si}] 共享点数组不是 16 字节对齐"));
+            return bad(crate::tr_fmt!("solid[%{solid}] the shared point array is not 16-byte aligned", solid = si));
         }
         let n_points = (node_off - shared_base) / POINT_SIZE;
         if n_points == 0 {
-            return bad(format!("solid[{si}] 共享点数组是空的"));
+            return bad(crate::tr_fmt!("solid[%{solid}] the shared point array is empty", solid = si));
         }
 
         for &lo in &hull_offsets {
@@ -3781,29 +3978,37 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             }
             let cpo = read_i32(bytes, lo);
             if lo as i64 + cpo as i64 != shared_base as i64 {
-                return bad(format!(
-                    "solid[{si}] hull @{lo} 的 c_point_offset={cpo} 指向 {}，应为共享数组起点 {shared_base}",
-                    lo as i64 + cpo as i64
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] hull @%{off} has c_point_offset=%{cpo} pointing at %{got}, but the shared array starts at %{want}",
+                    solid = si,
+                    off = lo,
+                    cpo = cpo,
+                    got = lo as i64 + cpo as i64,
+                    want = shared_base
                 ));
             }
             if cpo as i64 != expect_cpo {
-                return bad(format!(
-                    "solid[{si}] hull @{lo} 的 c_point_offset={cpo}，按后缀和应为 {expect_cpo}"
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] hull @%{off} has c_point_offset=%{cpo}, but the suffix sum says %{want}",
+                    solid = si,
+                    off = lo,
+                    cpo = cpo,
+                    want = expect_cpo
                 ));
             }
             // 约束 6。
             let l2 = read_u32(bytes, lo + 8);
             if (l2 & 3) != 0 {
-                return bad(format!("solid[{si}] hull @{lo} 的 has_chilren_flag != 0"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} has has_chilren_flag != 0", solid = si, off = lo));
             }
             if ((l2 >> 2) & 3) != 1 {
-                return bad(format!("solid[{si}] hull @{lo} 的 is_compact_flag != 1"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} has is_compact_flag != 1", solid = si, off = lo));
             }
             if ((l2 >> 4) & 0xF) != 0 {
-                return bad(format!("solid[{si}] hull @{lo} 的 dummy != 0"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} has dummy != 0", solid = si, off = lo));
             }
             if read_i16(bytes, lo + 14) != 0 {
-                return bad(format!("solid[{si}] hull @{lo} 的 for_future_use != 0"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} has for_future_use != 0", solid = si, off = lo));
             }
         }
 
@@ -3816,15 +4021,22 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
                 let o = lo + LEDGE_HEADER_SIZE + k * TRIANGLE_SIZE;
                 // 约束 7：tri_index 从 0 起严格递增。
                 if read_u32(bytes, o) & 0x0FFF != k as u32 {
-                    return bad(format!(
-                        "solid[{si}] hull @{lo} 第 {k} 个三角形的 tri_index != {k}"
+                    return bad(crate::tr_fmt!(
+                        "solid[%{solid}] hull @%{off} triangle %{k} has tri_index != %{k}",
+                        solid = si,
+                        off = lo,
+                        k = k
                     ));
                 }
                 let t = [0usize, 1, 2].map(|i| read_u32(bytes, o + 4 + i * 4) & 0xFFFF);
                 for &v in &t {
                     if v as usize >= n_points {
-                        return bad(format!(
-                            "solid[{si}] hull @{lo} 引用了点 {v}，但共享数组只有 {n_points} 个点"
+                        return bad(crate::tr_fmt!(
+                            "solid[%{solid}] hull @%{off} references point %{v}, but the shared array only has %{n} points",
+                            solid = si,
+                            off = lo,
+                            v = v,
+                            n = n_points
                         ));
                     }
                 }
@@ -3840,10 +4052,10 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             }
             for (&(u, v), &c) in &dir {
                 if c != 1 {
-                    return bad(format!("solid[{si}] hull @{lo} 有向边 {u}->{v} 出现 {c} 次"));
+                    return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} directed edge %{u}->%{v} appears %{c} times", solid = si, off = lo, u = u, v = v, c = c));
                 }
                 if !dir.contains_key(&(v, u)) {
-                    return bad(format!("solid[{si}] hull @{lo} 有向边 {u}->{v} 没有反向边"));
+                    return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} directed edge %{u}->%{v} has no opposite edge", solid = si, off = lo, u = u, v = v));
                 }
             }
 
@@ -3875,8 +4087,14 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
                         raw as i32
                     };
                     if got != expect {
-                        return bad(format!(
-                            "solid[{si}] hull @{lo} 三角形 {k} 边 {i} 的 opposite_index 应为 {expect}，实际 {got}"
+                        return bad(crate::tr_fmt!(
+                            "solid[%{solid}] hull @%{off} triangle %{k} edge %{i} should have opposite_index %{want}, but has %{got}",
+                            solid = si,
+                            off = lo,
+                            k = k,
+                            i = i,
+                            want = expect,
+                            got = got
                         ));
                     }
                 }
@@ -3886,9 +4104,13 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             let size_div_16 = (read_u32(bytes, lo + 8) >> 8) & 0x00FF_FFFF;
             let expect = 1 + n_tri + used.len();
             if size_div_16 as usize != expect {
-                return bad(format!(
-                    "solid[{si}] hull @{lo} 的 size_div_16={size_div_16} != 1+{n_tri}+{}",
-                    used.len()
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] hull @%{off} has size_div_16=%{got} != 1+%{n_tri}+%{points}",
+                    solid = si,
+                    off = lo,
+                    got = size_div_16,
+                    n_tri = n_tri,
+                    points = used.len()
                 ));
             }
 
@@ -3913,31 +4135,44 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             for (a, &want) in expect_center.iter().enumerate() {
                 let got = read_f32(bytes, node + 8 + a * 4);
                 if (got - want).abs() > 1e-4 {
-                    return bad(format!(
-                        "solid[{si}] hull @{lo} 节点的 center[{a}] 应为 {want}，实际 {got}"
+                    return bad(crate::tr_fmt!(
+                        "solid[%{solid}] hull @%{off} node center[%{axis}] should be %{want}, but is %{got}",
+                        solid = si,
+                        off = lo,
+                        axis = a,
+                        want = want,
+                        got = got
                     ));
                 }
             }
             let got_radius = read_f32(bytes, node + 20);
             if (got_radius - expect_radius).abs() > 1e-3 {
-                return bad(format!(
-                    "solid[{si}] hull @{lo} 节点的 radius 应为 {expect_radius}，实际 {got_radius}"
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] hull @%{off} node radius should be %{want}, but is %{got}",
+                    solid = si,
+                    off = lo,
+                    want = expect_radius,
+                    got = got_radius
                 ));
             }
             if got_radius <= 0.0 {
-                return bad(format!("solid[{si}] hull @{lo} 节点的 radius 为 0"));
+                return bad(crate::tr_fmt!("solid[%{solid}] hull @%{off} node radius is 0", solid = si, off = lo));
             }
             for a in 0..3 {
                 let got = bytes[node + 24 + a];
                 if got != expect_box[a] {
-                    return bad(format!(
-                        "solid[{si}] hull @{lo} 节点的 box_sizes[{a}] 应为 {}，实际 {got}",
-                        expect_box[a]
+                    return bad(crate::tr_fmt!(
+                        "solid[%{solid}] hull @%{off} node box_sizes[%{axis}] should be %{want}, but is %{got}",
+                        solid = si,
+                        off = lo,
+                        axis = a,
+                        want = expect_box[a],
+                        got = got
                     ));
                 }
             }
             if bytes[node + 27] != 0 {
-                return bad(format!("solid[{si}] 节点的 free_0 != 0"));
+                return bad(crate::tr_fmt!("solid[%{solid}] node free_0 != 0", solid = si));
             }
         }
 
@@ -3946,13 +4181,18 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             let rel = read_i32(bytes, node_off + 4);
             let expect = COMPACT_SURFACE_SIZE as i32 - offset_ledgetree_root;
             if rel != expect {
-                return bad(format!(
-                    "solid[{si}] 单节点树的 offset_compact_ledge 应为 {expect}，实际 {rel}"
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] the offset_compact_ledge of a single-node tree should be %{want}, but is %{got}",
+                    solid = si,
+                    want = expect,
+                    got = rel
                 ));
             }
             if rel >= 0 {
-                return bad(format!(
-                    "solid[{si}] offset_compact_ledge={rel} 应为负（ledge 在低地址）"
+                return bad(crate::tr_fmt!(
+                    "solid[%{solid}] offset_compact_ledge=%{got} should be negative (the ledge lives at a lower address)",
+                    solid = si,
+                    got = rel
                 ));
             }
         }
@@ -3978,8 +4218,11 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
             }
         }
         if (upper_limit_radius - max_d).abs() > 1e-4 {
-            return bad(format!(
-                "solid[{si}] upper_limit_radius 应为 {max_d}，实际 {upper_limit_radius}"
+            return bad(crate::tr_fmt!(
+                "solid[%{solid}] upper_limit_radius should be %{want}, but is %{got}",
+                solid = si,
+                want = max_d,
+                got = upper_limit_radius
             ));
         }
 
@@ -3992,28 +4235,30 @@ pub fn check_invariants(bytes: &[u8]) -> Result<PhyLayout, PhyError> {
     // ---- 约束 13：text section ----
     let solids_end = base;
     if solids_end >= bytes.len() {
-        return bad("没有 text section".into());
+        return bad(crate::tr("there is no text section"));
     }
     let text_size = bytes.len() - solids_end;
     let text = &bytes[solids_end..];
     if *text.last().unwrap() != 0 {
-        return bad("text section 末尾不是单个 0x00".into());
+        return bad(crate::tr("the text section does not end with a single 0x00"));
     }
     if text[..text.len() - 1].contains(&0) {
-        return bad("text section 内部有 NUL 字节".into());
+        return bad(crate::tr("the text section contains a NUL byte"));
     }
     let body = std::str::from_utf8(&text[..text.len() - 1])
-        .map_err(|e| PhyError::SelfCheck(format!("text section 不是 UTF-8：{e}")))?;
+        .map_err(|e| PhyError::SelfCheck(crate::tr_fmt!("the text section is not UTF-8: %{err}", err = e)))?;
     if !body.starts_with("solid {") {
-        return bad("text section 没有以 \"solid {\" 开头".into());
+        return bad(crate::tr("the text section does not start with \"solid {\""));
     }
     if !body.ends_with("}\n") {
-        return bad("text section 没有以 \"}\\n\" 结尾".into());
+        return bad(crate::tr("the text section does not end with \"}\\n\""));
     }
     let blocks = body.lines().filter(|l| l.starts_with("solid {")).count();
     if blocks != solid_count {
-        return bad(format!(
-            "text section 里有 {blocks} 个 \"solid {{\" 块，但 solidCount={solid_count}"
+        return bad(crate::tr_fmt!(
+            "the text section has %{blocks} \"solid {\" blocks, but solidCount=%{solid}",
+            blocks = blocks,
+            solid = solid_count
         ));
     }
 
@@ -4042,7 +4287,7 @@ fn find_node_for_hull(
             return Ok(off);
         }
     }
-    Err(PhyError::SelfCheck(format!("没有节点引用 hull @{hull_off}")))
+    Err(PhyError::SelfCheck(crate::tr_fmt!("no node references hull @%{off}", off = hull_off)))
 }
 
 // ---------------------------------------------------------------------------
@@ -4072,7 +4317,7 @@ pub fn decompose_concave(
     if vertices.is_empty() || faces.is_empty() {
         return Err(PhyError::BadParameter {
             what: "decompose_concave",
-            detail: "顶点或面表为空".into(),
+            detail: crate::tr("the vertex or face list is empty"),
         });
     }
     if vertices.len() < 4 {
@@ -4119,7 +4364,7 @@ pub fn decompose_concave(
     if out.is_empty() {
         return Err(PhyError::HullDegenerate {
             solid: 0,
-            detail: "VHACD 没有产出任何有效的凸块".into(),
+            detail: crate::tr("VHACD produced no valid convex hull at all"),
         });
     }
     Ok(out)

@@ -776,7 +776,16 @@ impl SectionOffsets {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LayoutError {
     /// 两个段的偏移顺序颠倒。
-    #[error("段顺序错误：{earlier} @{earlier_at} 应在 {later} @{later_at} 之前")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Section order is wrong: %{earlier} @%{earlier_at} should come before %{later} @%{later_at}",
+            earlier = earlier,
+            earlier_at = earlier_at,
+            later = later,
+            later_at = later_at
+        )
+    )]
     OutOfOrder {
         earlier: &'static str,
         earlier_at: usize,
@@ -784,7 +793,15 @@ pub enum LayoutError {
         later_at: usize,
     },
     /// 段的偏移超出了文件总长度。
-    #[error("段 {section} 偏移 {offset} 超出文件长度 {total}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Section %{section} offset %{offset} is beyond the file length %{total}",
+            section = section,
+            offset = offset,
+            total = total
+        )
+    )]
     BeyondEnd {
         section: &'static str,
         offset: usize,

@@ -5408,18 +5408,32 @@ pub struct DescError {
 pub enum DescErrorKind {
     /// 必填字段为空。
     ///
-    /// `message` 保留原文 —— 各处的措辞并不统一（「不能为空」、
-    /// 「网格名不能为空」、「不能为空 —— 必须指向一个 SMD 文件」…）。
-    /// 归一化会改动既有文案，而 `match` 看的是**变体**，原话用
-    /// `to_string()` 就能读到。
-    #[error("{message}")]
+    /// `message` 保留原文 —— 各处的措辞并不统一（"must not be empty"、
+    /// "the mesh name must not be empty"、"must not be empty -- it must
+    /// point to an SMD file"…）。归一化会改动既有文案，而 `match` 看的是
+    /// **变体**，原话用 `to_string()` 就能读到。
+    ///
+    /// `message` 是**可翻译片段**：值本身是英文源文，渲染时经
+    /// [`crate::tr`] 过一遍译文表（与 [`Self::BoneNotFound`] 的
+    /// `what` / `note` 同一个技巧）。它是 `&'static str`，所以能在属性里
+    /// 直接过译文表 —— 不像 [`Self::Other`] 那样只能在构造点翻译。
+    #[error("{}", crate::tr(message))]
     Empty { message: &'static str },
 
     /// 引用了不存在的骨骼。
     ///
-    /// `what` 是限定语（`"父"` → 「找不到父骨骼」，空串 → 「找不到骨骼」），
-    /// `note` 是少数几处额外的补充说明。
-    #[error("找不到{what}骨骼 {bone:?}{note}")]
+    /// `what` 是限定语（`"parent "` → 「找不到父骨骼」，空串 → 「找不到骨骼」），
+    /// `note` 是少数几处额外的补充说明。**两者都是可翻译片段** ——
+    /// 值本身是英文源文，渲染时经 [`crate::tr`] 过一遍译文表。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Cannot find the %{what}bone %{bone}%{note}",
+            what = crate::tr(what),
+            bone = format!("{bone:?}"),
+            note = crate::tr(note)
+        )
+    )]
     BoneNotFound {
         what: &'static str,
         bone: String,
@@ -5427,36 +5441,78 @@ pub enum DescErrorKind {
     },
 
     /// 父骨骼排在本骨骼之后（官方要求父骨骼必须先出现）。
-    #[error("父骨骼 {bone:?} 排在本骨骼之后；父骨骼必须先出现")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "The parent bone %{bone} comes after this bone; parents must come first",
+            bone = format!("{bone:?}")
+        )
+    )]
     ParentBoneOutOfOrder { bone: String },
 
     /// 引用了不存在的权重表。
-    #[error("找不到权重表 {name:?}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Cannot find the weight list %{name}",
+            name = format!("{name:?}")
+        )
+    )]
     WeightListNotFound { name: String },
 
     /// 名字重复。
-    #[error("{what}重复：{name:?}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Duplicate %{what}: %{name}",
+            what = crate::tr(what),
+            name = format!("{name:?}")
+        )
+    )]
     Duplicate { what: &'static str, name: String },
 
     /// 数值不是有限数（NaN / ±inf）。
-    #[error("不是有限数{}", .value.as_ref().map(|v| format!("：{v}")).unwrap_or_default())]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Not a finite number%{value}",
+            value = .value.as_ref().map(|v| crate::tr_fmt!(": %{v}", v = v)).unwrap_or_default()
+        )
+    )]
     NotFinite { value: Option<String> },
 
     /// 数值必须是**正**有限数（`fps` / `src_scale` / `src_fps` 之类）。
     ///
-    /// `detail` 是「实际」与数值之间的那个字 —— 历史上有「实际**为** x」
-    /// 与「实际 x」两种措辞，都在用，所以原样保留。
-    #[error("必须是正有限数，实际{detail} {value}")]
+    /// `detail` 是「实际」与数值之间的那个连接词 —— 历史上有「实际**为** x」
+    /// 与「实际 x」两种措辞，都在用，所以原样保留。它也是可翻译片段。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Must be a positive finite number, but got %{detail}%{value}",
+            detail = crate::tr(detail),
+            value = value
+        )
+    )]
     NotPositive {
         detail: &'static str,
         value: String,
     },
 
     /// 版本号不在支持范围（44 / 48 / 49）。
-    #[error("只支持 44 / 48 / 49，实际为 {version}")]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Only 44 / 48 / 49 are supported, but the version is %{version}",
+            version = version
+        )
+    )]
     UnsupportedVersion { version: i32 },
 
     /// 其余检查：只产出一句话，没有更细的结构。
+    ///
+    /// ⚠️ `message` 是**运行时 `format!` 出来的**（带数值、带常量），
+    /// 所以属性里写不出 `crate::tr(message)` —— 译文必须在**构造点**
+    /// 用 [`crate::tr_fmt`] 做好。改这里的文案要连着改构造点。
     #[error("{message}")]
     Other { message: String },
 }
@@ -5493,10 +5549,10 @@ pub enum TomlError {
     /// `toml::from_str` 失败（语法错 / 未知字段 / 类型不符）。
     ///
     /// 源错误里保留着行列信息：`Display` 会渲染成带 `^` 指示的多行文本。
-    #[error("TOML 解析失败：{0}")]
+    #[error("{}", crate::tr_fmt!("TOML parse failed: %{err}", err = .0))]
     Parse(#[from] toml::de::Error),
     /// `toml::to_string_pretty` 失败。
-    #[error("TOML 序列化失败：{0}")]
+    #[error("{}", crate::tr_fmt!("TOML serialization failed: %{err}", err = .0))]
     Serialize(#[from] toml::ser::Error),
 }
 
@@ -5577,7 +5633,9 @@ impl ModelDesc {
         if self.model.name.trim().is_empty() {
             errs.push(DescError {
                 path: "model.name".into(),
-                kind: DescErrorKind::Empty { message: "不能为空" },
+                kind: DescErrorKind::Empty {
+                        message: "must not be empty",
+                    },
             });
         }
         if !matches!(self.version(), 44 | 48 | 49) {
@@ -5594,7 +5652,9 @@ impl ModelDesc {
             errs.push(DescError {
                 path: "bones".into(),
                 kind: DescErrorKind::Other {
-                    message: "至少需要一根骨骼（哪怕是静态道具的单一根骨骼）".into(),
+                    message: "at least one bone is required (even a static prop needs its \
+                              single root bone)"
+                        .into(),
                 },
             });
         }
@@ -5604,14 +5664,14 @@ impl ModelDesc {
             if b.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             if seen.insert(b.name.as_str(), i).is_some() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     kind: DescErrorKind::Duplicate {
-                        what: "骨骼名",
+                        what: "bone name",
                         name: b.name.clone(),
                     },
                 });
@@ -5628,7 +5688,7 @@ impl ModelDesc {
                     None => errs.push(DescError {
                         path: format!("{path}.parent"),
                         kind: DescErrorKind::BoneNotFound {
-                            what: "父",
+                            what: "parent ",
                             bone: p.clone(),
                             note: "",
                         },
@@ -5672,14 +5732,14 @@ impl ModelDesc {
             if bp.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{bpath}.name"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             if bp.models.is_empty() {
                 errs.push(DescError {
                     path: format!("{bpath}.models"),
                     kind: DescErrorKind::Other {
-                        message: "至少需要一个 model".into(),
+                        message: "at least one model is required".into(),
                     },
                 });
             }
@@ -5690,7 +5750,7 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{mpath}.smd"),
                         kind: DescErrorKind::Empty {
-                            message: "不能为空 —— 必须指向一个 SMD 文件",
+                            message: "must not be empty -- it must point to an SMD file",
                         },
                     });
                 }
@@ -5700,7 +5760,10 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{mpath}.name"),
                         kind: DescErrorKind::Other {
-                            message: format!("过长：{} 字节，上限 63", n.len()),
+                            message: crate::tr_fmt!(
+                                "too long: %{len} bytes, limit 63",
+                                len = n.len()
+                            ),
                         },
                     });
                 }
@@ -5710,10 +5773,10 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{mpath}.lods"),
                         kind: DescErrorKind::Other {
-                            message: format!(
-                                "LOD 过多：{} 层（含 LOD 0），引擎上限 {}",
-                                m.lods.len() + 1,
-                                crate::vvd::MAX_NUM_LODS
+                            message: crate::tr_fmt!(
+                                "too many LODs: %{count} levels (LOD 0 included), the engine limit is %{max}",
+                                count = m.lods.len() + 1,
+                                max = crate::vvd::MAX_NUM_LODS
                             ),
                         },
                     });
@@ -5727,18 +5790,18 @@ impl ModelDesc {
                             errs.push(DescError {
                                 path: format!("{lpath}.smd"),
                                 kind: DescErrorKind::Empty {
-                                    message: "不能为空 —— 要么省略（复用 LOD 0 的网格），\
-                                              要么指向一个 SMD 文件",
+                                    message: "must not be empty -- either omit it (to reuse \
+                                              the LOD 0 mesh) or point it to an SMD file",
                                 },
                             });
                         } else if s == m.smd {
                             errs.push(DescError {
                                 path: format!("{lpath}.smd"),
                                 kind: DescErrorKind::Other {
-                                    message: format!(
-                                        "与 LOD 0 的 smd 相同（{:?}）—— \
-                                         同一个网格请**省略** smd，只写骨骼选项",
-                                        m.smd
+                                    message: crate::tr_fmt!(
+                                        "same as the LOD 0 smd (%{smd}) -- for the same mesh \
+                                         **omit** smd and only write the bone options",
+                                        smd = format!("{:?}", m.smd)
                                     ),
                                 },
                             });
@@ -5803,7 +5866,8 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.bbmin"),
                     kind: DescErrorKind::Other {
-                        message: "包围盒退化（bbmin 每个分量都 ≥ bbmax）".into(),
+                        message: "degenerate bounding box (every bbmin component is >= bbmax)"
+                            .into(),
                     },
                 });
             }
@@ -5816,7 +5880,7 @@ impl ModelDesc {
             if at.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             // 合成附着点（`$illumposition x y z <骨骼>`）两条都豁免：
@@ -5827,7 +5891,7 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     kind: DescErrorKind::Duplicate {
-                        what: "附着点名",
+                        what: "attachment name",
                         name: at.name.clone(),
                     },
                 });
@@ -5855,7 +5919,7 @@ impl ModelDesc {
             if s.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             // 重名判定**只对实体序列**生效 —— 官方 `Cmd_Sequence` 走
@@ -5869,7 +5933,7 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     kind: DescErrorKind::Duplicate {
-                        what: "序列名",
+                        what: "sequence name",
                         name: s.name.clone(),
                     },
                 });
@@ -5883,7 +5947,9 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{path}.smd"),
                         kind: DescErrorKind::Other {
-                            message: "前向声明（`$declaresequence`）的空壳不该有 smd".into(),
+                            message: "the empty shell of a forward declaration \
+                                      (`$declaresequence`) must not have an smd"
+                                .into(),
                         },
                     });
                 }
@@ -5893,7 +5959,7 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.smd"),
                     kind: DescErrorKind::Empty {
-                        message: "不能为空 —— 必须指向一个含多帧 skeleton 的 SMD",
+                        message: "must not be empty -- it must point to an SMD with a multi-frame skeleton",
                     },
                 });
             }
@@ -5903,7 +5969,7 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.fps"),
                     kind: DescErrorKind::NotPositive {
-                        detail: "为",
+                        detail: "",
                         value: format!("{fps}"),
                     },
                 });
@@ -5939,11 +6005,12 @@ impl ModelDesc {
             errs.push(DescError {
                 path: "weight_lists".into(),
                 kind: DescErrorKind::Other {
-                    message: format!(
-                        "表过多：{} 张，官方上限 {MAX_WEIGHT_LISTS}（含隐式默认表 0，\
-                         所以手写最多 {} 张）",
-                        self.weight_lists.len(),
-                        MAX_WEIGHT_LISTS - 1
+                    message: crate::tr_fmt!(
+                        "too many tables: %{count}, the official limit is %{max} (the implicit \
+                         default table 0 is included, so at most %{hand} may be written by hand)",
+                        count = self.weight_lists.len(),
+                        max = MAX_WEIGHT_LISTS,
+                        hand = MAX_WEIGHT_LISTS - 1
                     ),
                 },
             });
@@ -5953,7 +6020,7 @@ impl ModelDesc {
             if wl.name.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.name"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             if wl_names
@@ -5963,7 +6030,7 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.name"),
                     kind: DescErrorKind::Duplicate {
-                        what: "权重表名",
+                        what: "weight list name",
                         name: wl.name.clone(),
                     },
                 });
@@ -5974,9 +6041,10 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: format!("{path}.bones"),
                     kind: DescErrorKind::Other {
-                        message: format!(
-                            "条目过多：{} 条，官方上限 {MAX_WEIGHT_ENTRIES}",
-                            wl.bones.len()
+                        message: crate::tr_fmt!(
+                            "too many entries: %{count}, the official limit is %{max}",
+                            count = wl.bones.len(),
+                            max = MAX_WEIGHT_ENTRIES
                         ),
                     },
                 });
@@ -5988,8 +6056,8 @@ impl ModelDesc {
                         kind: DescErrorKind::BoneNotFound {
                             what: "",
                             bone: e.bone.clone(),
-                            note: " —— 官方这里是 MdlError（`unknown bone \
-                                   reference`），不是 warning",
+                            note: " -- the official code raises MdlError \
+                                   (`unknown bone reference`) here, not a warning",
                         },
                     });
                 }
@@ -6033,7 +6101,7 @@ impl ModelDesc {
             if j.bone.trim().is_empty() {
                 errs.push(DescError {
                     path: format!("{path}.bone"),
-                    kind: DescErrorKind::Empty { message: "不能为空" },
+                    kind: DescErrorKind::Empty { message: "must not be empty" },
                 });
             }
             let has_blocks =
@@ -6042,9 +6110,10 @@ impl ModelDesc {
                 errs.push(DescError {
                     path: path.clone(),
                     kind: DescErrorKind::Other {
-                        message: "`writes` 与 `is_flexible`/`is_rigid`/`has_base_spring` \
-                                  不能同时给出：`writes` 是 QC 的无损写入日志（含顺序），\
-                                  三个块是按固定顺序合并的便捷语法，两者含义不同"
+                        message: "`writes` and `is_flexible`/`is_rigid`/`has_base_spring` \
+                                  cannot be given together: `writes` is the QC's lossless write \
+                                  log (order included), while the three blocks are a convenience \
+                                  syntax merged in a fixed order -- the two mean different things"
                             .into(),
                     },
                 });
@@ -6054,10 +6123,10 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{path}.writes[{k}].key"),
                         kind: DescErrorKind::Other {
-                            message: format!(
-                                "未知的 `$jigglebone` 键 {:?}（官方会 abort：\
-                                 `$jigglebone: invalid syntax`）",
-                                w.key
+                            message: crate::tr_fmt!(
+                                "unknown `$jigglebone` key %{key} (the official code aborts with \
+                                 `$jigglebone: invalid syntax`)",
+                                key = format!("{:?}", w.key)
                             ),
                         },
                     });
@@ -6091,9 +6160,10 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{path}.src_axis"),
                         kind: DescErrorKind::Other {
-                            message: format!(
-                                "只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，\
-                                 大小写不敏感），实际 {a:?}"
+                            message: crate::tr_fmt!(
+                                "only \"y\" / \"z\" are accepted (yup / y-up / zup / z-up \
+                                 are also accepted, case-insensitively), but got %{value}",
+                                value = format!("{:?}", a)
                             ),
                         },
                     });
@@ -6104,7 +6174,7 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{path}.src_material"),
                         kind: DescErrorKind::Empty {
-                            message: "不能为空（省略这个字段就是官方的 debug/debugempty）",
+                            message: "must not be empty (omitting this field is the official debug/debugempty)",
                         },
                     });
                 }
@@ -6113,7 +6183,7 @@ impl ModelDesc {
                         errs.push(DescError {
                             path: format!("{path}.src_parts[{k}]"),
                             kind: DescErrorKind::Empty {
-                                message: "网格名不能为空",
+                                message: "the mesh name must not be empty",
                             },
                         });
                     }
@@ -6123,7 +6193,7 @@ impl ModelDesc {
                         errs.push(DescError {
                             path: format!("{path}.src_shape_keys[{k}]"),
                             kind: DescErrorKind::Empty {
-                                message: "形变目标名不能为空",
+                                message: "the morph target name must not be empty",
                             },
                         });
                     }
@@ -6133,7 +6203,7 @@ impl ModelDesc {
                         errs.push(DescError {
                             path: format!("{path}.src_shape_key_order[{k}]"),
                             kind: DescErrorKind::Empty {
-                                message: "形变目标名不能为空",
+                                message: "the morph target name must not be empty",
                             },
                         });
                     }
@@ -6146,8 +6216,9 @@ impl ModelDesc {
                     errs.push(DescError {
                         path: format!("{path}.src_shape_key_ignore"),
                         kind: DescErrorKind::Other {
-                            message: "与 `src_shape_keys` / `src_shape_key_order` 不能同时给出：\
-                                      前者是「一个形变目标都不要」，后两者是「按名单取」"
+                            message: "cannot be given together with `src_shape_keys` / \
+                                      `src_shape_key_order`: the former means \"no morph target \
+                                      at all\", the latter two mean \"take them by name\""
                                 .into(),
                         },
                     });
@@ -6455,7 +6526,7 @@ pos_weight = 0.25
         assert!(
             errs.iter().any(|e| matches!(
                 &e.kind,
-                DescErrorKind::BoneNotFound { what: "父", bone, .. } if bone == "ghost"
+                DescErrorKind::BoneNotFound { what: "parent ", bone, .. } if bone == "ghost"
             )),
             "{errs:?}"
         );
@@ -6479,10 +6550,11 @@ pos_weight = 0.25
             "smd = \"minimal-ref.smd\"\nname = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"",
         );
         let d = ModelDesc::from_toml(&bad).unwrap();
-        let errs = d.validate().unwrap_err();
+        // ⚠️ `Other` 的 message 在 `validate()` 里就渲染好了，语言要在那一刻生效。
+        let errs = crate::test_locale::with_english(|| d.validate().unwrap_err());
         assert!(
             errs.iter()
-                .any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("过长"))),
+                .any(|e| matches!(&e.kind, DescErrorKind::Other { message } if message.contains("too long"))),
             "{errs:?}"
         );
     }
