@@ -117,8 +117,8 @@ _version: 2
 "Checksum of the paired .mdl (decimal or 0x hex), default 0":
   zh-CN: "配对 .mdl 的 checksum（十进制或 0x 十六进制），默认 0"
 
-"$mass equivalent total mass, default 1 (the official default; see the --automass note)":
-  zh-CN: "$mass 等效总质量，默认 1（官方缺省；见 --automass 说明）"
+"$mass equivalent total mass, default 1 (the official default; automatic mass via [physics].auto_mass is not supported)":
+  zh-CN: "$mass 等效总质量，默认 1（官方缺省；[physics].auto_mass 的自动质量不支持）"
 
 "Surface material, default default":
   zh-CN: "表面材质，默认 default"
@@ -128,9 +128,6 @@ _version: 2
 
 "VHACD approximate convex decomposition. Non-official semantics: concavities are preserved, whereas the official $concave fills them in":
   zh-CN: "VHACD 近似凸分解。非官方语义：保留凹口，而官方 $concave 是填平"
-
-"Legacy alias of --vhacd (kept so existing scripts keep working; its meaning is now unambiguously VHACD)":
-  zh-CN: "--vhacd 的旧别名（保留以免破坏既有脚本；语义已明确为 VHACD）"
 
 "$collisionjoints: group by skin-weight bone, one solid per bone":
   zh-CN: "$collisionjoints：按蒙皮权重骨骼分组，每个骨骼一个 solid"
@@ -164,3 +161,290 @@ _version: 2
 
 "Game directory (the official -game); output goes to <gamedir>/models/":
   zh-CN: "游戏目录（官方 -game）；产物写到 <gamedir>\\models\\"
+
+# ---------------------------------------------------------------------------
+# 诊断与错误文案（`log::info!` / `log::warn!` / `log::error!` 与 `#[error(...)]`）
+#
+# ⚠️ 这一批的源文风格是固定的三个前缀：`Note: ` / `Warning: ` / `Error: `。
+# 译文对应「提示：」/「警告：」/「错误：」，与第一期之前的手写文案一致。
+#
+# ⚠️ 带参数的条目里，占位符写成 `%{名}`（`rust-i18n` 的 `replace_patterns`
+# 语法，见 `rust_i18n::replace_patterns`）。**占位符名不翻译**，译文里必须
+# 与源文用同一批名字，否则替换不到、用户会看到裸露的 `%{...}`。
+#
+# ⚠️ 反引号里的命令名 / TOML 键 / QC 关键字（`srcpart` / `$lod` / …）一律
+# **不翻译** —— 它们是用户要照着敲的字面量。
+# ---------------------------------------------------------------------------
+
+# --- 提示（Note）-----------------------------------------------------------
+
+"Note: the %{n} meshes of %{at} were merged into one part: %{meshes}. The official tool merges them the same way (part boundaries are lost); to keep them apart, select them one by one with `srcpart`, or split them into several `$body` / `$model` blocks.":
+  zh-CN: "提示：%{at} 的 %{n} 块网格被合并进同一个部件：%{meshes}。官方同样合并（部件边界丢失）；要分开请用 `srcpart` 逐个选，或拆成多条 `$body` / `$model`。"
+
+"Note: the meshes %{meshes} of %{at} have no material, so %{fallback} was synthesized. To use another name, write `srcmaterial \"...\"`.":
+  zh-CN: "提示：%{at} 的网格 %{meshes} 没有材质，已合成 %{fallback}。要改用别的名字写 `srcmaterial \"...\"`。"
+
+"Note: %{at} has %{n} animation stacks %{stacks}; both the official tool and mdlc use only the **first** one by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).":
+  zh-CN: "提示：%{at} 有 %{n} 条动画栈 %{stacks}；官方与 mdlc 默认都只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。"
+
+"%{name}(frame %{frame})":
+  zh-CN: "%{name}(帧 %{frame})"
+
+"Note: the %{n} shape keys of %{at} were registered as flexes automatically: %{list}. To control which ones are taken, their order, or to ignore some, use `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`.":
+  zh-CN: "提示：%{at} 的 %{n} 个 shape key 已自动注册成 flex：%{list}。要控制取哪些 / 顺序 / 忽略，用 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`。"
+
+"%{path} is used as both the mesh source and the animation source. FBX can hold meshes and animation together, and mdlc read %{n_frames} frames as usual — but the official studiomdl **silently** produces only 1 frame in this combination (measured: exit=0, no warning; see docs/fbx-support.md §4.4). This is a **deliberate deviation**: mdlc does not copy that degenerate behavior. ⚠️ If you are comparing against the official output, a frame-count mismatch here is **expected**. To make the two agree, split the animation into a separate FBX file (both the official tool and mdlc handle that normally).":
+  zh-CN: "%{path} 同时用作网格源与动画源。FBX 可以同时包含网格与动画，mdlc 正常采出了 %{n_frames} 帧 —— 但官方 studiomdl 在这个组合下会**静默地**只产出 1 帧（实测 exit=0、无警告，见 docs/fbx-support.md §4.4）。这是**有意的偏离**：mdlc 不复制这个退化行为。⚠️ 若你在与官方产物对照，这里的帧数不一致是**预期**的。想让两边一致，把动画拆到独立的 FBX 文件（官方与 mdlc 都会正常）。"
+
+"Note: the bone %{bone} of %{at} was not found; skipped, matching the official behavior":
+  zh-CN: "提示：%{at} 骨骼 %{bone} 找不到，按官方行为跳过"
+
+"Note: %{path} has %{n} animation stacks %{names}; only the **first** one is used by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).":
+  zh-CN: "提示：%{path} 有 %{n} 条动画栈 %{names}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。"
+
+"Note: %{path} has %{n} animations %{names}; only the **first** one is used by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).":
+  zh-CN: "提示：%{path} 有 %{n} 条动画 %{names}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。"
+
+"Note: %{at} has %{n} accessors without a `bufferView`; per the glTF spec they mean **all zero**, and they were treated that way (the validation layer of `gltf` 1.4.1 misjudges them as an error; mdlc takes the read path that bypasses validation).":
+  zh-CN: "提示：%{at} 有 %{n} 个 accessor 没有 `bufferView`；按 glTF 规范它们表示**全零**，已照此处理（`gltf` 1.4.1 的校验层会把它误判为错误，mdlc 走的是绕校验的读取路径）。"
+
+"Note: %{at} has %{n} animation channels interpolated with `CubicSpline`; mdlc resamples them **linearly** (the cubic spline's tangent information is ignored). To avoid this note, make the exporter use `LINEAR`.":
+  zh-CN: "提示：%{at} 有 %{n} 个动画通道用 `CubicSpline` 插值；mdlc 按**线性**重采样（三次样条的切线信息被忽略）。要避免这条提示请让导出器改用 `LINEAR`。"
+
+"Note: %{at} has %{n} animation channels driving `MorphTargetWeights` (per-frame morph weights); mdlc does **not** do per-frame morph weights — morphs are controlled only by the QC `flex` statements, and these channels are ignored.":
+  zh-CN: "提示：%{at} 有 %{n} 个动画通道驱动 `MorphTargetWeights`（逐帧表情权重）；mdlc **不做**逐帧表情权重 —— 表情只由 QC 的 `flex` 语句控制，这些通道被忽略。"
+
+"Note: the VRD pointed to by $proceduralbones does not exist; skipped, matching the official behavior: %{path}":
+  zh-CN: "提示：$proceduralbones 指向的 VRD 不存在，按官方行为跳过：%{path}"
+
+"Note: $lod names %{n} bones that do not exist; skipped, matching the official behavior: %{list}":
+  zh-CN: "提示：$lod 里有 %{n} 个不存在的骨骼，已按官方行为跳过：%{list}"
+
+"Note: mdlc %{latest} is available (you have v%{current}) — https://github.com/%{repo}/releases/latest":
+  zh-CN: "提示：mdlc 有新版本 %{latest}（当前 v%{current}）—— https://github.com/%{repo}/releases/latest"
+
+# --- 错误（Error）-----------------------------------------------------------
+#
+# 这些是 `PipelineError` 的 `#[error(...)]` 文案。`thiserror` 要求属性第一个
+# token 是字符串字面量，所以源码里写成 `#[error("{}", crate::tr_fmt!(...))]`
+# —— 键仍然是这里的第一列。
+
+"Compilation failed with %{n} error(s):":
+  zh-CN: "编译失败，%{n} 处错误："
+
+"Error: %{err}":
+  zh-CN: "错误：%{err}"
+
+"Error: cannot read collision SMD %{path}: %{err}":
+  zh-CN: "错误：读不到碰撞 SMD %{path}：%{err}"
+
+"Error: cannot parse collision SMD %{path}: %{err}":
+  zh-CN: "错误：解析碰撞 SMD %{path} 失败：%{err}"
+
+"Error: cannot build VVD: %{err}":
+  zh-CN: "错误：构造 VVD 失败：%{err}"
+
+"Error: cannot encode VVD: %{err}":
+  zh-CN: "错误：写出 VVD 失败：%{err}"
+
+"Error: the VVD we wrote is not self-consistent (bug in mdlc): %{err}":
+  zh-CN: "错误：写出的 VVD 不自洽（本实现的 bug）：%{err}"
+
+"Error: cannot write VTX: %{err}":
+  zh-CN: "错误：写出 VTX 失败：%{err}"
+
+"Error: the VTX we wrote is not self-consistent (bug in mdlc): %{err}":
+  zh-CN: "错误：写出的 VTX 不自洽（本实现的 bug）：%{err}"
+
+"Error: cannot build PHY: %{err}":
+  zh-CN: "错误：构造 PHY 失败：%{err}"
+
+"Error: the PHY we wrote failed self-check (bug in mdlc): %{err}":
+  zh-CN: "错误：写出的 PHY 自检失败（本实现的 bug）：%{err}"
+
+"Error: cannot create directory %{path}: %{err}":
+  zh-CN: "错误：建目录 %{path} 失败：%{err}"
+
+"Error: cannot write %{path}: %{err}":
+  zh-CN: "错误：写 %{path} 失败：%{err}"
+
+# --- 提示 / 警告 / 错误：官方兼容形态 ---------------------------------------
+
+"Warning: ignoring unrecognized option(s) %{names} (not implemented by mdlc, or not an official option)":
+  zh-CN: "警告：忽略无法识别的选项 %{names}（mdlc 未实现或非官方选项）"
+
+"Warning: the official option -%{name} is not implemented yet; ignored":
+  zh-CN: "警告：官方选项 -%{name} 尚未实现，已忽略"
+
+"Error: missing the .qc file argument":
+  zh-CN: "错误：缺少 .qc 文件参数"
+
+"Usage: mdlc -game <gamedir> [options] <model.qc>":
+  zh-CN: "用法：mdlc -game <gamedir> [选项] <model.qc>"
+
+# --- 错误：通用读写 / 解析 ---------------------------------------------------
+
+"Error: cannot read %{path}: %{err}":
+  zh-CN: "错误：读不到 %{path}：%{err}"
+
+"Error: cannot parse: %{err}":
+  zh-CN: "错误：解析失败：%{err}"
+
+"Error: cannot parse %{path}: %{err}":
+  zh-CN: "错误：解析 %{path} 失败：%{err}"
+
+"Error: %{path} contains no triangles":
+  zh-CN: "错误：%{path} 里没有任何三角形"
+
+"Error: only %{n} distinct vertices after welding; a hull needs at least 4":
+  zh-CN: "错误：焊接后只有 %{n} 个不同顶点，凸包至少要 4 个"
+
+"Error: cannot build the ragdoll: %{err}":
+  zh-CN: "错误：ragdoll 构造失败：%{err}"
+
+"Error: $concave decomposition failed: %{err}":
+  zh-CN: "错误：$concave 分解失败：%{err}"
+
+"convex decomposition failed: %{err}":
+  zh-CN: "凸分解失败：%{err}"
+
+"cannot compute the convex hull: %{err}":
+  zh-CN: "算凸包失败：%{err}"
+
+"Error: cannot write PHY: %{err}":
+  zh-CN: "错误：写出 PHY 失败：%{err}"
+
+# --- 错误计数表头 -----------------------------------------------------------
+#
+# 「N 处错误：」之后逐条 `  - <err>` 缩进列出。`  - ` 前缀在源码里是**字面量**，
+# 不进译文表（它没有可翻译的内容）。
+
+"The description file has %{n} error(s):":
+  zh-CN: "描述文件有 %{n} 处错误："
+
+"%{path} has %{n} error(s):":
+  zh-CN: "%{path} 有 %{n} 处错误："
+
+"Cannot parse %{path}: %{n} error(s):":
+  zh-CN: "%{path} 解析失败，%{n} 处错误："
+
+"The parsed description has %{n} error(s):":
+  zh-CN: "解析出的描述有 %{n} 处错误："
+
+# --- `check` 报表 -----------------------------------------------------------
+
+"%{path} is valid":
+  zh-CN: "%{path} 合法"
+
+"  bones %{bones}, materials %{materials}, body parts %{bodyparts}, vertices %{vertices}, triangles %{triangles}":
+  zh-CN: "  骨骼 %{bones}，材质 %{materials}，body part %{bodyparts}，顶点 %{vertices}，三角形 %{triangles}"
+
+"    bodyparts[%{bi}].models[%{mi}] %{name} <- %{smd} (%{meshes} mesh(es), %{vertices} vertices)":
+  zh-CN: "    bodyparts[%{bi}].models[%{mi}] %{name} ← %{smd}（%{meshes} mesh，%{vertices} 顶点）"
+
+"  bounds %{min} .. %{max}":
+  zh-CN: "  包围盒 %{min} .. %{max}"
+
+# --- `qc2toml` 报表 ---------------------------------------------------------
+
+"%{qc} -> %{out}":
+  zh-CN: "%{qc} → %{out}"
+
+"  bones %{bones}, materials %{materials}, body parts %{bodyparts}, sequences %{sequences}, animations %{animations}":
+  zh-CN: "  骨骼 %{bones}，材质 %{materials}，body part %{bodyparts}，序列 %{sequences}，动画 %{animations}"
+
+# --- `vvd-info` 报表 --------------------------------------------------------
+#
+# 标签后的空格是**对齐用的填充**，译文里保留等宽形态（中文标签占两个西文字符
+# 宽，所以对齐点会与英文版略有出入 —— 这是刻意的，不为此改标签）。
+
+"file        %{path}":
+  zh-CN: "文件        %{path}"
+
+"length      %{n} bytes":
+  zh-CN: "长度        %{n} 字节"
+
+"checksum    %{checksum}  (paired with .mdl/.vtx/.phy; not a content hash)":
+  zh-CN: "checksum    %{checksum}  （与 .mdl/.vtx/.phy 配对，非内容哈希）"
+
+"numLODs     %{n}":
+  zh-CN: "numLODs     %{n}"
+
+"vertices    %{n}   (numLODVertexes[0]; also the tangent count)":
+  zh-CN: "顶点数      %{n}   （numLODVertexes[0]，也是切线数）"
+
+"numLODVertexes  %{list}":
+  zh-CN: "numLODVertexes  %{list}"
+
+"numFixups   %{n}":
+  zh-CN: "numFixups   %{n}"
+
+"vertex block      @ %{start}  (%{n} x 48 = %{bytes} bytes)":
+  zh-CN: "顶点块      @ %{start}  （%{n} × 48 = %{bytes} 字节）"
+
+"tangent block     @ %{start}  (%{n} x 16 = %{bytes} bytes)":
+  zh-CN: "切线块      @ %{start}  （%{n} × 16 = %{bytes} 字节）"
+
+"expected length   %{n} bytes":
+  zh-CN: "预期总长    %{n} 字节"
+
+"self-consistency  passed (offsets, lengths and block sizes all agree)":
+  zh-CN: "自洽性      通过（偏移、长度、块大小全部一致）"
+
+"self-consistency  **FAILED**: %{err}":
+  zh-CN: "自洽性      **失败**：%{err}"
+
+"first vertex    pos=%{pos} nrm=%{nrm} uv=%{uv}":
+  zh-CN: "首个顶点    pos=%{pos} nrm=%{nrm} uv=%{uv}"
+
+"            weight=%{weight} bone=%{bone} boneCount=%{n}":
+  zh-CN: "            weight=%{weight} bone=%{bone} boneCount=%{n}"
+
+# --- `vvd-roundtrip` 报表 ---------------------------------------------------
+
+"original    %{n} bytes":
+  zh-CN: "原文件      %{n} 字节"
+
+"rewritten   %{n} bytes":
+  zh-CN: "重写后      %{n} 字节"
+
+"result      **byte-for-byte identical** (all %{n} bytes match)":
+  zh-CN: "结果        **逐字节完全相同**（%{n} 字节全部一致）"
+
+"result      **MISMATCH**: first difference @%{at}, %{n} bytes differ":
+  zh-CN: "结果        **不一致**：首个差异 @%{at}，共 %{n} 字节不同"
+
+# --- `phy` 报表（ragdoll 与普通两条路径共用）--------------------------------
+
+"input       %{path}":
+  zh-CN: "输入        %{path}"
+
+"output      %{path}":
+  zh-CN: "输出        %{path}"
+
+"checksum    0x%{checksum}":
+  zh-CN: "checksum    0x%{checksum}"
+
+"triangles   %{tris} (%{verts} distinct vertices after welding)":
+  zh-CN: "三角形      %{tris}（焊接后 %{verts} 个不同顶点）"
+
+"solid       %{n} (ragdoll, one per bone)":
+  zh-CN: "solid       %{n}（ragdoll，每骨骼一个）"
+
+"solid       %{solids} (%{hulls} convex piece(s) in total)":
+  zh-CN: "solid       %{solids}（共 %{hulls} 个凸块）"
+
+"file        %{n} bytes":
+  zh-CN: "文件        %{n} 字节"
+
+"solid       %{n}":
+  zh-CN: "solid       %{n}"
+
+"text block  %{n} bytes  @ %{at}":
+  zh-CN: "text 段     %{n} 字节  @ %{at}"
+
+"  solid[%{i}]  surfaceSize=%{surf}  ledge region=%{ledge}  tree nodes=%{nodes}":
+  zh-CN: "  solid[%{i}]  surfaceSize=%{surf}  ledge 区=%{ledge}  树节点=%{nodes}"
+
+"**write succeeded** (all 13 hard constraints self-checked)":
+  zh-CN: "**写出成功**（13 条硬约束自检全部通过）"

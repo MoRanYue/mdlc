@@ -76,6 +76,9 @@ pub mod tangent;
 /// 真实素材测试的路径解析（**仅测试**，`#[cfg(test)]`）。
 #[cfg(test)]
 pub mod test_assets;
+/// 测试里切换语言（**仅测试**，`#[cfg(test)]`）。
+#[cfg(test)]
+pub mod test_locale;
 pub mod update;
 pub mod vta;
 pub mod vtx_writer;
@@ -111,6 +114,43 @@ rust_i18n::i18n!("locales");
 /// `about` / `help` / `value_name`（要 owned）或 `log::info!` 的格式串。
 pub fn tr(key: &str) -> String {
     rust_i18n::t!(key).into_owned()
+}
+
+/// 取一条译文并做占位符替换（自有文案的**带参数**版本）。
+///
+/// `args` 是 `(占位符名, 值)` 对；源文与译文里都写 `%{名}`。源文（英文）
+/// 本身就是键，所以**未命中译文时照样能替换** —— 英文用户看到的是填好值
+/// 的英文句子，而不是带着 `%{...}` 的模板。
+///
+/// 为什么不直接用 `rust_i18n::t!(key, name = value)`：那个形态把参数名
+/// 当**标识符**解析（`tr.rs` 的 `Argument::parse`），且每个参数都要在宏里
+/// 逐个写死。这里的调用点大多是「格式串 + 若干 `format!` 值」，用切片传
+/// 更顺手，也免得为每条文案写一个专门的宏调用。
+///
+/// ⚠️ 占位符名要避开值里可能出现的字面 `%{`；本仓库的文案都只用
+/// `{name}` / `{n}` / `{path}` 这类简单名，且值由 `format!` 产出、不含 `%{`。
+pub fn tr_args(key: &str, args: &[(&str, String)]) -> String {
+    let names: Vec<&str> = args.iter().map(|(k, _)| *k).collect();
+    let values: Vec<String> = args.iter().map(|(_, v)| v.clone()).collect();
+    rust_i18n::replace_patterns(&rust_i18n::t!(key), &names, &values)
+}
+
+/// [`tr_args`] 的宏糖：`tr_fmt!("Error: cannot read %{path}: %{err}", path = p, err = e)`。
+///
+/// 每个值都过一遍 `ToString`；需要 `{:?}` 时显式写
+/// `bone = format!("{:?}", b)`。参数名是**标识符**（`stringify!` 取名字），
+/// 与源文里的 `%{...}` 一一对应。
+#[macro_export]
+macro_rules! tr_fmt {
+    ($key:expr) => {
+        $crate::tr($key)
+    };
+    ($key:expr, $($name:ident = $val:expr),+ $(,)?) => {
+        $crate::tr_args(
+            $key,
+            &[$( (stringify!($name), ::std::string::ToString::to_string(&$val)) ),+],
+        )
+    };
 }
 
 /// 往返比对的结果。

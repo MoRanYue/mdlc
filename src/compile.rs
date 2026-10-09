@@ -887,27 +887,30 @@ fn fbx_diagnostics(
     // ① 多块网格被合并进同一个 `mstudiomodel_t`（§1.10，部件边界丢失）。
     //    只有多于一块时才提 —— 一块网格是绝大多数情况，不值得打扰。
     if geom.merged_meshes.len() > 1 {
-        out.push(format!(
-            "提示：{at} 的 {} 块网格被合并进同一个部件：{:?}。官方同样合并（部件边界丢失）；要分开请用 `srcpart` 逐个选，或拆成多条 `$body` / `$model`。",
-            geom.merged_meshes.len(),
-            geom.merged_meshes
+        out.push(crate::tr_fmt!(
+            "Note: the %{n} meshes of %{at} were merged into one part: %{meshes}. The official tool merges them the same way (part boundaries are lost); to keep them apart, select them one by one with `srcpart`, or split them into several `$body` / `$model` blocks.",
+            n = geom.merged_meshes.len(),
+            at = at,
+            meshes = format!("{:?}", geom.merged_meshes)
         ));
     }
     // ② 网格没有材质 ⟹ 合成了兜底名。官方静默用 `debug/debugempty`。
     if !geom.untextured_meshes.is_empty() {
-        out.push(format!(
-            "提示：{at} 的网格 {:?} 没有材质，已合成 {:?}。要改用别的名字写 `srcmaterial \"...\"`。",
-            geom.untextured_meshes,
-            crate::fbx::FALLBACK_MATERIAL
+        out.push(crate::tr_fmt!(
+            "Note: the meshes %{meshes} of %{at} have no material, so %{fallback} was synthesized. To use another name, write `srcmaterial \"...\"`.",
+            meshes = format!("{:?}", geom.untextured_meshes),
+            at = at,
+            fallback = format!("{:?}", crate::fbx::FALLBACK_MATERIAL)
         ));
     }
     // ③ 多动画栈：官方恒取第一条（§1.8），用户想用第二条只能靠 `srcstack`。
     //    这是 FBX 路径下最容易踩的坑 —— 名字明明对得上却不生效。
     if geom.anim_stacks.len() > 1 {
-        out.push(format!(
-            "提示：{at} 有 {} 条动画栈 {:?}；官方与 mdlc 默认都只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
-            geom.anim_stacks.len(),
-            geom.anim_stacks
+        out.push(crate::tr_fmt!(
+            "Note: %{at} has %{n} animation stacks %{stacks}; both the official tool and mdlc use only the **first** one by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).",
+            at = at,
+            n = geom.anim_stacks.len(),
+            stacks = format!("{:?}", geom.anim_stacks)
         ));
     }
     // ④ shape key 已自动注册成 flex（§1.6b）—— 列出来让用户知道帧号怎么来的。
@@ -916,17 +919,18 @@ fn fbx_diagnostics(
             .iter()
             .enumerate()
             .map(|(i, k)| {
-                format!(
-                    "{:?}(帧{})",
-                    k.name,
-                    crate::fbx::FbxGeometry::shape_key_frame(i)
+                crate::tr_fmt!(
+                    "%{name}(frame %{frame})",
+                    name = format!("{:?}", k.name),
+                    frame = crate::fbx::FbxGeometry::shape_key_frame(i)
                 )
             })
             .collect();
-        out.push(format!(
-            "提示：{at} 的 {} 个 shape key 已自动注册成 flex：{}。要控制取哪些 / 顺序 / 忽略，用 `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`。",
-            shape_keys.len(),
-            list.join(" ")
+        out.push(crate::tr_fmt!(
+            "Note: the %{n} shape keys of %{at} were registered as flexes automatically: %{list}. To control which ones are taken, their order, or to ignore some, use `srcshapekey` / `srcshapekeyorder` / `srcshapekeyignore`.",
+            n = shape_keys.len(),
+            at = at,
+            list = list.join(" ")
         ));
     }
     out
@@ -1058,14 +1062,10 @@ fn same_fbx_geometry_note(
     if !geometry.iter().any(|g| same_file(g, path)) {
         return None;
     }
-    Some(format!(
-        "{} 同时用作网格源与动画源。FBX 可以同时包含网格与动画，mdlc 正常采出了 \
-         {n_frames} 帧 —— 但官方 studiomdl 在这个组合下会**静默地**只产出 1 帧\
-         （实测 exit=0、无警告，见 docs/fbx-support.md §4.4）。\
-         这是**有意的偏离**：mdlc 不复制这个退化行为。\
-         ⚠️ 若你在与官方产物对照，这里的帧数不一致是**预期**的。\
-         想让两边一致，把动画拆到独立的 FBX 文件（官方与 mdlc 都会正常）。",
-        path.display()
+    Some(crate::tr_fmt!(
+        "%{path} is used as both the mesh source and the animation source. FBX can hold meshes and animation together, and mdlc read %{n_frames} frames as usual — but the official studiomdl **silently** produces only 1 frame in this combination (measured: exit=0, no warning; see docs/fbx-support.md §4.4). This is a **deliberate deviation**: mdlc does not copy that degenerate behavior. ⚠️ If you are comparing against the official output, a frame-count mismatch here is **expected**. To make the two agree, split the animation into a separate FBX file (both the official tool and mdlc handle that normally).",
+        path = path.display(),
+        n_frames = n_frames
     ))
 }
 
@@ -7265,7 +7265,14 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
         // （`Missing control bone "%s" for procedural bone "%s"`），
         // 见 `resolve_quat_interp_bones` 里的 control 段。
         let Some(&bone) = desc.bone_index().get(j.bone.as_str()) else {
-            log::info!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", j.bone);
+            log::info!(
+                "{}",
+                crate::tr_fmt!(
+                    "Note: the bone %{bone} of %{at} was not found; skipped, matching the official behavior",
+                    bone = format!("{:?}", j.bone),
+                    at = at
+                )
+            );
             continue;
         };
 
@@ -7433,7 +7440,14 @@ fn resolve_quat_interp_bones(
         // 后 `continue; // optimized out, don't complain`。L4D2 exe 里该串在
         // @0x5764a4。修前 mdlc 在这里报「骨骼 {:?} 找不到」并中止编译。
         let Some(&bone) = bone_index.get(q.bone.as_str()) else {
-            log::info!("提示：{at} 骨骼 {:?} 找不到，按官方行为跳过", q.bone);
+            log::info!(
+                "{}",
+                crate::tr_fmt!(
+                    "Note: the bone %{bone} of %{at} was not found; skipped, matching the official behavior",
+                    bone = format!("{:?}", q.bone),
+                    at = at
+                )
+            );
             continue;
         };
         let bone = bone as i32;
@@ -9606,52 +9620,70 @@ type = "mouth"
     }
 
     /// 四条提示各自的触发条件与关键措辞。
+    ///
+    /// ⚠️ 断言的是**英文源文**（键本身），所以要显式钉住语言 —— 系统语言是
+    /// 中文时 `t!` 会命中 `locales/app.yml` 的译文，不钉就会随机器而变。
     #[test]
     fn fbx_diagnostics_cover_the_four_hazards() {
-        // ① 多网格合并
-        let g = geom_with(&[], &["body", "hat"], &[]);
-        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
-        assert_eq!(d.len(), 1);
-        assert!(d[0].contains("2 块网格被合并"), "{}", d[0]);
-        assert!(d[0].contains("srcpart"), "要指出出路：{}", d[0]);
+        crate::test_locale::with_english(|| {
+            // ① 多网格合并
+            let g = geom_with(&[], &["body", "hat"], &[]);
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+            assert_eq!(d.len(), 1);
+            assert!(d[0].contains("2 meshes"), "{}", d[0]);
+            assert!(d[0].contains("srcpart"), "要指出出路：{}", d[0]);
 
-        // ② 无材质
-        let g = geom_with(&["box"], &["box"], &[]);
-        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
-        assert_eq!(d.len(), 1);
-        assert!(d[0].contains("没有材质"), "{}", d[0]);
-        assert!(d[0].contains("debug/debugempty"), "{}", d[0]);
-        assert!(d[0].contains("srcmaterial"), "{}", d[0]);
+            // ② 无材质
+            let g = geom_with(&["box"], &["box"], &[]);
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+            assert_eq!(d.len(), 1);
+            assert!(d[0].contains("no material"), "{}", d[0]);
+            assert!(d[0].contains("debug/debugempty"), "{}", d[0]);
+            assert!(d[0].contains("srcmaterial"), "{}", d[0]);
 
-        // ③ 多动画栈
-        let g = geom_with(&[], &["box"], &["walk", "run"]);
-        let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
-        assert_eq!(d.len(), 1);
-        assert!(d[0].contains("2 条动画栈"), "{}", d[0]);
-        assert!(d[0].contains("srcstack"), "{}", d[0]);
+            // ③ 多动画栈
+            let g = geom_with(&[], &["box"], &["walk", "run"]);
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+            assert_eq!(d.len(), 1);
+            assert!(d[0].contains("2 animation stacks"), "{}", d[0]);
+            assert!(d[0].contains("srcstack"), "{}", d[0]);
 
-        // ④ shape key 自动注册（帧号 1 起，与 `shape_key_frame` 一致）
-        let g = geom_with(&[], &["body"], &[]);
-        let keys = vec![sk("wide"), sk("tall")];
-        let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
-        assert_eq!(d.len(), 1);
-        assert!(d[0].contains("2 个 shape key"), "{}", d[0]);
-        assert!(d[0].contains("\"wide\"(帧1)"), "{}", d[0]);
-        assert!(d[0].contains("\"tall\"(帧2)"), "{}", d[0]);
-        assert!(d[0].contains("srcshapekey"), "{}", d[0]);
+            // ④ shape key 自动注册（帧号 1 起，与 `shape_key_frame` 一致）
+            let g = geom_with(&[], &["body"], &[]);
+            let keys = vec![sk("wide"), sk("tall")];
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
+            assert_eq!(d.len(), 1);
+            assert!(d[0].contains("2 shape keys"), "{}", d[0]);
+            assert!(d[0].contains("\"wide\"(frame 1)"), "{}", d[0]);
+            assert!(d[0].contains("\"tall\"(frame 2)"), "{}", d[0]);
+            assert!(d[0].contains("srcshapekey"), "{}", d[0]);
+        });
+    }
+
+    /// 提示文案会跟着语言走（中文系统上不该再看到英文源文）。
+    #[test]
+    fn fbx_diagnostics_are_translated_for_chinese() {
+        crate::test_locale::with_locale("zh-CN", || {
+            let g = geom_with(&[], &["body", "hat"], &[]);
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &[]);
+            assert!(d[0].contains("2 块网格被合并"), "{}", d[0]);
+            assert!(d[0].contains("srcpart"), "命令名不翻译：{}", d[0]);
+        });
     }
 
     /// 四条可以同时触发，顺序固定（多网格 → 无材质 → 多栈 → shape key）。
     #[test]
     fn fbx_diagnostics_can_fire_all_four_at_once() {
-        let g = geom_with(&["body"], &["body", "hat"], &["walk", "run"]);
-        let keys = vec![sk("wide")];
-        let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
-        assert_eq!(d.len(), 4, "{d:#?}");
-        assert!(d[0].contains("块网格被合并"), "{}", d[0]);
-        assert!(d[1].contains("没有材质"), "{}", d[1]);
-        assert!(d[2].contains("条动画栈"), "{}", d[2]);
-        assert!(d[3].contains("个 shape key"), "{}", d[3]);
+        crate::test_locale::with_english(|| {
+            let g = geom_with(&["body"], &["body", "hat"], &["walk", "run"]);
+            let keys = vec![sk("wide")];
+            let d = fbx_diagnostics("bp[0].m[0]", &g, &keys);
+            assert_eq!(d.len(), 4, "{d:#?}");
+            assert!(d[0].contains("meshes"), "{}", d[0]);
+            assert!(d[1].contains("no material"), "{}", d[1]);
+            assert!(d[2].contains("animation stacks"), "{}", d[2]);
+            assert!(d[3].contains("shape keys"), "{}", d[3]);
+        });
     }
 
     fn sk(name: &str) -> crate::fbx::FbxShapeKey {
@@ -12021,18 +12053,21 @@ end
         let geom = vec![PathBuf::from("box.fbx")];
         let p = Path::new("box.fbx");
         // ① 多帧 + 几何源 ⟹ 提示，且文案要点明「这是有意的偏离」。
-        let msg = same_fbx_geometry_note(p, &geom, 6).expect("多帧同文件应当提示");
-        assert!(msg.contains("同时用作网格源与动画源"), "{msg}");
+        //    文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let msg = crate::test_locale::with_english(|| {
+            same_fbx_geometry_note(p, &geom, 6).expect("多帧同文件应当提示")
+        });
+        assert!(msg.contains("used as both the mesh source"), "{msg}");
         assert!(
-            msg.contains("有意的偏离"),
+            msg.contains("deliberate deviation"),
             "必须说明这是有意偏离官方行为：{msg}"
         );
         assert!(
-            msg.contains("独立的 FBX 文件"),
+            msg.contains("separate FBX file"),
             "必须给出「想与官方一致时」的做法：{msg}"
         );
         assert!(
-            msg.contains("6 帧"),
+            msg.contains("6 frames"),
             "必须报出 mdlc 实际采到的帧数（用户才知道分歧有多大）：{msg}"
         );
         // ② 只有 1 帧 ⟹ 官方与 mdlc 一致，**不提示**。

@@ -325,10 +325,13 @@ pub fn read_frames(
                     .map(|s| s.element.name.to_string())
                     .collect();
                 log::info!(
-                    "提示：{} 有 {} 条动画栈 {:?}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
-                    path.display(),
-                    names.len(),
-                    names
+                    "{}",
+                    crate::tr_fmt!(
+                        "Note: %{path} has %{n} animation stacks %{names}; only the **first** one is used by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).",
+                        path = path.display(),
+                        n = names.len(),
+                        names = format!("{:?}", names)
+                    )
                 );
             }
             0

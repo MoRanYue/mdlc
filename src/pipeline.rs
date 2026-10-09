@@ -81,8 +81,13 @@ pub struct PipelineOptions {
 /// 现在每个变体各自持有**产生它的那个错误类型**，`source()` 能把整条链
 /// 走到底，调用方可以 `match` 到具体种类（例如
 /// `Err(PipelineError::ReadCollisionSmd { source, .. }) if source.kind() ==
-/// ErrorKind::NotFound`）。[`Self::lines`] 仍拼出**与改造前逐字节相同**
-/// 的文案，所以 CLI 输出与既有探针的断言都不受影响。
+/// ErrorKind::NotFound`）。[`Self::lines`] 拼出的仍是**单行**文案，
+/// 所以 CLI 逐行输出的形态不变。
+///
+/// ⚠️ 文案本身已改为走译文表（源文英文，见 `locales/app.yml`）——
+/// 各变体的 `#[error("{}", crate::tr_fmt!(...))]` 形态是 `thiserror` 逼出来的：
+/// `#[error(...)]` 的第一个 token 必须是字符串字面量，所以用 `"{}"` 占位、
+/// 把真正的文案交给 `tr_fmt!` 表达式。
 ///
 /// ⚠️ 因此本类型**不是** `Clone` / `PartialEq`：它内部装着
 /// [`std::io::Error`]，那个类型两者都不实现，而且「两次失败是否相等」
@@ -93,55 +98,92 @@ pub enum PipelineError {
     #[error("{}", Self::compile_lines(.0).join("\n"))]
     Compile(Vec<CompileError>),
     /// 碰撞 SMD 的**路径字符串**不合法（缺扩展名等）。
-    #[error("错误：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: %{err}", err = .0))]
     ResolveCollisionSmd(#[source] SrcError),
     /// 碰撞 SMD 路径解析出来了，但文件读不进来。
-    #[error("错误：读不到碰撞 SMD {}：{}", path.display(), source)]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Error: cannot read collision SMD %{path}: %{err}",
+            path = path.display(),
+            err = source
+        )
+    )]
     ReadCollisionSmd {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     /// 碰撞 SMD 读进来了，但解析不了。
-    #[error("错误：解析碰撞 SMD {} 失败：{}", path.display(), source)]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Error: cannot parse collision SMD %{path}: %{err}",
+            path = path.display(),
+            err = source
+        )
+    )]
     ParseCollisionSmd {
         path: PathBuf,
         #[source]
         source: SmdError,
     },
     /// [`write_mdl`] 失败（`.mdl` 字节的构造）。
-    #[error("错误：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: %{err}", err = .0))]
     WriteMdl(#[source] WriteError),
     /// `lod::build_vvd` 失败。
-    #[error("错误：构造 VVD 失败：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: cannot build VVD: %{err}", err = .0))]
     BuildVvd(#[source] VvdError),
     /// `Vvd::to_bytes` 失败。
-    #[error("错误：写出 VVD 失败：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: cannot encode VVD: %{err}", err = .0))]
     EncodeVvd(#[source] VvdError),
     /// VVD 的自检没过 —— 这是**本实现的 bug**，不是用户输入的问题。
-    #[error("错误：写出的 VVD 不自洽（本实现的 bug）：{}", .0)]
+    #[error(
+        "{}",
+        crate::tr_fmt!("Error: the VVD we wrote is not self-consistent (bug in mdlc): %{err}", err = .0)
+    )]
     CheckVvd(#[source] VvdError),
     /// `vtx_writer::write_vtx_with` 失败。
-    #[error("错误：写出 VTX 失败：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: cannot write VTX: %{err}", err = .0))]
     WriteVtx(#[source] VtxWriteError),
     /// VTX 的自检没过 —— 同上，是本实现的 bug。
-    #[error("错误：写出的 VTX 不自洽（本实现的 bug）：{}", .0)]
+    #[error(
+        "{}",
+        crate::tr_fmt!("Error: the VTX we wrote is not self-consistent (bug in mdlc): %{err}", err = .0)
+    )]
     CheckVtx(#[source] VtxWriteError),
     /// `phy::build_phy_from_smd` / `build_ragdoll_phy_from_smd` 失败。
-    #[error("错误：构造 PHY 失败：{}", .0)]
+    #[error("{}", crate::tr_fmt!("Error: cannot build PHY: %{err}", err = .0))]
     BuildPhy(#[source] PhyError),
     /// PHY 的自检没过 —— 同上，是本实现的 bug。
-    #[error("错误：写出的 PHY 自检失败（本实现的 bug）：{}", .0)]
+    #[error(
+        "{}",
+        crate::tr_fmt!("Error: the PHY we wrote failed self-check (bug in mdlc): %{err}", err = .0)
+    )]
     CheckPhy(#[source] PhyError),
     /// 建输出目录失败。
-    #[error("错误：建目录 {} 失败：{}", path.display(), source)]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Error: cannot create directory %{path}: %{err}",
+            path = path.display(),
+            err = source
+        )
+    )]
     CreateDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     /// 写产物文件失败。
-    #[error("错误：写 {} 失败：{}", path.display(), source)]
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "Error: cannot write %{path}: %{err}",
+            path = path.display(),
+            err = source
+        )
+    )]
     WriteFile {
         path: PathBuf,
         #[source]
@@ -198,7 +240,10 @@ impl PipelineError {
     /// 抽成关联函数是为了让 `#[error(...)]` 属性也能用它 —— 属性里写不出
     /// 带循环的表达式，而这里需要「首行 + N 条缩进」的形态。
     fn compile_lines(errs: &[CompileError]) -> Vec<String> {
-        let mut v = vec![format!("编译失败，{} 处错误：", errs.len())];
+        let mut v = vec![crate::tr_fmt!(
+            "Compilation failed with %{n} error(s):",
+            n = errs.len()
+        )];
         v.extend(errs.iter().map(|e| format!("  - {e}")));
         v
     }
@@ -891,13 +936,18 @@ smd = "a.smd"
         );
 
         // 编译失败是多行（首行计数），其余是单行。
-        let lines = compile.lines();
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let lines = crate::test_locale::with_english(|| compile.lines());
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "编译失败，1 处错误：");
+        assert_eq!(lines[0], "Compilation failed with 1 error(s):");
         assert_eq!(lines[1], "  - x: y");
+        // ⚠️ 外层前缀已是英文（本轮），内层 `WriteError` 的文案还没迁
+        // （那是第三期的事），所以断言里两段语言不一致 —— 这正是当前状态。
         assert_eq!(
-            PipelineError::WriteMdl(WriteError::Internal("i".into())).lines(),
-            vec!["错误：内部错误（请报告）：i"]
+            crate::test_locale::with_english(
+                || PipelineError::WriteMdl(WriteError::Internal("i".into())).lines()
+            ),
+            vec!["Error: 内部错误（请报告）：i"]
         );
         // `Display` 与 `lines()` 必须一致（CLI 走前者，GUI 走后者）。
         assert_eq!(compile.to_string(), lines.join("\n"));
@@ -913,10 +963,11 @@ smd = "a.smd"
             path: PathBuf::from("nope.smd"),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "系统找不到指定的文件。"),
         };
-        // 文案与改造前逐字节相同。
+        // ⚠️ 外层前缀已是英文（本轮），内层 `io::Error` 的文案来自操作系统
+        // （中文系统上就是中文），所以断言里两段语言不一致 —— 这正是当前状态。
         assert_eq!(
             err.to_string(),
-            "错误：读不到碰撞 SMD nope.smd：系统找不到指定的文件。"
+            "Error: cannot read collision SMD nope.smd: 系统找不到指定的文件。"
         );
 
         let source = std::error::Error::source(&err).expect("应能拿到源错误");
@@ -935,8 +986,10 @@ smd = "a.smd"
 
         let err = build(&desc, &d, PipelineOptions::default()).expect_err("应失败");
         assert_eq!(err.kind(), PipelineErrorKind::Io, "{err}");
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
         assert!(
-            err.to_string().contains("读不到碰撞 SMD"),
+            crate::test_locale::with_english(|| err.to_string())
+                .contains("cannot read collision SMD"),
             "文案：{err}"
         );
         // 端到端也验证一次：源错误真的是 NotFound，而不是被压平的字符串。
@@ -958,8 +1011,10 @@ smd = "a.smd"
 
         let err = build(&desc, &d, PipelineOptions::default()).expect_err("应失败");
         assert_eq!(err.kind(), PipelineErrorKind::Build, "{err}");
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
         assert!(
-            err.to_string().contains("解析碰撞 SMD"),
+            crate::test_locale::with_english(|| err.to_string())
+                .contains("cannot parse collision SMD"),
             "文案：{err}"
         );
 

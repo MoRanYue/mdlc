@@ -118,24 +118,24 @@ impl GltfNotes {
     pub fn lines(&self, at: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if self.zero_accessors > 0 {
-            out.push(format!(
-                "提示：{at} 有 {} 个 accessor 没有 `bufferView`；按 glTF 规范它们表示**全零**，\
-                 已照此处理（`gltf` 1.4.1 的校验层会把它误判为错误，mdlc 走的是绕校验的读取路径）。",
-                self.zero_accessors
+            out.push(crate::tr_fmt!(
+                "Note: %{at} has %{n} accessors without a `bufferView`; per the glTF spec they mean **all zero**, and they were treated that way (the validation layer of `gltf` 1.4.1 misjudges them as an error; mdlc takes the read path that bypasses validation).",
+                at = at,
+                n = self.zero_accessors
             ));
         }
         if self.cubic_spline_channels > 0 {
-            out.push(format!(
-                "提示：{at} 有 {} 个动画通道用 `CubicSpline` 插值；mdlc 按**线性**重采样\
-                 （三次样条的切线信息被忽略）。要避免这条提示请让导出器改用 `LINEAR`。",
-                self.cubic_spline_channels
+            out.push(crate::tr_fmt!(
+                "Note: %{at} has %{n} animation channels interpolated with `CubicSpline`; mdlc resamples them **linearly** (the cubic spline's tangent information is ignored). To avoid this note, make the exporter use `LINEAR`.",
+                at = at,
+                n = self.cubic_spline_channels
             ));
         }
         if self.morph_weight_channels > 0 {
-            out.push(format!(
-                "提示：{at} 有 {} 个动画通道驱动 `MorphTargetWeights`（逐帧表情权重）；\
-                 mdlc **不做**逐帧表情权重 —— 表情只由 QC 的 `flex` 语句控制，这些通道被忽略。",
-                self.morph_weight_channels
+            out.push(crate::tr_fmt!(
+                "Note: %{at} has %{n} animation channels driving `MorphTargetWeights` (per-frame morph weights); mdlc does **not** do per-frame morph weights — morphs are controlled only by the QC `flex` statements, and these channels are ignored.",
+                at = at,
+                n = self.morph_weight_channels
             ));
         }
         out
@@ -1532,10 +1532,13 @@ pub fn read_frames(
             // 而 `srcstack` 就是按名字选的，所以这条提示只是告知默认值。
             if names.len() > 1 {
                 log::info!(
-                    "提示：{} 有 {} 条动画 {:?}；默认只用**第一条**。要用别的写 `srcstack \"名\"`（写在 `$sequence` / `$animation` 里）。",
-                    path.display(),
-                    names.len(),
-                    names
+                    "{}",
+                    crate::tr_fmt!(
+                        "Note: %{path} has %{n} animations %{names}; only the **first** one is used by default. To use another, write `srcstack \"name\"` (inside `$sequence` / `$animation`).",
+                        path = path.display(),
+                        n = names.len(),
+                        names = format!("{:?}", names)
+                    )
                 );
             }
             doc.animations().next()
@@ -2810,9 +2813,10 @@ mod tests {
             morph_weight_channels: 4,
         };
         assert!(!n.is_empty());
-        let lines = n.lines("a.gltf");
+        // 文案走译文表 ⟹ 断言英文源文前先钉住语言。
+        let lines = crate::test_locale::with_english(|| n.lines("a.gltf"));
         assert_eq!(lines.len(), 3, "三种提示各一条：{lines:?}");
-        assert!(lines[0].contains("2 个 accessor"), "{}", lines[0]);
+        assert!(lines[0].contains("2 accessors"), "{}", lines[0]);
         assert!(lines[1].contains("CubicSpline"), "{}", lines[1]);
         assert!(lines[2].contains("MorphTargetWeights"), "{}", lines[2]);
 

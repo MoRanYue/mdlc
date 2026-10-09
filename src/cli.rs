@@ -370,7 +370,7 @@ pub struct PhyArgs {
     pub checksum: u32,
     #[arg(long, value_name = "F", default_value_t = 1.0)]
     #[arg(help = crate::tr(
-        "$mass equivalent total mass, default 1 (the official default; see the --automass note)"
+        "$mass equivalent total mass, default 1 (the official default; automatic mass via [physics].auto_mass is not supported)"
     ))]
     pub mass: f32,
     #[arg(long = "surfaceprop", value_name = "S", default_value = "default")]
@@ -387,19 +387,14 @@ pub struct PhyArgs {
     ))]
     pub vhacd: bool,
     #[arg(long)]
-    #[arg(help = crate::tr(
-        "Legacy alias of --vhacd (kept so existing scripts keep working; its meaning is now unambiguously VHACD)"
-    ))]
-    pub decompose: bool,
-    #[arg(long)]
     #[arg(help = crate::tr("$collisionjoints: group by skin-weight bone, one solid per bone"))]
     pub ragdoll: bool,
 }
 
 impl PhyArgs {
-    /// 是否走 VHACD 体分解：`--vhacd` 或它的旧别名 `--decompose`。
+    /// 是否走 VHACD 体分解。
     pub fn vhacd_enabled(&self) -> bool {
-        self.vhacd || self.decompose
+        self.vhacd
     }
 }
 
@@ -828,7 +823,7 @@ mod tests {
             "2.5".into(),
             "--surfaceprop".into(),
             "metal".into(),
-            "--decompose".into(),
+            "--vhacd".into(),
             "--ragdoll".into(),
         ])
         .expect("phy 必须可解析");
@@ -840,9 +835,8 @@ mod tests {
                 assert_eq!(a.mass, 2.5);
                 assert_eq!(a.surface_prop, "metal");
                 assert!(!a.concave);
-                assert!(!a.vhacd);
-                assert!(a.decompose);
-                assert!(a.vhacd_enabled(), "--decompose 是 --vhacd 的旧别名");
+                assert!(a.vhacd);
+                assert!(a.vhacd_enabled());
                 assert!(a.ragdoll);
             }
             other => panic!("期望 Phy，得到 {other:?}"),
@@ -967,22 +961,11 @@ mod tests {
     // 自有文案的 i18n
     // -----------------------------------------------------------------------
 
-    /// 改语言是**进程级全局状态**（`rust_i18n` 里的 `static CURRENT_LOCALE`），
-    /// 而 `cargo test` 默认多线程 —— 这几条测试必须串行，且跑完要还原。
-    static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// 在指定语言下跑一段代码，跑完还原原语言。
     ///
-    /// 还原不只是卫生问题：`cargo test` 里同一个进程还跑着几百条别的测试，
-    /// 留下改过的语言会影响它们的输出（虽然目前没有测试断言文案）。
-    fn with_locale<R>(locale: &str, f: impl FnOnce() -> R) -> R {
-        let _guard = LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = (*rust_i18n::locale()).to_string();
-        rust_i18n::set_locale(locale);
-        let out = f();
-        rust_i18n::set_locale(&saved);
-        out
-    }
+    /// ⚠️ 锁在 [`crate::test_locale`] 里，**全仓共用一把** —— 语言是进程级
+    /// 全局状态，各模块各拿一把锁等于没锁。
+    use crate::test_locale::with_locale;
 
     /// 渲染一个 `DisplayHelp` / `DisplayVersion` 错误的正文。
     ///

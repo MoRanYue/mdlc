@@ -173,8 +173,11 @@ fn run_official(argv: &[String]) -> ExitCode {
     // 用户要求：未知选项**一律警告后继续**（不中断编译）。
     if !norm.unknown.is_empty() {
         log::warn!(
-            "警告：忽略无法识别的选项 {}（mdlc 未实现或非官方选项）",
-            norm.unknown.join(" ")
+            "{}",
+            mdlc::tr_fmt!(
+                "Warning: ignoring unrecognized option(s) %{names} (not implemented by mdlc, or not an official option)",
+                names = norm.unknown.join(" ")
+            )
         );
     }
 
@@ -191,18 +194,33 @@ fn run_official(argv: &[String]) -> ExitCode {
     // 用它会把「没传的 flag」也报成「已忽略」。
     for name in ["striplods", "definebones", "printbones"] {
         if m.get_flag(name) {
-            log::warn!("警告：官方选项 -{name} 尚未实现，已忽略");
+            log::warn!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Warning: the official option -%{name} is not implemented yet; ignored",
+                    name = name
+                )
+            );
         }
     }
     for name in ["minlod", "t", "a"] {
         if m.value_source(name).is_some() {
-            log::warn!("警告：官方选项 -{name} 尚未实现，已忽略");
+            log::warn!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Warning: the official option -%{name} is not implemented yet; ignored",
+                    name = name
+                )
+            );
         }
     }
 
     let Some(qc) = m.get_one::<String>("qc") else {
-        log::error!("错误：缺少 .qc 文件参数");
-        log::error!("用法：mdlc -game <gamedir> [选项] <model.qc>");
+        log::error!("{}", mdlc::tr("Error: missing the .qc file argument"));
+        log::error!(
+            "{}",
+            mdlc::tr("Usage: mdlc -game <gamedir> [options] <model.qc>")
+        );
         return ExitCode::from(2);
     };
 
@@ -215,19 +233,32 @@ fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            log::error!("错误：读不到 {}：{e}", path.display());
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Error: cannot read %{path}: %{err}",
+                    path = path.display(),
+                    err = e
+                )
+            );
             return Err(ExitCode::from(2));
         }
     };
     let desc = match ModelDesc::from_toml(&text) {
         Ok(d) => d,
         Err(e) => {
-            log::error!("错误：{e}");
+            log::error!("{}", mdlc::tr_fmt!("Error: %{err}", err = e));
             return Err(ExitCode::from(2));
         }
     };
     if let Err(errs) = desc.validate() {
-        log::error!("描述文件有 {} 处错误：", errs.len());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "The description file has %{n} error(s):",
+                n = errs.len()
+            )
+        );
         for e in &errs {
             log::error!("  - {e}");
         }
@@ -245,33 +276,58 @@ fn check(p: &Path) -> ExitCode {
     let base = p.parent().unwrap_or(Path::new("."));
     match compile(&desc, base) {
         Ok(c) => {
-            println!("{} 合法", p.display());
             println!(
-                "  骨骼 {}，材质 {}，body part {}，顶点 {}，三角形 {}",
-                desc.bones.len(),
-                desc.materials.textures.len(),
-                c.bodyparts.len(),
-                c.total_vertices(),
-                c.total_triangles()
+                "{}",
+                mdlc::tr_fmt!("%{path} is valid", path = p.display())
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "  bones %{bones}, materials %{materials}, body parts %{bodyparts}, vertices %{vertices}, triangles %{triangles}",
+                    bones = desc.bones.len(),
+                    materials = desc.materials.textures.len(),
+                    bodyparts = c.bodyparts.len(),
+                    vertices = c.total_vertices(),
+                    triangles = c.total_triangles()
+                )
             );
             for (bi, bp) in c.bodyparts.iter().enumerate() {
                 for (mi, m) in bp.models.iter().enumerate() {
                     println!(
-                        "    bodyparts[{bi}].models[{mi}] {} ← {}（{} mesh，{} 顶点）",
-                        m.name,
-                        m.smd_path.display(),
-                        m.meshes.len(),
-                        m.meshes.iter().map(|k| k.vertices.len()).sum::<usize>()
+                        "{}",
+                        mdlc::tr_fmt!(
+                            "    bodyparts[%{bi}].models[%{mi}] %{name} <- %{smd} (%{meshes} mesh(es), %{vertices} vertices)",
+                            bi = bi,
+                            mi = mi,
+                            name = m.name,
+                            smd = m.smd_path.display(),
+                            meshes = m.meshes.len(),
+                            vertices = m.meshes.iter().map(|k| k.vertices.len()).sum::<usize>()
+                        )
                     );
                 }
             }
             if let Some((min, max)) = c.bounds() {
-                println!("  包围盒 {min:?} .. {max:?}");
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "  bounds %{min} .. %{max}",
+                        min = format!("{min:?}"),
+                        max = format!("{max:?}")
+                    )
+                );
             }
             ExitCode::SUCCESS
         }
         Err(errs) => {
-            log::error!("{} 有 {} 处错误：", p.display(), errs.len());
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "%{path} has %{n} error(s):",
+                    path = p.display(),
+                    n = errs.len()
+                )
+            );
             for e in &errs {
                 log::error!("  - {e}");
             }
@@ -285,7 +341,14 @@ fn load_qc(path: &Path) -> Result<ModelDesc, ExitCode> {
     match mdlc::qc::parse_qc_file(path) {
         Ok(d) => Ok(d),
         Err(errs) => {
-            log::error!("{} 解析失败，{} 处错误：", path.display(), errs.len());
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Cannot parse %{path}: %{n} error(s):",
+                    path = path.display(),
+                    n = errs.len()
+                )
+            );
             for e in &errs {
                 log::error!("  - {e}");
             }
@@ -304,7 +367,13 @@ fn qc2toml(a: &mdlc::cli::Qc2tomlArgs) -> ExitCode {
     };
     // 与 `build` 一样先校验 —— 「解析成功但描述非法」也应当报出来。
     if let Err(errs) = desc.validate() {
-        log::error!("解析出的描述有 {} 处错误：", errs.len());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "The parsed description has %{n} error(s):",
+                n = errs.len()
+            )
+        );
         for e in &errs {
             log::error!("  - {e}");
         }
@@ -313,23 +382,36 @@ fn qc2toml(a: &mdlc::cli::Qc2tomlArgs) -> ExitCode {
     let text = match desc.to_toml() {
         Ok(t) => t,
         Err(e) => {
-            log::error!("错误：{e}");
+            log::error!("{}", mdlc::tr_fmt!("Error: %{err}", err = e));
             return ExitCode::from(1);
         }
     };
     let out = out.unwrap_or_else(|| qc.with_extension("toml"));
     if let Err(e) = std::fs::write(&out, &text) {
-        log::error!("错误：写不到 {}：{e}", out.display());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "Error: cannot write %{path}: %{err}",
+                path = out.display(),
+                err = e
+            )
+        );
         return ExitCode::from(2);
     }
-    println!("{} → {}", qc.display(), out.display());
     println!(
-        "  骨骼 {}，材质 {}，body part {}，序列 {}，动画 {}",
-        desc.bones.len(),
-        desc.materials.textures.len(),
-        desc.bodyparts.len(),
-        desc.sequences.len(),
-        desc.animations.len()
+        "{}",
+        mdlc::tr_fmt!("%{qc} -> %{out}", qc = qc.display(), out = out.display())
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "  bones %{bones}, materials %{materials}, body parts %{bodyparts}, sequences %{sequences}, animations %{animations}",
+            bones = desc.bones.len(),
+            materials = desc.materials.textures.len(),
+            bodyparts = desc.bodyparts.len(),
+            sequences = desc.sequences.len(),
+            animations = desc.animations.len()
+        )
     );
     ExitCode::SUCCESS
 }
@@ -394,51 +476,119 @@ fn vvd_info(path: &str) -> ExitCode {
     let buf = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            log::error!("错误：读不到 {path}：{e}");
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!("Error: cannot read %{path}: %{err}", path = path, err = e)
+            );
             return ExitCode::from(2);
         }
     };
     let v = match Vvd::parse(&buf) {
         Ok(v) => v,
         Err(e) => {
-            log::error!("错误：解析失败：{e}");
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!("Error: cannot parse: %{err}", err = e)
+            );
             return ExitCode::from(2);
         }
     };
     let h = &v.header;
-    println!("文件        {path}");
-    println!("长度        {} 字节", buf.len());
-    println!("checksum    {}  （与 .mdl/.vtx/.phy 配对，非内容哈希）", h.checksum);
-    println!("numLODs     {}", h.num_lods);
     println!(
-        "顶点数      {}   （numLODVertexes[0]，也是切线数）",
-        h.vertex_count()
+        "{}",
+        mdlc::tr_fmt!("file        %{path}", path = path)
     );
     println!(
-        "numLODVertexes  {:?}",
-        &h.num_lod_vertexes[..(h.num_lods.max(0) as usize).clamp(1, 8)]
+        "{}",
+        mdlc::tr_fmt!("length      %{n} bytes", n = buf.len())
     );
-    println!("numFixups   {}", h.num_fixups);
-    println!("顶点块      @ {}  （{} × 48 = {} 字节）", h.vertex_data_start, h.vertex_count(), h.vertex_count() * 48);
-    println!("切线块      @ {}  （{} × 16 = {} 字节）", h.tangent_data_start, h.vertex_count(), h.vertex_count() * 16);
     println!(
-        "预期总长    {} 字节",
-        h.tangent_data_start.max(0) as usize + h.vertex_count() * 16
+        "{}",
+        mdlc::tr_fmt!(
+            "checksum    %{checksum}  (paired with .mdl/.vtx/.phy; not a content hash)",
+            checksum = h.checksum
+        )
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!("numLODs     %{n}", n = h.num_lods)
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "vertices    %{n}   (numLODVertexes[0]; also the tangent count)",
+            n = h.vertex_count()
+        )
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "numLODVertexes  %{list}",
+            list = format!("{:?}", &h.num_lod_vertexes[..(h.num_lods.max(0) as usize).clamp(1, 8)])
+        )
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!("numFixups   %{n}", n = h.num_fixups)
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "vertex block      @ %{start}  (%{n} x 48 = %{bytes} bytes)",
+            start = h.vertex_data_start,
+            n = h.vertex_count(),
+            bytes = h.vertex_count() * 48
+        )
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "tangent block     @ %{start}  (%{n} x 16 = %{bytes} bytes)",
+            start = h.tangent_data_start,
+            n = h.vertex_count(),
+            bytes = h.vertex_count() * 16
+        )
+    );
+    println!(
+        "{}",
+        mdlc::tr_fmt!(
+            "expected length   %{n} bytes",
+            n = h.tangent_data_start.max(0) as usize + h.vertex_count() * 16
+        )
     );
 
     match check_invariants(&v, buf.len()) {
-        Ok(()) => println!("自洽性      通过（偏移、长度、块大小全部一致）"),
+        Ok(()) => println!(
+            "{}",
+            mdlc::tr("self-consistency  passed (offsets, lengths and block sizes all agree)")
+        ),
         Err(e) => {
-            println!("自洽性      **失败**：{e}");
+            println!(
+                "{}",
+                mdlc::tr_fmt!("self-consistency  **FAILED**: %{err}", err = e)
+            );
             return ExitCode::from(1);
         }
     }
 
     if let Some(v0) = v.vertices.first() {
-        println!("首个顶点    pos={:?} nrm={:?} uv={:?}", v0.position, v0.normal, v0.tex_coord);
         println!(
-            "            weight={:?} bone={:?} boneCount={}",
-            v0.weight, v0.bone, v0.bone_count
+            "{}",
+            mdlc::tr_fmt!(
+                "first vertex    pos=%{pos} nrm=%{nrm} uv=%{uv}",
+                pos = format!("{:?}", v0.position),
+                nrm = format!("{:?}", v0.normal),
+                uv = format!("{:?}", v0.tex_coord)
+            )
+        );
+        println!(
+            "{}",
+            mdlc::tr_fmt!(
+                "            weight=%{weight} bone=%{bone} boneCount=%{n}",
+                weight = format!("{:?}", v0.weight),
+                bone = format!("{:?}", v0.bone),
+                n = v0.bone_count
+            )
         );
     }
     ExitCode::SUCCESS
@@ -448,28 +598,46 @@ fn vvd_roundtrip(path: &str) -> ExitCode {
     let buf = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            log::error!("错误：读不到 {path}：{e}");
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!("Error: cannot read %{path}: %{err}", path = path, err = e)
+            );
             return ExitCode::from(2);
         }
     };
     match mdlc::vvd_round_trip(&buf) {
         Ok(rt) => {
-            println!("原文件      {} 字节", rt.original_len);
-            println!("重写后      {} 字节", rt.rewritten_len);
+            println!(
+                "{}",
+                mdlc::tr_fmt!("original    %{n} bytes", n = rt.original_len)
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!("rewritten   %{n} bytes", n = rt.rewritten_len)
+            );
             if rt.is_identical() {
-                println!("结果        **逐字节完全相同**（{} 字节全部一致）", rt.original_len);
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "result      **byte-for-byte identical** (all %{n} bytes match)",
+                        n = rt.original_len
+                    )
+                );
                 ExitCode::SUCCESS
             } else {
                 println!(
-                    "结果        **不一致**：首个差异 @{}，共 {} 字节不同",
-                    rt.first_diff.unwrap_or(0),
-                    rt.diff_count
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "result      **MISMATCH**: first difference @%{at}, %{n} bytes differ",
+                        at = rt.first_diff.unwrap_or(0),
+                        n = rt.diff_count
+                    )
                 );
                 ExitCode::from(1)
             }
         }
         Err(e) => {
-            log::error!("错误：{e}");
+            log::error!("{}", mdlc::tr_fmt!("Error: %{err}", err = e));
             ExitCode::from(2)
         }
     }
@@ -487,19 +655,39 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     let text = match std::fs::read_to_string(&args.input) {
         Ok(t) => t,
         Err(e) => {
-            log::error!("错误：读不到 {}：{e}", args.input.display());
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Error: cannot read %{path}: %{err}",
+                    path = args.input.display(),
+                    err = e
+                )
+            );
             return ExitCode::from(2);
         }
     };
     let smd = match mdlc::smd::parse_smd(&text) {
         Ok(s) => s,
         Err(e) => {
-            log::error!("错误：解析 {} 失败：{e}", args.input.display());
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Error: cannot parse %{path}: %{err}",
+                    path = args.input.display(),
+                    err = e
+                )
+            );
             return ExitCode::from(1);
         }
     };
     if smd.triangles.is_empty() {
-        log::error!("错误：{} 里没有任何三角形", args.input.display());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "Error: %{path} contains no triangles",
+                path = args.input.display()
+            )
+        );
         return ExitCode::from(1);
     }
 
@@ -535,8 +723,11 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     }
     if vertices.len() < 4 {
         log::error!(
-            "错误：焊接后只有 {} 个不同顶点，凸包至少要 4 个",
-            vertices.len()
+            "{}",
+            mdlc::tr_fmt!(
+                "Error: only %{n} distinct vertices after welding; a hull needs at least 4",
+                n = vertices.len()
+            )
         );
         return ExitCode::from(1);
     }
@@ -551,14 +742,18 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     //
     // 渲染网格通常既不凸也不闭合（有 T 型接缝、有重复边），所以**不能**
     // 直接把面表当凸包喂进去 —— 必须先算凸包。
+    // ⚠️ 这里返回的串**不带** `Error: ` 前缀 —— 调用点（`hull_of` 的唯一消费者）
+    // 会用 `Error: %{err}` 再包一层，带前缀就成了「Error: Error: …」。
     let hull_of = |verts: &[[f32; 3]], face_idx: &[usize]| -> Result<Vec<PhyHull>, String> {
         if args.vhacd_enabled() {
             let sub: Vec<[u32; 3]> = face_idx.iter().map(|&i| faces[i]).collect();
-            phy::decompose_concave(verts, &sub, 64, 16).map_err(|e| format!("凸分解失败：{e}"))
+            phy::decompose_concave(verts, &sub, 64, 16).map_err(|e| {
+                mdlc::tr_fmt!("convex decomposition failed: %{err}", err = e)
+            })
         } else {
-            PhyHull::from_points(verts)
-                .map(|h| vec![h])
-                .map_err(|e| format!("算凸包失败：{e}"))
+            PhyHull::from_points(verts).map(|h| vec![h]).map_err(|e| {
+                mdlc::tr_fmt!("cannot compute the convex hull: %{err}", err = e)
+            })
         }
     };
 
@@ -599,35 +794,99 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
             Ok(b) => {
                 // 自检后直接落盘，跳过下面通用的写出路径。
                 if let Err(e) = phy::check_invariants(&b) {
-                    log::error!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
+                    log::error!(
+                        "{}",
+                        mdlc::tr_fmt!(
+                            "Error: the PHY we wrote failed self-check (bug in mdlc): %{err}",
+                            err = e
+                        )
+                    );
                     return ExitCode::from(1);
                 }
                 if let Some(dir) = args.output.parent()
                     && !dir.as_os_str().is_empty()
                     && let Err(e) = std::fs::create_dir_all(dir)
                 {
-                    log::error!("错误：建目录 {} 失败：{e}", dir.display());
+                    log::error!(
+                        "{}",
+                        mdlc::tr_fmt!(
+                            "Error: cannot create directory %{path}: %{err}",
+                            path = dir.display(),
+                            err = e
+                        )
+                    );
                     return ExitCode::from(2);
                 }
                 if let Err(e) = std::fs::write(&args.output, &b) {
-                    log::error!("错误：写 {} 失败：{e}", args.output.display());
+                    log::error!(
+                        "{}",
+                        mdlc::tr_fmt!(
+                            "Error: cannot write %{path}: %{err}",
+                            path = args.output.display(),
+                            err = e
+                        )
+                    );
                     return ExitCode::from(2);
                 }
                 let layout = phy::check_invariants(&b).expect("刚查过");
-                println!("输入        {}", args.input.display());
-                println!("输出        {}", args.output.display());
-                println!("checksum    0x{:08x}", args.checksum);
-                println!("三角形      {}（焊接后 {} 个不同顶点）", smd.triangles.len(), vertices.len());
-                println!("solid       {}（ragdoll，每骨骼一个）", layout.solid_count);
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!("input       %{path}", path = args.input.display())
+                );
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!("output      %{path}", path = args.output.display())
+                );
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "checksum    0x%{checksum}",
+                        checksum = format!("{:08x}", args.checksum)
+                    )
+                );
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "triangles   %{tris} (%{verts} distinct vertices after welding)",
+                        tris = smd.triangles.len(),
+                        verts = vertices.len()
+                    )
+                );
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "solid       %{n} (ragdoll, one per bone)",
+                        n = layout.solid_count
+                    )
+                );
                 println!();
-                println!("文件        {:>8} 字节", layout.file_size);
-                println!("text 段     {:>8} 字节  @ {}", layout.text_size, layout.solids_end);
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "file        %{n} bytes",
+                        n = format!("{:>8}", layout.file_size)
+                    )
+                );
+                println!(
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "text block  %{n} bytes  @ %{at}",
+                        n = format!("{:>8}", layout.text_size),
+                        at = layout.solids_end
+                    )
+                );
                 println!();
-                println!("**写出成功**（13 条硬约束自检全部通过）");
+                println!(
+                    "{}",
+                    mdlc::tr("**write succeeded** (all 13 hard constraints self-checked)")
+                );
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
-                log::error!("错误：ragdoll 构造失败：{e}");
+                log::error!(
+                    "{}",
+                    mdlc::tr_fmt!("Error: cannot build the ragdoll: %{err}", err = e)
+                );
                 return ExitCode::from(1);
             }
         }
@@ -648,7 +907,10 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
         let hs = match phy::decompose_connected_components(&smd, None) {
             Ok(h) => h,
             Err(e) => {
-                log::error!("错误：$concave 分解失败：{e}");
+                log::error!(
+                    "{}",
+                    mdlc::tr_fmt!("Error: $concave decomposition failed: %{err}", err = e)
+                );
                 return ExitCode::from(1);
             }
         };
@@ -661,7 +923,7 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
         let hs = match hull_of(&vertices, &all_idx) {
             Ok(h) => h,
             Err(e) => {
-                log::error!("错误：{e}");
+                log::error!("{}", mdlc::tr_fmt!("Error: %{err}", err = e));
                 return ExitCode::from(1);
             }
         };
@@ -683,7 +945,10 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     let bytes = match phy::write_phy_multi(&grouped, &solids, &params) {
         Ok(b) => b,
         Err(e) => {
-            log::error!("错误：写出 PHY 失败：{e}");
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!("Error: cannot write PHY: %{err}", err = e)
+            );
             return ExitCode::from(1);
         }
     };
@@ -693,11 +958,25 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
         && !dir.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
-        log::error!("错误：建目录 {} 失败：{e}", dir.display());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "Error: cannot create directory %{path}: %{err}",
+                path = dir.display(),
+                err = e
+            )
+        );
         return ExitCode::from(2);
     }
     if let Err(e) = std::fs::write(&args.output, &bytes) {
-        log::error!("错误：写 {} 失败：{e}", args.output.display());
+        log::error!(
+            "{}",
+            mdlc::tr_fmt!(
+                "Error: cannot write %{path}: %{err}",
+                path = args.output.display(),
+                err = e
+            )
+        );
         return ExitCode::from(2);
     }
 
@@ -705,19 +984,57 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
     // 是为了覆盖"落盘"这一段（截断、权限、路径写错都能被它抓到）。
     match phy::check_invariants(&bytes) {
         Ok(layout) => {
-            println!("输入        {}", args.input.display());
-            println!("输出        {}", args.output.display());
-            println!("checksum    0x{:08x}", args.checksum);
             println!(
-                "三角形      {}（焊接后 {} 个不同顶点）",
-                smd.triangles.len(),
-                vertices.len()
+                "{}",
+                mdlc::tr_fmt!("input       %{path}", path = args.input.display())
             );
-            println!("solid       {}（共 {} 个凸块）", solids.len(), hull_count);
+            println!(
+                "{}",
+                mdlc::tr_fmt!("output      %{path}", path = args.output.display())
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "checksum    0x%{checksum}",
+                    checksum = format!("{:08x}", args.checksum)
+                )
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "triangles   %{tris} (%{verts} distinct vertices after welding)",
+                    tris = smd.triangles.len(),
+                    verts = vertices.len()
+                )
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "solid       %{solids} (%{hulls} convex piece(s) in total)",
+                    solids = solids.len(),
+                    hulls = hull_count
+                )
+            );
             println!();
-            println!("文件        {:>8} 字节", layout.file_size);
-            println!("solid       {}", layout.solid_count);
-            println!("text 段     {:>8} 字节  @ {}", layout.text_size, layout.solids_end);
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "file        %{n} bytes",
+                    n = format!("{:>8}", layout.file_size)
+                )
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!("solid       %{n}", n = layout.solid_count)
+            );
+            println!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "text block  %{n} bytes  @ %{at}",
+                    n = format!("{:>8}", layout.text_size),
+                    at = layout.solids_end
+                )
+            );
             for (i, ((surf, nodes), ledge)) in layout
                 .surface_sizes
                 .iter()
@@ -726,15 +1043,31 @@ fn phy_cmd(args: &mdlc::cli::PhyArgs) -> ExitCode {
                 .enumerate()
             {
                 println!(
-                    "  solid[{i}]  surfaceSize={surf}  ledge 区={ledge}  树节点={nodes}"
+                    "{}",
+                    mdlc::tr_fmt!(
+                        "  solid[%{i}]  surfaceSize=%{surf}  ledge region=%{ledge}  tree nodes=%{nodes}",
+                        i = i,
+                        surf = surf,
+                        ledge = ledge,
+                        nodes = nodes
+                    )
                 );
             }
             println!();
-            println!("**写出成功**（13 条硬约束自检全部通过）");
+            println!(
+                "{}",
+                mdlc::tr("**write succeeded** (all 13 hard constraints self-checked)")
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
-            log::error!("错误：写出的 PHY 自检失败（本实现的 bug）：{e}");
+            log::error!(
+                "{}",
+                mdlc::tr_fmt!(
+                    "Error: the PHY we wrote failed self-check (bug in mdlc): %{err}",
+                    err = e
+                )
+            );
             ExitCode::from(1)
         }
     }

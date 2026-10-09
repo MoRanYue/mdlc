@@ -620,7 +620,7 @@ glTF 的 morph target 都会被**自动注册**成 flexdesc + flexcontroller + f
 ### FBX / glTF 的诊断
 
 官方在这些情形下**静默通过**（`exit=0`），但结果通常不是你要的。
-mdlc 会打一行 `提示：`：
+mdlc 会打一行提示（中文系统上是 `提示：`，英文源文是 `Note:`）：
 
 | 情形 | 提示内容 |
 |---|---|
@@ -654,7 +654,7 @@ mdlc check <model.toml>
 mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
-                          [--concave] [--vhacd] [--decompose] [--ragdoll]
+                          [--concave] [--vhacd] [--ragdoll]
 mdlc vvd-info <file.vvd>
 mdlc vvd-roundtrip <file.vvd>
 mdlc template
@@ -717,6 +717,13 @@ _version: 2
   zh-CN: "输出 .phy 路径"
   de-DE: "Pfad der .phy-Ausgabe"    # 新加的语言
 ```
+
+这张表覆盖的不只是帮助：**运行时的诊断与错误文案也走它** ——
+`log::error!` / `log::warn!` / `log::info!` 发出的 `Error: ` / `Warning: ` /
+`Note: ` 三类前缀，以及 `check` / `vvd-info` / `vvd-roundtrip` / `phy` 的
+报表。带参数的行用 `%{名}` 占位（`rust-i18n` 的 `replace_patterns` 语法，
+名字不翻译）。**例外**：`mdlc template` 打出的 TOML 模板正文
+（`src/model.rs` 的 `TEMPLATE_TOML`）保持中文 —— 它是模板文件内容而非诊断。
 
 > 颜色**只在直连终端时**才出现，被重定向或管道抓取时自动降级成纯文本 ——
 > 所以不会往 Crowbar 之类的宿主日志里塞 ANSI 转义码。

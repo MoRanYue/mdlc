@@ -222,13 +222,18 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 /// 有更新时返回要打印的那一行，否则 `None`。**纯函数**，便于直接测文案。
+///
+/// 文案走译文表（源文英文，见 `locales/app.yml`）；`REPO` 也当占位符传，
+/// 免得把仓库名在键里写死一遍。
 pub fn notice(cache: &Cache, current: &str) -> Option<String> {
     if !is_newer(&cache.latest, current) {
         return None;
     }
-    Some(format!(
-        "提示：mdlc 有新版本 {}（当前 v{}）—— https://github.com/{REPO}/releases/latest",
-        cache.latest, current
+    Some(crate::tr_fmt!(
+        "Note: mdlc %{latest} is available (you have v%{current}) — https://github.com/%{repo}/releases/latest",
+        latest = cache.latest,
+        current = current,
+        repo = REPO
     ))
 }
 
@@ -656,11 +661,28 @@ mod tests {
 
     #[test]
     fn notice_mentions_both_versions_and_the_url() {
-        let msg = notice(&cache(0, "v0.2.0"), "0.1.0").expect("应触发提示");
+        // 这几条断言在两种语言下都成立（版本号、仓库名、URL 都是值，
+        // 不是文案），但仍显式钉住语言 —— 免得日后有人加一条只对
+        // 某一门语言成立的断言，测试就随机器语言时红时绿。
+        let msg = crate::test_locale::with_english(|| {
+            notice(&cache(0, "v0.2.0"), "0.1.0").expect("应触发提示")
+        });
         assert!(msg.contains("v0.2.0"), "缺新版本号：{msg}");
         assert!(msg.contains("v0.1.0"), "缺当前版本号：{msg}");
         assert!(msg.contains(REPO), "缺仓库：{msg}");
         assert!(msg.contains("releases/latest"), "缺 URL：{msg}");
+    }
+
+    /// 提示文案会跟着语言走（中文系统上不该再看到英文源文）。
+    #[test]
+    fn notice_is_translated_for_chinese() {
+        let msg = crate::test_locale::with_locale("zh-CN", || {
+            notice(&cache(0, "v0.2.0"), "0.1.0").expect("应触发提示")
+        });
+        assert!(msg.contains("有新版本"), "{msg}");
+        assert!(msg.contains("v0.2.0"), "占位符要替换：{msg}");
+        assert!(msg.contains(REPO), "占位符要替换：{msg}");
+        assert!(!msg.contains("%{"), "译文里不该残留未替换的占位符：{msg}");
     }
 
     #[test]

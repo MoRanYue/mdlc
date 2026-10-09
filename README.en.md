@@ -661,7 +661,8 @@ The three `srcshapekey*` commands are only needed when you want to **filter or r
 ### FBX / glTF diagnostics
 
 The official tool **passes silently** (`exit=0`) in these situations, but the result is usually
-not what you wanted. mdlc prints a `提示：` line:
+not what you wanted. mdlc prints a notice line (`Note:` in the English source text, `提示：` on a
+Chinese system):
 
 | Situation | Message |
 |---|---|
@@ -696,7 +697,7 @@ mdlc check <model.toml>
 mdlc build-qc <model.qc> [--out <dir>] [--optimize-vtx]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
-                          [--concave] [--vhacd] [--decompose] [--ragdoll]
+                          [--concave] [--vhacd] [--ragdoll]
 mdlc vvd-info <file.vvd>
 mdlc vvd-roundtrip <file.vvd>
 mdlc template
@@ -761,6 +762,13 @@ _version: 2
   zh-CN: "输出 .phy 路径"
   de-DE: "Pfad der .phy-Ausgabe"    # a newly added language
 ```
+
+This table covers more than help text: **runtime diagnostics and error messages go through it too** —
+the `Error: ` / `Warning: ` / `Note: ` prefixes emitted via `log::error!` / `log::warn!` /
+`log::info!`, plus the `check` / `vvd-info` / `vvd-roundtrip` / `phy` reports. Parameterized lines use
+`%{name}` placeholders (`rust-i18n`'s `replace_patterns` syntax; the names are never translated).
+**One exception**: the TOML template body printed by `mdlc template` (`TEMPLATE_TOML` in
+`src/model.rs`) stays Chinese — it is template file content, not a diagnostic.
 
 > Colour **only appears on a direct terminal** and degrades to plain text when redirected or
 > captured through a pipe — so no ANSI escape codes are ever pushed into host logs such as

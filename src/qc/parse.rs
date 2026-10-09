@@ -3795,8 +3795,11 @@ impl<'a> Parser<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // 与官方一致：文件不在 ⟹ 没有程序化骨骼。
                 log::info!(
-                    "提示：$proceduralbones 指向的 VRD 不存在，按官方行为跳过：{}",
-                    path.display()
+                    "{}",
+                    crate::tr_fmt!(
+                        "Note: the VRD pointed to by $proceduralbones does not exist; skipped, matching the official behavior: %{path}",
+                        path = path.display()
+                    )
                 );
                 return Ok(());
             }
@@ -5042,9 +5045,12 @@ impl<'a> Parser<'a> {
             skipped.sort();
             skipped.dedup();
             log::info!(
-                "提示：$lod 里有 {} 个不存在的骨骼，已按官方行为跳过：{}",
-                skipped.len(),
-                skipped.join(", ")
+                "{}",
+                crate::tr_fmt!(
+                    "Note: $lod names %{n} bones that do not exist; skipped, matching the official behavior: %{list}",
+                    n = skipped.len(),
+                    list = skipped.join(", ")
+                )
             );
         }
         // 若没有任何 bodypart（官方会报错），保持空 —— `validate()` 会报。
