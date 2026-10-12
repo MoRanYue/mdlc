@@ -157,41 +157,47 @@ fn variable_match_compares_only_len_minus_2_chars() {
     // ⚠️ 反例（钉住「n 由**引用名**长度决定，不是被查变量名」）：
     // 引用名很长（`$zzzzzzzzzzz$`，len 11 ⟹ n 9）时，
     // 被查的 `scale` 只有 5 字符，前 9 字符根本比不出来 ⟹ **不命中**。
-    let mut l = lex("$definevariable scale 0.9\n$contents $zzzzzzzzzzz$\n");
-    let mut err = None;
-    loop {
-        match l.next_token(true) {
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => {
-                err = Some(e);
-                break;
+    //
+    // ⚠️ 下面两段都在 `next_token()` 里渲染文案，所以语言必须在那一刻生效。
+    let e = crate::test_locale::with_english(|| {
+        let mut l = lex("$definevariable scale 0.9\n$contents $zzzzzzzzzzz$\n");
+        let mut err = None;
+        loop {
+            match l.next_token(true) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
-    }
-    let e = err.expect("引用名过长必须不命中 ⟹ 报错");
+        err.expect("引用名过长必须不命中 ⟹ 报错")
+    });
     assert!(
-        e.message.contains("未知的变量"),
+        e.message.contains("unknown variable"),
         "n 由引用名长度决定；引用名过长应不命中，实际：{}",
         e.message
     );
 
     // 前若干字符**不同** ⟹ 不命中 ⟹ 报错。
-    let mut l = lex("$definevariable scale 0.9\n$contents $other$\n");
-    let mut err = None;
-    loop {
-        match l.next_token(true) {
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => {
-                err = Some(e);
-                break;
+    let e = crate::test_locale::with_english(|| {
+        let mut l = lex("$definevariable scale 0.9\n$contents $other$\n");
+        let mut err = None;
+        loop {
+            match l.next_token(true) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
-    }
-    let e = err.expect("前缀不同必须报错");
+        err.expect("前缀不同必须报错")
+    });
     assert!(
-        e.message.contains("未知的变量"),
+        e.message.contains("unknown variable"),
         "错误信息应指出未知变量，实际：{}",
         e.message
     );
@@ -413,16 +419,19 @@ fn double_backslash_inside_comment_is_harmless() {
 /// mdlc 报错 —— 静默跳过属于「静默吃数据」。
 #[test]
 fn missing_include_is_an_error_not_a_silent_skip() {
-    let mut l = lex("$include nope_missing_file.qci\n");
-    let err = loop {
-        match l.next_token(true) {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("必须报错，而不是静默结束"),
-            Err(e) => break e,
+    // ⚠️ 文案在 `next_token()` 里就渲染好了，所以语言必须在那一刻生效。
+    let err = crate::test_locale::with_english(|| {
+        let mut l = lex("$include nope_missing_file.qci\n");
+        loop {
+            match l.next_token(true) {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("必须报错，而不是静默结束"),
+                Err(e) => break e,
+            }
         }
-    };
+    });
     assert!(
-        err.message.contains("$include 找不到"),
+        err.message.contains("$include cannot find"),
         "应报 $include 找不到，实际：{}",
         err.message
     );

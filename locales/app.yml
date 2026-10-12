@@ -1346,3 +1346,195 @@ _version: 2
 "vertices    %{n}":
   zh-CN: "顶点        %{n}"
 
+"$continue cannot find the sequence or animation %{name} (the official code says unknown continue animation %{name2})":
+  zh-CN: "$continue 找不到序列或动画 %{name}（官方报 unknown continue animation %{name2}）"
+
+"$defaultweightlist is not supported yet — it overrides the weights of **all** sequences that do not name a weightlist explicitly, so ignoring it silently would produce a model that looks right but means something else. The command appears 0 times in the corpus ($weightlist appears 9 times). If your QC uses it, switch to `$weightlist \"<name>\"` and reference it explicitly on the sequence.":
+  zh-CN: "$defaultweightlist 尚未支持 —— 它会覆盖**所有**未显式指定 weightlist 的序列的权重，静默忽略会产出看起来对但语义错的模型。语料里该命令出现 0 次（$weightlist 出现 9 次）。若你的 QC 用到它，请改用 `$weightlist \"<name>\"` 并在序列上显式引用。"
+
+"$include cannot find %{name} (%{path}): %{err}":
+  zh-CN: "$include 找不到 %{name}（%{path}）：%{err}"
+
+"$include nesting exceeds %{max} levels":
+  zh-CN: "$include 嵌套超过 %{max} 层"
+
+"$jigglebone %{bone}: a nested `{{` appears inside a block — the official code aborts (`$jigglebone: invalid syntax '{{'`)":
+  zh-CN: "$jigglebone %{bone}：块内出现嵌套的 `{{` —— 官方会 abort（`$jigglebone: invalid syntax '{{'`）"
+
+"$jigglebone %{bone}: a nested `{{` with no block name before it — the official code aborts (`$jigglebone: invalid syntax`)":
+  zh-CN: "$jigglebone %{bone}：嵌套的 `{{` 之前没有块名 —— 官方会 abort（`$jigglebone: invalid syntax`）"
+
+"$jigglebone %{bone}: the %{block} block does not accept the key %{key} — the official code aborts (`$jigglebone: invalid syntax '%{key2}'`)":
+  zh-CN: "$jigglebone %{bone}：%{block} 块不接受键 %{key} —— 官方会 abort（`$jigglebone: invalid syntax '%{key2}'`）"
+
+"$jigglebone %{bone}: the key %{key} appears in an unnamed nested block":
+  zh-CN: "$jigglebone %{bone}：键 %{key} 出现在无名的嵌套块里"
+
+"$jigglebone %{bone}: the key %{key} is written outside any block — the official code aborts (`$jigglebone: invalid syntax '%{key2}'`)":
+  zh-CN: "$jigglebone %{bone}：键 %{key} 写在任何块之外 —— 官方会 abort（`$jigglebone: invalid syntax '%{key2}'`）"
+
+"$nekomodel points at a DMX source; mdlc does not implement DMX (the official code delegates to dmxconvert.exe as well)":
+  zh-CN: "$nekomodel 指向 DMX 源，mdlc 不实现 DMX（官方也委托 dmxconvert.exe）"
+
+"%{what} is missing controls (the official code says missing controls on %{what2})":
+  zh-CN: "%{what} 缺少控制位（官方报 missing controls on %{what2}）"
+
+"`blank` bodygroup member: mdlc's BodyModel requires an SMD, so blank is not supported yet":
+  zh-CN: "`blank` bodygroup 成员：mdlc 的 BodyModel 必须有 SMD，暂不支持 blank"
+
+"`srcshapekeyignore` cannot be given together with `srcshapekey` / `srcshapekeyorder`: the former means \"no morph targets at all\", the latter two mean \"take them by name\"":
+  zh-CN: "`srcshapekeyignore` 与 `srcshapekey` / `srcshapekeyorder` 不能同时给出：前者是「一个形变目标都不要」，后两者是「按名单取」"
+
+"cannot read the QC file: %{err}":
+  zh-CN: "读不到 QC 文件：%{err}"
+
+"cannot read the VRD %{path}: %{err}":
+  zh-CN: "读不到 VRD %{path}：%{err}"
+
+"duplicate $weightlist %{name}":
+  zh-CN: "重复的 $weightlist %{name}"
+
+"duplicate animation name %{name} (the official code says Duplicate animation name)":
+  zh-CN: "重复的动画名 %{name}（官方报 Duplicate animation name）"
+
+"duplicate sequence name %{name} (the official code says Duplicate sequence name)":
+  zh-CN: "重复的序列名 %{name}（官方报 Duplicate sequence name）"
+
+"expected a number, got %{text}":
+  zh-CN: "期望数字，得到 %{text}"
+
+"expected an integer, got %{text}":
+  zh-CN: "期望整数，得到 %{text}"
+
+"eyelid %{name} %{what} out of range (+-%{radius}): the absolute value of the target %{target} exceeds the radius %{r} of eyeball %{eyeball}":
+  zh-CN: "eyelid %{name} %{what} out of range (+-%{radius})：目标值 %{target} 的绝对值超过眼球 %{eyeball} 的半径 %{r}"
+
+"eyelid %{name} is missing one of lowerer/neutral/raiser — the frame numbers and target values of the official's three flexkeys all come from them, and missing one reads an uninitialized stack value":
+  zh-CN: "eyelid %{name} 缺少 lowerer/neutral/raiser 之一 —— 官方三条 flexkey 的帧号与目标值全部来自它们，缺一个就会读到未初始化的栈值"
+
+"eyelid %{name} references a nonexistent eyeball %{want} (the official code skips it silently; mdlc reports an error so the eyelid does not fail silently)":
+  zh-CN: "eyelid %{name} 引用了不存在的眼球 %{want}（官方会静默跳过；mdlc 报错以免眼睑静默失效）"
+
+"incomplete line (missing argument at the end of the line)":
+  zh-CN: "行不完整（行尾缺少参数）"
+
+"incomplete line (the file ended unexpectedly)":
+  zh-CN: "行不完整（文件意外结束）"
+
+"incomplete line (the line ends in a comment)":
+  zh-CN: "行不完整（行尾是注释）"
+
+"macro expansion nesting exceeds %{max} levels":
+  zh-CN: "宏展开嵌套超过 %{max} 层"
+
+"more weight lists than the official limit of %{max} (including the implicit default list, at most %{hand} may be written by hand)":
+  zh-CN: "权重表超过官方上限 %{max} 张（含隐式默认表，手写最多 %{hand} 张）"
+
+"posweight appears before any bone entry (weightlist %{name})":
+  zh-CN: "posweight 出现在任何骨骼条目之前（weightlist %{name}）"
+
+"referenced by the QC":
+  zh-CN: "QC 里引用了它"
+
+"sequence %{name} found no animations (the official code says no animations found)":
+  zh-CN: "序列 %{name} 没有找到任何动画（官方报 no animations found）"
+
+"srcaxis only accepts \"y\" / \"z\" (also yup / y-up / zup / z-up, case-insensitive), got %{text}":
+  zh-CN: "srcaxis 只认 \"y\" / \"z\"（也接受 yup / y-up / zup / z-up，大小写不敏感），实际 %{text}"
+
+"srcfps must be a positive finite number, got %{v}":
+  zh-CN: "srcfps 必须是正有限数，实际 %{v}"
+
+"srcfps needs a number, got %{text}":
+  zh-CN: "srcfps 需要数字，实际 %{text}"
+
+"srcscale must be a positive finite number, got %{v}":
+  zh-CN: "srcscale 必须是正有限数，实际 %{v}"
+
+"srcscale needs a number, got %{text}":
+  zh-CN: "srcscale 需要数字，实际 %{text}"
+
+"the 3rd argument of replacemodel can only be reverse, got %{text}":
+  zh-CN: "replacemodel 第 3 个参数只能是 reverse，得到 %{text}"
+
+"the bone %{bone} has a rotation weight of 0 but a position weight of %{v} — the official code does not allow this":
+  zh-CN: "骨骼 %{bone} 的旋转权重为 0 而位置权重为 %{v} —— 官方不允许"
+
+"the script ended unexpectedly (missing argument)":
+  zh-CN: "脚本意外结束（缺少参数）"
+
+"the weight list %{name} has more entries than the official limit of %{max}":
+  zh-CN: "权重表 %{name} 的条目超过官方上限 %{max}"
+
+"there is no `flexfile` before `flex \"%{name}\"` — the official code uses an **uninitialized** `vtafile` here (UB, not reproducible). Write a `flexfile \"<x.vta>\"` line before `flex`, or use the inline form `$model <name> <smd> flex \"<name>\" \"<vta>\"`.":
+  zh-CN: "`flex \"%{name}\"` 之前没有 `flexfile` —— 官方此处用的是**未初始化**的 `vtafile`（UB，不可复现）。请在 `flex` 前写一行 `flexfile \"<x.vta>\"`，或用 `$model <name> <smd> flex \"<name>\" \"<vta>\"` 的内联形式。"
+
+"token too long (>%{max})":
+  zh-CN: "token 太长（>%{max}）"
+
+"too many commands: over the official limit of %{max} (the official code says Too many cmds in)":
+  zh-CN: "命令过多：超过官方上限 %{max} 条（官方报 Too many cmds in）"
+
+"too many sequences: the official limit is %{max}":
+  zh-CN: "序列过多：官方上限 %{max} 条"
+
+"unable to find valid bone for attachment __illumPosition:%{bone} (the official `simplify.cpp:5360`)":
+  zh-CN: "unable to find valid bone for attachment __illumPosition:%{bone}（官方 `simplify.cpp:5360`）"
+
+"unknown $attachment option %{opt}":
+  zh-CN: "未知的 $attachment 选项 %{opt}"
+
+"unknown $bodygroup option %{opt}":
+  zh-CN: "未知的 $bodygroup 选项 %{opt}"
+
+"unknown $ikchain option %{opt}":
+  zh-CN: "未知的 $ikchain 选项 %{opt}"
+
+"unknown $lod option %{opt}":
+  zh-CN: "未知的 $lod 选项 %{opt}"
+
+"unknown QC command %{cmd} (the official code says bad command)":
+  zh-CN: "未知的 QC 命令 %{cmd}（官方报 bad command）"
+
+"unknown animation option %{opt} (the official code says Unknown animation option'%{opt2}')":
+  zh-CN: "未知的动画选项 %{opt}（官方报 Unknown animation option'%{opt2}'）"
+
+"unknown attachment link %{bone}":
+  zh-CN: "unknown attachment link %{bone}"
+
+"unknown attachment link %{bone} — the 4th argument of `$illumposition` must be one of the SMD bones (the official `simplify.cpp:5375`)":
+  zh-CN: "unknown attachment link %{bone} —— `$illumposition` 的第 4 个参数必须是某根 SMD 骨骼（官方 `simplify.cpp:5375`）"
+
+"unknown cmdlist %{name} (the official code says unknown cmdlist %{name2})":
+  zh-CN: "未知的 cmdlist %{name}（官方报 unknown cmdlist %{name2}）"
+
+"unknown collision block subkey %{key}":
+  zh-CN: "未知的碰撞块子键 %{key}"
+
+"unknown command %{cmd} (the official code says unknown command %{cmd2})":
+  zh-CN: "未知的命令 %{cmd}（官方报 unknown command %{cmd2}）"
+
+"unknown command in $cmdlist: %{cmd} (the official code says unknown command: %{cmd2})":
+  zh-CN: "$cmdlist 里未知的命令 %{cmd}（官方报 unknown command: %{cmd2}）"
+
+"unknown eyelid option %{opt} (the official code says unknown option)":
+  zh-CN: "未知的 eyelid 选项 %{opt}（官方报 unknown option）"
+
+"unknown flex option %{opt} (the official code says unknown option)":
+  zh-CN: "未知的 flex 选项 %{opt}（官方报 unknown option）"
+
+"unknown ikrule type %{kind}":
+  zh-CN: "未知的 ikrule 类型 %{kind}"
+
+"unknown macro parameter \"%{name}\"":
+  zh-CN: "未知的宏参数 \"%{name}\""
+
+"unknown model option %{opt}":
+  zh-CN: "未知的 model 选项 %{opt}"
+
+"unknown studio option %{opt}":
+  zh-CN: "未知的 studio 选项 %{opt}"
+
+"unknown variable \"$%{name}$\"":
+  zh-CN: "未知的变量 \"$%{name}$\""
+

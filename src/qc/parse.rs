@@ -302,7 +302,11 @@ impl<'a> Parser<'a> {
     fn f(&mut self) -> Result<f32, QcError> {
         let t = self.tok(false)?;
         parse_f32(&t.text).ok_or_else(|| {
-            QcError::new(t.file.clone(), t.line, format!("期望数字，得到 {:?}", t.text))
+            QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!("expected a number, got %{text}", text = format!("{:?}", t.text)),
+            )
         })
     }
 
@@ -310,7 +314,14 @@ impl<'a> Parser<'a> {
     fn i(&mut self) -> Result<i32, QcError> {
         let t = self.tok(false)?;
         parse_i32(&t.text).ok_or_else(|| {
-            QcError::new(t.file.clone(), t.line, format!("期望整数，得到 {:?}", t.text))
+            QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "expected an integer, got %{text}",
+                    text = format!("{:?}", t.text)
+                ),
+            )
         })
     }
 
@@ -512,9 +523,9 @@ impl<'a> Parser<'a> {
             }
             // ---- 已知但**故意不支持**的命令（见各分支注释）----
             "$fakevta" => self.skip_block_with_name("$fakevta"),
-            "$nekomodel" => Err(self.lex.error(
-                "$nekomodel 指向 DMX 源，mdlc 不实现 DMX（官方也委托 dmxconvert.exe）",
-            )),
+            "$nekomodel" => Err(self.lex.error(crate::tr(
+                "$nekomodel points at a DMX source; mdlc does not implement DMX (the official code delegates to dmxconvert.exe as well)",
+            ))),
             "$jointconstrain" => self.cmd_jointconstrain(),
             "$animatedfriction" => self.cmd_animatedfriction(),
             "$noselfcollisions" => {
@@ -562,7 +573,10 @@ impl<'a> Parser<'a> {
                 self.skip_rest_of_line();
                 Ok(())
             }
-            other => Err(self.lex.error(format!("未知的 QC 命令 {other:?}（官方是 bad command）"))),
+            other => Err(self.lex.error(crate::tr_fmt!(
+                "unknown QC command %{cmd} (the official code says bad command)",
+                cmd = format!("{other:?}")
+            ))),
         }
     }
 
@@ -935,14 +949,19 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        "`blank` bodygroup 成员：mdlc 的 BodyModel 必须有 SMD，暂不支持 blank",
+                        crate::tr(
+                            "`blank` bodygroup member: mdlc's BodyModel requires an SMD, so blank is not supported yet",
+                        ),
                     ));
                 }
                 other => {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("未知的 $bodygroup 选项 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown $bodygroup option %{opt}",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -1021,14 +1040,20 @@ impl<'a> Parser<'a> {
                         QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcscale 需要数字，实际 {:?}", t.text),
+                            crate::tr_fmt!(
+                                "srcscale needs a number, got %{text}",
+                                text = format!("{:?}", t.text)
+                            ),
                         )
                     })?;
                     if !v.is_finite() || v <= 0.0 {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcscale 必须是正有限数，实际 {v}"),
+                            crate::tr_fmt!(
+                                "srcscale must be a positive finite number, got %{v}",
+                                v = v
+                            ),
                         ));
                     }
                     src_scale = Some(v);
@@ -1039,10 +1064,9 @@ impl<'a> Parser<'a> {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!(
-                                "srcaxis 只认 \"y\" / \"z\"（也接受 yup / y-up / \
-                                 zup / z-up，大小写不敏感），实际 {:?}",
-                                t.text
+                            crate::tr_fmt!(
+                                "srcaxis only accepts \"y\" / \"z\" (also yup / y-up / zup / z-up, case-insensitive), got %{text}",
+                                text = format!("{:?}", t.text)
                             ),
                         ));
                     }
@@ -1065,7 +1089,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         o.file.clone(),
                         o.line,
-                        format!("未知的 studio 选项 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown studio option %{opt}",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -1075,10 +1102,9 @@ impl<'a> Parser<'a> {
         // 这里也报一次：`validate()` 报的是 TOML 的字段路径，对 QC 用户没意义。
         if src_shape_key_ignore && (!src_shape_keys.is_empty() || !src_shape_key_order.is_empty())
         {
-            return Err(self.lex.error(
-                "`srcshapekeyignore` 与 `srcshapekey` / `srcshapekeyorder` 不能同时给出：\
-                 前者是「一个形变目标都不要」，后两者是「按名单取」",
-            ));
+            return Err(self.lex.error(crate::tr(
+                "`srcshapekeyignore` cannot be given together with `srcshapekey` / `srcshapekeyorder`: the former means \"no morph targets at all\", the latter two mean \"take them by name\"",
+            )));
         }
 
         let smd = self.resolve_src(&filename);
@@ -1162,7 +1188,10 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let low = t.text.to_ascii_lowercase();
-            let model = bp.models.last_mut().expect("$model 必有一个 model");
+            let model = bp
+                .models
+                .last_mut()
+                .expect("a $model block always has a model");
             match low.as_str() {
                 "flexfile" => {
                     let v = self.tok(false)?.text;
@@ -1233,14 +1262,20 @@ impl<'a> Parser<'a> {
                         QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcscale 需要数字，实际 {:?}", t.text),
+                            crate::tr_fmt!(
+                                "srcscale needs a number, got %{text}",
+                                text = format!("{:?}", t.text)
+                            ),
                         )
                     })?;
                     if !v.is_finite() || v <= 0.0 {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcscale 必须是正有限数，实际 {v}"),
+                            crate::tr_fmt!(
+                                "srcscale must be a positive finite number, got %{v}",
+                                v = v
+                            ),
                         ));
                     }
                     model.src_scale = Some(v);
@@ -1251,10 +1286,9 @@ impl<'a> Parser<'a> {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!(
-                                "srcaxis 只认 \"y\" / \"z\"（也接受 yup / y-up / \
-                                 zup / z-up，大小写不敏感），实际 {:?}",
-                                t.text
+                            crate::tr_fmt!(
+                                "srcaxis only accepts \"y\" / \"z\" (also yup / y-up / zup / z-up, case-insensitive), got %{text}",
+                                text = format!("{:?}", t.text)
                             ),
                         ));
                     }
@@ -1301,7 +1335,10 @@ impl<'a> Parser<'a> {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("未知的 model 选项 {other:?}"),
+                            crate::tr_fmt!(
+                                "unknown model option %{opt}",
+                                opt = format!("{other:?}")
+                            ),
                         ));
                     }
                 }
@@ -1342,7 +1379,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("未知的 flex 选项 {other:?}（官方是 unknown option）"),
+                        crate::tr_fmt!(
+                            "unknown flex option %{opt} (the official code says unknown option)",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -1401,11 +1441,9 @@ impl<'a> Parser<'a> {
         }
 
         let Some(vta) = self.pending_vta.clone() else {
-            return Err(self.lex.error(format!(
-                "`flex \"{name}\"` 之前没有 `flexfile` —— 官方此处用的是\
-                 **未初始化**的 `vtafile`（UB，不可复现）。\
-                 请在 `flex` 前写一行 `flexfile \"<x.vta>\"`，\
-                 或用 `$model <名> <smd> flex \"<名>\" \"<vta>\"` 的内联形式。"
+            return Err(self.lex.error(crate::tr_fmt!(
+                "there is no `flexfile` before `flex \"%{name}\"` — the official code uses an **uninitialized** `vtafile` here (UB, not reproducible). Write a `flexfile \"<x.vta>\"` line before `flex`, or use the inline form `$model <name> <smd> flex \"<name>\" \"<vta>\"`.",
+                name = name
             )));
         };
         model.flexes.push(Flex {
@@ -1619,17 +1657,18 @@ impl<'a> Parser<'a> {
                 "split" => split = self.f()?,
                 "eyeball" => eyeball = Some(self.tok(false)?.text),
                 other => {
-                    return Err(self
-                        .lex
-                        .error(format!("eyelid 的未知选项 {other:?}（官方是 unknown option）")));
+                    return Err(self.lex.error(crate::tr_fmt!(
+                        "unknown eyelid option %{opt} (the official code says unknown option)",
+                        opt = format!("{other:?}")
+                    )));
                 }
             }
         }
 
         let (Some(lowerer), Some(neutral), Some(raiser)) = (lowerer, neutral, raiser) else {
-            return Err(self.lex.error(format!(
-                "eyelid {type_name:?} 缺少 lowerer/neutral/raiser 之一 —— 官方三条 \
-                 flexkey 的帧号与目标值全部来自它们，缺一个就会读到未初始化的栈值"
+            return Err(self.lex.error(crate::tr_fmt!(
+                "eyelid %{name} is missing one of lowerer/neutral/raiser — the frame numbers and target values of the official's three flexkeys all come from them, and missing one reads an uninitialized stack value",
+                name = format!("{type_name:?}")
             )));
         };
         let (lowerer_desc, lowerer_frame, lowerer_target) = lowerer;
@@ -1684,12 +1723,14 @@ impl<'a> Parser<'a> {
             // 官方 `:3767-3778` 的三条范围检查，逐条 `TokenError`。
             for (what, t) in targets {
                 if t.abs() > eb.radius {
-                    return Err(self.lex.error(format!(
-                        "eyelid {type_name:?} {what} out of range (+-{:.1}): \
-                         目标值 {t} 的绝对值超过眼球 {:?} 的半径 {}",
-                        eb.radius,
-                        eb.name.as_deref().unwrap_or(""),
-                        eb.radius
+                    return Err(self.lex.error(crate::tr_fmt!(
+                        "eyelid %{name} %{what} out of range (+-%{radius}): the absolute value of the target %{target} exceeds the radius %{r} of eyeball %{eyeball}",
+                        name = format!("{type_name:?}"),
+                        what = what,
+                        radius = format!("{:.1}", eb.radius),
+                        target = t,
+                        r = eb.radius,
+                        eyeball = format!("{:?}", eb.name.as_deref().unwrap_or(""))
                     )));
                 }
             }
@@ -1722,9 +1763,10 @@ impl<'a> Parser<'a> {
         if let Some(want) = &eyeball
             && matched == 0
         {
-            return Err(self.lex.error(format!(
-                "eyelid {type_name:?} 引用了不存在的眼球 {want:?}\
-                 （官方会静默跳过；mdlc 报错以免眼睑静默失效）"
+            return Err(self.lex.error(crate::tr_fmt!(
+                "eyelid %{name} references a nonexistent eyeball %{want} (the official code skips it silently; mdlc reports an error so the eyelid does not fail silently)",
+                name = format!("{type_name:?}"),
+                want = format!("{want:?}")
             )));
         }
         Ok(())
@@ -1799,7 +1841,10 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!("序列过多：官方上限 {MAX_SEQUENCES} 条"),
+                crate::tr_fmt!(
+                    "too many sequences: the official limit is %{max}",
+                    max = MAX_SEQUENCES
+                ),
             ));
         }
         // 与实体序列重名 ⟹ 官方**不报错**，产出两条（实测）。
@@ -1857,7 +1902,10 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!("重复的序列名 {name:?}（官方是 Duplicate sequence name）"),
+                crate::tr_fmt!(
+                    "duplicate sequence name %{name} (the official code says Duplicate sequence name)",
+                    name = format!("{name:?}")
+                ),
             ));
         }
 
@@ -2272,14 +2320,20 @@ impl<'a> Parser<'a> {
                         QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcfps 需要数字，实际 {:?}", t.text),
+                            crate::tr_fmt!(
+                                "srcfps needs a number, got %{text}",
+                                text = format!("{:?}", t.text)
+                            ),
                         )
                     })?;
                     if !v.is_finite() || v <= 0.0 {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("srcfps 必须是正有限数，实际 {v}"),
+                            crate::tr_fmt!(
+                                "srcfps must be a positive finite number, got %{v}",
+                                v = v
+                            ),
                         ));
                     }
                     seq.src_fps = Some(v);
@@ -2349,7 +2403,11 @@ impl<'a> Parser<'a> {
                         return Err(QcError::new(
                             t.file.clone(),
                             t.line,
-                            format!("未知的命令 {:?}（官方是 unknown command {:?}）", t.text, t.text),
+                            crate::tr_fmt!(
+                                "unknown command %{cmd} (the official code says unknown command %{cmd2})",
+                                cmd = format!("{:?}", t.text),
+                                cmd2 = format!("{:?}", t.text)
+                            ),
                         ));
                     }
                     if crate::compile::is_source_ref(&t.text) {
@@ -2429,7 +2487,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     name_t.file.clone(),
                     name_t.line,
-                    format!("序列 {name:?} 没有找到任何动画（官方是 no animations found）"),
+                    crate::tr_fmt!(
+                        "sequence %{name} found no animations (the official code says no animations found)",
+                        name = format!("{name:?}")
+                    ),
                 ));
             }
             // 单动画序列：`blends` **留空**，引用放进 `smd`
@@ -2504,7 +2565,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     kind_t.file.clone(),
                     kind_t.line,
-                    format!("未知的 ikrule 类型 {other:?}"),
+                    crate::tr_fmt!(
+                        "unknown ikrule type %{kind}",
+                        kind = format!("{other:?}")
+                    ),
                 ));
             }
         };
@@ -2584,7 +2648,10 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!("重复的动画名 {name:?}（官方是 Duplicate animation name）"),
+                crate::tr_fmt!(
+                    "duplicate animation name %{name} (the official code says Duplicate animation name)",
+                    name = format!("{name:?}")
+                ),
             ));
         }
         let smd_raw = self.tok(false)?.text;
@@ -2639,9 +2706,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!(
-                        "未知的动画选项 {:?}（官方是 Unknown animation option'{:?}'）",
-                        t.text, t.text
+                    crate::tr_fmt!(
+                        "unknown animation option %{opt} (the official code says Unknown animation option'%{opt2}')",
+                        opt = format!("{:?}", t.text),
+                        opt2 = format!("{:?}", t.text)
                     ),
                 ));
             }
@@ -2741,14 +2809,20 @@ impl<'a> Parser<'a> {
                     QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("srcfps 需要数字，实际 {:?}", t.text),
+                        crate::tr_fmt!(
+                            "srcfps needs a number, got %{text}",
+                            text = format!("{:?}", t.text)
+                        ),
                     )
                 })?;
                 if !v.is_finite() || v <= 0.0 {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("srcfps 必须是正有限数，实际 {v}"),
+                        crate::tr_fmt!(
+                            "srcfps must be a positive finite number, got %{v}",
+                            v = v
+                        ),
                     ));
                 }
                 anim.src_fps = Some(v);
@@ -2819,7 +2893,11 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 t.file.clone(),
                 t.line,
-                format!("未知的 cmdlist {n:?}（官方是 unknown cmdlist {n}）"),
+                crate::tr_fmt!(
+                    "unknown cmdlist %{name} (the official code says unknown cmdlist %{name2})",
+                    name = format!("{n:?}"),
+                    name2 = n
+                ),
             ));
         };
         let copied = cl.cmds.clone();
@@ -2828,7 +2906,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!("命令过多：超过官方上限 {MAX_CMDS} 条（官方是 Too many cmds in）"),
+                    crate::tr_fmt!(
+                        "too many commands: over the official limit of %{max} (the official code says Too many cmds in)",
+                        max = MAX_CMDS
+                    ),
                 ));
             }
             out.push(c);
@@ -2872,7 +2953,11 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!("$cmdlist 里未知的命令 {:?}（官方是 unknown command: {})", t.text, t.text),
+                    crate::tr_fmt!(
+                        "unknown command in $cmdlist: %{cmd} (the official code says unknown command: %{cmd2})",
+                        cmd = format!("{:?}", t.text),
+                        cmd2 = t.text
+                    ),
                 ));
             }
         }
@@ -2927,7 +3012,11 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!("$continue 找不到序列或动画 {name:?}（官方是 unknown continue animation {name}）"),
+                crate::tr_fmt!(
+                    "$continue cannot find the sequence or animation %{name} (the official code says unknown continue animation %{name2})",
+                    name = format!("{name:?}"),
+                    name2 = name
+                ),
             ));
         }
 
@@ -2975,7 +3064,7 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
-        let ai = ai.expect("已判非 None");
+        let ai = ai.expect("already checked that it is not None");
         // `ParseAnimation( panim, true )` —— 官方那个 `isAppend` 形参
         // **完全没用**（`:2442-2499` 的函数体只有 `while (1)` 循环），
         // 所以这里与 `$animation` 体同一套解析。
@@ -3009,9 +3098,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!(
-                        "未知的动画选项 {:?}（官方是 Unknown animation option'{:?}'）",
-                        t.text, t.text
+                    crate::tr_fmt!(
+                        "unknown animation option %{opt} (the official code says Unknown animation option'%{opt2}')",
+                        opt = format!("{:?}", t.text),
+                        opt2 = format!("{:?}", t.text)
                     ),
                 ));
             }
@@ -3210,14 +3300,21 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 t.file.clone(),
                 t.line,
-                format!("{what} 缺少控制位（官方是 missing controls on {what}）"),
+                crate::tr_fmt!(
+                    "%{what} is missing controls (the official code says missing controls on %{what2})",
+                    what = what,
+                    what2 = what
+                ),
             ));
         }
         let frame = parse_i32(&cur.text).ok_or_else(|| {
             QcError::new(
                 cur.file.clone(),
                 cur.line,
-                format!("期望整数，得到 {:?}", cur.text),
+                crate::tr_fmt!(
+                    "expected an integer, got %{text}",
+                    text = format!("{:?}", cur.text)
+                ),
             )
         })?;
         Ok((motion_type, frame))
@@ -3398,7 +3495,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("未知的 $attachment 选项 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown $attachment option %{opt}",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -3481,7 +3581,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("未知的 $ikchain 选项 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown $ikchain option %{opt}",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -3591,7 +3694,10 @@ impl<'a> Parser<'a> {
                             return Err(QcError::new(
                                 t.file.clone(),
                                 t.line,
-                                format!("replacemodel 第 3 个参数只能是 reverse，得到 {:?}", t.text),
+                                crate::tr_fmt!(
+                                    "the 3rd argument of replacemodel can only be reverse, got %{text}",
+                                    text = format!("{:?}", t.text)
+                                ),
                             ));
                         }
                     }
@@ -3614,7 +3720,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("未知的 $lod 选项 {other:?}"),
+                        crate::tr_fmt!(
+                            "unknown $lod option %{opt}",
+                            opt = format!("{other:?}")
+                        ),
                     ));
                 }
             }
@@ -3677,10 +3786,9 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!(
-                            "$jigglebone {:?}: 块内出现嵌套的 `{{` —— 官方会 abort\
-                             （`$jigglebone: invalid syntax '{{'`）",
-                            jb.bone
+                        crate::tr_fmt!(
+                            "$jigglebone %{bone}: a nested `{{` appears inside a block — the official code aborts (`$jigglebone: invalid syntax '{{'`)",
+                            bone = format!("{:?}", jb.bone)
                         ),
                     ));
                 }
@@ -3689,10 +3797,9 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!(
-                            "$jigglebone {:?}: 嵌套的 `{{` 之前没有块名 —— 官方会 abort\
-                             （`$jigglebone: invalid syntax`）",
-                            jb.bone
+                        crate::tr_fmt!(
+                            "$jigglebone %{bone}: a nested `{{` with no block name before it — the official code aborts (`$jigglebone: invalid syntax`)",
+                            bone = format!("{:?}", jb.bone)
                         ),
                     ));
                 };
@@ -3724,10 +3831,11 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!(
-                        "$jigglebone {:?}: 键 {low:?} 写在任何块之外 —— 官方会 abort\
-                         （`$jigglebone: invalid syntax '{low}'`）",
-                        jb.bone
+                    crate::tr_fmt!(
+                        "$jigglebone %{bone}: the key %{key} is written outside any block — the official code aborts (`$jigglebone: invalid syntax '%{key2}'`)",
+                        bone = format!("{:?}", jb.bone),
+                        key = format!("{low:?}"),
+                        key2 = low
                     ),
                 ));
             }
@@ -3737,9 +3845,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!(
-                        "$jigglebone {:?}: 键 {low:?} 出现在无名的嵌套块里",
-                        jb.bone
+                    crate::tr_fmt!(
+                        "$jigglebone %{bone}: the key %{key} appears in an unnamed nested block",
+                        bone = format!("{:?}", jb.bone),
+                        key = format!("{low:?}")
                     ),
                 ));
             };
@@ -3748,10 +3857,12 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!(
-                        "$jigglebone {:?}: {b} 块不接受键 {low:?} —— 官方会 abort\
-                         （`$jigglebone: invalid syntax '{low}'`）",
-                        jb.bone
+                    crate::tr_fmt!(
+                        "$jigglebone %{bone}: the %{block} block does not accept the key %{key} — the official code aborts (`$jigglebone: invalid syntax '%{key2}'`)",
+                        bone = format!("{:?}", jb.bone),
+                        block = b,
+                        key = format!("{low:?}"),
+                        key2 = low
                     ),
                 ));
             }
@@ -3807,7 +3918,11 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!("读不到 VRD {}：{e}", path.display()),
+                    crate::tr_fmt!(
+                        "cannot read the VRD %{path}: %{err}",
+                        path = path.display(),
+                        err = e
+                    ),
                 ));
             }
         };
@@ -3860,10 +3975,10 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!(
-                    "权重表超过官方上限 {} 张（含隐式默认表，手写最多 {} 张）",
-                    crate::model::MAX_WEIGHT_LISTS,
-                    crate::model::MAX_WEIGHT_LISTS - 1
+                crate::tr_fmt!(
+                    "more weight lists than the official limit of %{max} (including the implicit default list, at most %{hand} may be written by hand)",
+                    max = crate::model::MAX_WEIGHT_LISTS,
+                    hand = crate::model::MAX_WEIGHT_LISTS - 1
                 ),
             ));
         }
@@ -3877,7 +3992,10 @@ impl<'a> Parser<'a> {
             return Err(QcError::new(
                 name_t.file.clone(),
                 name_t.line,
-                format!("重复的 $weightlist {name:?}"),
+                crate::tr_fmt!(
+                    "duplicate $weightlist %{name}",
+                    name = format!("{name:?}")
+                ),
             ));
         }
 
@@ -3909,16 +4027,20 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!("posweight 出现在任何骨骼条目之前（weightlist {name:?}）"),
+                        crate::tr_fmt!(
+                            "posweight appears before any bone entry (weightlist %{name})",
+                            name = format!("{name:?}")
+                        ),
                     ));
                 };
                 if last.weight == 0.0 && v > 0.0 {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!(
-                            "骨骼 {:?} 的旋转权重为 0 而位置权重为 {v} —— 官方不允许",
-                            last.bone
+                        crate::tr_fmt!(
+                            "the bone %{bone} has a rotation weight of 0 but a position weight of %{v} — the official code does not allow this",
+                            bone = format!("{:?}", last.bone),
+                            v = v
                         ),
                     ));
                 }
@@ -3935,9 +4057,10 @@ impl<'a> Parser<'a> {
                     return Err(QcError::new(
                         t.file.clone(),
                         t.line,
-                        format!(
-                            "权重表 {name:?} 的条目超过官方上限 {}",
-                            crate::model::MAX_WEIGHT_ENTRIES
+                        crate::tr_fmt!(
+                            "the weight list %{name} has more entries than the official limit of %{max}",
+                            name = format!("{name:?}"),
+                            max = crate::model::MAX_WEIGHT_ENTRIES
                         ),
                     ));
                 }
@@ -3971,12 +4094,9 @@ impl<'a> Parser<'a> {
     /// 语料实测：`$defaultweightlist` 在 53 个真实 QC 里出现 **0 次**
     /// （`$weightlist` 出现 9 次）。所以先显式报错，等有真实样本再实现。
     fn cmd_defaultweightlist(&mut self) -> Result<(), QcError> {
-        Err(self.lex.error(
-            "$defaultweightlist 尚未支持 —— 它会覆盖**所有**未显式指定 weightlist \
-             的序列的权重，静默忽略会产出语义错误的模型。\
-             语料里该命令出现 0 次（$weightlist 出现 9 次）。\
-             若你有用到它的 QC，请改用 `$weightlist \"<名>\"` 并在序列上显式引用。",
-        ))
+        Err(self.lex.error(crate::tr(
+            "$defaultweightlist is not supported yet — it overrides the weights of **all** sequences that do not name a weightlist explicitly, so ignoring it silently would produce a model that looks right but means something else. The command appears 0 times in the corpus ($weightlist appears 9 times). If your QC uses it, switch to `$weightlist \"<name>\"` and reference it explicitly on the sequence.",
+        )))
     }
 
     /// `$collisionmodel "<smd>" { ... }` / `$collisionjoints`。
@@ -4059,7 +4179,10 @@ impl<'a> Parser<'a> {
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
-                    format!("未知的碰撞块子键 {other:?}"),
+                    crate::tr_fmt!(
+                        "unknown collision block subkey %{key}",
+                        key = format!("{other:?}")
+                    ),
                 ));
             }
         }
@@ -4263,7 +4386,10 @@ impl<'a> Parser<'a> {
             // `option_studio`）就退回默认值。
             let fallback = crate::compile::SrcOpts::default();
             let opts = src_opts_of.get(f).unwrap_or(&fallback);
-            let info = match crate::compile::read_source(&p, "QC 里引用了它", opts) {
+            // ⚠️ `at` 会作为前缀出现在 `read_source()` 的错误文案里
+            // （`%{at}: cannot read %{path}: %{err}`），所以它也是用户可见的。
+            let at = crate::tr("referenced by the QC");
+            let info = match crate::compile::read_source(&p, &at, opts) {
                 Err(err) => {
                     self.errors.push(QcError::new(
                         p.display().to_string(),
@@ -4719,9 +4845,9 @@ impl<'a> Parser<'a> {
                     errs.push(QcError::new(
                         file,
                         line,
-                        format!(
-                            "unknown attachment link {:?} —— `$illumposition` 的第 4 个参数必须是某根 SMD 骨骼（官方 `simplify.cpp:5375`）",
-                            at.bone
+                        crate::tr_fmt!(
+                            "unknown attachment link %{bone} — the 4th argument of `$illumposition` must be one of the SMD bones (the official `simplify.cpp:5375`)",
+                            bone = format!("{:?}", at.bone)
                         ),
                     ));
                     out.push(None);
@@ -4747,7 +4873,10 @@ impl<'a> Parser<'a> {
                     errs.push(QcError::new(
                         file,
                         line,
-                        format!("unknown attachment link {:?}", at.bone),
+                        crate::tr_fmt!(
+                            "unknown attachment link %{bone}",
+                            bone = format!("{:?}", at.bone)
+                        ),
                     ));
                     out.push(None);
                     continue;
@@ -4768,9 +4897,9 @@ impl<'a> Parser<'a> {
                     errs.push(QcError::new(
                         file,
                         line,
-                        format!(
-                            "unable to find valid bone for attachment __illumPosition:{}（官方 `simplify.cpp:5360`）",
-                            at.bone
+                        crate::tr_fmt!(
+                            "unable to find valid bone for attachment __illumPosition:%{bone} (the official `simplify.cpp:5360`)",
+                            bone = at.bone
                         ),
                     ));
                     out.push(None);
@@ -7463,7 +7592,11 @@ $model \"body\" \"a.smd\" {
 }
 $sequence \"idle\" \"a.smd\" fps 30
 ";
-        let errs = crate::qc::parse_qc_str(bad, &dir).expect_err("超出半径必须报错");
+        // ⚠️ 文案在 `parse_qc_str` 里就渲染好了，所以语言必须在那一刻生效
+        //（`out of range` 是英文源文里刻意保留的官方记号，但锁住更稳）。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(bad, &dir).expect_err("超出半径必须报错")
+        });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             errs.iter().any(|e| e.message.contains("out of range")),
@@ -7512,10 +7645,15 @@ $model \"body\" \"a.smd\" {
 }
 $sequence \"idle\" \"a.smd\" fps 30
 ";
-        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("缺 raiser 必须报错");
+        // ⚠️ `QcError` 的 `message` 在 `parse_qc_str()` 里就渲染好了，
+        // 所以语言必须在**那一刻**生效（不是包住 `contains`）。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(qc, &dir).expect_err("缺 raiser 必须报错")
+        });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            errs.iter().any(|e| e.message.contains("缺少 lowerer/neutral/raiser")),
+            errs.iter()
+                .any(|e| e.message.contains("missing one of lowerer/neutral/raiser")),
             "应报缺项，实际：{errs:?}"
         );
     }
@@ -7532,10 +7670,13 @@ $model \"body\" \"a.smd\" {
 }
 $sequence \"idle\" \"a.smd\" fps 30
 ";
-        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未知眼球必须报错");
+        // ⚠️ 文案在 `parse_qc_str()` 里就渲染好了，语言必须在那一刻生效。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(qc, &dir).expect_err("未知眼球必须报错")
+        });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            errs.iter().any(|e| e.message.contains("不存在的眼球")
+            errs.iter().any(|e| e.message.contains("nonexistent eyeball")
                 && e.message.contains("nosuch")),
             "应点名 `nosuch`，实际：{errs:?}"
         );
@@ -7553,10 +7694,14 @@ $model \"body\" \"a.smd\" {
 }
 $sequence \"idle\" \"a.smd\" fps 30
 ";
-        let errs = crate::qc::parse_qc_str(qc, &dir).expect_err("未知选项必须报错");
+        // ⚠️ 文案在 `parse_qc_str()` 里就渲染好了，语言必须在那一刻生效。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(qc, &dir).expect_err("未知选项必须报错")
+        });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            errs.iter().any(|e| e.message.contains("eyelid 的未知选项")),
+            errs.iter()
+                .any(|e| e.message.contains("unknown eyelid option")),
             "应报未知选项，实际：{errs:?}"
         );
     }

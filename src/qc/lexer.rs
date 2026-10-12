@@ -185,7 +185,7 @@ impl Lexer {
             QcError::new(
                 path.display().to_string(),
                 0,
-                format!("读不到 QC 文件：{e}"),
+                crate::tr_fmt!("cannot read the QC file: %{err}", err = e),
             )
         })?;
         let name = path.display().to_string();
@@ -272,7 +272,9 @@ impl Lexer {
     pub fn expect_token(&mut self, crossline: bool) -> Result<Token, QcError> {
         match self.next_token(crossline)? {
             Some(t) => Ok(t),
-            None => Err(self.error("脚本意外结束（缺少参数）")),
+            None => Err(self.error(crate::tr(
+                "the script ended unexpectedly (missing argument)",
+            ))),
         }
     }
 
@@ -346,7 +348,9 @@ impl Lexer {
                 self.frame_mut().pos += 1;
                 if c == b'\n' {
                     if !crossline {
-                        return Err(self.error("行不完整（行尾缺少参数）"));
+                        return Err(self.error(crate::tr(
+                            "incomplete line (missing argument at the end of the line)",
+                        )));
                     }
                     let f = self.frame_mut();
                     f.line += 1;
@@ -362,12 +366,12 @@ impl Lexer {
             // `;` `#` `//` 三者都起注释。注意 `#` 与 `/` **不**结束 token，
             // 只有 `;` 会（见下面的常规 token 扫描条件）。
             let c = self.frame().cur();
-            let is_comment = c == b';'
-                || c == b'#'
-                || (c == b'/' && self.frame().peek1() == b'/');
+            let is_comment = c == b';' || c == b'#' || (c == b'/' && self.frame().peek1() == b'/');
             if is_comment {
                 if !crossline {
-                    return Err(self.error("行不完整（行尾是注释）"));
+                    return Err(
+                        self.error(crate::tr("incomplete line (the line ends in a comment)"))
+                    );
                 }
                 // `while (*script->script_p++ != '\n')` —— 注意是**先取后判**，
                 // 所以 `\n` 本身也被消费掉。
@@ -451,7 +455,9 @@ impl Lexer {
                     break;
                 }
                 if out.len() >= MAX_TOKEN {
-                    return Err(self.error(format!("token 太长（>{MAX_TOKEN}）")));
+                    return Err(
+                        self.error(crate::tr_fmt!("token too long (>%{max})", max = MAX_TOKEN))
+                    );
                 }
                 out.push(ch);
                 self.frame_mut().pos += 1;
@@ -475,7 +481,9 @@ impl Lexer {
                     continue;
                 }
                 if out.len() >= MAX_TOKEN {
-                    return Err(self.error(format!("token 太长（>{MAX_TOKEN}）")));
+                    return Err(
+                        self.error(crate::tr_fmt!("token too long (>%{max})", max = MAX_TOKEN))
+                    );
                 }
                 out.push(ch);
                 self.frame_mut().pos += 1;
@@ -518,7 +526,7 @@ impl Lexer {
     /// 若已在最外层则置 `end_of_script`（正常结束）。
     fn end_of_script_inner(&mut self, crossline: bool) -> Result<(), QcError> {
         if !crossline {
-            return Err(self.error("行不完整（文件意外结束）"));
+            return Err(self.error(crate::tr("incomplete line (the file ended unexpectedly)")));
         }
         if self.stack.len() <= 1 {
             self.end_of_script = true;
@@ -536,7 +544,10 @@ impl Lexer {
     /// 也不是 `$pushd` 之后的目录 —— 见 [`super`] 的说明第 3 条。
     fn push_include(&mut self, name: &Token) -> Result<(), QcError> {
         if self.stack.len() + 1 >= MAX_INCLUDES {
-            return Err(self.error(format!("$include 嵌套超过 {MAX_INCLUDES} 层")));
+            return Err(self.error(crate::tr_fmt!(
+                "$include nesting exceeds %{max} levels",
+                max = MAX_INCLUDES
+            )));
         }
         let rel = Path::new(&name.text);
         let full = if rel.is_absolute() {
@@ -549,7 +560,12 @@ impl Lexer {
             QcError::new(
                 name.file.clone(),
                 name.line,
-                format!("$include 找不到 {}（{}）：{e}", name.text, full.display()),
+                crate::tr_fmt!(
+                    "$include cannot find %{name} (%{path}): %{err}",
+                    name = name.text,
+                    path = full.display(),
+                    err = e
+                ),
             )
         })?;
         let display = full.display().to_string();
@@ -706,7 +722,10 @@ impl Lexer {
             return Ok(false);
         };
         if self.stack.len() + 1 >= MAX_INCLUDES {
-            return Err(self.error(format!("宏展开嵌套超过 {MAX_INCLUDES} 层")));
+            return Err(self.error(crate::tr_fmt!(
+                "macro expansion nesting exceeds %{max} levels",
+                max = MAX_INCLUDES
+            )));
         }
         let params = self.macros[m].params.clone();
         let body = self.macros[m].body.clone();
@@ -753,7 +772,7 @@ impl Lexer {
             return Err(QcError::new(
                 file,
                 line,
-                format!("未知的宏参数 \"{name}\""),
+                crate::tr_fmt!("unknown macro parameter \"%{name}\"", name = name),
             ));
         };
         let value = f.macro_values[idx].clone();
@@ -797,7 +816,7 @@ impl Lexer {
             return Err(QcError::new(
                 file,
                 line,
-                format!("未知的变量 \"${name}$\""),
+                crate::tr_fmt!("unknown variable \"$%{name}$\"", name = name),
             ));
         };
         let value = self.variables[idx].value.clone();
