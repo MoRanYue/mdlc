@@ -2525,11 +2525,45 @@ impl<'a> Parser<'a> {
     ///
     /// 返回 `(事件, 需要从 depth 减去的量)` —— 官方允许事件带 `{ }` 块
     /// （`Option_Event` 返回值即「是否吃掉了 `}`」）。
+    ///
+    /// # ⚠️ **回归（R67）**：收尾的 `}` 必须先判、不能当 options
+    ///
+    /// 官方 `Option_Event`（`studiomdl.cpp:1206-1214`）读 options 之前**先**
+    /// 检查这个 token 是不是块结束符：
+    ///
+    /// ```c
+    /// if (TokenAvailable())
+    /// {
+    ///     GetToken( false );
+    ///     if (token[0] == '}') return 1;      // ← 不吃它，让调用方减 depth
+    ///     strcpyn( psequence->events[psequence->numevents-1].options, token );
+    /// }
+    /// return 0;
+    /// ```
+    ///
+    /// 调用点 `studiomdl.cpp:2706-2709` 是 `depth -= Option_Event( pseq );`。
+    ///
+    /// 修前本实现**无条件**把下一个 token 当 options 字符串 ⟹
+    /// `{ event AE_PICKUP_CLIPIN 40 }` 里那个收尾 `}` 被吞进 `options`，
+    /// `depth` 永不归零 ⟹ **整个块不再闭合**，后续每一条 `$sequence`
+    /// 的关键字全部漏进本序列的 `blends`。用户的
+    /// `v_huntingrifle_processed.qc` 就是这么变成 103 格 blend 的
+    /// （12 处 `{ event … }` × 后续 token）。真 exe 裁决见
+    /// `target/_r67/oracle_event.js`：`}` 同行与换行两种写法产物
+    /// **逐字节相同**，即官方两种都正确解析。
     fn option_event(&mut self, _seq: &str) -> Result<(SequenceEvent, i32), QcError> {
         let name = self.tok(false)?.text;
         let frame = self.i()?;
+        let mut consumed_depth = 0i32;
         let options = if self.avail() {
-            self.tok(false)?.text
+            let opt = self.tok(false)?;
+            // 官方判据逐字照抄：只看**首字节**是不是 `}`。
+            if opt.text.starts_with('}') {
+                consumed_depth = 1;
+                String::new()
+            } else {
+                opt.text
+            }
         } else {
             String::new()
         };
@@ -2547,7 +2581,7 @@ impl<'a> Parser<'a> {
                 name: if numeric { String::new() } else { name },
                 options,
             },
-            0,
+            consumed_depth,
         ))
     }
 
@@ -2597,11 +2631,15 @@ impl<'a> Parser<'a> {
             // 官方 `Option_IKRule` 的 `attachment` 分支**只读一个 token**
             // （附着点名），把它存进 `pRule->attachment`。
             //
-            // ⚠️ 实测 `abi3.qc` 写的是 `ikrule "leg" attachment "ankle" "muzzle"`
-            // —— **两个** token。官方只读第一个（`"ankle"`）当附着点名，
-            // 第二个（`"muzzle"`）会落进下面的 `while (TokenAvailable())` 循环，
-            // 而那个循环**不认识的 token 直接跳过**（没有 else 报错）。
-            // 所以这里也照做：读一个当附着名，剩下的由循环静默忽略。
+            // ⚠️ 多写的第二个 token（`abi3.qc` 的 `ikrule "leg" attachment
+            // "ankle" "muzzle"` 里的 `"muzzle"`）**不是被忽略** —— 它落进
+            // 下面的选项循环，而那个循环的不认识分支是
+            // `UnGetToken(); return;`（`studiomdl.cpp:1378-1382`）⟹
+            // **吐回给调用者**。真 exe 裁决（`target/_r67/oracle_ikrule.js`）：
+            // 官方把它当**第二格 blend 动画**（`Cmd_ImpliedAnimation` →
+            // `Load_Source` 找 `muzzle.smd`），文件不存在报
+            // `could not load file 'muzzle'`，存在则变成 2 格非方形网格报
+            // `calcblend failed in idle`（`simplify.cpp:5568`）。
             rule.attachment = Some(self.tok(false)?.text);
         }
         while self.avail() {
@@ -2629,11 +2667,22 @@ impl<'a> Parser<'a> {
                     }
                     rule.range = Some(r);
                 }
-                other => {
-                    // 官方 `Option_IKRule` 的选项循环**没有 else 分支** ——
-                    // 不认识的 token 被静默忽略（例如 `abi3.qc` 多写的那个
-                    // 附着点名）。这里照抄：不报错，只跳过。
-                    let _ = other;
+                _ => {
+                    // ⚠️ **回归（R67.2）**：官方 `Option_IKRule` 的选项循环
+                    // 结尾是 `else { UnGetToken(); return; }`
+                    // （`studiomdl.cpp:1378-1382`），而 `UnGetToken` 的真身
+                    // 只是 `tokenready = true`（`scriplib.cpp:330-333`）
+                    // ⟹ 不认识的 token **原样吐回调用者**，不是吞掉。
+                    //
+                    // 修前本实现写 `let _ = other;`（静默丢弃）—— 于是
+                    // 那个 token 既没进规则、也没回到 `$sequence` 主循环，
+                    // 官方「当成第二格 blend 动画」的行为完全消失。
+                    //
+                    // 吐回之后由 `parse_sequence_body` 的兜底 arm 接住，
+                    // 走 `is_source_ref`/动画池/隐含动画三条路 —— 与官方
+                    // `ParseSequence` 的三段尾部分派同构（见该函数文档）。
+                    self.lex.unget(t);
+                    return Ok(rule);
                 }
             }
         }
@@ -7888,6 +7937,122 @@ $sequence \"idle\" \"a.smd\" fps 30
             d.materials.textures.iter().any(|t| t.name == "mat"),
             "SMD 里出现的材质名仍须进材质表，实际：{:?}",
             d.materials.textures.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// ⚠️ **回归（R67.1）**：`{ event <名> <帧> }` 的收尾 `}` 不能被当成 options。
+    ///
+    /// 官方 `Option_Event`（`studiomdl.cpp:1188-1215`）读完事件名与帧号后是
+    /// `if (TokenAvailable()) { GetToken(false); if (token[0] == '}') return 1;
+    /// strcpyn(options, token); } return 0;` —— **返回 1 表示「这个 `}` 我吃掉了」**，
+    /// 调用点 `ParseSequence` 是 `depth -= Option_Event( pseq );`（`:2706-2709`）。
+    ///
+    /// 修前本实现无条件把下一个 token 当 options、并硬编码返回 `0`
+    /// ⟹ `}` 被写进 `options` 而 `depth` 没减 ⟹ **`$sequence` 块永不闭合**，
+    /// 后续每个 `$sequence` 块的 3 个 token（`$sequence`/名字/SMD）全被兜底
+    /// arm 当成 blend 格吞进 `blends`。真实工程
+    /// `v_huntingrifle_processed.qc` 的 12 处 `{ event … }` 累计吞出 **103 格**，
+    /// 编译时报「blend 格数 103 不是完全平方数」。
+    ///
+    /// 真 exe 裁决（`target/_r67/oracle_event.js`）：`}` 同行与换行两种写法
+    /// 官方产物**逐字节相同** ⟹ 两种都合法，只有 mdlc 会错。
+    #[test]
+    fn event_closing_brace_is_not_swallowed_as_options() {
+        let dir = fixture("event_brace");
+        // 8 帧的 SMD：帧号 7 落在范围内 ⟹ `finish()` 会把它换算成
+        // `cycle = 7 / (8-1) = 1.0`（`parse.rs` 的 `k = nf - 1` 那一支）。
+        // 用单帧 SMD 的话任何非零帧号都会被判越界而写成 0，断言就没有分辨力。
+        let mut smd = String::from("version 1\nnodes\n0 \"root\" -1\n1 \"bone1\" 0\nend\nskeleton\n");
+        for i in 0..8 {
+            smd.push_str(&format!("time {i}\n"));
+            smd.push_str("0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n");
+            smd.push_str("1 0.000000 0.000000 1.000000 0.000000 0.000000 0.000000\n");
+        }
+        smd.push_str("end\ntriangles\nmat\n");
+        smd.push_str(
+            "0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 0 1.000000\n",
+        );
+        smd.push_str(
+            "0 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n",
+        );
+        smd.push_str(
+            "0 0.000000 1.000000 0.000000 0.000000 0.000000 1.000000 0.000000 1.000000 1 1 1.000000\n",
+        );
+        smd.push_str("end\n");
+        std::fs::write(dir.join("a.smd"), &smd).expect("应能写 8 帧 SMD");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$sequence \"seq_a\" {
+    \"a.smd\"
+    { event AE_TEST 7 }
+    fps 30
+}
+$sequence \"seq_b\" { \"b.smd\" }
+$sequence \"seq_c\" { \"c.smd\" }
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            d.sequences.len(),
+            3,
+            "`}}` 同行时后续序列不该被吞进 blends，实际序列：{:?}",
+            d.sequences.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let a = &d.sequences[0];
+        assert_eq!(a.events.len(), 1, "事件本身必须照常入表");
+        assert_eq!(a.events[0].name, "AE_TEST");
+        assert_eq!(
+            a.events[0].cycle, 1.0,
+            "帧号 7 应经 `finish()` 换算成 7/(8-1)=1.0（证明帧号确实被读到了）"
+        );
+        assert_eq!(
+            a.events[0].options, "",
+            "收尾 `}}` 不是 options（官方 `token[0] == '}}'` 时返回 1）"
+        );
+        assert!(a.blends.is_empty(), "不该有 blend 格，实际：{:?}", a.blends);
+        assert_eq!(a.fps, Some(30.0), "`}}` 之后的 `fps` 仍属于本序列");
+    }
+
+    /// ⚠️ **回归（R67.2）**：`ikrule` 选项循环遇到不认识的 token 必须**吐回**。
+    ///
+    /// 官方 `Option_IKRule` 的选项循环结尾是 `else { UnGetToken(); return; }`
+    /// （`studiomdl.cpp:1378-1382`），而 `UnGetToken` 的真身只是
+    /// `tokenready = true`（`utils\common\scriplib.cpp:330-333`）
+    /// ⟹ token 原样回到 `ParseSequence` 主循环，走三段尾部分派。
+    ///
+    /// 修前本实现写 `let _ = other;`（静默丢弃）⟹ `abi3.qc` 的
+    /// `ikrule "leg" attachment "ankle" "muzzle"` 里那个 `"muzzle"` 凭空消失。
+    /// 真 exe 裁决（`target/_r67/oracle_ikrule.js`）：官方把它当**第二格
+    /// blend 动画**（`Cmd_ImpliedAnimation` → `Load_Source` 找 `muzzle.smd`）——
+    /// 文件不存在报 `could not load file 'muzzle'`，存在则变成 2 格非方形
+    /// 网格报 `calcblend failed in idle`（`simplify.cpp:5568`）。
+    #[test]
+    fn ikrule_unknown_token_is_unget_not_swallowed() {
+        let dir = fixture("ikrule_unget");
+        let qc = "\
+$modelname \"t.mdl\"
+$body body \"a.smd\"
+$ikchain \"leg\" \"bone1\" knee 0.5 0.5 0
+$sequence \"idle\" \"a.smd\" fps 30 {
+    ikrule \"leg\" attachment \"bone1\" \"muzzle\"
+}
+";
+        let d = parse(qc, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = &d.sequences[0];
+        assert_eq!(s.ik_rules.len(), 1, "ikrule 本身要入表");
+        assert_eq!(
+            s.ik_rules[0].attachment.as_deref(),
+            Some("bone1"),
+            "`attachment` 只吃一个 token"
+        );
+        assert_eq!(
+            s.blends,
+            vec!["muzzle".to_string()],
+            "多写的 token 必须吐回 `$sequence` 主循环、被当成隐含动画\
+             （官方 `Cmd_ImpliedAnimation`），实际：{:?}",
+            s.blends
         );
     }
 }
