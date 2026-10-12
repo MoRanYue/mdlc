@@ -632,7 +632,38 @@ fn delta_frames(
         }
         rot_frames.push(r);
 
+        // ⚠️ **根骨骼的位移必须「先旋转、再减参考姿态」，不能反过来。**
+        //
+        // 官方两条规则的作用对象不同：
+        // * `simplify.cpp:1461` `VectorRotate(tmp, rootxform, pos)` —— 旋转
+        //   作用在 **`sanim`（绝对位移）** 上；
+        // * `simplify.cpp:6510` `(sanim.pos − g_bonetable.pos) / posscale`
+        //   —— 相减的是 `sanim` 与 **未旋转的** `g_bonetable.pos`。
+        //
+        // 合起来就是 `rotate(p) − ref`。早先 mdlc 写成 `rotate(p − ref)`，
+        // 两者只在 **参考位移非零** 时分道扬镳 —— 而 `ValveBiped.ValveBiped`
+        // （`b0`）的参考位移恰好是 0，所以这个 bug 在 `b0` 上**完全隐形**，
+        // 只在第二根根骨骼 `weapon`（`b63`，参考位移 `[0, −13.1675, 52.6154]`）
+        // 上显形。
+        //
+        // 判据（`v_smg_mp5` `a_idle_1`，`b63 weapon`，`ref = [0, −13.1675, 52.6154]`、
+        // `posscale = 3.9064e-3`，SMD 第 0 帧 `pos = [−2.9641, −16.2935, −3.7340]`）：
+        //
+        // | 公式 | 采样值 `pos[0]`/`pos[1]` | 与官方（neko）对照 |
+        // |---|---|---|
+        // | **`rotate(p) − ref`** | **`4171` / `2611`** | ✅ 逐值相同 |
+        // | `rotate(p − ref)`（修前） | `800` / `−758` | ❌ |
+        //
+        // 姿态层面这个偏差是**固定 13.1684** 的位移（`probe_bone.js`
+        // `a_idle_1 weapon` 全 771 帧恒为 `Δpos=13.1684`、`Δrot=0.00°`）。
         let mut t = [0.0f32; 3];
+        if is_root {
+            t[0] = -p.position[1];
+            t[1] = p.position[0];
+            t[2] = p.position[2];
+        } else {
+            t = p.position;
+        }
         for (k, tk) in t.iter_mut().enumerate() {
             // ⚠️ **位移不做 `LOOPING` 末帧折叠**（旋转做）。
             //
@@ -648,41 +679,7 @@ fn delta_frames(
             //
             // 差别可能在帧数（5 vs 121）或 fixture 的其它属性，**尚未定死**。
             // 在拿到新判据前按真实项目走。
-            *tk = p.position[k] - ref_pos[k];
-        }
-        if is_root {
-            // ⚠️ **根骨骼的位移要按 `rootxform` 的 yaw +90° 旋转** ——
-            // 即 `(x, y) → (−y, x)`（`simplify.cpp:1461`
-            // `VectorRotate(tmp, rootxform, pos)`）。
-            //
-            // # 这条规则对**两种**位移编码都成立
-            //
-            // 官方把 `rootxform` 作用在 `sanim` 上，而 `sanim` 是**所有**
-            // 位移编码的共同来源：
-            //
-            // | 编码 | 存的量 | 是否含 `rootxform` |
-            // |---|---|---|
-            // | `RAWPOS`（绝对值） | `sanim.pos` | ✅ |
-            // | `ANIMPOS`（差值） | `(sanim.pos − bonetable.pos) / posscale` | ✅ |
-            //
-            // ⚠️ 早先 mdlc **只对 `RAWPOS` 旋转**（在 `per_seq_abs_pos`
-            // 里做），`ANIMPOS` 的差值流**没有旋转** ⟹ 根骨骼的 X/Y
-            // **互换**。
-            //
-            // # 实测判据（`v_snip_awp` `a_run` 根骨骼，`probe_rootbone.js`）
-            //
-            // | | `pos[0]` 采样 | `pos[1]` 采样 |
-            // |---|---|---|
-            // | 官方 | **−1227** | **+50** |
-            // | mdlc（修前） | +51 | **+1227** |
-            //
-            // 两者恰好是「交换 + 变号」的关系 ⟹ 位移差 **4.99**。
-            // 注意 `RAWPOS` 那条路径是对的（`a_idle_1` 的 `RAWPOS`
-            // 与官方逐字节相同），所以这个 bug **只在走 `ANIMPOS` 时显形**
-            // —— 「同一条规则只在一半的代码路径上实现」。
-            let (x, y) = (t[0], t[1]);
-            t[0] = -y;
-            t[1] = x;
+            *tk -= ref_pos[k];
         }
         pos_frames.push(t);
     }
@@ -699,6 +696,10 @@ fn delta_frames(
 /// 2. **不加根骨骼 Z 偏置。** `panim->rotation` 对 `subtract` 出来的
 ///    动画仍是默认值 —— 但增量本身就是「差值」，再叠一个 +90° 会让
 ///    它变成一个非零常量，于是每根骨骼都多出一条常量轨道。
+///
+///    ⚠️ **但位移的 `rootxform` yaw +90° 仍然要加**（见 [`delta_stored_frames`]）
+///    —— 这两件事不是一回事：旋转偏置作用在**参考姿态的差**上（`subtract`
+///    已把它吸收掉），位移旋转作用在 **`sanim` 本身**上。
 /// 3. **逐帧规范化仍然要**（`canonical_euler`），因为 SMD 里的欧拉角
 ///    可能超出 `(−π, π]`。
 ///
@@ -714,6 +715,7 @@ fn delta_stored_frames(
     looping: bool,
     b: usize,
     n: usize,
+    is_root: bool,
 ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
     let mut rot_frames: Vec<[f32; 3]> = Vec::with_capacity(n);
     let mut pos_frames: Vec<[f32; 3]> = Vec::with_capacity(n);
@@ -730,7 +732,30 @@ fn delta_stored_frames(
             continue;
         };
         rot_frames.push(crate::bone_math::canonical_euler(p.rotation));
-        pos_frames.push(p.position);
+        // ⚠️ **根骨骼的位移仍要按 `rootxform` 的 yaw +90° 旋转**
+        // （`(x, y) → (−y, x)`，`simplify.cpp:1461`
+        // `VectorRotate(tmp, rootxform, pos)`）。
+        //
+        // 上面第 2 条「不加根骨骼 Z 偏置」说的是**旋转**增量：`subtract`
+        // 已经把参考姿态的差算好了，再叠 +90° 会凭空多出一条常量轨道。
+        // 位移是**另一回事** —— `rootxform` 作用在 `sanim.pos` 本身，
+        // 而 `subtract` 减掉的是**未旋转的**参考位移，两者不互相吸收。
+        //
+        // 判据（`v_smg_mp5` `@melee`，`b63 weapon`，`probe_bone.js`）：
+        //
+        // | | 第 12 帧解码位移 |
+        // |---|---|
+        // | neko（官方口径） | `[−20.0436, 14.8247, −2.5704]` |
+        // | mdlc（修前） | `[14.8286, 20.0436, −2.5704]` |
+        //
+        // 两者正是 `(x, y) → (−y, x)` 的关系，`Δpos = 34.87`。
+        // 受影响的 49 条 `subtract` 动画（本模型 56 条里 49 条带 `DELTA`）
+        // 全部只差这一处。
+        if is_root {
+            pos_frames.push([-p.position[1], p.position[0], p.position[2]]);
+        } else {
+            pos_frames.push(p.position);
+        }
     }
     (rot_frames, pos_frames)
 }
@@ -1390,15 +1415,69 @@ fn section_rot_const(
     })
 }
 
+/// 求某一段的**位移常量载荷**（`RAWPOS` 要写的绝对值）。
+///
+/// 与 [`section_rot_const`] **完全对称** —— 只是位移不是角度，不做
+/// `wrap_to_pi`。
+///
+/// # 为什么位移也要逐段重算
+///
+/// [`section_rot_const`] 已经为旋转解决了「单帧末段够不到 `ANIMROT`」的
+/// 问题，但**位移侧漏了同一件事**，于是那个末段仍然沿用整条动画的
+/// `pos_delta_is_const`（通常为 `false`）⟹ `pos_can_const` 为假 ⟹
+/// `use_rawrot2` 的让位条件（`pos_can_const || !pos_has_data`）失败 ⟹
+/// 旋转降级成 `ANIMROT`，而 `n == 1` 又要求 `n > 1` ⟹ **旋转整个丢失**。
+///
+/// 实测 `v_smg_mp5`：`a_idle_1`（771 帧 / `sf=30`）的 `last-single`
+/// 段 `sec26` 里 41/57 根骨骼与 NekoMDL（官方口径）不符，全部是
+/// `ANIMPOS` → `RAWPOS|RAWROT2`；逐帧对照显示差异**只出现在末帧**
+/// （`b15 L_Finger4` 差 **43.84°**，其余 770 帧全 `0.00°`）。
+///
+/// # 载荷是**绝对值**，不是差值
+///
+/// `RAWPOS` 的载荷是 `sanim[0].pos`（`write.cpp:765`），根骨骼还经过
+/// `rootxform` 的 yaw +90° 旋转。而 [`delta_frames`] /
+/// [`delta_stored_frames`] 存的是**差值**，所以这里要把参考位移加回去：
+///
+/// * 非 `DELTA`：`差值 = rotate(p) − ref`（根）或 `p − ref`（非根）
+///   ⟹ `差值 + ref` 恰好还原成载荷 ✅
+/// * `DELTA`（`subtract`）：存的就是 `rotate(p)` 本身，引擎也不加参考
+///   ⟹ 直接用，**不能**加 `ref`。
+///
+/// ⚠️ 判据是**原始差值逐帧精确相等**（不是量化后）—— 与
+/// [`section_rot_const`] 同一口径。
+fn section_pos_const(
+    raw_pos: Option<&Vec<[f32; 3]>>,
+    lo: usize,
+    hi: usize,
+    delta: bool,
+    ref_pos: Option<&[f32; 3]>,
+) -> Option<[f32; 3]> {
+    let sub = raw_pos?.get(lo..=hi)?;
+    let first = sub.first()?;
+    if !sub.iter().all(|r| r == first) {
+        return None;
+    }
+    Some(if delta {
+        *first
+    } else {
+        let r = ref_pos?;
+        [0, 1, 2].map(|k| first[k] + r[k])
+    })
+}
+
 /// 写一条**段链**所需的「整条动画级」上下文。
 ///
 /// 打包成结构体是为了让参数个数可控，也让「哪些量是整条动画的、
 /// 哪些是本段的」在类型上一眼可见。
 struct ChainCtx<'a> {
-    /// 逐骨骼的**原始旋转差值帧**（未量化）—— 逐段重算旋转常量用。
-    raw_rot_per_bone: Option<&'a BoneFrameTable>,
+    /// 逐骨骼的**原始差值帧**（未量化）—— 逐段重算常量用。
+    ///
+    /// 元组是 `(rot 差值帧, pos 差值帧)`：旋转走 [`section_rot_const`]、
+    /// 位移走 [`section_pos_const`]，两者都从这一份表里取。
+    raw_frames_per_bone: Option<&'a BoneFrameTable>,
     /// 逐骨骼的参考姿态 `(pos, rot)` —— 常量载荷要烘进参考姿态。
-    ref_rots: Option<&'a [([f32; 3], [f32; 3])]>,
+    ref_poses: Option<&'a [([f32; 3], [f32; 3])]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1414,8 +1493,8 @@ fn write_one_chain(
     anim_data_abs: usize,
     ctx: &ChainCtx<'_>,
 ) -> Result<(), AnimWriteError> {
-    let raw_rot_per_bone = ctx.raw_rot_per_bone;
-    let ref_rots = ctx.ref_rots;
+    let raw_frames_per_bone = ctx.raw_frames_per_bone;
+    let ref_poses = ctx.ref_poses;
     // 空段：**不是**写 `ff` 占位，而是照常写「与帧无关的那些骨骼」。
     //
     // 实测官方 `sfw120` 的段 4/5（`nEnt-2`、`nEnt-1`）：
@@ -1475,40 +1554,65 @@ fn write_one_chain(
             other => other.clone(),
         }
     };
+    let n = hi - lo + 1;
     let seg_channels: Vec<BoneChannels> = channels
         .iter()
         .enumerate()
-        .map(|(b, ch)| BoneChannels {
-            rot: [slice(&ch.rot[0]), slice(&ch.rot[1]), slice(&ch.rot[2])],
-            pos: [slice(&ch.pos[0]), slice(&ch.pos[1]), slice(&ch.pos[2])],
+        .map(|(b, ch)| {
             // 分段只切「逐帧采样」的轴；`Constant`/`Absent` 原样保留
             // （`slice` 对它们走 `other.clone()`）。所以整条位移若原本恒定，
             // 切出来的每一段也恒定，常量位移可以照用。
             //
-            // ⚠️ **位移不做逐段重算** —— 实测把它也改成「本段差值恒定
-            // ⟹ `RAWPOS`」会**引入回归**：多帧段里官方仍写 `ANIMPOS`
-            // （`@deploy_layer` sec0 官方 `0x1c`、误改后 `0x14`），
-            // 姿态差从 0 涨到 **345**。位移的判据是整条动画的
-            // `pos_delta_is_const`，只有**单帧末段**例外 —— 而那个例外
-            // 已由 [`section_frame_range`] 把末帧单独切出来天然满足。
-            pos_const_raw: ch.pos_const_raw,
-            pos_delta_is_const: ch.pos_delta_is_const,
-            // ⚠️ **旋转常量载荷必须逐段重算**（见 [`section_rot_const`]）。
-            // 沿用整条动画的结论会让「单帧末段」丢掉旋转 ——
-            // 那段够不到 `ANIMROT`（要求 `n > 1`），而整条动画的
-            // `rot_const_raw` 又常因其它段不恒定而为 `None`。
-            rot_const_raw: section_rot_const(
-                raw_rot_per_bone.and_then(|t| t.get(b)).map(|pair| &pair.0),
-                lo,
-                hi,
-                delta,
-                ref_rots.and_then(|t| t.get(b)).map(|(_, r)| r),
-            )
-            .or(ch.rot_const_raw),
+            // ⚠️ **多帧段沿用整条动画的 `pos_delta_is_const`** —— 实测把
+            // 它改成「本段差值恒定 ⟹ `RAWPOS`」会**引入回归**：多帧段里
+            // 官方仍写 `ANIMPOS`（`@deploy_layer` sec0 官方 `0x1c`、误改后
+            // `0x14`），姿态差从 0 涨到 **345**。
+            //
+            // ⚠️ **但单帧段必须逐段重算**（见 [`section_pos_const`]）——
+            // 这里原先是「一律沿用整条动画」的，于是单帧末段沿用了一个
+            // 通常为 `false` 的 `pos_delta_is_const` ⟹ `pos_can_const`
+            // 为假 ⟹ `use_rawrot2` 的让位条件失败 ⟹ 旋转降级成
+            // `ANIMROT`，而 `n == 1` 又要求 `n > 1` ⟹ **旋转整个丢失**。
+            // 「单帧段天然满足」这个说法是错的：判据取自整条动画，
+            // 切段并不会让它变成真的。
+            let (pos_const_raw, pos_delta_is_const) = if n == 1 {
+                match section_pos_const(
+                    raw_frames_per_bone
+                        .and_then(|t| t.get(b))
+                        .map(|pair| &pair.1),
+                    lo,
+                    hi,
+                    delta,
+                    ref_poses.and_then(|t| t.get(b)).map(|(p, _)| p),
+                ) {
+                    Some(v) => (Some(v), true),
+                    None => (ch.pos_const_raw, ch.pos_delta_is_const),
+                }
+            } else {
+                (ch.pos_const_raw, ch.pos_delta_is_const)
+            };
+            BoneChannels {
+                rot: [slice(&ch.rot[0]), slice(&ch.rot[1]), slice(&ch.rot[2])],
+                pos: [slice(&ch.pos[0]), slice(&ch.pos[1]), slice(&ch.pos[2])],
+                pos_const_raw,
+                pos_delta_is_const,
+                // ⚠️ **旋转常量载荷必须逐段重算**（见 [`section_rot_const`]）。
+                // 沿用整条动画的结论会让「单帧末段」丢掉旋转 ——
+                // 那段够不到 `ANIMROT`（要求 `n > 1`），而整条动画的
+                // `rot_const_raw` 又常因其它段不恒定而为 `None`。
+                rot_const_raw: section_rot_const(
+                    raw_frames_per_bone
+                        .and_then(|t| t.get(b))
+                        .map(|pair| &pair.0),
+                    lo,
+                    hi,
+                    delta,
+                    ref_poses.and_then(|t| t.get(b)).map(|(_, r)| r),
+                )
+                .or(ch.rot_const_raw),
+            }
         })
         .collect();
-
-    let n = hi - lo + 1;
     write_chain_body(
         anim_data,
         &seg_channels,
@@ -3265,7 +3369,7 @@ pub fn write_animations(
                 // 差值，不再减参考姿态、也不加根骨骼 Z 偏置
                 // （见 [`delta_stored_frames`]）。
                 if compiled.animations[spec.anim_index].delta {
-                    delta_stored_frames(spec.cell_frames(compiled), spec.looping, b, n)
+                    delta_stored_frames(spec.cell_frames(compiled), spec.looping, b, n, is_root)
                 } else {
                     delta_frames(
                         spec.cell_frames(compiled),
@@ -3635,8 +3739,8 @@ pub fn write_animations(
                     is_delta,
                     anim_data_abs,
                     &ChainCtx {
-                        raw_rot_per_bone: per_seq_frames.get(si),
-                        ref_rots: Some(ref_poses),
+                        raw_frames_per_bone: per_seq_frames.get(si),
+                        ref_poses: Some(ref_poses),
                     },
                 )?;
             }
@@ -6220,6 +6324,161 @@ mod tests {
         assert_eq!(
             section_rot_const(Some(&raw), 0, 99, false, Some(&ref_rot)),
             None
+        );
+    }
+
+    /// **`section_pos_const`：位移常量载荷同样必须逐段算。**
+    ///
+    /// 与 [`section_rot_const`] 完全对称，但它修的是**旋转被连累**的问题：
+    /// 单帧末段若沿用整条动画的 `pos_delta_is_const`（通常 `false`），
+    /// `pos_can_const` 就是假 ⟹ `use_rawrot2` 的让位条件
+    /// （`pos_can_const || !pos_has_data`）失败 ⟹ 旋转降级成 `ANIMROT`，
+    /// 而 `n == 1` 又要求 `n > 1` ⟹ **旋转整个丢失**。
+    ///
+    /// 实测 `v_smg_mp5` `a_idle_1`：末段 `sec26` 的 41/57 根骨骼与官方
+    /// 不符，全部是 `ANIMPOS` → `RAWPOS|RAWROT2`；逐帧对照显示差异
+    /// **只出现在末帧**（`b15 L_Finger4` 差 **43.84°**，其余 770 帧全
+    /// `0.00°`）。
+    #[test]
+    fn section_pos_const_is_computed_per_section() {
+        // 整条动画位移**不恒定**、但末帧自成一"段" —— `a_idle_1` 的形态。
+        let raw: Vec<[f32; 3]> = vec![
+            [0.0, 0.0, 0.1],
+            [0.0, 0.0, 0.2],
+            [0.0, 0.0, 0.3],
+            [0.5, 0.0, 0.3], // ← 末帧，与前一帧不同 ⟹ 整条不恒定
+        ];
+        let ref_pos = [0.0, 0.0, 10.0];
+
+        // 整条不恒定 ⟹ None（沿用整条动画的结论就是这里返回 None）。
+        assert_eq!(
+            section_pos_const(Some(&raw), 0, 3, false, Some(&ref_pos)),
+            None,
+            "整条动画位移不恒定 ⟹ 不能写 RAWPOS"
+        );
+        // **末段**（单帧）恒定 ⟹ `Some(差值 + 参考)` —— 载荷是**绝对值**。
+        assert_eq!(
+            section_pos_const(Some(&raw), 3, 3, false, Some(&ref_pos)),
+            Some([0.5, 0.0, 10.3]),
+            "单帧段必然恒定 ⟹ 必须给出绝对值载荷（RAWPOS 存的是 sanim.pos）"
+        );
+        // [1,2] 是 0.2 与 0.3 ⟹ 不恒定。
+        assert_eq!(
+            section_pos_const(Some(&raw), 1, 2, false, Some(&ref_pos)),
+            None,
+            "[0.2, 0.3] 不恒定 ⟹ None"
+        );
+        // `DELTA`（`subtract`）动画：存的就是 `rotate(p)` 本身，
+        // 引擎也不加参考 ⟹ **不能**再加 `ref_pos`。
+        assert_eq!(
+            section_pos_const(Some(&raw), 3, 3, true, Some(&ref_pos)),
+            Some([0.5, 0.0, 0.3]),
+            "DELTA 动画的位移就是增量本身，引擎不加参考"
+        );
+        // 没有原始帧 / 越界 ⟹ None（不 panic）。
+        assert_eq!(section_pos_const(None, 0, 0, false, Some(&ref_pos)), None);
+        assert_eq!(
+            section_pos_const(Some(&raw), 0, 99, false, Some(&ref_pos)),
+            None
+        );
+        // 非 DELTA 但拿不到参考位移 ⟹ None（不能瞎猜绝对值）。
+        assert_eq!(section_pos_const(Some(&raw), 3, 3, false, None), None);
+    }
+
+    /// **单帧段的旋转不能因为位移判据而丢失** —— 端到端判据。
+    ///
+    /// 这条是 [`section_pos_const`] 的**真实后果**测试：构造一个
+    /// 「旋转逐帧变化（整条 `rot_const_raw` 为 `None`）+ 位移逐帧变化
+    /// （整条 `pos_delta_is_const` 为 `false`）+ 末帧单独成段」的模型，
+    /// 断言末段**仍然写出旋转**（`RAWROT2` 或 `ANIMROT`，不能是「没有旋转」）。
+    ///
+    /// ⚠️ 修前这里会写 `flags = 0x04`（只有 `ANIMPOS`）⟹ 引擎按
+    /// 「无 `ANIMROT` 且非 `DELTA`」分支退回**参考姿态** ⟹ 末帧姿态跳变。
+    #[test]
+    fn single_frame_last_section_keeps_rotation() {
+        // 5 帧、`sectionframes = 2` ⟹ `n_sec = 5/2+2 = 4`，末段 `sec3` = 单帧。
+        // 旋转每帧都不同（保证整条 `rot_const_raw == None`）；
+        // 位移每帧都不同（保证整条 `pos_delta_is_const == false`）。
+        let frames: Vec<Vec<SmdPose>> = (0..5)
+            .map(|f| vec![pose([f as f32, 0.0, 0.0], [0.0, 0.0, 0.1 * f as f32])])
+            .collect();
+        let mut s = seq("idle", false, frames);
+        s.section_frames = 2;
+        s.num_sections = 4;
+        let c = compiled(vec![s], 1);
+        // 参考姿态**非零**，否则「绝对值 vs 差值」两种写法会重合。
+        let refs = [([0.0f32, 0.0, 5.0], [0.0f32, 0.0, 0.0])];
+        let out = write_animations(&c, &[-1], &refs, 0).expect("写出动画");
+
+        // ⚠️ 不能读 `out.animdescs[0x50]`（`sectionindex`）—— 那里**还是 0**，
+        // 它由 `write_mdl` 才回填。`section_table_offsets` 是现成的。
+        let sec_tab = out.section_table_offsets[0].expect("本夹具必须分段");
+        // 段 3（末段，单帧）的链起点（临时值是「相对 `anim_data` 起点」）。
+        let g = |b: &[u8], o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let chain_off = g(&out.anim_data, sec_tab + 3 * 8 + 4) as usize;
+        assert_ne!(chain_off, 0, "末段必须有链（不能是空段）");
+        let chain = walk_chain(&out.anim_data, chain_off);
+        let (bone, flags, _) = chain[0];
+        assert_eq!(bone, 0);
+        assert_ne!(
+            flags & (STUDIO_ANIM_RAWROT2 | STUDIO_ANIM_ANIMROT),
+            0,
+            "单帧末段必须写出旋转（flags=0x{flags:02x}）—— \
+             若只剩 ANIMPOS，说明位移判据把旋转连累了"
+        );
+    }
+
+    /// **`subtract`（`DELTA`）动画的根骨骼位移也要 yaw 旋转。**
+    ///
+    /// `delta_stored_frames` 早先没有 `is_root` 参数，位移直接照抄
+    /// `p.position` ⟹ 49 条 `subtract` 动画（本模型 56 条里 49 条带
+    /// `DELTA`）的根骨骼位移全部少一次 `(x, y) → (−y, x)`。
+    ///
+    /// 实测 `v_smg_mp5` `@melee` 的 `b63 weapon`（第二根根骨骼，
+    /// `ref = [0, −13.1675, 52.6154]`）：mdlc 修前 `[14.8286, 20.0436, …]`
+    /// vs neko `[−20.0436, 14.8247, …]`，`Δpos = 34.87`。
+    #[test]
+    fn delta_stored_root_position_is_yaw_rotated() {
+        let s = seq(
+            "sub",
+            false,
+            vec![
+                vec![pose([1.0, 2.0, 3.0], [0.0; 3])],
+                vec![pose([1.5, 2.5, 3.5], [0.0; 3])],
+            ],
+        );
+        // 根骨骼：`(x, y) → (−y, x)`。
+        let (_, pos_root) = delta_stored_frames(&s.frames, s.looping, 0, 2, true);
+        assert_eq!(
+            pos_root[0],
+            [-2.0, 1.0, 3.0],
+            "DELTA 动画的根骨骼位移必须 yaw 旋转（(x,y) → (−y,x)）"
+        );
+        assert_eq!(pos_root[1], [-2.5, 1.5, 3.5]);
+        // 非根骨骼原样。
+        let (_, pos_plain) = delta_stored_frames(&s.frames, s.looping, 0, 2, false);
+        assert_eq!(pos_plain[0], [1.0, 2.0, 3.0], "非根骨骼不做旋转");
+    }
+
+    /// **非 `DELTA` 动画的根骨骼位移是「先旋转、再减参考」，不是反过来。**
+    ///
+    /// 两条官方规则的作用对象不同：`rootxform` 作用在 **`sanim`（绝对值）**
+    /// 上，而相减的是 `sanim` 与**未旋转的** `g_bonetable.pos`
+    /// （`simplify.cpp:1461` 与 `:6510`）⟹ 合起来是 `rotate(p) − ref`。
+    ///
+    /// ⚠️ 这个 bug 在 `b0`（`ValveBiped.ValveBiped`，参考位移恰为 0）
+    /// 上**完全隐形**，只在第二根根骨骼 `weapon` 上显形 —— 实测
+    /// `a_idle_1` 全 771 帧恒差 `Δpos = 13.1684`。
+    #[test]
+    fn delta_frames_rotates_root_position_before_subtracting_reference() {
+        let s = seq("idle", false, vec![vec![pose([1.0, 2.0, 3.0], [0.0; 3])]]);
+        let ref_pos = [0.0, 0.0, 10.0];
+        let (_, pos) = delta_frames(&s.frames, s.looping, 0, 1, true, [0.0; 3], ref_pos);
+        // `rotate(p) − ref` = (−2, 1, 3) − (0, 0, 10) = (−2, 1, −7)
+        assert_eq!(
+            pos[0],
+            [-2.0, 1.0, -7.0],
+            "必须是 rotate(p) − ref；写成 rotate(p − ref) 会给 (2, −1, −7)"
         );
     }
 
