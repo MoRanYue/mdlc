@@ -414,26 +414,31 @@ pub fn resolve_flex_indexed(
         if flex.from_eyelid {
             return Ok(out);
         }
-        return Err(ferr(format!(
-            "{at}：frame = 0 是**特殊帧**，studiomdl 会强制把载荷清零\
-             （`simplify.cpp:2453-2457`），产物里 `numflexes` 恒为 0。\
-             请改用 frame = 1（或更大）。"
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: frame = 0 is a special frame: studiomdl force-clears the payload (`simplify.cpp:2453-2457`), so `numflexes` is always 0 in the output. Use frame = 1 (or larger).",
+            at = at
         )));
     }
     if flex.frame < 0 {
-        return Err(ferr(format!("{at}：frame 不能为负（{}）", flex.frame)));
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: frame must not be negative (%{frame})",
+            at = at,
+            frame = flex.frame
+        )));
     }
 
     // ---- 相对帧号：TOML 的 frame 直接就是相对帧号 ----
     let rel = flex.frame;
     let n_frames = i32::try_from(vta.num_frames()).unwrap_or(i32::MAX);
     if rel >= n_frames {
-        return Err(ferr(format!(
-            "{at}：frame = {rel} 超出 .vta 的帧范围（共 {n_frames} 帧，\
-             即相对帧 0..={}；`.vta` 的 skeleton 是 time {}..{}）",
-            n_frames - 1,
-            vta.start_frame,
-            vta.end_frame
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: frame = %{rel} is out of the .vta frame range (the file has %{n_frames} frames, i.e. relative frames 0..=%{last}; the `.vta` skeleton is time %{start}..%{end})",
+            at = at,
+            rel = rel,
+            n_frames = n_frames,
+            last = n_frames - 1,
+            start = vta.start_frame,
+            end = vta.end_frame
         )));
     }
     let src = vta.frame(rel).unwrap_or(&[]);
@@ -745,7 +750,7 @@ end
         let e = resolve_flex(&f, &vta, &verts, &map2(), (0, 0), 0)
             .expect_err("frame 0 必须报错");
         assert!(
-            e.message.contains("特殊帧") || e.message.contains("frame = 0"),
+            e.message.contains("special frame") || e.message.contains("frame = 0"),
             "错误信息应解释 frame 0 的问题：{}",
             e.message
         );
@@ -757,8 +762,15 @@ end
         let vta = parse_vta(&vta_text(10.0)).unwrap();
         let verts = two_verts();
         let f = flex("x.vta", "vanim", 5);
-        let e = resolve_flex(&f, &vta, &verts, &map2(), (0, 0), 0).expect_err("超范围必须报错");
-        assert!(e.message.contains("超出"), "{}", e.message);
+        // ⚠️ 文案在 `resolve_flex` 里就渲染好了，所以语言必须在那一刻生效。
+        let e =
+            crate::test_locale::with_english(|| resolve_flex(&f, &vta, &verts, &map2(), (0, 0), 0))
+                .expect_err("超范围必须报错");
+        assert!(
+            e.message.contains("out of the .vta frame range"),
+            "{}",
+            e.message
+        );
     }
 
     /// **就近匹配的阈值是硬的** —— 顶点挪远就不该有载荷。

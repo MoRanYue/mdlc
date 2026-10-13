@@ -346,9 +346,11 @@ pub fn read_frames(
                     .iter()
                     .map(|s| s.element.name.to_string())
                     .collect();
-                ferr(format!(
-                    "{} 里没有名为 {want:?} 的动画栈；现有的是 {names:?}。",
-                    path.display()
+                ferr(crate::tr_fmt!(
+                    "%{path} has no animation stack named %{want}; the available ones are %{names}.",
+                    path = path.display(),
+                    want = format!("{want:?}"),
+                    names = format!("{names:?}")
                 ))
             })?,
     };
@@ -362,7 +364,13 @@ pub fn read_frames(
             ..Default::default()
         },
     )
-    .map_err(|err| ferr(format!("{} 的动画烘焙失败：{err:?}", path.display())))?;
+    .map_err(|err| {
+        ferr(crate::tr_fmt!(
+            "failed to bake the animation of %{path}: %{err}",
+            path = path.display(),
+            err = format!("{err:?}")
+        ))
+    })?;
 
     // 帧数 = 重采样后的时长 × fps + 1（含首帧）。
     let duration = bake.playback_duration;
@@ -767,10 +775,22 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
 }
 
 fn load_scene(path: &Path, at: &str) -> Result<ufbx::SceneRoot, FbxError> {
-    let bytes =
-        std::fs::read(path).map_err(|err| ferr(format!("{at}：读不到 {}：{err}", path.display())))?;
-    ufbx::load_memory(&bytes, ufbx::LoadOpts::default())
-        .map_err(|err| ferr(format!("{at}：{} 解析失败：{err:?}", path.display())))
+    let bytes = std::fs::read(path).map_err(|err| {
+        ferr(crate::tr_fmt!(
+            "%{at}: cannot read %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = err
+        ))
+    })?;
+    ufbx::load_memory(&bytes, ufbx::LoadOpts::default()).map_err(|err| {
+        ferr(crate::tr_fmt!(
+            "%{at}: failed to parse %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = format!("{err:?}")
+        ))
+    })
 }
 
 /// 该网格节点是否被 `srcpart` 选中（没写 `srcpart` 时全选）。
@@ -1065,10 +1085,10 @@ fn from_scene(
     }
 
     if triangles.is_empty() {
-        return Err(ferr(format!(
-            "{at}：{} 里没有任何三角形（网格）。\
-             若写了 `srcpart`，请核对网格名字是否与文件里的一致。",
-            path.display()
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.",
+            at = at,
+            path = path.display()
         )));
     }
 

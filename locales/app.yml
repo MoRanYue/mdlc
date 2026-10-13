@@ -1538,3 +1538,171 @@ _version: 2
 "unknown variable \"$%{name}$\"":
   zh-CN: "未知的变量 \"$%{name}$\""
 
+"%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.":
+  zh-CN: "%{at}：%{path} 里没有任何三角形（网格）。若写了 `srcpart`，请核对网格名字是否与文件里的一致。"
+
+"%{at}: `extensionsUsed` lists %{ext}; mdlc does not support it, so the geometry it reads may be incomplete. Turn off mesh compression and re-export.":
+  zh-CN: "%{at}：`extensionsUsed` 里有 %{ext}；mdlc 不支持它，读出来的几何可能不完整。请关掉网格压缩后重导。"
+
+"%{at}: accessor[%{index}] has %{count} elements (stride %{stride}, %{size} bytes each) needing %{end} bytes, which exceeds the %{len} bytes of bufferView[%{view}].":
+  zh-CN: "%{at}：accessor[%{index}] 的 %{count} 个元素（步长 %{stride}、单元素 %{size} 字节）需要 %{end} 字节，超出 bufferView[%{view}] 的 %{len} 字节。"
+
+"%{at}: bufferView[%{index}] covers [%{offset}, %{end}), which exceeds the %{len} bytes of buffer[%{buffer}].":
+  zh-CN: "%{at}：bufferView[%{index}] 覆盖 [%{offset}, %{end})，超出 buffer[%{buffer}] 的 %{len} 字节。"
+
+"%{at}: buffer[%{index}] declares %{declared} bytes but only %{actual} are present.":
+  zh-CN: "%{at}：buffer[%{index}] 声明 %{declared} 字节，实际只有 %{actual} 字节。"
+
+"%{at}: buffer[%{index}] declares itself as the GLB BIN chunk, but the file has no BIN chunk.":
+  zh-CN: "%{at}：buffer[%{index}] 声明自己是 GLB 的 BIN chunk，但文件里没有 BIN chunk。"
+
+"%{at}: cannot read the external buffer %{uri} (resolved to %{path}): %{err}":
+  zh-CN: "%{at}：读不到外部 buffer %{uri}（解析为 %{path}）：%{err}"
+
+"%{at}: failed to base64-decode the data URI (%{err}). This must not be skipped silently -- skipping would read a model with zero vertices without reporting an error.":
+  zh-CN: "%{at}：data URI 的 base64 解码失败（%{err}）。这条**不能静默跳过** —— 跳过会让模型读出零顶点却不报错。"
+
+"%{at}: frame = %{rel} is out of the .vta frame range (the file has %{n_frames} frames, i.e. relative frames 0..=%{last}; the `.vta` skeleton is time %{start}..%{end})":
+  zh-CN: "%{at}：frame = %{rel} 超出 .vta 的帧范围（共 %{n_frames} 帧，即相对帧 0..=%{last}；`.vta` 的 skeleton 是 time %{start}..%{end}）"
+
+"%{at}: frame = 0 is a special frame: studiomdl force-clears the payload (`simplify.cpp:2453-2457`), so `numflexes` is always 0 in the output. Use frame = 1 (or larger).":
+  zh-CN: "%{at}：frame = 0 是**特殊帧**，studiomdl 会强制把载荷清零（`simplify.cpp:2453-2457`），产物里 `numflexes` 恒为 0。请改用 frame = 1（或更大）。"
+
+"%{at}: frame must not be negative (%{frame})":
+  zh-CN: "%{at}：frame 不能为负（%{frame}）"
+
+"%{at}: internal error -- %{uri} is not a data URI":
+  zh-CN: "%{at}：内部错误 —— %{uri} 不是 data URI"
+
+"%{at}: the data URI has no comma, so the payload cannot be located (first 64 bytes: %{head})":
+  zh-CN: "%{at}：data URI 里没有逗号，无法定位载荷（前 64 字节：%{head}）"
+
+"%{at}: the data URI is not in base64 form (metadata %{meta}). A glTF binary buffer should be written as `data:application/octet-stream;base64,...`.":
+  zh-CN: "%{at}：data URI 不是 base64 形态（元信息 %{meta}）。glTF 的二进制 buffer 应当用 `data:application/octet-stream;base64,...`。"
+
+"%{at}: the file uses %{ext} (listed in `extensionsRequired`), and mdlc cannot decompress it. Turn off mesh compression when exporting (called `Compression` in Blender's glTF exporter).":
+  zh-CN: "%{at}：用了 %{ext}（列在 `extensionsRequired` 里），mdlc 不支持解压它。请在导出时关掉网格压缩（Blender 的 glTF 导出器里叫 `Compression`）。"
+
+"%{declared} bone links were declared, but link #%{n} is incomplete":
+  zh-CN: "声明了 %{declared} 组绑定，但第 %{n} 组不完整"
+
+"%{path} has no animation named %{want}; the available ones are %{names}.":
+  zh-CN: "%{path} 里没有名为 %{want} 的动画；现有的是 %{names}。"
+
+"%{path} has no animation stack named %{want}; the available ones are %{names}.":
+  zh-CN: "%{path} 里没有名为 %{want} 的动画栈；现有的是 %{names}。"
+
+"%{what} is missing its argument":
+  zh-CN: "%{what} 缺参数"
+
+"%{what} is not a valid float: %{tok}":
+  zh-CN: "%{what} 不是合法浮点数：%{tok}"
+
+"%{what} is not a valid integer: %{tok}":
+  zh-CN: "%{what} 不是合法整数：%{tok}"
+
+"Line %{line}: %{message}":
+  zh-CN: "第 %{line} 行：%{message}"
+
+"`version 1` is missing (studiomdl reports bad version)":
+  zh-CN: "缺少 `version 1`（studiomdl 会报 bad version）"
+
+"a nodes line must be `<index> \"<name>\" <parent>`":
+  zh-CN: "nodes 行应为 `<index> \"<name>\" <parent>`"
+
+"a pose line appeared before the first `time` in the skeleton section":
+  zh-CN: "skeleton 段在 time 之前出现了姿态行"
+
+"a skeleton line must be `<bone> <px py pz> <rx ry rz>` (7 tokens)":
+  zh-CN: "skeleton 行应为 `<bone> <px py pz> <rx ry rz>`（7 个 token）"
+
+"a triangle vertex line needs at least 9 tokens (`<parentBone> <px py pz> <nx ny nz> <u v>`; `links`/`bone`/`weight` are Source's optional extension), but this one has %{n}: %{head}. If this is an OBJ-style `0 1 2` index line, the file is not an SMD.":
+  zh-CN: "三角形顶点行需要至少 9 个 token（`<parentBone> <px py pz> <nx ny nz> <u v>`；`links`/`bone`/`weight` 是 Source 的可选扩展），实际 %{n} 个：%{head}。若这是 OBJ 风格的 `0 1 2` 索引行，说明该文件不是 SMD。"
+
+"a vertex line appeared before any material name":
+  zh-CN: "顶点行出现在任何材质名之前"
+
+"a vertexanimation data line appeared before any `time`: %{line}":
+  zh-CN: "vertexanimation 的数据行出现在 `time` 之前：%{line}"
+
+"bad version: %{v} (only 1 is supported)":
+  zh-CN: "bad version：%{v}（只支持 1）"
+
+"failed to bake the animation of %{path}: %{err}":
+  zh-CN: "%{path} 的动画烘焙失败：%{err}"
+
+"line %{lineno}: ignored %{line} in the skeleton section":
+  zh-CN: "第 %{lineno} 行：skeleton 里忽略 %{line}"
+
+"line %{lineno}: unknown command %{cmd} (ignored)":
+  zh-CN: "第 %{lineno} 行：未知命令 %{cmd}（已忽略）"
+
+"only version 1 is supported, but the file says %{version}":
+  zh-CN: "只支持 version 1，实际为 %{version}"
+
+"the `nodes` section is empty -- at least one bone is required":
+  zh-CN: "`nodes` 段为空 —— 至少需要一根骨骼"
+
+"the `skeleton` block is missing (the frame range cannot be determined)":
+  zh-CN: "缺少 `skeleton` 块（无法确定帧范围）"
+
+"the `version` line is missing":
+  zh-CN: "缺少 `version` 行"
+
+"the links count must not be negative, but it is %{n}":
+  zh-CN: "links 数不能为负，实际 %{n}"
+
+"the material name %{name} appeared in the middle of an unfinished triangle (%{n} vertex lines so far)":
+  zh-CN: "材质名 %{name} 出现在未完成的三角形中间（已有 %{n} 个顶点行）"
+
+"the skeleton `time` went backwards: %{prev} -> %{t}":
+  zh-CN: "skeleton 的 time 倒退：%{prev} → %{t}"
+
+"the skeleton is missing frame %{frame} (no `time %{frame}` line)":
+  zh-CN: "skeleton 缺帧 %{frame}（`time %{frame}` 未出现）"
+
+"the time keyword is missing its frame number":
+  zh-CN: "time 后面缺少帧号"
+
+"the version keyword is missing its number":
+  zh-CN: "version 后面缺少数字"
+
+"the vertex index must not be negative: %{index}":
+  zh-CN: "顶点下标为负：%{index}"
+
+"time %{t} is outside the skeleton range [%{start}, %{end}]":
+  zh-CN: "time %{t} 超出 skeleton 范围 [%{start}, %{end}]"
+
+"unknown command or malformed data line in vertexanimation: %{line} (a data line must have 7 fields: `<index> <px py pz> <nx ny nz>`, but this one has %{n})":
+  zh-CN: "vertexanimation 里的未知命令或格式错误的数据行：%{line}（数据行必须是 7 个字段：`<index> <px py pz> <nx ny nz>`，实际 %{n} 个）"
+
+"unrecognized content outside any section: %{tok}":
+  zh-CN: "段外出现无法识别的内容：%{tok}"
+
+"vertexanimation appeared before the skeleton (the frame range is unknown)":
+  zh-CN: "vertexanimation 出现在 skeleton 之前（帧范围未知）"
+
+# --- 第五期：`smd.rs` / `vta.rs` 传给 `crate::tr(what)` 的片段 ------------------
+#
+# `parse_f32` / `parse_i32` 把 `what` 当**变量**传进来，所以只能手列。
+# 技术字段名（`pos.x` / `nrm.x` / `u` / `v` / `parentBone` / `version`）不进表 ——
+# 回退英文，与 `out of range` / `bad command` 同一策略。
+
+"links count":
+  zh-CN: "links 数"
+
+"bone link":
+  zh-CN: "绑定骨骼"
+
+"bone weight":
+  zh-CN: "绑定权重"
+
+"the skeleton `time`":
+  zh-CN: "skeleton 的 time"
+
+"the vertexanimation `time`":
+  zh-CN: "vertexanimation 的 time"
+
+"the vertex index":
+  zh-CN: "顶点下标"
+

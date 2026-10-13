@@ -44,7 +44,10 @@ use std::collections::HashMap;
 
 /// SMD 解析错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("第 {line} 行：{message}")]
+#[error(
+    "{}",
+    crate::tr_fmt!("Line %{line}: %{message}", line = line, message = message)
+)]
 pub struct SmdError {
     /// 出错行号（1 起）。
     pub line: usize,
@@ -174,8 +177,16 @@ impl Smd {
 // 而名字里不含空格 —— 这是格式约定，不是本实现的简化）。
 
 fn parse_f32(tok: &str, line: usize, what: &str) -> Result<f32, SmdError> {
-    tok.parse::<f32>()
-        .map_err(|_| err(line, format!("{what} 不是合法浮点数：{tok:?}")))
+    tok.parse::<f32>().map_err(|_| {
+        err(
+            line,
+            crate::tr_fmt!(
+                "%{what} is not a valid float: %{tok}",
+                what = crate::tr(what),
+                tok = format!("{tok:?}")
+            ),
+        )
+    })
 }
 
 fn parse_i32(tok: &str, line: usize, what: &str) -> Result<i32, SmdError> {
@@ -183,9 +194,16 @@ fn parse_i32(tok: &str, line: usize, what: &str) -> Result<i32, SmdError> {
     if let Ok(v) = tok.parse::<i32>() {
         return Ok(v);
     }
-    tok.parse::<f32>()
-        .map(|v| v as i32)
-        .map_err(|_| err(line, format!("{what} 不是合法整数：{tok:?}")))
+    tok.parse::<f32>().map(|v| v as i32).map_err(|_| {
+        err(
+            line,
+            crate::tr_fmt!(
+                "%{what} is not a valid integer: %{tok}",
+                what = crate::tr(what),
+                tok = format!("{tok:?}")
+            ),
+        )
+    })
 }
 
 /// 去掉名字两侧的引号。
@@ -249,9 +267,9 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
 
         match t[0] {
             "version" => {
-                let v = t
-                    .get(1)
-                    .ok_or_else(|| err(line, "version 后面缺少数字"))?;
+                let v = t.get(1).ok_or_else(|| {
+                    err(line, crate::tr("the version keyword is missing its number"))
+                })?;
                 version = Some(parse_i32(v, line, "version")?);
                 continue;
             }
@@ -311,11 +329,20 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
 
         match section {
             Section::None => {
-                return Err(err(line, format!("段外出现无法识别的内容：{:?}", t[0])));
+                return Err(err(
+                    line,
+                    crate::tr_fmt!(
+                        "unrecognized content outside any section: %{tok}",
+                        tok = format!("{:?}", t[0])
+                    ),
+                ));
             }
             Section::Nodes => {
                 if t.len() < 3 {
-                    return Err(err(line, "nodes 行应为 `<index> \"<name>\" <parent>`"));
+                    return Err(err(
+                        line,
+                        crate::tr("a nodes line must be `<index> \"<name>\" <parent>`"),
+                    ));
                 }
                 nodes.push(SmdNode {
                     index: parse_i32(t[0], line, "node index")?,
@@ -329,7 +356,12 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     if let Some(f) = frame.take() {
                         frames.push(f);
                     }
-                    let v = t.get(1).ok_or_else(|| err(line, "time 后面缺少帧号"))?;
+                    let v = t.get(1).ok_or_else(|| {
+                        err(
+                            line,
+                            crate::tr("the time keyword is missing its frame number"),
+                        )
+                    })?;
                     frame = Some(SmdFrame {
                         time: parse_i32(v, line, "frame time")?,
                         poses: Vec::new(),
@@ -339,12 +371,19 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 if t.len() < 7 {
                     return Err(err(
                         line,
-                        "skeleton 行应为 `<bone> <px py pz> <rx ry rz>`（7 个 token）",
+                        crate::tr(
+                            "a skeleton line must be `<bone> <px py pz> <rx ry rz>` (7 tokens)",
+                        ),
                     ));
                 }
-                let f = frame
-                    .as_mut()
-                    .ok_or_else(|| err(line, "skeleton 段在 time 之前出现了姿态行"))?;
+                let f = frame.as_mut().ok_or_else(|| {
+                    err(
+                        line,
+                        crate::tr(
+                            "a pose line appeared before the first `time` in the skeleton section",
+                        ),
+                    )
+                })?;
                 f.poses.push(SmdPose {
                     bone: parse_i32(t[0], line, "pose bone")?,
                     position: [
@@ -367,9 +406,10 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                     if pending_len != 0 {
                         return Err(err(
                             line,
-                            format!(
-                                "材质名 {:?} 出现在未完成的三角形中间（已有 {} 个顶点行）",
-                                t[0], pending_len
+                            crate::tr_fmt!(
+                                "the material name %{name} appeared in the middle of an unfinished triangle (%{n} vertex lines so far)",
+                                name = format!("{:?}", t[0]),
+                                n = pending_len
                             ),
                         ));
                     }
@@ -427,20 +467,16 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 if t.len() < 9 {
                     return Err(err(
                         line,
-                        format!(
-                            "三角形顶点行需要至少 9 个 token\
-                             （`<parentBone> <px py pz> <nx ny nz> <u v>`；\
-                             `links`/`bone`/`weight` 是 Source 的可选扩展），\
-                             实际 {} 个：{:?}。\
-                             若这是 OBJ 风格的 `0 1 2` 索引行，说明该文件不是 SMD。",
-                            t.len(),
-                            t.iter().take(4).copied().collect::<Vec<_>>().join(" ")
+                        crate::tr_fmt!(
+                            "a triangle vertex line needs at least 9 tokens (`<parentBone> <px py pz> <nx ny nz> <u v>`; `links`/`bone`/`weight` are Source's optional extension), but this one has %{n}: %{head}. If this is an OBJ-style `0 1 2` index line, the file is not an SMD.",
+                            n = t.len(),
+                            head = t.iter().take(4).copied().collect::<Vec<_>>().join(" ")
                         ),
                     ));
                 }
                 // `links` 字段缺失（只有 9 个 token）⟹ 与显式 0 走同一分支。
                 let links_count = if t.len() > 9 {
-                    parse_i32(t[9], line, "links 数")?
+                    parse_i32(t[9], line, "links count")?
                 } else {
                     0
                 };
@@ -461,19 +497,29 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                         weight: 1.0,
                     });
                 } else if links_count < 0 {
-                    return Err(err(line, format!("links 数不能为负，实际 {links_count}")));
+                    return Err(err(
+                        line,
+                        crate::tr_fmt!(
+                            "the links count must not be negative, but it is %{n}",
+                            n = links_count
+                        ),
+                    ));
                 } else {
                     let mut k = 10usize;
                     for n in 0..links_count as usize {
                         if k + 1 >= t.len() {
                             return Err(err(
                                 line,
-                                format!("声明了 {links_count} 组绑定，但第 {} 组不完整", n + 1),
+                                crate::tr_fmt!(
+                                    "%{declared} bone links were declared, but link #%{n} is incomplete",
+                                    declared = links_count,
+                                    n = n + 1
+                                ),
                             ));
                         }
                         links.push(SmdBoneLink {
-                            bone: parse_i32(t[k], line, "绑定骨骼")?,
-                            weight: parse_f32(t[k + 1], line, "绑定权重")?,
+                            bone: parse_i32(t[k], line, "bone link")?,
+                            weight: parse_f32(t[k + 1], line, "bone weight")?,
                         });
                         k += 2;
                     }
@@ -484,11 +530,15 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
                 // 一个 `String`（100 万三角形约 300 万次）；这里改成先借用，
                 // 到 `triangles.push` 时才 `to_string()`。
                 let material = current_material.as_deref().ok_or_else(|| {
-                    err(line, "顶点行出现在任何材质名之前")
+                    err(
+                        line,
+                        crate::tr("a vertex line appeared before any material name"),
+                    )
                 })?;
 
                 pending[pending_len] = Some(SmdVertex {
-                    parent_bone: parse_i32(t[0], line, "parentBone")?,                    position: [
+                    parent_bone: parse_i32(t[0], line, "parentBone")?,
+                    position: [
                         parse_f32(t[1], line, "pos.x")?,
                         parse_f32(t[2], line, "pos.y")?,
                         parse_f32(t[3], line, "pos.z")?,
@@ -568,20 +618,23 @@ pub fn parse_smd(text: &str) -> Result<Smd, SmdError> {
     // 且 `pending_len` 此后不再被读。写 `pending = [None; 3]` 只会触发
     // `unused_assignments` 警告。
 
-    let version = version.ok_or(SmdError {
+    let version = version.ok_or_else(|| SmdError {
         line: 1,
-        message: "缺少 `version` 行".into(),
+        message: crate::tr("the `version` line is missing"),
     })?;
     if version != 1 {
         return Err(SmdError {
             line: 1,
-            message: format!("只支持 version 1，实际为 {version}"),
+            message: crate::tr_fmt!(
+                "only version 1 is supported, but the file says %{version}",
+                version = version
+            ),
         });
     }
     if nodes.is_empty() {
         return Err(SmdError {
             line: 1,
-            message: "`nodes` 段为空 —— 至少需要一根骨骼".into(),
+            message: crate::tr("the `nodes` section is empty -- at least one bone is required"),
         });
     }
 
@@ -672,9 +725,13 @@ end
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
             "0 1 2",
         );
-        let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("9 个 token"), "{e}");
-        assert!(e.message.contains("索引行"), "应提示可能是 OBJ 索引行：{e}");
+        // ⚠️ 文案在 `parse_smd` 里就渲染好了，所以语言必须在那一刻生效。
+        let e = crate::test_locale::with_english(|| parse_smd(&bad)).unwrap_err();
+        assert!(e.message.contains("at least 9 tokens"), "{e}");
+        assert!(
+            e.message.contains("OBJ-style"),
+            "应提示可能是 OBJ 索引行：{e}"
+        );
     }
 
     #[test]
@@ -684,8 +741,8 @@ end
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000",
             "  -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000",
         );
-        let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("9 个 token"), "{e}");
+        let e = crate::test_locale::with_english(|| parse_smd(&bad)).unwrap_err();
+        assert!(e.message.contains("at least 9 tokens"), "{e}");
     }
 
     /// **不足一组的顶点行必须被静默丢弃**（官方实测行为）。
@@ -734,8 +791,8 @@ end
     #[test]
     fn rejects_unsupported_version() {
         let bad = MINIMAL.replace("version 1", "version 2");
-        let e = parse_smd(&bad).unwrap_err();
-        assert!(e.message.contains("只支持 version 1"), "{e}");
+        let e = crate::test_locale::with_english(|| parse_smd(&bad)).unwrap_err();
+        assert!(e.message.contains("only version 1 is supported"), "{e}");
     }
 
     #[test]
@@ -997,9 +1054,9 @@ end
             "  1 -8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 0.000000 0.000000 1 1 1.000000\n  1 8.000000 -8.000000 0.000000 0.000000 0.000000 1.000000 1.000000 0.000000 1 1 1.000000\n  1 0.000000 8.000000 0.000000 0.000000 0.000000 1.000000 0.500000 1.000000 1 1 1.000000",
             "  1 -8 -8 0 0 0 1 0\n  1 8 -8 0 0 0 1 1 0\n  1 0 8 0 0 0 1 0.5 1",
         );
-        let e = parse_smd(&bad).unwrap_err();
+        let e = crate::test_locale::with_english(|| parse_smd(&bad)).unwrap_err();
         assert!(
-            e.message.contains("9 个 token"),
+            e.message.contains("at least 9 tokens"),
             "8 token 必须报错且说明下限是 9：{e}"
         );
     }

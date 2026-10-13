@@ -30,7 +30,10 @@
 
 /// `.vta` 解析错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("第 {line} 行：{message}")]
+#[error(
+    "{}",
+    crate::tr_fmt!("Line %{line}: %{message}", line = line, message = message)
+)]
 pub struct VtaError {
     /// 1-based 行号。
     pub line: usize,
@@ -171,10 +174,9 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                         if !skeleton_times.contains(&(t + start)) {
                             return Err(err(
                                 lineno,
-                                format!(
-                                    "skeleton 缺帧 {}（`time {}` 未出现）",
-                                    t + start,
-                                    t + start
+                                crate::tr_fmt!(
+                                    "the skeleton is missing frame %{frame} (no `time %{frame}` line)",
+                                    frame = t + start
                                 ),
                             ));
                         }
@@ -195,11 +197,18 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
             }
             Section::Skeleton => {
                 if cmd.eq_ignore_ascii_case("time") {
-                    let t = parse_i32(toks.get(1), lineno, "skeleton 的 time")?;
+                    let t = parse_i32(toks.get(1), lineno, "the skeleton `time`")?;
                     if let Some(prev) = last_time
                         && t < prev
                     {
-                        return Err(err(lineno, format!("skeleton 的 time 倒退：{prev} → {t}")));
+                        return Err(err(
+                            lineno,
+                            crate::tr_fmt!(
+                                "the skeleton `time` went backwards: %{prev} -> %{t}",
+                                prev = prev,
+                                t = t
+                            ),
+                        ));
                     }
                     last_time = Some(t);
                     if start_frame.is_none() {
@@ -212,7 +221,11 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                 } else if toks.len() == 7 {
                     // 骨骼姿态行，忽略。
                 } else {
-                    warnings.push(format!("第 {lineno} 行：skeleton 里忽略 {line:?}"));
+                    warnings.push(crate::tr_fmt!(
+                        "line %{lineno}: ignored %{line} in the skeleton section",
+                        lineno = lineno,
+                        line = format!("{line:?}")
+                    ));
                 }
             }
             Section::VertexAnimation => {
@@ -227,12 +240,21 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                     if cur_time < 0 {
                         return Err(err(
                             lineno,
-                            format!("vertexanimation 的数据行出现在 `time` 之前：{line:?}"),
+                            crate::tr_fmt!(
+                                "a vertexanimation data line appeared before any `time`: %{line}",
+                                line = format!("{line:?}")
+                            ),
                         ));
                     }
-                    let index = parse_i32(Some(&toks[0]), lineno, "顶点下标")?;
+                    let index = parse_i32(Some(&toks[0]), lineno, "the vertex index")?;
                     if index < 0 {
-                        return Err(err(lineno, format!("顶点下标为负：{index}")));
+                        return Err(err(
+                            lineno,
+                            crate::tr_fmt!(
+                                "the vertex index must not be negative: %{index}",
+                                index = index
+                            ),
+                        ));
                     }
                     let idx = index as usize;
                     if idx >= num_vertices {
@@ -246,14 +268,24 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                     });
                 } else if cmd.eq_ignore_ascii_case("time") {
                     flush(&mut frames, &mut cur_verts, cur_time, start_frame.unwrap_or(0));
-                    let t = parse_i32(toks.get(1), lineno, "vertexanimation 的 time")?;
+                    let t = parse_i32(toks.get(1), lineno, "the vertexanimation `time`")?;
                     let start = start_frame.ok_or_else(|| {
-                        err(lineno, "vertexanimation 出现在 skeleton 之前（帧范围未知）")
+                        err(
+                            lineno,
+                            crate::tr(
+                                "vertexanimation appeared before the skeleton (the frame range is unknown)",
+                            ),
+                        )
                     })?;
                     if t < start || t > end_frame {
                         return Err(err(
                             lineno,
-                            format!("time {t} 超出 skeleton 范围 [{start}, {end_frame}]"),
+                            crate::tr_fmt!(
+                                "time %{t} is outside the skeleton range [%{start}, %{end}]",
+                                t = t,
+                                start = start,
+                                end = end_frame
+                            ),
                         ));
                     }
                     cur_time = t;
@@ -266,11 +298,10 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                     // 覆盖两种情形。
                     return Err(err(
                         lineno,
-                        format!(
-                            "vertexanimation 里的未知命令或格式错误的数据行：{line:?}\
-                             （数据行必须是 7 个字段：`<下标> <px py pz> <nx ny nz>`，\
-                             实际 {} 个）",
-                            toks.len()
+                        crate::tr_fmt!(
+                            "unknown command or malformed data line in vertexanimation: %{line} (a data line must have 7 fields: `<index> <px py pz> <nx ny nz>`, but this one has %{n})",
+                            line = format!("{line:?}"),
+                            n = toks.len()
                         ),
                     ));
                 }
@@ -279,7 +310,10 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                 if cmd.eq_ignore_ascii_case("version") {
                     let v = parse_i32(toks.get(1), lineno, "version")?;
                     if v != 1 {
-                        return Err(err(lineno, format!("bad version：{v}（只支持 1）")));
+                        return Err(err(
+                            lineno,
+                            crate::tr_fmt!("bad version: %{v} (only 1 is supported)", v = v),
+                        ));
                     }
                     version_seen = true;
                 } else if cmd.eq_ignore_ascii_case("nodes") {
@@ -288,7 +322,12 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                     section = Section::Skeleton;
                 } else if cmd.eq_ignore_ascii_case("vertexanimation") {
                     let start = start_frame.ok_or_else(|| {
-                        err(lineno, "vertexanimation 出现在 skeleton 之前（帧范围未知）")
+                        err(
+                            lineno,
+                            crate::tr(
+                                "vertexanimation appeared before the skeleton (the frame range is unknown)",
+                            ),
+                        )
                     })?;
                     // 此时 end_frame 已由 skeleton 定下，据此开好 frames 数组。
                     let n = usize::try_from(end_frame - start + 1).unwrap_or(0);
@@ -301,15 +340,25 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
                     // 不该让编译失败。受控实验用的 fixture 没有注释，
                     // 所以这一点是**真实生产文件**才暴露出来的。
                 } else {
-                    warnings.push(format!("第 {lineno} 行：未知命令 {cmd:?}（已忽略）"));
+                    warnings.push(crate::tr_fmt!(
+                        "line %{lineno}: unknown command %{cmd} (ignored)",
+                        lineno = lineno,
+                        cmd = format!("{cmd:?}")
+                    ));
                 }
             }
         }
     }
 
-    let start = start_frame.ok_or_else(|| err(0, "缺少 `skeleton` 块（无法确定帧范围）"))?;
+    let start = start_frame.ok_or_else(|| {
+        err(
+            0,
+            crate::tr("the `skeleton` block is missing (the frame range cannot be determined)"),
+        )
+    })?;
     if !version_seen {
-        warnings.push("缺少 `version 1`（studiomdl 会报 bad version）".to_string());
+        warnings
+            .push(crate::tr("`version 1` is missing (studiomdl reports bad version)").to_string());
     }
 
     Ok(Vta {
@@ -322,20 +371,45 @@ pub fn parse_vta(text: &str) -> Result<Vta, VtaError> {
 }
 
 fn parse_i32(tok: Option<&&str>, line: usize, what: &str) -> Result<i32, VtaError> {
-    let t = tok.ok_or_else(|| err(line, format!("{what} 缺参数")))?;
+    let t = tok.ok_or_else(|| {
+        err(
+            line,
+            crate::tr_fmt!("%{what} is missing its argument", what = crate::tr(what)),
+        )
+    })?;
     // `.vta` 里偶见 `0.000000` 形式的整数，先试 i32 再退 f32。
     if let Ok(v) = t.parse::<i32>() {
         return Ok(v);
     }
-    t.parse::<f32>()
-        .map(|v| v as i32)
-        .map_err(|_| err(line, format!("{what} 不是合法整数：{t:?}")))
+    t.parse::<f32>().map(|v| v as i32).map_err(|_| {
+        err(
+            line,
+            crate::tr_fmt!(
+                "%{what} is not a valid integer: %{tok}",
+                what = crate::tr(what),
+                tok = format!("{t:?}")
+            ),
+        )
+    })
 }
 
 fn parse_f32(tok: Option<&&str>, line: usize, what: &str) -> Result<f32, VtaError> {
-    let t = tok.ok_or_else(|| err(line, format!("{what} 缺参数")))?;
-    t.parse::<f32>()
-        .map_err(|_| err(line, format!("{what} 不是合法浮点数：{t:?}")))
+    let t = tok.ok_or_else(|| {
+        err(
+            line,
+            crate::tr_fmt!("%{what} is missing its argument", what = crate::tr(what)),
+        )
+    })?;
+    t.parse::<f32>().map_err(|_| {
+        err(
+            line,
+            crate::tr_fmt!(
+                "%{what} is not a valid float: %{tok}",
+                what = crate::tr(what),
+                tok = format!("{t:?}")
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -385,9 +459,10 @@ end
             "0 1.000000 2.000000 3.000000 0.000000 0.000000 1.000000",
             "0 1.000000 2.000000 3.000000",
         );
-        let e = parse_vta(&bad).expect_err("4 字段行必须报错");
+        // ⚠️ 文案在 `parse_vta` 里就渲染好了，所以语言必须在那一刻生效。
+        let e = crate::test_locale::with_english(|| parse_vta(&bad)).expect_err("4 字段行必须报错");
         assert!(
-            e.message.contains("7 个字段"),
+            e.message.contains("7 fields"),
             "错误信息应说明字段数要求，实际：{}",
             e.message
         );
@@ -403,8 +478,12 @@ end
     #[test]
     fn time_out_of_skeleton_range_is_rejected() {
         let bad = MIN.replace("time 1\n0 1.000000", "time 5\n0 1.000000");
-        let e = parse_vta(&bad).expect_err("超范围必须报错");
-        assert!(e.message.contains("超出 skeleton 范围"), "{}", e.message);
+        let e = crate::test_locale::with_english(|| parse_vta(&bad)).expect_err("超范围必须报错");
+        assert!(
+            e.message.contains("outside the skeleton range"),
+            "{}",
+            e.message
+        );
     }
 
     /// 帧号是**相对** `start_frame` 的 —— 这是 QC `frame <n>` 的口径。
@@ -440,9 +519,12 @@ end
     /// `skeleton` 跳号必须报错（studiomdl 的 `is missing frame`）。
     #[test]
     fn skeleton_gap_is_rejected() {
-        let bad = MIN.replace("time 1\n0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000", "time 2\n0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000");
-        let e = parse_vta(&bad).expect_err("跳号必须报错");
-        assert!(e.message.contains("缺帧"), "{}", e.message);
+        let bad = MIN.replace(
+            "time 1\n0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000",
+            "time 2\n0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000",
+        );
+        let e = crate::test_locale::with_english(|| parse_vta(&bad)).expect_err("跳号必须报错");
+        assert!(e.message.contains("missing frame"), "{}", e.message);
     }
 
     /// 顶层未知命令只**警告**（受控实验 `u5`：studiomdl 打
@@ -487,10 +569,7 @@ end
     #[test]
     fn trailing_hash_comment_is_stripped() {
         let with_hash = MIN
-            .replace(
-                "time 0\n0 0.000000",
-                "time 0 # basis shape key\n0 0.000000",
-            )
+            .replace("time 0\n0 0.000000", "time 0 # basis shape key\n0 0.000000")
             .replace("time 1\n0 0.000000", "time 1 # frame01\n0 0.000000");
         let v = parse_vta(&with_hash).expect("行尾 # 注释不该致命");
         assert!(v.warnings.is_empty(), "不该有警告：{:?}", v.warnings);
@@ -504,10 +583,14 @@ end
     /// 这一条极易搞反 —— 我第一版就写成了「记警告」。
     #[test]
     fn inner_unknown_command_is_fatal() {
-        let bad = MIN.replace("vertexanimation\ntime 0", "vertexanimation\nbogus 1\ntime 0");
-        let e = parse_vta(&bad).expect_err("块内未知命令必须致命");
+        let bad = MIN.replace(
+            "vertexanimation\ntime 0",
+            "vertexanimation\nbogus 1\ntime 0",
+        );
+        let e =
+            crate::test_locale::with_english(|| parse_vta(&bad)).expect_err("块内未知命令必须致命");
         assert!(
-            e.message.contains("未知命令"),
+            e.message.contains("unknown command"),
             "错误信息应指明是未知命令，实际：{}",
             e.message
         );
@@ -533,8 +616,8 @@ end
             "vertexanimation\ntime 0\n",
             "vertexanimation\n0 1.000000 2.000000 3.000000 0.000000 0.000000 1.000000\n",
         );
-        let e = parse_vta(&bad).expect_err("缺 time 必须报错");
-        assert!(e.message.contains("`time` 之前"), "{}", e.message);
+        let e = crate::test_locale::with_english(|| parse_vta(&bad)).expect_err("缺 time 必须报错");
+        assert!(e.message.contains("before any `time`"), "{}", e.message);
     }
 
     /// `num_vertices` = 全部帧里 `max(index)+1`。

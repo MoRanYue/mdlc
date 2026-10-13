@@ -5075,14 +5075,20 @@ impl CompiledModelDesc {
 
 /// `mdlc template` 打印的最小模板（带注释，可直接改）。
 pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格式）
+# mdlc model description file (native input format)
 #
 # 网格**不写在这里** —— 由 SMD 文件承载，本文件只引用它们
 # （与 QC 的 $bodygroup { studio "x.smd" } 一致）。
+# The mesh is **not written here** -- it lives in SMD files, and this file
+# only references them (same as QC's $bodygroup { studio "x.smd" }).
 #
 # 想直接用 QC 而不写 TOML：`mdlc build-qc model.qc --out <目录>`
 # （QC 前端已实现；也可用 `mdlc qc2toml model.qc` 把它转成本格式）。
+# To use QC directly instead of writing TOML: `mdlc build-qc model.qc --out <dir>`
+# (the QC front end is implemented; `mdlc qc2toml model.qc` converts it to this format).
 #
 # 与 QC 的对应关系：
+# How this maps to QC:
 #   [model].name             <- $modelname
 #   [model].static_prop      <- $staticprop
 #   [model].surface_prop     <- $surfaceprop
@@ -5090,52 +5096,78 @@ pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格�
 #   [model].illum_position   <- $illumposition
 #   [model].contents         <- $contents
 #   [physics].mass           <- $mass（在 $collisionmodel / $collisionjoints 块内）
+#                               ($mass inside the $collisionmodel / $collisionjoints block)
 #   [materials].search_paths <- $cdmaterials
 #   [[bones]]                <- $definebone
 #   [[bodyparts]]            <- $bodygroup + $body
 #   [[bodyparts.models]].smd <- studio "x.smd"
 #   [[bodyparts.models.lods]] <- $lod <距离> replacemodel <lodN.smd> <lod0.smd>
+#                                ($lod <distance> replacemodel <lodN.smd> <lod0.smd>)
 #   [[bones]].surface_prop   <- $jointsurfaceprop
 #   [[ikchains]]             <- $ikchain
 #   [[ik_autoplay_locks]]    <- $ikautoplaylock
 #   [[sequences.ik_rules]]   <- $sequence 块内的 ikrule
+#                               (ikrule inside a $sequence block)
 #   [[sequences]].no_auto_ik <- $sequence 块内的 noautoik
+#                               (noautoik inside a $sequence block)
 #   [[weight_lists]]         <- $weightlist
 #   [[sequences]].weight_list <- $sequence ... weightlist "名"
+#                                ($sequence ... weightlist "name")
 #   [[sequences]].forward_declared <- $declaresequence（空壳）
+#                                     ($declaresequence, an empty shell)
 
 # ⚠️ 顶层裸键（上面这些 `key = value`）必须写在所有 `[[表]]` 之前。
 #    这是 TOML 的作用域规则，不是 mdlc 的要求。
 #    同理 `[[weight_lists]]` 放在这里也只是为了可读性 ——
 #    它是**顶层**表，**不是** `[model]` 的字段。
+# ⚠️ Top-level bare keys (the `key = value` pairs above) must come before every
+#    `[[table]]`. That is TOML's scoping rule, not a mdlc requirement.
+#    Likewise `[[weight_lists]]` sits here only for readability -- it is a
+#    **top-level** table, **not** a field of `[model]`.
 
 [model]
 # 输出路径，相对游戏目录。反斜杠会被自动规范化为正斜杠。
+# Output path, relative to the game directory. Backslashes are normalized to forward slashes.
 name = "models/mymod/myprop.mdl"
 # 可省略，默认 49（L4D2）。支持 44 / 48 / 49。
+# Optional; defaults to 49 (L4D2). 44 / 48 / 49 are supported.
 # version = 49
 # 可省略；省略时按模型名生成一个稳定值。
 # 它不是内容哈希，只是 .mdl/.vvd/.vtx/.phy 四件套的配对令牌。
+# Optional; when omitted a stable value is derived from the model name.
+# It is not a content hash, only the pairing token for the .mdl/.vvd/.vtx/.phy set.
 # checksum = 12345
 static_prop = true
 surface_prop = "metal"
 # ⚠️ 质量**不在** [model] 里 —— 它在 [physics] 的 `mass`（对应
 #    $collisionmodel / $collisionjoints 块内的 `$mass`）。在 [model] 下写
 #    `mass = 1.0` 会因为 deny_unknown_fields 直接解析失败。
+# ⚠️ Mass is **not** in [model] -- it is [physics].`mass` (corresponding to
+#    `$mass` inside the $collisionmodel / $collisionjoints block). Writing
+#    `mass = 1.0` under [model] fails to parse outright (deny_unknown_fields).
 # 可省略，默认 1（CONTENTS_SOLID）。$contents 的 "solid" = 1，会写进头部与每根骨骼。
+# Optional; defaults to 1 (CONTENTS_SOLID). $contents "solid" = 1, written into the header and every bone.
 # contents = 1
 # 可省略；省略时由 SMD 顶点自动计算包围盒。
+# Optional; when omitted the bounding box is computed from the SMD vertices.
 # hull_min = [-8.0, -8.0, 0.0]
 # hull_max = [ 8.0,  8.0, 16.0]
 # 可省略。额外的 STUDIOHDR_FLAGS_* 位（static_prop 会自动置 0x10）。
+# Optional. Extra STUDIOHDR_FLAGS_* bits (static_prop sets 0x10 automatically).
 # extra_flags = 0
 #
 # ---- 两个「优化 / 兜底」开关 ----
+# ---- Two "optimization / fallback" switches ----
 #
 # 顶点缓存优化：重排每个 strip group 的索引顺序，让 GPU 的后变换顶点缓存
 # 命中率更高。**只改索引顺序**，顶点池与三角形集合都不变（渲染结果相同）。
 # 可省略，默认 false（保持与既有产物逐字节相同）。
 # QC 侧等价命令：$optimizevtx（mdlc 扩展）；命令行：--optimize-vtx。
+# Vertex cache optimization: reorders the indices of each strip group so the GPU's
+# post-transform vertex cache hits more often. **Only the index order changes** --
+# the vertex pool and triangle set are untouched (identical rendering).
+# Optional; defaults to false (keeps byte-identical output with existing artifacts).
+# QC equivalent: $optimizevtx (a mdlc extension); command line: --optimize-vtx.
 # optimize_vtx = true
 #
 # 顶点超限自动拆分：VTX 的 origMeshVertID 是 uint16 ⟹ **一个 mesh（= 一个
@@ -5145,13 +5177,24 @@ surface_prop = "metal"
 # 可省略，**默认 true**。关掉它则遇到超限 mesh 直接报错。
 # QC 侧等价命令：$nosplitoversizedmeshes 关 / $splitoversizedmeshes 开
 # （都是 mdlc 扩展）。
+# Automatic split on vertex overflow: VTX's origMeshVertID is uint16, so **one mesh
+# (= one material) holds at most 65536 vertices**. When enabled, an oversized mesh is
+# **split into several meshes in triangle order**, all staying in the **same model**
+# and **sharing the original material index**, so $bodygroup semantics are unchanged
+# and the rendering is pixel-identical to the unsplit result.
+# Optional; **defaults to true**. Turn it off to error out on an oversized mesh.
+# QC equivalents: $nosplitoversizedmeshes (off) / $splitoversizedmeshes (on)
+# (both are mdlc extensions).
 # split_oversized_meshes = false
 
 [materials]
 # 材质搜索目录（$cdmaterials）。落盘时会规范化成反斜杠 + 结尾分隔符。
+# Material search directories ($cdmaterials). Normalized to backslashes with a trailing separator when written.
 search_paths = ["models/mymod"]
 # 材质表。SMD 里的材质名会按**首次出现顺序**映射到这里；
 # 名字带 search_paths 前缀时落盘会自动剥掉（与 studiomdl 一致）。
+# Material table. SMD material names map here in **first-appearance order**;
+# a name carrying a search_paths prefix is stripped when written (same as studiomdl).
 textures = [
   { name = "models/mymod/myprop" },
 ]
@@ -5159,6 +5202,10 @@ textures = [
 # 骨骼：根骨骼必须排在最前；父骨骼只能指向更靠前的骨骼。
 # position / rotation 留空时**自动取自 SMD 的 skeleton 第 0 帧**；
 # 显式写出则覆盖 SMD 的值（SMD 的旋转是弧度，这里写角度）。
+# Bones: the root bone must come first; a parent may only point at an earlier bone.
+# When position / rotation are omitted they are **taken from frame 0 of the SMD
+# skeleton**; writing them overrides the SMD values (SMD rotations are radians,
+# these are degrees).
 [[bones]]
 name = "root"
 # position = [0.0, 0.0, 0.0]
@@ -5168,17 +5215,28 @@ name = "root"
 # 与官方逐位一致。**不是**无条件的 0x500 —— 0x500
 # （BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_HITBOX）只是「该骨骼确实
 # 被顶点与 hitbox 使用」时的结果，一律写它会把未被顶点使用的骨骼误标。
+# Optional; when omitted it is computed per bone from **usage** (used by vertices /
+# used by a hitbox / used by an attachment / used by an ikchain / bonemerge) and
+# propagated up the parent chain, bit-identical to the official code. It is **not**
+# an unconditional 0x500 -- 0x500 (BONE_USED_BY_VERTEX_LOD0 | BONE_USED_BY_HITBOX)
+# is merely the result when the bone really is used by vertices and a hitbox, and
+# writing it everywhere would mislabel bones no vertex uses.
 # flags = 1280
 # 可省略；省略时继承 [model].surface_prop。
+# Optional; when omitted it inherits [model].surface_prop.
 # surface_prop = "metal"
 # $bonemerge：允许该骨骼被 bone merge（L4D2 survivor 模型靠它合并武器/手）。
+# $bonemerge: allows the bone to be bone-merged (L4D2 survivor models rely on it to merge weapons/hands).
 # bonemerge = true
 
 # ---------------------------------------------------------------------------
 # 权重表（QC 的 `$weightlist "<名>" { <骨骼> <权重> ... }`）
+# Weight lists (QC's `$weightlist "<name>" { <bone> <weight> ... }`)
 #
 # ⚠️ 这是**顶层**表（与 [[bones]] 同级），**不是** [model] 的字段 ——
 #    它是模型级的表集合，序列按名字引用它。
+# ⚠️ This is a **top-level** table (a sibling of [[bones]]), **not** a field of
+#    [model] -- it is a model-level table collection that sequences reference by name.
 #
 # 用途：引擎做**增量动画（delta）的重建缩放**：
 #     float s = panimation->weight[k];
@@ -5187,6 +5245,13 @@ name = "root"
 # 所以 `s = 0` 的骨骼**完全不参与**该序列的增量叠加（保持基准姿态）。
 # 模组作者用它做「只让上半身动」（真实例子：`v_katana` 的 `empty`、
 # `v_autoshotgun` 的 `weights_fire_layer`）。
+# Purpose: the engine's **delta animation reconstruction scaling**:
+#     float s = panimation->weight[k];
+#     QuaternionMA( q1, s, q2, q3 );      // q3 = q1 interpolated to q2 by s
+#     p3 = base.pos + s * delta.pos;
+# So a bone with `s = 0` takes **no part at all** in that sequence's delta
+# accumulation (it keeps the base pose). Mod authors use it for "only the upper
+# body moves" (real examples: `v_katana`'s `empty`, `v_autoshotgun`'s `weights_fire_layer`).
 #
 # ⚠️ 语义**不是**「没列出的骨骼就是 1」。官方算法（simplify.cpp:1646-1719）：
 #     ① 具名表的**根骨骼默认 0**（不是 1），子骨骼初始为哨兵 -1；
@@ -5195,10 +5260,23 @@ name = "root"
 # 例：骨骼链 root → mid → leaf → tip，只写 `mid 0.5` 得到
 #     [0, 0.5, 0.5, 0.5]（root 是 **0**，leaf/tip 跟着 mid 变 0.5）。
 # 显式列出的骨骼能**覆盖**继承（再写 `tip 0` 就得到 [0, 0.5, 0.5, 0]）。
+# ⚠️ The semantics are **not** "any bone not listed is 1". The official algorithm
+#    (simplify.cpp:1646-1719):
+#      1. the named table's **root bone defaults to 0** (not 1), children start at the sentinel -1;
+#      2. explicit entries override;
+#      3. fill along the parent chain: a child **inherits its parent's** value.
+# Example: the chain root -> mid -> leaf -> tip, writing only `mid 0.5` yields
+#    [0, 0.5, 0.5, 0.5] (root is **0**, leaf/tip follow mid to 0.5).
+# An explicitly listed bone can **override** the inherited value (adding `tip 0`
+# yields [0, 0.5, 0.5, 0]).
 #
 # 骨名与表名都是**大小写不敏感**的（官方用 stricmp）。
 # 官方上限：每表 128 条、共 127 张表（**实测**，不是头文件里的 16/32）。
 # 引用不存在的骨骼是**硬错误**（即使这张表没被任何序列引用）。
+# Bone and table names are **case-insensitive** (the official code uses stricmp).
+# Official limits: 128 entries per table, 127 tables total (**measured**, not the
+# 16/32 in the headers). Referencing a nonexistent bone is a **hard error** (even
+# if no sequence references the table).
 # ---------------------------------------------------------------------------
 # [[weight_lists]]
 # name = "upper"
@@ -5208,41 +5286,62 @@ name = "root"
 # weight = 0.5
 # 位置权重（QC 的 posweight）。**不落盘** —— 只参与编译期 IK 误差计算。
 # 缺省 = 与 weight 相同。
+# Position weight (QC's posweight). **Not written to disk** -- it only feeds the
+# compile-time IK error computation. Defaults to the same value as weight.
 # pos_weight = 0.25
 
 [[bodyparts]]
 name = "body"
 # bodygroup 预设的权重基数，可省略，默认 1。
+# The bodygroup preset's weight base; optional, defaults to 1.
 base = 1
 
 [[bodyparts.models]]
 # 网格来源。相对路径以**描述文件所在目录**为基准。
 # 这是 **LOD 0**（最精细）的网格。
+# Mesh source. Relative paths resolve against **the description file's directory**.
+# This is the **LOD 0** (finest) mesh.
 smd = "myprop-ref.smd"
 # 可省略。studiomdl 把源 SMD 文件名写进 mstudiomodel_t.name；
 # 省略时自动取 smd 的文件名部分，与 studiomdl 行为一致。
+# Optional. studiomdl writes the source SMD file name into mstudiomodel_t.name;
+# when omitted the file-name part of smd is used, matching studiomdl.
 # name = "myprop-ref.smd"
 
 # ---------------------------------------------------------------------------
 # 多 LOD（QC 的 $lod <距离> replacemodel <lodN.smd> <lod0.smd>）
+# Multiple LODs (QC's $lod <distance> replacemodel <lodN.smd> <lod0.smd>)
 #
 # 每个 LOD 是一个**完整独立的 SMD**（不是「删掉一些三角形」）。
 # 本实现把它们跨 LOD 精确去重合并成一个顶点池，按 LOD 归属排序，
 # 并生成 fixup 表 —— 与 studiomdl 的 UnifyLODs 一致。
+# Each LOD is a **complete standalone SMD** (not "a few triangles removed").
+# This implementation deduplicates them exactly across LODs into one vertex pool,
+# sorts by LOD membership and generates the fixup table -- same as studiomdl's UnifyLODs.
 #
 # 三条约束（违反会显式报错，不会静默贴错材质）：
 #   1. 各 LOD 的**材质集合必须一致**（同一个 mesh 在各 LOD 里都得存在）；
 #   2. 每个 LOD 的顶点数应当**单调不增**（LOD 越高越粗）；
 #   3. 最多 8 层（含 LOD 0），引擎的 MAX_NUM_LODS 上限。
+# Three constraints (violations are explicit errors, never silently misassigned materials):
+#   1. every LOD must have the **same material set** (each mesh exists in all LODs);
+#   2. the vertex count should be **monotonically non-increasing** (higher LOD = coarser);
+#   3. at most 8 levels including LOD 0, the engine's MAX_NUM_LODS limit.
 #
 # 注意：本实现**不做网格简化** —— LOD 的 SMD 要你自己准备。
 # 不写 lods 时走单 LOD 路径，产物与加这个特性之前逐字节相同。
+# Note: this implementation **does not simplify meshes** -- you supply the LOD SMDs.
+# Without lods the single-LOD path runs, producing byte-identical output to before
+# this feature existed.
 # ---------------------------------------------------------------------------
 # [[bodyparts.models.lods]]
 # smd = "myprop-lod1.smd"
 # 可省略。切换到该 LOD 的屏幕高度阈值（ModelLODHeader_t.switchPoint）。
 # LOD 0 恒为 0；其余缺省按 20/40/80… 推算。
 # 实测真实取值：10/15/20/25/30/40/50/60/65/80/100/150/200，以及 -1（不切换）。
+# Optional. The screen-height threshold at which this LOD takes over (ModelLODHeader_t.switchPoint).
+# LOD 0 is always 0; the others default to 20/40/80...
+# Measured real values: 10/15/20/25/30/40/50/60/65/80/100/150/200, plus -1 (never switch).
 # switch_point = 20.0
 
 # [[bodyparts.models.lods]]
@@ -5252,9 +5351,13 @@ smd = "myprop-ref.smd"
 # ---------------------------------------------------------------------------
 # hitbox（命中判定）。实测真实 L4D2 模型 100% 都有，没有它子弹打不中。
 # 包围盒是**骨骼空间**的；可用 hlmv 的 hitbox 视图核对。
+# hitboxes (hit detection). Every real L4D2 model measured has them; without one,
+# bullets do not connect. The bounding boxes are in **bone space**; verify them
+# with hlmv's hitbox view.
 # ---------------------------------------------------------------------------
 [hitboxes]
 # hitbox set 名，可省略，默认 "default"。
+# The hitbox set name; optional, defaults to "default".
 # set_name = "default"
 
 # [[hitboxes.boxes]]
@@ -5262,20 +5365,32 @@ smd = "myprop-ref.smd"
 # bbmin = [-8.0, -8.0, -8.0]
 # bbmax = [ 8.0,  8.0,  8.0]
 # group = 0            # 相交分组，可省略
+#                      # intersection group; optional
 # name = "body"        # hitbox 名，可省略
+#                      # hitbox name; optional
 
 # ---------------------------------------------------------------------------
 # 附着点（挂枪口火焰、弹壳抛出点等）。L4D2 全部武器模型依赖它。
 # position / rotation 相对绑定的骨骼；rotation 是**角度**。
+# Attachments (muzzle flashes, shell ejection points, ...). Every L4D2 weapon model needs them.
+# position / rotation are relative to the bound bone; rotation is in **degrees**.
 #
 # `absolute` / `rigid` 对应官方的 `IS_ABSOLUTE` / `IS_RIGID` —— 它们
 # **不落盘**（官方写进 `g_attachment[].type`，而 `write.cpp:350` 只写
 # `flags`），但都影响产物：`absolute` 让 `local` 变成世界坐标下的绝对位姿
 # （官方 `studiomdl.cpp:5246` + `simplify.cpp:5388`），`rigid` 让骨骼保活时
 # 沿父链上溯到第一根被顶点引用的骨骼（`simplify.cpp:3472-3484`）。
+# `absolute` / `rigid` correspond to the official `IS_ABSOLUTE` / `IS_RIGID` -- they are
+# **not written to disk** (the official code stores them in `g_attachment[].type`, while
+# `write.cpp:350` writes only `flags`), but both affect the output: `absolute` turns
+# `local` into an absolute pose in world coordinates (official `studiomdl.cpp:5246` +
+# `simplify.cpp:5388`), and `rigid` walks up the parent chain to the first bone a vertex
+# references when keeping bones alive (`simplify.cpp:3472-3484`).
 #
 # `flags` 直接落进 `mstudioattachment_t.flags`，官方那里**只**可能是
 # `ATTACHMENT_FLAG_WORLD_ALIGN`（`0x10000`）。
+# `flags` lands directly in `mstudioattachment_t.flags`; in the official code it can
+# **only** be `ATTACHMENT_FLAG_WORLD_ALIGN` (`0x10000`).
 # ---------------------------------------------------------------------------
 # [[attachments]]
 # name = "muzzle"
@@ -5283,66 +5398,97 @@ smd = "myprop-ref.smd"
 # position = [0.0, 0.0, 8.0]
 # rotation = [0.0, 0.0, 0.0]
 # absolute = false          # 缺省 false；`absolute` 的旋转来自 g_defaultrotation
+#                           # defaults to false; an `absolute` attachment's rotation comes from g_defaultrotation
 # rigid = false             # 缺省 false
+#                           # defaults to false
 # flags = 0                 # 缺省 0；`world_align` ⟹ 65536 (0x10000)
+#                           # defaults to 0; `world_align` => 65536 (0x10000)
 
 # ---------------------------------------------------------------------------
 # $bonemerge：允许该骨骼被合并（L4D2 的 survivor 模型大量使用）。
 # 写在 [[bones]] 里（`bonemerge = true`），不另设顶层键 ——
 # TOML 的顶层键必须写在所有 [[表]] 之前，容易踩坑。
+# $bonemerge: allows the bone to be merged (heavily used by L4D2 survivor models).
+# Written inside [[bones]] (`bonemerge = true`) rather than as a separate top-level
+# key -- TOML top-level keys must precede every [[table]], which is easy to trip over.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # IK 链与 IK rule。L4D2 语料里 2.3% 的模型有 $ikchain、1.53% 有 ikrule。
+# IK chains and IK rules. In the L4D2 corpus 2.3% of models have $ikchain and 1.53% have ikrule.
 #
 # 自动补规则：**只要模型有 [[ikchains]]**，官方会给每个「没有任何显式
 # ikrule 的链」自动追加一条 type = 4（IK_RELEASE）的规则
 # （simplify.cpp:6254-6281）。所以绝大多数情况下你**不需要**写
 # [[sequences.ik_rules]]，产物里就已经有正确的规则了。
 # 要抑制它（对应 QC 的 noautoik）就在该序列上写 no_auto_ik = true。
+# Auto-added rules: **whenever the model has [[ikchains]]**, the official code appends
+# a type = 4 (IK_RELEASE) rule to every chain that has no explicit ikrule
+# (simplify.cpp:6254-6281). So in the vast majority of cases you **do not need** to write
+# [[sequences.ik_rules]] -- the output already carries the right rules.
+# To suppress it (QC's noautoik) write no_auto_ik = true on that sequence.
 #
 # 官方 QC：
+# Official QC:
 #   $ikchain "leg" "ankle" knee 0.5 0.5 0
 #   $ikautoplaylock "leg" 1.0 0.1
 #   $sequence idle "x.smd" { ikrule "leg" touch "knee" }
 # ---------------------------------------------------------------------------
 # [[ikchains]]
 # name = "leg"          # 链名，ikrule / ikautoplaylock 按它引用
+#                       # chain name; ikrule / ikautoplaylock reference it
 # bone = "ankle"        # **末端**骨骼；父（膝）与祖父（胯）自动推出
+#                       # the **end** bone; the parent (knee) and grandparent (hip) are derived
 # knee_dir = [0.5, 0.5, 0.0]   # 对应 QC 的 knee <x y z>，可省略
+#                              # corresponds to QC's knee <x y z>; optional
 
 # [[ik_autoplay_locks]]
 # chain = "leg"         # 写链名，落盘时解析成链下标
+#                       # write the chain name; resolved to a chain index when written
 # pos_weight = 1.0
 # local_q_weight = 0.1
 
 # ---------------------------------------------------------------------------
 # [[sequences.ik_rules]] —— 每条规则一个表，顺序 = 写出顺序。
+# [[sequences.ik_rules]] -- one table per rule; the order is the write order.
 #
 # type 取值与它对 QC 关键字的对应：
+# The type values and the QC keywords they correspond to:
 #   "touch"      <- ikrule <链> touch <骨骼>      误差 = 该骨骼与链末端的相对变换
+#                   ikrule <chain> touch <bone>   error = the relative transform between that bone and the chain end
 #   "attachment" <- ikrule <链> attachment <名字>  + 可选的 target <槽位>
+#                   ikrule <chain> attachment <name>  + optional target <slot>
 #   "release"    <- ikrule <链> release
 #   "unlatch"    <- ikrule <链> unlatch
 #   "footstep"   <- ikrule <链> footstep          **尚未实现**（语料 0 次）
+#                                                 **not implemented yet** (0 occurrences in the corpus)
 #
 # 省略 range 时 tail/end 自动展开成「末帧」（numframes − 1）。
 # range 的四个数是**帧号**；写成 `range = [1, 1, 2, 3]`。
+# When range is omitted, tail/end expand to "the last frame" (numframes - 1).
+# The four numbers in range are **frame numbers**; write `range = [1, 1, 2, 3]`.
 # ---------------------------------------------------------------------------
 # [[sequences.ik_rules]]
 # chain = "leg"
 # type = "touch"
 # bone = "knee"
 # # 以下全部可省略（省略 = 官方默认）
+# # everything below is optional (omitted = the official default)
 # # target = 0                   # slot，缺省 = 链下标
+# #                              # slot; defaults to the chain index
 # # range = [0, 0, 3, 3]         # [start, peak, tail, end]，帧号
+# #                              # [start, peak, tail, end], frame numbers
 # # contact = 2                  # 帧号，缺省 = peak
+# #                              # frame number; defaults to peak
 # # height = 12.0 / radius = 4.0 / pad = 8.0 / floor = 0.0
 # # fake_origin = [0.0, 0.0, 0.0]   # 强制 pos 并把 bone 置 -1
+# #                                 # force pos and set bone to -1
 # # fake_rotate = [0.0, 0.0, 0.0]   # 度；强制 q 并把 bone 置 -1
+# #                                 # degrees; force q and set bone to -1
 
 # ---------------------------------------------------------------------------
 # 序列。单动画序列写 `smd = "..."`；blend 序列写 `blends = [...]`。
+# Sequences. A single-animation sequence writes `smd = "..."`; a blend sequence writes `blends = [...]`.
 # ---------------------------------------------------------------------------
 # [[sequences]]
 # name = "idle"
@@ -5351,15 +5497,23 @@ smd = "myprop-ref.smd"
 # looping = true
 # # 按名字引用 [[weight_lists]] 里的表；缺省 = 隐式全 1 表。
 # # 表名大小写不敏感。引用不存在的表会报错（官方也是硬错误）。
+# # Reference a table in [[weight_lists]] by name; default = an implicit all-ones table.
+# # Table names are case-insensitive. Referencing a nonexistent table is an error (also a hard error officially).
 # weight_list = "upper"
 
 # ---------------------------------------------------------------------------
 # `$declaresequence` —— **前向声明的空壳序列**（survivor 模组核心机制）。
+# `$declaresequence` -- a **forward-declared empty-shell sequence** (the core mechanism of survivor mods).
 #
 # 主模型里声明一堆空名字，真正的动画在 `$includemodel` 进来的
 # `anim_<survivor>.mdl` 里；引擎加载时按名字**替换**掉空壳
 # （`studio_virtualmodel.cpp:185` 的 `STUDIO_OVERRIDE` 分支）。
 # 于是网格/骨骼/flex 与几百条动画可以**分开发布**。
+# The main model declares a batch of empty names; the real animations live in the
+# `anim_<survivor>.mdl` pulled in by `$includemodel`, and the engine **replaces** the
+# shells by name at load time (the `STUDIO_OVERRIDE` branch of
+# `studio_virtualmodel.cpp:185`). That lets the mesh/bones/flex ship **separately**
+# from hundreds of animations.
 #
 # ⚠️ 空壳**不要写 smd**（官方连 `panim` 都不分配），写了会被 `validate()` 拒。
 # ⚠️ 空壳**不能**用 `$sequence <同名>` 去填 —— 官方会报
@@ -5367,6 +5521,13 @@ smd = "myprop-ref.smd"
 #    填充是**引擎运行时**做的事，不是编译期。
 # 实测真实工程：`Zoey_$DeclareSequence.qci` 933 条空壳，
 # 编出的 `.mdl` 里 `numlocalseq = 936`（含 3 条实体序列）。
+# ⚠️ Do **not** give a shell an smd (the official code does not even allocate `panim`);
+#    doing so is rejected by `validate()`.
+# ⚠️ A shell **cannot** be filled by `$sequence <same name>` -- the official code reports
+#    `no animations found` (`ParseSequence` checks `numblends == 0`). The filling happens
+#    at **engine run time**, not at compile time.
+# Measured on a real project: `Zoey_$DeclareSequence.qci` has 933 shells, and the compiled
+# `.mdl` reports `numlocalseq = 936` (including 3 concrete sequences).
 # ---------------------------------------------------------------------------
 # [[sequences]]
 # name = "Idle_Standing_Align"
@@ -6350,9 +6511,24 @@ smd = "minimal-ref.smd"
 
     #[test]
     fn template_does_not_contain_mesh_data() {
-        // 网格必须由 SMD 承载：模板里不该出现 vertices/triangles。
-        assert!(!TEMPLATE_TOML.contains("vertices"), "模板不应内联顶点");
-        assert!(!TEMPLATE_TOML.contains("triangles"), "模板不应内联三角形");
+        // 网格必须由 SMD 承载：模板里不该出现 vertices/triangles 这两个**键**。
+        //
+        // ⚠️ 判据是「**非注释行**里没有它们」，不是「整份文本里没有它们」——
+        // 模板的注释是**中英双语**的，英文散文里正常会说 "the SMD vertices"
+        // （如「包围盒由 SMD 顶点算」那条）。按整份文本判会把正当的说明
+        // 误判成「内联了网格数据」。
+        let code: String = TEMPLATE_TOML
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("vertices"), "模板不应内联顶点：{code}");
+        assert!(!code.contains("triangles"), "模板不应内联三角形：{code}");
+        // 注释掉的 `# vertices = [...]` 同样算「内联了网格数据」—— 用户会照抄。
+        assert!(
+            !TEMPLATE_TOML.contains("vertices =") && !TEMPLATE_TOML.contains("triangles ="),
+            "模板里不该有（哪怕是注释掉的）vertices/triangles 赋值"
+        );
         assert!(TEMPLATE_TOML.contains("smd ="), "模板应引用 SMD");
     }
 

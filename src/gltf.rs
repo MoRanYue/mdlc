@@ -158,28 +158,35 @@ impl GltfNotes {
 /// （mime 可省）。**非 base64 的百分号编码形态不支持** —— 那是给文本用的，
 /// 二进制 buffer 不会那么写；真遇到就报错，不猜。
 fn decode_data_uri(uri: &str, at: &str) -> Result<Vec<u8>, GltfError> {
-    let rest = uri
-        .strip_prefix("data:")
-        .ok_or_else(|| ferr(format!("{at}：内部错误 —— {uri:?} 不是 data URI")))?;
+    let rest = uri.strip_prefix("data:").ok_or_else(|| {
+        ferr(crate::tr_fmt!(
+            "%{at}: internal error -- %{uri} is not a data URI",
+            at = at,
+            uri = format!("{uri:?}")
+        ))
+    })?;
     let (meta, payload) = rest.split_once(',').ok_or_else(|| {
-        ferr(format!(
-            "{at}：data URI 里没有逗号，无法定位载荷（前 64 字节：{:?}）",
-            &uri[..uri.len().min(64)]
+        ferr(crate::tr_fmt!(
+            "%{at}: the data URI has no comma, so the payload cannot be located (first 64 bytes: %{head})",
+            at = at,
+            head = format!("{:?}", &uri[..uri.len().min(64)])
         ))
     })?;
     if !meta.ends_with(";base64") {
-        return Err(ferr(format!(
-            "{at}：data URI 不是 base64 形态（元信息 {meta:?}）。\
-             glTF 的二进制 buffer 应当用 `data:application/octet-stream;base64,...`。"
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: the data URI is not in base64 form (metadata %{meta}). A glTF binary buffer should be written as `data:application/octet-stream;base64,...`.",
+            at = at,
+            meta = format!("{meta:?}")
         )));
     }
     // ⚠️ `base64` 0.13 的 API 是**自由函数** `base64::decode`；
     // `Engine` trait + `engine::general_purpose::STANDARD` 是 0.21 起才有的。
     // 这里钉 `0.13` 是为了与 `gltf` 的 `import` 分支同版本（不新增包）。
     base64::decode(payload.trim()).map_err(|err| {
-        ferr(format!(
-            "{at}：data URI 的 base64 解码失败（{err}）。\
-             这条**不能静默跳过** —— 跳过会让模型读出零顶点却不报错。"
+        ferr(crate::tr_fmt!(
+            "%{at}: failed to base64-decode the data URI (%{err}). This must not be skipped silently -- skipping would read a model with zero vertices without reporting an error.",
+            at = at,
+            err = err
         ))
     })
 }
@@ -201,9 +208,10 @@ fn load_buffers(
     for b in doc.buffers() {
         let bytes = match b.source() {
             Source::Bin => blob.clone().ok_or_else(|| {
-                ferr(format!(
-                    "{at}：buffer[{}] 声明自己是 GLB 的 BIN chunk，但文件里没有 BIN chunk。",
-                    b.index()
+                ferr(crate::tr_fmt!(
+                    "%{at}: buffer[%{index}] declares itself as the GLB BIN chunk, but the file has no BIN chunk.",
+                    at = at,
+                    index = b.index()
                 ))
             })?,
             Source::Uri(uri) if uri.starts_with("data:") => decode_data_uri(uri, at)?,
@@ -211,9 +219,12 @@ fn load_buffers(
                 // 外部文件：相对当前 glTF 文件所在目录解析。
                 let path = base_dir.join(uri);
                 std::fs::read(&path).map_err(|err| {
-                    ferr(format!(
-                        "{at}：读不到外部 buffer {uri:?}（解析为 {}）：{err}",
-                        path.display()
+                    ferr(crate::tr_fmt!(
+                        "%{at}: cannot read the external buffer %{uri} (resolved to %{path}): %{err}",
+                        at = at,
+                        uri = format!("{uri:?}"),
+                        path = path.display(),
+                        err = err
                     ))
                 })?
             }
@@ -223,11 +234,12 @@ fn load_buffers(
         // 少了这一条，越界的 bufferView 会在 reader 层静默变成 `None`，
         // 表现为「顶点少了一截」而不是报错。
         if bytes.len() < b.length() {
-            return Err(ferr(format!(
-                "{at}：buffer[{}] 声明 {} 字节，实际只有 {} 字节。",
-                b.index(),
-                b.length(),
-                bytes.len()
+            return Err(ferr(crate::tr_fmt!(
+                "%{at}: buffer[%{index}] declares %{declared} bytes but only %{actual} are present.",
+                at = at,
+                index = b.index(),
+                declared = b.length(),
+                actual = bytes.len()
             )));
         }
         out.push(bytes);
@@ -251,11 +263,14 @@ fn validate_ranges(doc: &gltf::Document, buffers: &[Vec<u8>], at: &str) -> Resul
         let len = buffers.get(bi).map_or(0, Vec::len);
         let end = v.offset().saturating_add(v.length());
         if end > len {
-            return Err(ferr(format!(
-                "{at}：bufferView[{}] 覆盖 [{}, {})，超出 buffer[{bi}] 的 {len} 字节。",
-                v.index(),
-                v.offset(),
-                end
+            return Err(ferr(crate::tr_fmt!(
+                "%{at}: bufferView[%{index}] covers [%{offset}, %{end}), which exceeds the %{len} bytes of buffer[%{buffer}].",
+                at = at,
+                index = v.index(),
+                offset = v.offset(),
+                end = end,
+                len = len,
+                buffer = bi
             )));
         }
     }
@@ -278,14 +293,16 @@ fn validate_ranges(doc: &gltf::Document, buffers: &[Vec<u8>], at: &str) -> Resul
             .saturating_add(stride.saturating_mul(a.count() - 1))
             .saturating_add(a.size());
         if end > v.length() {
-            return Err(ferr(format!(
-                "{at}：accessor[{}] 的 {} 个元素（步长 {stride}、单元素 {} 字节）\
-                 需要 {end} 字节，超出 bufferView[{}] 的 {} 字节。",
-                a.index(),
-                a.count(),
-                a.size(),
-                v.index(),
-                v.length()
+            return Err(ferr(crate::tr_fmt!(
+                "%{at}: accessor[%{index}] has %{count} elements (stride %{stride}, %{size} bytes each) needing %{end} bytes, which exceeds the %{len} bytes of bufferView[%{view}].",
+                at = at,
+                index = a.index(),
+                count = a.count(),
+                stride = stride,
+                size = a.size(),
+                end = end,
+                len = v.length(),
+                view = v.index()
             )));
         }
     }
@@ -312,15 +329,17 @@ fn check_extensions(doc: &gltf::Document, at: &str) -> Result<(), GltfError> {
     let used: HashSet<&str> = doc.extensions_used().collect();
     for ext in UNSUPPORTED_EXTENSIONS {
         if required.contains(ext) {
-            return Err(ferr(format!(
-                "{at}：用了 {ext}（列在 `extensionsRequired` 里），mdlc 不支持解压它。\
-                 请在导出时关掉网格压缩（Blender 的 glTF 导出器里叫 `Compression`）。"
+            return Err(ferr(crate::tr_fmt!(
+                "%{at}: the file uses %{ext} (listed in `extensionsRequired`), and mdlc cannot decompress it. Turn off mesh compression when exporting (called `Compression` in Blender's glTF exporter).",
+                at = at,
+                ext = ext
             )));
         }
         if used.contains(ext) {
-            return Err(ferr(format!(
-                "{at}：`extensionsUsed` 里有 {ext}；mdlc 不支持它，读出来的几何可能不完整。\
-                 请关掉网格压缩后重导。"
+            return Err(ferr(crate::tr_fmt!(
+                "%{at}: `extensionsUsed` lists %{ext}; mdlc does not support it, so the geometry it reads may be incomplete. Turn off mesh compression and re-export.",
+                at = at,
+                ext = ext
             )));
         }
     }
@@ -332,8 +351,14 @@ fn load_document(
     path: &Path,
     at: &str,
 ) -> Result<(gltf::Document, Vec<Vec<u8>>, GltfNotes), GltfError> {
-    let bytes =
-        std::fs::read(path).map_err(|err| ferr(format!("{at}：读不到 {}：{err}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|err| {
+        ferr(crate::tr_fmt!(
+            "%{at}: cannot read %{path}: %{err}",
+            at = at,
+            path = path.display(),
+            err = err
+        ))
+    })?;
 
     // ⭐ **永远走绕校验的这条路径**（`docs/gltf-support.md` §8.1）：
     // 1.4.1 的校验层会把「无 bufferView 的 accessor」误判为错误，而那是
@@ -342,7 +367,14 @@ fn load_document(
     // 不写成「先试 from_slice，失败再退」—— 那会让行为依赖 crate 版本
     // （同一个文件在两个版本下走不同分支），而且失败重试本身有成本。
     let (doc, blob) = gltf::Gltf::from_slice_without_validation(&bytes)
-        .map_err(|err| ferr(format!("{at}：{} 解析失败：{err}", path.display())))
+        .map_err(|err| {
+            ferr(crate::tr_fmt!(
+                "%{at}: failed to parse %{path}: %{err}",
+                at = at,
+                path = path.display(),
+                err = err
+            ))
+        })
         .map(|g| (g.document, g.blob))?;
 
     check_extensions(&doc, at)?;
@@ -1464,10 +1496,10 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
     }
 
     if triangles.is_empty() {
-        return Err(ferr(format!(
-            "{at}：{} 里没有任何三角形（网格）。\
-             若写了 `srcpart`，请核对网格名字是否与文件里的一致。",
-            path.display()
+        return Err(ferr(crate::tr_fmt!(
+            "%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.",
+            at = at,
+            path = path.display()
         )));
     }
 
@@ -1559,9 +1591,11 @@ pub fn read_frames(
     // 1 帧），只有**显式点名**了不存在的栈才是错误。
     let Some(anim) = anim else {
         if let Some(want) = stack {
-            return Err(ferr(format!(
-                "{} 里没有名为 {want:?} 的动画；现有的是 {names:?}。",
-                path.display()
+            return Err(ferr(crate::tr_fmt!(
+                "%{path} has no animation named %{want}; the available ones are %{names}.",
+                path = path.display(),
+                want = format!("{want:?}"),
+                names = format!("{names:?}")
             )));
         }
         return Ok(Smd {
@@ -2512,9 +2546,10 @@ mod tests {
             parts: vec!["nope".to_string()],
             ..Default::default()
         };
-        let err = read(&p, "tri.gltf", &opts).unwrap_err();
+        // ⚠️ 文案在 `read` 里就渲染好了，所以语言必须在那一刻生效。
+        let err = crate::test_locale::with_english(|| read(&p, "tri.gltf", &opts)).unwrap_err();
         assert!(
-            err.to_string().contains("没有任何三角形"),
+            err.to_string().contains("contains no triangles"),
             "选不中时要报错而不是静默出空模型：{err}"
         );
     }
