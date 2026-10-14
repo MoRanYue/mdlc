@@ -767,8 +767,16 @@ This table covers more than help text: **runtime diagnostics and error messages 
 the `Error: ` / `Warning: ` / `Note: ` prefixes emitted via `log::error!` / `log::warn!` /
 `log::info!`, plus the `check` / `vvd-info` / `vvd-roundtrip` / `phy` reports. Parameterized lines use
 `%{name}` placeholders (`rust-i18n`'s `replace_patterns` syntax; the names are never translated).
-**One exception**: the TOML template body printed by `mdlc template` (`TEMPLATE_TOML` in
-`src/model.rs`) stays Chinese — it is template file content, not a diagnostic.
+**One exception**: the comments in the TOML template printed by `mdlc template` (`TEMPLATE_TOML` in
+`src/model.rs`) are **bilingual (Chinese + English)** — it is template file content rather than a
+diagnostic, so it does not go through the translation table.
+
+> ⚠️ **Language detection goes through `sys-locale`, which on Windows reads the *user-preferred UI
+> language* (`GetUserPreferredUILanguages`) and does *not* read `LC_ALL` / `LANG`.** So switching
+> languages currently means changing the system display language. To force English in a test, call
+> `rust_i18n::set_locale("en")` — but that only affects **mdlc's own strings**; the framework words
+> (`Usage:` / `Arguments:` / `Options:`) come from `clap-i18n-richformatter`'s own
+> `FluentLanguageLoader` and are a separate piece of state.
 
 > Colour **only appears on a direct terminal** and degrades to plain text when redirected or
 > captured through a pipe — so no ANSI escape codes are ever pushed into host logs such as

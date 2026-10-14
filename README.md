@@ -723,7 +723,15 @@ _version: 2
 `Note: ` 三类前缀，以及 `check` / `vvd-info` / `vvd-roundtrip` / `phy` 的
 报表。带参数的行用 `%{名}` 占位（`rust-i18n` 的 `replace_patterns` 语法，
 名字不翻译）。**例外**：`mdlc template` 打出的 TOML 模板正文
-（`src/model.rs` 的 `TEMPLATE_TOML`）保持中文 —— 它是模板文件内容而非诊断。
+（`src/model.rs` 的 `TEMPLATE_TOML`）的**注释是中英双语**（正文是模板内容而非诊断，
+不进译文表）。
+
+> ⚠️ **语言探测走 `sys-locale`，Windows 上读的是「用户首选显示语言」
+> （`GetUserPreferredUILanguages`），不读 `LC_ALL` / `LANG`。**
+> 所以想换语言目前只能改系统显示语言。若只是想在测试里切到英文，
+> 用 `rust_i18n::set_locale("en")` —— 但那**只影响自有文案**，
+> `用法:` / `参数:` / `选项:` 这些**框架词**由 `clap-i18n-richformatter`
+> 自己的 `FluentLanguageLoader` 探测，是另一套独立状态。
 
 > 颜色**只在直连终端时**才出现，被重定向或管道抓取时自动降级成纯文本 ——
 > 所以不会往 Crowbar 之类的宿主日志里塞 ANSI 转义码。
