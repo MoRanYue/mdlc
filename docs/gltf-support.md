@@ -573,7 +573,11 @@ posed.glb （关）                              最大偏离 = 1.129e+1 (Head) 
 - 下游**不需要再改**：`CompiledModel.source_world`（`src\model.rs:3913`）与
   `remap_vertices_to_reference_pose`（`src\compile.rs:4870-4978`）本来就通了 ——
   glTF 侧也是经 `read()` 产出 `FbxGeometry`（含 `reference_frame`）再走同一条 `compile()`。
-- `read_frames`（动画流）与 FBX 侧同状态：**未同步改**（见 `docs/fbx-support.md` §1.7c.4）。
+- `read_frames`（动画流）**不该同步改**（**已定案，2026-10-14**）：glTF 的动画采样器
+  与 SMD 的动画 `skeleton` 段同性质，都是**逐帧姿态流**，其自然参照系就是
+  网格顶点所在的空间（= 绑定姿态）。**依据是 BlenderSourceTools 的 SMD 导出源码**：
+  网格顶点写未变形局部坐标、网格 SMD 的 `skeleton` 段写 rest、动画 SMD 写逐帧姿态。
+  完整推理见 `docs/fbx-support.md` §1.7c.4。
 
 **验收**（`fbxbug\cmp3\`，同一二进制、只换导出开关）：
 
@@ -858,7 +862,7 @@ cdtexture 表**差一条空串**。第三方实现（NekoMDL 的 `neko_rig.mdl` 
 | 6 | `base64 0.13.1` 版本较老（2021） | 低。只在解 data URI 时用，且输入是本地文件。 |
 | 7 | glTF 几何源**不追加**空 cdtexture | ✅ **用户裁决，见 §6.5**。代价：同一场景 `.fbx` vs `.glb` 的 cdtexture 表差一条。 |
 | 8 | ⭐⭐⭐⭐⭐ **`inverseBindMatrices` 被完全忽略** | ✅ **已修**（§5.1b）。`src\gltf.rs` 新增 `bind_worlds` 读 IBM 求逆，`reference_poses` 的世界矩阵基改成「有绑定姿态用绑定姿态、没有退回节点 TRS」。修复前 `posed.glb` 的 `outside` 达 **9.823**、模型空间包围盒从 `[2,2,2]` 被拉成 `[2, 11.726, 8.633]`；修复后 `rest`/`posed` 骨骼表 **70/70 逐字段相同**、`outside` 全 `0.000`，用户真实资产与 FBX 路径只差骨架根的坐标轴约定。✅ **零回归风险已实测**：parity 夹具无任何 `.glb`/`.gltf`，101/101 全过。 |
-| 9 | **动画流是否同步 bind 口径** | 中（未定案，§5.1b.4 末）。与 FBX 侧同状态：`read_frames` 取节点 TRS。 |
+| 9 | **动画流是否同步 bind 口径** | ✅ **已定案：不改**（§5.1b.4 末，2026-10-14）。动画采样器是逐帧姿态流，自然参照系就是绑定姿态；依据是 BlenderSourceTools 的 SMD 导出源码（`docs/fbx-support.md` §1.7c.4）。 |
 
 ### 8.1 兼容两种上游的写法（风险 2 + 3）
 

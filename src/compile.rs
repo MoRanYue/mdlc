@@ -2688,17 +2688,6 @@ pub(crate) fn attachment_local_matrix(
     }
 }
 
-/// 取 SMD 参考姿态里某根骨骼的姿态。
-fn pose_for(smd: &Smd, node_index: usize) -> Option<&SmdPose> {
-    let f = smd.reference_frame()?;
-    // skeleton 段的行序与 nodes 顺序一一对应，所以按下标取；
-    // 但也允许文件里显式给出 bone 下标（用 bone 字段匹配）。
-    f.poses
-        .iter()
-        .find(|p| p.bone == node_index as i32)
-        .or_else(|| f.poses.get(node_index))
-}
-
 /// 编译：描述 + SMD → IR。
 ///
 /// `base_dir` 是描述文件所在目录，用于解析 SMD 的相对路径。
@@ -2879,7 +2868,6 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         });
                     }
                 }
-                let _ = pose_for; // 保留该辅助函数供后续「按名取姿态」使用
 
                 models.push(CompiledModel {
                     smd_path,
