@@ -424,7 +424,7 @@ so does `auto_mass = true` — it needs a surface-material density table that md
 | `[[flex_rules]]` | `%<flex> = <expr>` | `flex` + `ops` (each with `op` + `value`/`controller`/`flexdesc`) |
 | `[[flex_controller_ui]]` | — | `name` / `stereo` / `left` / `right` |
 | `[[mouths]]` | `mouth` | `index` (explicit, drives `g_nummouths`) / `flexdesc` / `bone` / `forward` |
-| `[[jiggle_bones]]` | `$jigglebone` | `bone` + `is_flexible` / `is_rigid` / `has_base_spring` + **`writes`** |
+| `[[jiggle_bones]]` | `$jigglebone` | `bone` + `is_flexible` / `is_rigid` / `has_base_spring` / `is_boing` (**v48 only**) + **`writes`** |
 | `[[quat_interp_bones]]` | `$proceduralbones` (proctype 2) | `bone` / `control` / `base_pos` / `triggers` |
 | `[[bonecontrollers]]` | `$controller` | L4D2 has deprecated the feature, but the section still holds a slot. ⚠️ the key is the literal **`type_`** (with an underscore) |
 | `include_models` | `$includemodel` | Top-level string array; **you must write the `models/` prefix yourself**, mdlc will not add it |
@@ -760,10 +760,15 @@ Measured (one and the same QC with a single `$jigglebone`): the official Garry's
 `studiomdl.exe -mdlreport`, which prints real Performance Stats instead of
 `is wrong version (49 should be 48)`.
 
-> ⚠️ **The `is_boing` sub-block is not supported yet.** Besides `is_flexible` / `is_rigid` /
-> `has_base_spring`, Garry's Mod's `$jigglebone` also accepts `is_boing { impact_speed … }`;
-> mdlc reports "key written outside any block". Jigglebones without boing work fine, and the 5
-> extra `boing*` slots of v48 are always written as 0.
+> **The `is_boing` sub-block is supported** (v48 only). Besides `is_flexible` / `is_rigid` /
+> `has_base_spring`, Garry's Mod's `$jigglebone` also accepts `is_boing { impact_speed 100 }`
+> with five single-float keys: `impact_speed` / `impact_angle` (**degrees in, cosine out**) /
+> `damping_rate` / `frequency` / `amplitude`. Omitting the keys uses the official defaults
+> `100 / 0.7071 / 0.25 / 30 / 0.35`. Unknown tokens inside the block are **silently skipped**
+> by the official compiler (mdlc does the same), but keys written in any *other* block still
+> error out. Targeting v49 with `is_boing` is a **hard error, not a silent drop** — v49's
+> `mstudiojigglebone_t` simply has no such slots. Measured: the 140-byte v48 record is
+> **byte-for-byte identical** to the official Garry's Mod `studiomdl.exe` output.
 
 > ⚠️ **v44 is not supported** (the Dark Messiah / Episode One era). It lacks the whole
 > `studiohdr2_t` / `mstudiolinearbone_t` family and has different field layouts in

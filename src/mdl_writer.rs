@@ -3116,19 +3116,21 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             for (k, v) in vals.iter().enumerate() {
                 put_f32(&mut buf, rec + 4 + k * 4, *v);
             }
-            // ⚠️ v48 在 29 个 float 之后**还有 5 个 `boing*` float**
+            // v48 在 29 个 float 之后**还有 5 个 `boing*` float**
             // （`boingImpactSpeed` / `boingImpactAngle` / `boingDampingRate` /
             // `boingFrequency` / `boingAmplitude`），整条记录 140 字节。
             //
-            // mdlc **不实现 boing**：官方 v44（`hl2sdk-darkm`，唯一带
-            // `utils/studiomdl` 源码的版本之一）里根本没有 jigglebone
-            // （`grep jiggle` 0 命中、`studio.h` 里 `boing` 0 命中），
-            // v48 的官方 `write.cpp` 拿不到 ⟹ **没有 oracle 可依据就不猜语法**。
-            // 这里写 0.0，与「模型没写 boing」同形（官方把记录 memset 成 0
-            // 就是这个结果）。
+            // 语义（缺省值、`impact_angle` 的角度→cos 换算）在
+            // `compile::resolve_jiggle_bones` 里做一次，这里只落字节。
+            // 没写 `is_boing` 时 `j.boing` 是全 0 —— 与官方把记录 memset
+            // 成 0 同形（实测 `jig1.mdl` 的这 5 个槽都是 0）。
             let boing_slots = (spec.jiggle_bone_size - 120) / 4;
+            debug_assert!(
+                boing_slots == 0 || boing_slots == j.boing.len(),
+                "v48 的 boing 槽恰好 5 个"
+            );
             for k in 0..boing_slots {
-                put_f32(&mut buf, rec + 120 + k * 4, 0.0);
+                put_f32(&mut buf, rec + 120 + k * 4, j.boing[k]);
             }
         }
     }
@@ -7413,8 +7415,9 @@ fps = 30.0
     /// （`docs/_probe/smdl/jig1.qc`，1 条 `$jigglebone`、4 根骨骼）官方 v48 的
     /// `bonecontrollerindex = 1668 = procStart(1528) + 140`，而 mdlc 的 v48
     /// 产物该字段**与官方逐字节相同**，jigglebone 记录的 35 个槽也全等
-    /// （官方那 5 个 `boing*` float 实测**全是 0** —— 与「不实现 boing 语法、
-    /// 一律写 0」的取舍一致）。
+    /// （该夹具没写 `is_boing`，所以官方那 5 个 `boing*` float 实测全是 0 ——
+    /// 与 mdlc 把「没写 is_boing」写成 0 同形；写了 `is_boing` 的情形见
+    /// 下一个测试）。
     ///
     /// 另两条 v48 专属规则：`surfaceprop` 的两个字段都写 0（v48 的
     /// `studiohdr_t` 那里是 `unused3[1]`、`mstudiobone_t` 那里是 `unused[7]`）。
@@ -7491,6 +7494,73 @@ fps = 30.0
                 assert_ne!(hdr_sp, 0, "v49 的头部 surfaceprop 应指向字符串池");
             }
         }
+    }
+
+    /// 写了 `is_boing` 时，v48 那 5 个 `boing*` 槽真的会把值写出去。
+    ///
+    /// 判据来自受控实验（`PROGRESS.md` §111）：`is_boing {}` 写官方缺省
+    /// `[100, 0.7071, 0.25, 30, 0.35]`；`impact_angle` 是**角度进、cos 出**
+    /// （45° → 0.70710677，与缺省字面量 0.7071 差 1 个末位）。
+    #[test]
+    fn v48_jigglebone_writes_the_five_boing_slots() {
+        let toml = r#"
+[model]
+name = "mymod/jigboing.mdl"
+surface_prop = "metal"
+version = 48
+
+[[jiggle_bones]]
+bone = "tip"
+
+[[jiggle_bones.writes]]
+key = "is_boing"
+
+[[jiggle_bones.writes]]
+key = "impact_angle"
+values = [45.0]
+
+[materials]
+textures = [{ name = "myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "tip"
+parent = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "myprop-ref.smd"
+
+[[sequences]]
+name = "idle"
+smd = "myprop-ref.smd"
+fps = 30.0
+"#;
+        let c = build_from_toml(toml);
+        assert_eq!(c.desc.model.version, Some(48), "夹具必须钉在 v48");
+        let out = write_mdl(&c).unwrap();
+        let b = &out.bytes;
+        let rd = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let nb = rd(0x9C) as usize; // `numbones`
+        let bi = rd(off::BONE_OFFSET) as usize;
+        let proc_start = (bi + nb * BONE_SIZE + 3) & !3;
+        assert_ne!(rd(proc_start) & 0x80, 0, "flags 必须含 IS_BOING(0x80)");
+        let mut slots = [0.0f32; 5];
+        for (k, s) in slots.iter_mut().enumerate() {
+            let at = proc_start + 120 + k * 4;
+            *s = f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        }
+        assert_eq!(slots[0], 100.0, "impact_speed 缺省");
+        assert!(
+            (slots[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+            "45° 应写成 cos = 0.70710677，实际 {}",
+            slots[1]
+        );
+        assert_eq!(slots[2..], [0.25, 30.0, 0.35], "其余三个缺省");
     }
 
     /// **触发条件**：`linearboneindex != 0` ⟺ `numbones >= 2`。

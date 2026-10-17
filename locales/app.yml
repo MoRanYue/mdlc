@@ -1726,3 +1726,6 @@ _version: 2
 
 "not a version number: %{s}":
   zh-CN: "不是版本号：%{s}"
+
+"$jigglebone %{bone}: `is_boing` needs studio version 48 -- v49's mstudiojigglebone_t has no boing fields, so the five boing* slots do not exist. Target 48 (`--studio-version 48` or `$version 48`), or drop the block.":
+  zh-CN: "$jigglebone %{bone}：`is_boing` 需要 studio 版本 48 —— v49 的 mstudiojigglebone_t 没有 boing 字段，那五个 boing* 槽不存在。请改为目标 48（`--studio-version 48` 或 `$version 48`），或删掉该块。"

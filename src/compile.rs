@@ -7446,6 +7446,9 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
             (def::BASE_MIN, def::BASE_MAX, 0.0);
         let (mut base_min_fwd, mut base_max_fwd, mut base_fwd_friction) =
             (def::BASE_MIN, def::BASE_MAX, 0.0);
+        // v48 的 5 个 `boing*` 槽：只有写了 `is_boing` 才有值（进入块时置缺省），
+        // 否则保持全 0 —— 与官方把记录 memset 成 0 同形。
+        let mut boing = [0.0f32; 5];
 
         // ---- 唯一的一条应用路径：按 token 顺序逐条写 ----
         for (k, w) in j.effective_writes().iter().enumerate() {
@@ -7506,6 +7509,29 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
                 "left_friction" => base_left_friction = v0,
                 "up_friction" => base_up_friction = v0,
                 "forward_friction" => base_fwd_friction = v0,
+                // ---- v48 的 `is_boing`（v49 没有这 5 个槽，见循环后的版本检查）----
+                //
+                // 块**进入**时先把 5 个槽重置成官方缺省 —— 实测重复块会重置：
+                // `is_boing { impact_angle 30 } is_boing { impact_speed 20 }`
+                // ⟹ `impact_angle` 回到 0.7071（不是保留 `cos(30°)`）。
+                "is_boing" => {
+                    flags |= fl::IS_BOING;
+                    boing = [
+                        def::BOING_IMPACT_SPEED,
+                        def::BOING_IMPACT_ANGLE_COS,
+                        def::BOING_DAMPING_RATE,
+                        def::BOING_FREQUENCY,
+                        def::BOING_AMPLITUDE,
+                    ];
+                }
+                // `impact_angle` 是**角度进、cos 出**（实测 0°→1、45°→0.70710677、
+                // 90°→0、180°→−1）；另外 4 个原值透传、不钳位
+                // （实测 `impact_speed -50` 与 `100000` 都原样写盘）。
+                "impact_speed" => boing[0] = v0,
+                "impact_angle" => boing[1] = deg2rad(v0).cos(),
+                "damping_rate" => boing[2] = v0,
+                "frequency" => boing[3] = v0,
+                "amplitude" => boing[4] = v0,
                 other => {
                     // `validate()` 已经拦过；这里兜底，绝不静默忽略
                     // （官方是 `$jigglebone: invalid syntax` + abort）。
@@ -7518,6 +7544,23 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
                     ));
                 }
             }
+        }
+
+        // `is_boing` 只存在于 v48 —— v49 的 `mstudiojigglebone_t` 里既没有
+        // `JIGGLE_IS_BOING` 宏、也没有那 5 个 `boing*` 字段（`hl2sdk-l4d2` /
+        // `hl2sdk-doi` / `hl2sdk-csgo` 的 `studio.h` grep `boing` = 0 命中）。
+        // 静默丢掉用户写的 boing 参数是最坏结果，所以直接报错。
+        if flags & fl::IS_BOING != 0
+            && crate::format::StudioVersion::from_i32(desc.version())
+                != Some(crate::format::StudioVersion::V48)
+        {
+            errs.push(e(
+                format!("{at}.is_boing"),
+                crate::tr_fmt!(
+                    "$jigglebone %{bone}: `is_boing` needs studio version 48 -- v49's mstudiojigglebone_t has no boing fields, so the five boing* slots do not exist. Target 48 (`--studio-version 48` or `$version 48`), or drop the block.",
+                    bone = format!("{:?}", j.bone)
+                ),
+            ));
         }
 
         out.push(crate::model::ResolvedJiggleBone {
@@ -7552,6 +7595,7 @@ fn resolve_jiggle_bones(compiled: &mut CompiledModelDesc) -> Result<(), Vec<Comp
             base_min_forward: base_min_fwd,
             base_max_forward: base_max_fwd,
             base_forward_friction: base_fwd_friction,
+            boing,
         });
     }
     compiled.resolved_jiggle_bones = out;
@@ -10083,6 +10127,109 @@ type = "mouth"
         assert!(near(j.min_pitch, -20.0f32.to_radians()), "-20°");
         assert!(near(j.max_pitch, 50.0f32.to_radians()), "50°");
         assert_eq!(j.flags, 0x3d, "FLEXIBLE|YAW|PITCH|ANGLE|LENGTH");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **`is_boing`（v48）**：进入块置 `0x80` 并写好官方缺省，5 个键各自覆盖。
+    ///
+    /// 缺省来自受控实验（`PROGRESS.md` §111）：`is_boing {}` 写
+    /// `[100, 0.7071, 0.25, 30, 0.35]`；重复块会**重置**成缺省。
+    /// `impact_speed` / `damping_rate` / `frequency` / `amplitude` 都**不钳位**
+    /// （实测 `-50`、`100000`、`0`、`2` 全原样）。
+    #[test]
+    // `0.7071` 是官方字面量（实测落盘 f32 = 0.70709997），不是 1/√2 的近似：
+    // 换成 `FRAC_1_SQRT_2` 就会和官方差 1 个末位，所以 clippy 在这里是误报。
+    #[allow(clippy::approx_constant)]
+    fn jiggle_is_boing_writes_official_defaults() {
+        let d = tmpdir("jigboing");
+        write(&d, "myprop-ref.smd", SMD);
+        // `is_boing` 只有 v48 有槽 ⟹ 夹具必须显式把版本钉到 48。
+        let v48 = |t: String| t.replace("[model]\n", "[model]\nversion = 48\n");
+        let t = v48(format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[[jiggle_bones.writes]]\nkey = \"is_boing\"\n",
+            desc_toml("myprop-ref.smd")
+        ));
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(j.flags, 0x80, "is_boing → 0x80");
+        assert_eq!(j.boing, [100.0, 0.7071, 0.25, 30.0, 0.35], "官方缺省");
+
+        let t = v48(format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n\
+             [[jiggle_bones.writes]]\nkey = \"is_boing\"\n\
+             [[jiggle_bones.writes]]\nkey = \"impact_speed\"\nvalues = [-50.0]\n\
+             [[jiggle_bones.writes]]\nkey = \"damping_rate\"\nvalues = [0.9]\n\
+             [[jiggle_bones.writes]]\nkey = \"frequency\"\nvalues = [0.0]\n\
+             [[jiggle_bones.writes]]\nkey = \"amplitude\"\nvalues = [2.0]\n",
+            desc_toml("myprop-ref.smd")
+        ));
+        let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+        let j = &c.resolved_jiggle_bones[0];
+        assert_eq!(
+            j.boing,
+            [-50.0, 0.7071, 0.9, 0.0, 2.0],
+            "4 个原值透传且不钳位；angle 未写 ⟹ 保持缺省"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `is_boing` 的 `impact_angle` 是**角度进、cos 出**。
+    ///
+    /// 实测 0°→1、45°→0.70710677、90°→0、180°→−1、270°→0、−45°→0.70710677。
+    /// ⚠️ 缺省值是**字面量 0.7071**（不是 `cos(45°)`），两者差 1 个末位 ⟹
+    /// 「不写」与「写 45」在产物里**不一样**，必须分别钉住。
+    #[test]
+    fn jiggle_is_boing_impact_angle_is_cos_of_degrees() {
+        let d = tmpdir("jigboingcos");
+        write(&d, "myprop-ref.smd", SMD);
+        // `is_boing` 只有 v48 有槽 ⟹ 夹具必须显式把版本钉到 48。
+        let v48 = |t: String| t.replace("[model]\n", "[model]\nversion = 48\n");
+        for (deg, want) in [
+            (0.0f32, 1.0f32),
+            (45.0, 0.70710677),
+            (90.0, 0.0),
+            (180.0, -1.0),
+        ] {
+            let t = v48(format!(
+                "{}\n[[jiggle_bones]]\nbone = \"tip\"\n\
+                 [[jiggle_bones.writes]]\nkey = \"is_boing\"\n\
+                 [[jiggle_bones.writes]]\nkey = \"impact_angle\"\nvalues = [{deg}]\n",
+                desc_toml("myprop-ref.smd")
+            ));
+            let c = compile(&ModelDesc::from_toml(&t).unwrap(), &d).unwrap();
+            let got = c.resolved_jiggle_bones[0].boing[1];
+            assert!((got - want).abs() < 1e-6, "{deg}° → {want}，实际 {got}");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **`is_boing` 只存在于 v48**：目标 v49 时必须报错，不能静默丢掉参数。
+    ///
+    /// v49 的 `mstudiojigglebone_t`（120 B）没有那 5 个 `boing*` 槽
+    /// （`hl2sdk-l4d2`/`doi`/`csgo` 的 `studio.h` grep `boing` = 0 命中）。
+    #[test]
+    fn jiggle_is_boing_requires_v48() {
+        let d = tmpdir("jigboingver");
+        write(&d, "myprop-ref.smd", SMD);
+        let body = format!(
+            "{}\n[[jiggle_bones]]\nbone = \"tip\"\n[[jiggle_bones.writes]]\nkey = \"is_boing\"\n",
+            desc_toml("myprop-ref.smd")
+        );
+        // 默认 49 ⟹ 报错。
+        let errs = crate::test_locale::with_english(|| {
+            compile(&ModelDesc::from_toml(&body).unwrap(), &d)
+                .expect_err("v49 没有 boing 槽，必须报错")
+        });
+        let msg = errs
+            .iter()
+            .map(|e| e.message().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(msg.contains("is_boing"), "报错应点名 is_boing，实际：{msg}");
+        // 显式 48 ⟹ 通过。
+        let t48 = body.replace("[model]\n", "[model]\nversion = 48\n");
+        let c = compile(&ModelDesc::from_toml(&t48).unwrap(), &d).expect("v48 应通过");
+        assert_eq!(c.resolved_jiggle_bones[0].flags, 0x80);
         std::fs::remove_dir_all(&d).ok();
     }
 

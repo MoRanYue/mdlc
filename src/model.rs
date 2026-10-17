@@ -4714,7 +4714,8 @@ pub struct ResolvedMouth {
 /// 一条**已解析**的 jigglebone：`flags` 算好、角度已转弧度、缺省已填。
 ///
 /// 这是 [`JiggleBone`] 的「可直接写字节」形态，字段顺序 == `mstudiojigglebone_t`
-/// 的 30 个 4 字节槽（**实测偏移**，见 [`JiggleBone`] 的说明）。
+/// 的 30 个 4 字节槽（**实测偏移**，见 [`JiggleBone`] 的说明）；
+/// v48 在末尾多 5 个 `boing*` 槽（见 [`ResolvedJiggleBone::boing`]）。
 ///
 /// **顺序敏感**：写出器按这个顺序连续写 30 个 4 字节值，
 /// 所以字段声明顺序**必须**与文件一致（`flags` 是 i32，其余 29 个是 f32）。
@@ -4782,6 +4783,18 @@ pub struct ResolvedJiggleBone {
     pub base_max_forward: f32,
     /// `+0x74`。
     pub base_forward_friction: f32,
+    /// v48 才有的 5 个 `boing*` 槽（`+0x78`..`+0x88`，整条记录 140 字节）：
+    /// `boingImpactSpeed` / `boingImpactAngle` / `boingDampingRate` /
+    /// `boingFrequency` / `boingAmplitude`。
+    ///
+    /// **v49 的记录里没有这 5 个槽**（120 字节），所以写出器只在
+    /// `spec().jiggle_bone_size == 140` 时写它。全 0 = 没写 `is_boing`
+    /// （官方把记录 memset 成 0 就是这个结果）。
+    ///
+    /// 语义（受控实验实测，见 `PROGRESS.md` §111）：`is_boing` 块**进入时**
+    /// 先把这 5 个槽重置成官方缺省，再按块内的键覆盖；`impact_angle` 是
+    /// **角度进、cos 出**（写盘的是 `cos(deg2rad(v))`）。
+    pub boing: [f32; 5],
 }
 
 /// 一条**已解析**的 quatinterp 骨骼（`mstudioquatinterpbone_t` 12 字节 + 触发器区）。
@@ -4839,6 +4852,13 @@ pub mod jiggle_flags {
     pub const HAS_LENGTH_CONSTRAINT: i32 = 0x20;
     /// `has_base_spring` 块出现。
     pub const HAS_BASE_SPRING: i32 = 0x40;
+    /// `is_boing` 块出现（**只有 v48 的 `studio.h` 有这个位**）。
+    ///
+    /// v49 的 `mstudiojigglebone_t` 里既没有 `JIGGLE_IS_BOING` 宏、也没有那
+    /// 5 个 `boing*` 字段（`hl2sdk-l4d2` / `hl2sdk-doi` / `hl2sdk-csgo` 的
+    /// `studio.h` grep `boing` = 0 命中）⟹ 目标版本为 v49 时 mdlc 直接报错，
+    /// 不会写出这个位（见 `compile::resolve_jiggle_bones`）。
+    pub const IS_BOING: i32 = 0x80;
 }
 
 /// jigglebone 的缺省值（受控实验实测，报告 §6.3 —— **这节未发现错误**）。
@@ -4864,6 +4884,27 @@ pub mod jiggle_defaults {
     /// ⚠️ **`yaw_friction`/`yaw_bounce`/`pitch_friction`/`pitch_bounce` 不钳位**
     /// （实测 `jig41`/`jig42` 的 `5000`/`6000`/`-7` 全原值透传）。
     pub const STIFFNESS_MAX: f32 = 1000.0;
+
+    // ---- v48 的 `is_boing` 五个缺省（受控实验实测，`PROGRESS.md` §111）----
+    //
+    // ⚠️ 这些是**写盘的原始值**，不是角度：`impact_angle` 缺省是
+    // **字面量 0.7071**（= 45° 的 cos 近似），而 `cos(45°)` 是 0.70710677
+    // —— 实测官方写的就是 0.7071，差 1 个末位，所以这里不能写成表达式。
+    /// `boingImpactSpeed` 缺省（原值透传，不钳位）。
+    pub const BOING_IMPACT_SPEED: f32 = 100.0;
+    /// `boingImpactAngle` 缺省（**已经是 cos 值**；键的输入是度）。
+    ///
+    /// `clippy::approx_constant` 在这里是**误报**：`0.7071` 是官方写死的
+    /// 字面量（实测落盘 f32 位模式 = `0.70709997`），改成
+    /// `FRAC_1_SQRT_2`（`0.70710677`）会与官方差 1 个末位。
+    #[allow(clippy::approx_constant)]
+    pub const BOING_IMPACT_ANGLE_COS: f32 = 0.7071;
+    /// `boingDampingRate` 缺省。
+    pub const BOING_DAMPING_RATE: f32 = 0.25;
+    /// `boingFrequency` 缺省。
+    pub const BOING_FREQUENCY: f32 = 30.0;
+    /// `boingAmplitude` 缺省。
+    pub const BOING_AMPLITUDE: f32 = 0.35;
 }
 
 /// `stiffness`/`damping` 的官方钳位（`[0, 1000]`）。
@@ -4879,7 +4920,7 @@ pub fn clamp_stiffness(v: f32) -> f32 {
     }
 }
 
-/// **官方 `$jigglebone` 接受的键全集**（含三个块名）。
+/// **官方 `$jigglebone` 接受的键全集**（含四个块名）。
 ///
 /// 由反编译 + 27 个受控夹具（`jig1`–`jig50`）共同钉死：
 ///
@@ -4890,17 +4931,26 @@ pub fn clamp_stiffness(v: f32) -> f32 {
 /// | `allow_length_flex` | ✓ | ✗ | ✗ |
 /// | `stiffness` `damping` `base_mass` `left_constraint` `up_constraint` `forward_constraint` `left_friction` `up_friction` `forward_friction` | ✗ | ✗ | ✓ |
 ///
+/// 外加 `is_boing`（**只有 v48**）与它的 5 个键 `impact_speed` /
+/// `impact_angle` / `damping_rate` / `frequency` / `amplitude`。
+///
 /// 官方对**任何**不在此表的键（含顶层裸键）走 `_ => abort`
 /// （`$jigglebone: invalid syntax '%s'` + `Aborted Processing`），
 /// **不是**静默忽略。实测 `jig5`/`jig31` 报 `invalid syntax 'tip_mass'`。
 ///
+/// ⚠️ **`is_boing` 块是唯一例外**：块内不认识的 token 官方**静默跳过**
+/// （实测 `is_boing { bogus 1 impact_speed 50 }` 编过、`impact_speed = 50`；
+/// 对照 `is_flexible { impact_speed 50 }` 报 `invalid syntax`）。那些被跳过
+/// 的 token 不会进 `writes`，所以本表也看不到它们。
+///
 /// ⚠️ mdlc 的 TOML 侧键名是自创的 `base_*` 前缀（见 [`JiggleBaseSpring`]），
 /// 与官方 QC 键名不同 —— 本表只约束 **QC 侧**与 `writes[].key`。
-pub const KNOWN_JIGGLE_KEYS: [&str; 28] = [
-    // 三个块名（`writes` 里表示「进入该块」）。
+pub const KNOWN_JIGGLE_KEYS: [&str; 34] = [
+    // 四个块名（`writes` 里表示「进入该块」）。
     "is_flexible",
     "is_rigid",
     "has_base_spring",
+    "is_boing",
     // 三块共享的 9 个通用键。
     "tip_mass",
     "length",
@@ -4929,6 +4979,12 @@ pub const KNOWN_JIGGLE_KEYS: [&str; 28] = [
     "left_friction",
     "up_friction",
     "forward_friction",
+    // is_boing 独有的 5 个（**只有 v48**）。
+    "impact_speed",
+    "impact_angle",
+    "damping_rate",
+    "frequency",
+    "amplitude",
 ];
 
 /// 一个**已解析**的 eyeball：`up`/`forward`/`org` 已转成骨骼空间，

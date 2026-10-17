@@ -402,7 +402,7 @@ joints = false               # true = $collisionjoints（每骨骼一个 solid �
 | `[[flex_rules]]` | `%<flex> = <expr>` | `flex` + `ops`（每项 `op` + `value`/`controller`/`flexdesc`） |
 | `[[flex_controller_ui]]` | — | `name` / `stereo` / `left` / `right` |
 | `[[mouths]]` | `mouth` | `index`（显式，决定 `g_nummouths`）/ `flexdesc` / `bone` / `forward` |
-| `[[jiggle_bones]]` | `$jigglebone` | `bone` + `is_flexible` / `is_rigid` / `has_base_spring` + **`writes`** |
+| `[[jiggle_bones]]` | `$jigglebone` | `bone` + `is_flexible` / `is_rigid` / `has_base_spring` / `is_boing`（**v48 独有**） + **`writes`** |
 | `[[quat_interp_bones]]` | `$proceduralbones`（proctype 2） | `bone` / `control` / `base_pos` / `triggers` |
 | `[[bonecontrollers]]` | `$controller` | L4D2 已废弃该特性，但段仍占位。⚠️ 键名是字面的 **`type_`**（带下划线） |
 | `include_models` | `$includemodel` | 顶层字符串数组；**必须自己写 `models/` 前缀**，mdlc 不替你补 |
@@ -714,9 +714,13 @@ Crowbar 两个都不会传，所以不影响直接替换。
 mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真实 Performance Stats 而
 不再报 `is wrong version (49 should be 48)`。
 
-> ⚠️ **`is_boing` 子块暂未支持。** GMod 的 `$jigglebone` 除 `is_flexible` / `is_rigid` /
-> `has_base_spring` 外还认 `is_boing { impact_speed … }`，mdlc 会报「键写在任何块之外」。
-> 不带 boing 的 jigglebone 正常，v48 那多出来的 5 个 `boing*` 槽一律写 0。
+> **`is_boing` 子块（v48 独有）已支持。** GMod 的 `$jigglebone` 除 `is_flexible` /
+> `is_rigid` / `has_base_spring` 外还认 `is_boing { impact_speed 100 }`，五个键各一个数：
+> `impact_speed` / `impact_angle`（**度进、cos 出**）/ `damping_rate` / `frequency` /
+> `amplitude`。不写键时用官方缺省 `100 / 0.7071 / 0.25 / 30 / 0.35`。块内不认识的 token
+> 官方**静默跳过**（mdlc 照做），但**键写在其他块里仍会报错**。
+> 目标 v49 时写 `is_boing` 会**报错而不是静默丢弃** —— v49 的 `mstudiojigglebone_t`
+> 根本没有那 5 个槽。实测 v48 的 140 字节记录与官方 GMod `studiomdl.exe` **逐字节相同**。
 
 > ⚠️ **不支持 v44**（Dark Messiah / Episode One 时代）。它缺 `studiohdr2_t`、
 > `mstudiolinearbone_t` 等一整套结构，`mstudioanimdesc_t` / `mstudioseqdesc_t` 的字段体也不

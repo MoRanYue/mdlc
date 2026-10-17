@@ -3910,7 +3910,10 @@ impl<'a> Parser<'a> {
                 // 触发「进入该块」的写入）。顶层裸键官方一律 abort ——
                 // 实测 `jig5`/`jig31`（`tip_mass 7` 写在所有块之外）都报
                 // `$jigglebone: invalid syntax 'tip_mass'` 并中止。
-                if matches!(low.as_str(), "is_flexible" | "is_rigid" | "has_base_spring") {
+                if matches!(
+                    low.as_str(),
+                    "is_flexible" | "is_rigid" | "has_base_spring" | "is_boing"
+                ) {
                     block = Some(low);
                     continue;
                 }
@@ -3939,7 +3942,16 @@ impl<'a> Parser<'a> {
                 ));
             };
             // 键是否属于当前块 —— 这是官方「每个块只认自己那组键」的硬规则。
+            //
+            // ⚠️ `is_boing` 是唯一例外：块内不认识的 token 官方**静默跳过**
+            // （实测 `is_boing { bogus 1 impact_speed 50 }` 编过且
+            // `impact_speed = 50`；对照 `is_flexible { impact_speed 50 }`
+            // 报 `invalid syntax`）。被跳过的 token 也不连带吃掉后面的值 ——
+            // 实测 `bogus impact_speed 50` 仍是 50。
             if !jiggle_block_accepts(b, &low) {
+                if b == "is_boing" {
+                    continue;
+                }
                 return Err(QcError::new(
                     t.file.clone(),
                     t.line,
@@ -5473,6 +5485,12 @@ fn jiggle_block_accepts(block: &str, key: &str) -> bool {
         return matches!(block, "is_flexible" | "is_rigid" | "has_base_spring");
     }
     match block {
+        // `is_boing`（**只有 v48 的 `studio.h` 有它**）：5 个键、各 1 个 float。
+        // 块内未知 token 官方静默跳过 —— 那条由调用方处理，这里只回答「认识的」。
+        "is_boing" => matches!(
+            key,
+            "impact_speed" | "impact_angle" | "damping_rate" | "frequency" | "amplitude"
+        ),
         "is_flexible" => matches!(
             key,
             "yaw_stiffness"
@@ -6311,6 +6329,61 @@ $sequence \"idle\" \"a.smd\" fps 30
             crate::qc::parse_qc_str(&qc, &dir).expect_err("is_flexible 不接受 left_constraint");
         assert!(
             errs.iter().any(|e| e.message.contains("left_constraint")),
+            "实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`is_boing`（v48 独有）**：5 个键各 1 个 float，块内未知 token **静默跳过**。
+    ///
+    /// 官方语义（受控实验，见 `PROGRESS.md` §111）：
+    /// - 5 个键 `impact_speed` / `impact_angle` / `damping_rate` / `frequency` /
+    ///   `amplitude` 全部进记录（角度仍是度，`cos` 换算留到 `resolve`）；
+    /// - `is_boing { bogus 1 impact_speed 50 }` **编过**且 `impact_speed = 50`
+    ///   （对照 `is_flexible { impact_speed 50 }` 报 `invalid syntax`）⟹
+    ///   块内不认识的 token 只跳自己，既不报错也不吃后面的值。
+    #[test]
+    fn jiggle_is_boing_accepts_five_keys_and_skips_unknown_tokens() {
+        let dir = fixture("jig_boing");
+        let qc = jig_qc(
+            "\tis_boing {\n\t\timpact_speed 100\n\t\timpact_angle 45\n\
+             \t\tdamping_rate 0.25\n\t\tfrequency 30\n\t\tamplitude 0.35\n\t}",
+        );
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "is_boing",
+                "impact_speed",
+                "impact_angle",
+                "damping_rate",
+                "frequency",
+                "amplitude"
+            ]
+        );
+        assert_eq!(
+            w[2].1,
+            vec![45.0],
+            "角度必须原样保留（cos 换算留到 resolve）"
+        );
+
+        // 块内未知 token：官方静默跳过。
+        let qc = jig_qc("\tis_boing {\n\t\tbogus 1 impact_speed 50\n\t}");
+        let w = jig_writes(&qc, &dir);
+        let keys: Vec<&str> = w.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["is_boing", "impact_speed"],
+            "未知 token（含它后面那个 1）不得进日志，也不得报错"
+        );
+        assert_eq!(w[1].1, vec![50.0]);
+
+        // 但 `is_boing` 的键在别的块里仍然报错（三块的行为没有变化）。
+        let qc = jig_qc("\tis_flexible {\n\t\timpact_speed 50\n\t}");
+        let errs = crate::qc::parse_qc_str(&qc, &dir).expect_err("is_flexible 不接受 impact_speed");
+        assert!(
+            errs.iter().any(|e| e.message.contains("impact_speed")),
             "实际：{errs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
