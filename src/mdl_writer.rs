@@ -248,15 +248,14 @@ pub const IK_LOCK_SIZE: usize = 32;
 
 /// `mstudioflexdesc_t` 的字节大小（`+0x00 int szFACSindex`）。
 pub const FLEXDESC_SIZE: usize = 4;
-/// `mstudiojigglebone_t` 的字节大小 —— **120** = 30 个 4 字节槽。
-///
-/// 语料反解：22 个模型的 `ALIGN4(boneindex + numbones*216) + N*120`
-/// 精确等于 `bonecontrollerindex`（含 1/3/9/12/13 条记录的各种组合，
-/// `rsrch_jiggle_layout.js`）。
-///
-/// 字段偏移见 [`crate::model::JiggleBone`] —— ⚠️ 调研报告 §1.5 的表格
-/// **整体错位**，以实测为准。
-pub const JIGGLE_BONE_SIZE: usize = 120;
+// `mstudiojigglebone_t` 的大小**随 studio 版本变化**（v49 = 120、v48 = 140），
+// 所以它不再是一个常量 —— 一律取
+// [`crate::format::StudioVersion::spec`] 的 `jiggle_bone_size`。
+//
+// 语料反解（v49）：22 个模型的 `ALIGN4(boneindex + numbones*216) + N*120`
+// 精确等于 `bonecontrollerindex`（含 1/3/9/12/13 条记录的各种组合，
+// `rsrch_jiggle_layout.js`）。字段偏移见 [`crate::model::JiggleBone`] ——
+// ⚠️ 调研报告 §1.5 的表格**整体错位**，以实测为准。
 
 /// `mstudioquatinterpbone_t` 的字节大小（`control` + `numtriggers` + `triggerindex`）。
 ///
@@ -897,6 +896,19 @@ pub enum WriteError {
         )
     )]
     Invalid(Vec<String>),
+    /// 目标 studio 版本不受支持。
+    ///
+    /// 正常路径上 [`crate::model::ModelDesc::validate`] 已经拦过一次，
+    /// 这里是**直接调用 [`write_mdl`] 的库使用者**的最后一道闸 ——
+    /// 静默按 v49 写会产出「标称 44、结构 49」的文件。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "unsupported studio version %{version} (mdlc writes 48 and 49)",
+            version = version
+        )
+    )]
+    UnsupportedVersion { version: i32 },
     /// 内部不一致（例如偏移溢出）—— 属于本实现的 bug，不应发生。
     #[error("{}", crate::tr_fmt!("Internal error (please report): %{err}", err = .0))]
     Internal(String),
@@ -1796,7 +1808,14 @@ fn build_string_pool(
 pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteError> {
     let desc = &compiled.desc;
     let checksum = desc.checksum();
-    let version = desc.version();
+    // 版本决定布局（jigglebone 大小）与两处 surfaceprop 字段的写法，
+    // 所以先解析成规格表，后面一律取 `spec`。
+    let version = crate::format::StudioVersion::from_i32(desc.version()).ok_or(
+        WriteError::UnsupportedVersion {
+            version: desc.version(),
+        },
+    )?;
+    let spec = version.spec();
 
     // ---- 1. 段偏移：交给声明式的 `layout` 模块算 ----
     //
@@ -1868,6 +1887,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 早先这里抄了一份 `layout.rs` 的公式，加 quatinterp 时两处只改了一处，
     // 分段产物会**静默错位**（布局自检抓不到，因为两处各自都「自洽」）。
     let anim_data_abs = crate::layout::anim_data_start(&crate::layout::SectionCounts {
+        version,
         bones: bone_count,
         bonecontrollers: bc_count,
         attachments: at_count,
@@ -1945,6 +1965,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     let skin_entries = texture_count * skin_families;
 
     let layout = crate::layout::SectionOffsets::compute(&crate::layout::SectionCounts {
+        version,
         bones: bone_count,
         bonecontrollers: bc_count,
         attachments: at_count,
@@ -2185,7 +2206,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
 
     // ---- 4. 头部 ----
     put_bytes(&mut buf, off::ID, b"IDST");
-    put_i32(&mut buf, off::VERSION, version);
+    put_i32(&mut buf, off::VERSION, spec.version);
     put_i32(&mut buf, off::CHECKSUM, checksum);
     // ⚠️ **头部的 `name[64]` 用 `$modelname` 的原文，不做分隔符规范化。**
     //
@@ -2775,13 +2796,18 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
     // 真实 survivor 产物 `survivor_teenangst.mdl` 也是这个形态。
     put_i32(&mut buf, off::LOCAL_SEQ_OFFSET, seq_off as i32);
     // surfaceprop 是**文件绝对偏移**（头部字段一律绝对）。
+    //
+    // ⚠️ **v48 没有这个字段** —— 那里是 `int unused3[1]`
+    // （`studio.h` 的 `studiohdr_t`：v48 是 `int checksum; int unused3[1];`，
+    // v49 是 `long checksum; int surfacepropLookup;`）。往未定义字段里写
+    // 文件偏移没有意义，v48 一律写 0。
     put_i32(
         &mut buf,
         off::SURFACE_PROP_OFFSET,
-        if surface_prop.is_empty() {
-            0
-        } else {
+        if spec.writes_surfaceprop && !surface_prop.is_empty() {
             abs(header_sp_offset)?
+        } else {
+            0
         },
     );
 
@@ -2913,16 +2939,22 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
         // 骨骼的 surfaceprop 缺省时**继承头部的 surfaceprop** ——
         // 实测 studiomdl：QC 只写 `$surfaceprop "metal"` 而不写
         // `$jointsurfaceprop`，产物里 bone[0].surface_prop 也是 "metal"。
-        let bone_sp = match bone_sp_offsets[i] {
-            Some(rel) => {
-                i32::try_from((strings_off + rel) as i64 - base as i64)
-                    .map_err(|_| WriteError::Internal(crate::tr("the surfaceprop relative offset overflows i32")))?
+        // ⚠️ v48 的 `mstudiobone_t` 在这里是 `int unused[0]`（v49 才改名成
+        // `surfacepropLookup`），同样写 0。
+        let bone_sp = if !spec.writes_surfaceprop {
+            0
+        } else {
+            match bone_sp_offsets[i] {
+                Some(rel) => {
+                    i32::try_from((strings_off + rel) as i64 - base as i64)
+                        .map_err(|_| WriteError::Internal(crate::tr("the surfaceprop relative offset overflows i32")))?
+                }
+                None if !surface_prop.is_empty() => {
+                    i32::try_from((strings_off + header_sp_offset) as i64 - base as i64)
+                        .map_err(|_| WriteError::Internal(crate::tr("the inherited surfaceprop offset overflows i32")))?
+                }
+                None => 0,
             }
-            None if !surface_prop.is_empty() => {
-                i32::try_from((strings_off + header_sp_offset) as i64 - base as i64)
-                    .map_err(|_| WriteError::Internal(crate::tr("the inherited surfaceprop offset overflows i32")))?
-            }
-            None => 0,
         };
         put_i32(&mut buf, base + bone_off::SURFACE_PROP_INDEX, bone_sp);
         // `physicsbone`（+0xAC）：「该骨骼受哪个碰撞 solid 的物理模拟驱动」。
@@ -3037,7 +3069,7 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                     * QUATINTERP_INFO_SIZE
         };
         for (i, j) in compiled.resolved_jiggle_bones.iter().enumerate() {
-            let rec = proc_start + i * JIGGLE_BONE_SIZE;
+            let rec = proc_start + i * spec.jiggle_bone_size;
             let bone_rec = layout.bone + j.bone as usize * BONE_SIZE;
             put_i32(&mut buf, bone_rec + bone_off::PROC_TYPE, 5);
             // 相对骨骼记录**自身**。
@@ -3046,7 +3078,8 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
                 bone_rec + bone_off::PROC_INDEX,
                 (rec as i64 - bone_rec as i64) as i32,
             );
-            // 30 个 4 字节槽，顺序见 `ResolvedJiggleBone`（**实测偏移**）。
+            // 槽位 = flags + 29 个 float（v49 的 120 字节）；顺序见
+            // `ResolvedJiggleBone`（**实测偏移**）。
             put_i32(&mut buf, rec, j.flags);
             let vals = [
                 j.length,
@@ -3082,6 +3115,20 @@ pub fn write_mdl(compiled: &CompiledModelDesc) -> Result<WriteOutcome, WriteErro
             debug_assert_eq!(vals.len(), 29, "120 - 4(flags) = 116 = 29 * 4");
             for (k, v) in vals.iter().enumerate() {
                 put_f32(&mut buf, rec + 4 + k * 4, *v);
+            }
+            // ⚠️ v48 在 29 个 float 之后**还有 5 个 `boing*` float**
+            // （`boingImpactSpeed` / `boingImpactAngle` / `boingDampingRate` /
+            // `boingFrequency` / `boingAmplitude`），整条记录 140 字节。
+            //
+            // mdlc **不实现 boing**：官方 v44（`hl2sdk-darkm`，唯一带
+            // `utils/studiomdl` 源码的版本之一）里根本没有 jigglebone
+            // （`grep jiggle` 0 命中、`studio.h` 里 `boing` 0 命中），
+            // v48 的官方 `write.cpp` 拿不到 ⟹ **没有 oracle 可依据就不猜语法**。
+            // 这里写 0.0，与「模型没写 boing」同形（官方把记录 memset 成 0
+            // 就是这个结果）。
+            let boing_slots = (spec.jiggle_bone_size - 120) / 4;
+            for k in 0..boing_slots {
+                put_f32(&mut buf, rec + 120 + k * 4, 0.0);
             }
         }
     }
@@ -7358,6 +7405,92 @@ fps = 30.0
             bci,
             "程序化块末尾应等于 bonecontrollerindex"
         );
+    }
+
+    /// v48 的 `mstudiojigglebone_t` 是 **140 字节**（v49 是 120），它驱动整条布局。
+    ///
+    /// 判据来自官方 oracle（Garry's Mod 的 `studiomdl.exe`）：同一份 QC
+    /// （`docs/_probe/smdl/jig1.qc`，1 条 `$jigglebone`、4 根骨骼）官方 v48 的
+    /// `bonecontrollerindex = 1668 = procStart(1528) + 140`，而 mdlc 的 v48
+    /// 产物该字段**与官方逐字节相同**，jigglebone 记录的 35 个槽也全等
+    /// （官方那 5 个 `boing*` float 实测**全是 0** —— 与「不实现 boing 语法、
+    /// 一律写 0」的取舍一致）。
+    ///
+    /// 另两条 v48 专属规则：`surfaceprop` 的两个字段都写 0（v48 的
+    /// `studiohdr_t` 那里是 `unused3[1]`、`mstudiobone_t` 那里是 `unused[7]`）。
+    #[test]
+    fn v48_jigglebone_record_is_140_bytes() {
+        let toml = r#"
+[model]
+name = "mymod/jig1.mdl"
+surface_prop = "metal"
+
+[[jiggle_bones]]
+bone = "tip"
+
+[jiggle_bones.is_flexible]
+length = 20.0
+tip_mass = 7.0
+yaw_stiffness = 100.0
+
+[materials]
+textures = [{ name = "myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bones]]
+name = "tip"
+parent = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "myprop-ref.smd"
+
+[[sequences]]
+name = "idle"
+smd = "myprop-ref.smd"
+fps = 30.0
+"#;
+        for (version, rec) in [(48i32, 140usize), (49, 120)] {
+            let mut c = build_from_toml(toml);
+            c.desc.model.version = Some(version);
+            let out = write_mdl(&c).unwrap();
+            let b = &out.bytes;
+            let rd = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            assert_eq!(rd(off::VERSION), version, "头部 version 字段");
+            let nb = rd(0x9C) as usize; // `numbones`（`off` 里没有具名常量）
+            let bi = rd(off::BONE_OFFSET) as usize;
+            let proc_start = (bi + nb * BONE_SIZE + 3) & !3;
+            let bci = rd(off::BONE_CONTROLLER_OFFSET) as usize;
+            assert_eq!(
+                bci - proc_start,
+                rec,
+                "v{version} 的 jigglebone 块应占 {rec} 字节（bonecontrollerindex 紧跟其后）"
+            );
+            assert_eq!(
+                proc_start + rec,
+                bci,
+                "jiggle 块末尾应等于 bonecontrollerindex"
+            );
+            // v48 多出来的 5 个 `boing*` 槽：官方实测全是 0。
+            for k in 0..(rec - 120) / 4 {
+                let at = proc_start + 120 + k * 4;
+                let v = f32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                assert_eq!(v, 0.0, "v48 的 boing 槽 {k} 应写 0");
+            }
+            // surfaceprop：v48 的两个字段都必须是 0。
+            let hdr_sp = rd(off::SURFACE_PROP_OFFSET);
+            let bone_sp = rd(bi + bone_off::SURFACE_PROP_INDEX);
+            if version == 48 {
+                assert_eq!(hdr_sp, 0, "v48 的头部 surfaceprop 必须写 0");
+                assert_eq!(bone_sp, 0, "v48 的骨骼 surfaceprop 必须写 0");
+            } else {
+                assert_ne!(hdr_sp, 0, "v49 的头部 surfaceprop 应指向字符串池");
+            }
+        }
     }
 
     /// **触发条件**：`linearboneindex != 0` ⟺ `numbones >= 2`。

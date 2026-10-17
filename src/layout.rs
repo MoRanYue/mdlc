@@ -147,9 +147,18 @@ pub struct SectionOffsets {
 /// 各段的元素数。由调用方按当前模型填。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SectionCounts {
+    /// 目标 studio 版本。
+    ///
+    /// 它**真的会改变布局** —— `mstudiojigglebone_t` 在 v48 是 140 字节、
+    /// v49 是 120 字节（v48 多 5 个 `boing*` float，见 [`crate::format`]）。
+    /// 默认 v49，所以旧的 `..Default::default()` 调用点行为不变。
+    pub version: crate::format::StudioVersion,
     pub bones: usize,
     pub bonecontrollers: usize,
-    /// jigglebone（`mstudiojigglebone_t`，**120 字节**）的条数。
+    /// jigglebone（`mstudiojigglebone_t`）的条数。
+    ///
+    /// 每条 **v49 = 120 字节 / v48 = 140 字节**（取
+    /// [`crate::format::StudioVersion::spec`] 的 `jiggle_bone_size`）。
     ///
     /// **不走段头** —— 它是骨骼数组的延伸，起点
     /// `ALIGN4(boneindex + bones*216)`，在 `bonecontroller` 之前。
@@ -309,7 +318,7 @@ pub struct SectionCounts {
 // ---- 各结构体的字节大小（实测确认，见 mdl_writer 的常量文档）----
 use crate::mdl_writer::{
     ATTACHMENT_SIZE, BONE_CONTROLLER_SIZE, BONE_SIZE, BODY_PART_SIZE, HDR_PART1_SIZE,
-    HITBOX_SET_SIZE, HITBOX_SIZE, JIGGLE_BONE_SIZE, LINEARBONE_HEADER_SIZE, LINEARBONE_PER_BONE,
+    HITBOX_SET_SIZE, HITBOX_SIZE, LINEARBONE_HEADER_SIZE, LINEARBONE_PER_BONE,
     MESH_SIZE, MODEL_SIZE, QUATINTERP_BONE_SIZE, QUATINTERP_INFO_SIZE, SRCOBONETRANSFORM_SIZE,
     STUDIOHDR2_SIZE, TEXTURE_SIZE,
 };
@@ -390,7 +399,7 @@ pub fn anim_data_start(c: &SectionCounts) -> usize {
     let quat_triggers = align4(quat_records);
     let proc_end = quat_triggers
         + c.quat_interp_triggers * QUATINTERP_INFO_SIZE
-        + c.jiggle_bones * JIGGLE_BONE_SIZE;
+        + c.jiggle_bones * c.version.spec().jiggle_bone_size;
     let bonecontroller = align4(proc_end);
     let attachment = bonecontroller + c.bonecontrollers * BONE_CONTROLLER_SIZE;
     let hitboxset = attachment + c.attachments * ATTACHMENT_SIZE;
@@ -465,7 +474,7 @@ impl SectionOffsets {
         let quat_records = proc_start + c.quat_interp_bones * QUATINTERP_BONE_SIZE;
         let quat_triggers = align4(quat_records);
         let proc_end = quat_triggers + c.quat_interp_triggers * QUATINTERP_INFO_SIZE
-            + c.jiggle_bones * JIGGLE_BONE_SIZE;
+            + c.jiggle_bones * c.version.spec().jiggle_bone_size;
         let bonecontroller = align4(proc_end);
         let attachment = bonecontroller + c.bonecontrollers * BONE_CONTROLLER_SIZE;
         let hitboxset = attachment + c.attachments * ATTACHMENT_SIZE;

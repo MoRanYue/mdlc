@@ -192,7 +192,7 @@ Division of responsibility:
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | **required** | Output path, relative to the game directory; backslashes are normalised to forward slashes |
-| `version` | int | `49` | Only **44 / 48 / 49** are supported |
+| `version` | int | `49` | Target studio version; only **48 / 49** are supported (see [Target studio version](#target-studio-version-v48--v49)) |
 | `checksum` | int | derived from the model name | Pairing token for the four files; not a content hash |
 | `static_prop` | bool | `false` | `$staticprop`, sets header bit `0x10` automatically |
 | `surface_prop` | string | — | `$surfaceprop`; also the default `surface_prop` of every bone |
@@ -536,7 +536,7 @@ The QC front end implements full lexing/parsing, `$include`, `$definevariable`,
 
 ### mdlc-extended QC commands
 
-The following 3 are **not official commands**; they are mdlc's own extensions. The naming rule
+The following 4 are **not official commands**; they are mdlc's own extensions. The naming rule
 maps one-to-one onto TOML fields (drop the underscores from the field name and prefix `$`):
 
 | Command | Equivalent TOML | Notes |
@@ -544,16 +544,18 @@ maps one-to-one onto TOML fields (drop the underscores from the field name and p
 | `$optimizevtx` | `optimize_vtx = true` | Turns on vertex cache optimisation; equivalent to the `--optimize-vtx` command-line flag |
 | `$nosplitoversizedmeshes` | `split_oversized_meshes = false` | Turns off [automatic splitting of oversized meshes](#automatic-splitting-of-oversized-meshes) and errors out on an oversized mesh |
 | `$splitoversizedmeshes` | `split_oversized_meshes = true` | Turns the previous one **back on** (the default is already `true`; it exists so a main QC can undo what an included `.qci` turned off) |
+| `$version 48` | `version = 48` | [Target studio version](#target-studio-version-v48--v49); equivalent to `--studio-version` |
 
-All three are **bare flags** (no argument, consuming only their own token) and their **command
-names are case-insensitive** (matching the official tokenizer). QC is interpreted top to bottom,
-**last write wins**.
+The first three are **bare flags** (no argument, consuming only their own token); `$version`
+takes one argument. All four have **case-insensitive command names** (matching the official
+tokenizer). QC is interpreted top to bottom, **last write wins**.
 
 ```qc
 $modelname "models/mymod/myprop.mdl"
 $body body "myprop.smd"
 $optimizevtx              ; turn on vertex cache optimisation
 $nosplitoversizedmeshes   ; turn off automatic splitting (error out on an oversized mesh)
+$version 48               ; target Source 2013 (Garry's Mod)
 ```
 
 > ⚠️ **Why these are mdlc extensions rather than official command names.** The official
@@ -565,9 +567,14 @@ $nosplitoversizedmeshes   ; turn off automatic splitting (error out on an oversi
 > bodyparts**, which mdlc deliberately does not copy, see
 > [automatic splitting of oversized meshes](#automatic-splitting-of-oversized-meshes)).
 >
-> So a real `studiomdl.exe` reports `bad command` for all three. **A QC containing them cannot be
-> fed to the official tool as-is**; for cross-tool compatibility use the corresponding TOML
+> So a real `studiomdl.exe` reports `bad command` for all of them. **A QC containing them cannot
+> be fed to the official tool as-is**; for cross-tool compatibility use the corresponding TOML
 > fields instead.
+>
+> `$version` is an extension for the same reason (measured: Garry's Mod's `studiomdl.exe` reports
+> `bad command $version`). **For cross-tool compatibility use the command-line flag
+> `--studio-version 48`** — put it in Crowbar's "compile options" and the QC itself needs no
+> mdlc-specific command at all.
 
 > ⚠️ **`$optimizevtx` has no inverse command.** `optimize_vtx` already defaults to `false`, so a
 > "turn it off" command would have no use (the official bare flags such as `$staticprop` have no
@@ -692,9 +699,9 @@ glTF has three notices of its own (see `docs/gltf-support.md` §6.3):
 ### mdlc-native form
 
 ```text
-mdlc build <model.toml> [--out <dir>] [--optimize-vtx]
+mdlc build <model.toml> [--out <dir>] [--optimize-vtx] [--studio-version 48|49]
 mdlc check <model.toml>
-mdlc build-qc <model.qc> [--out <dir>] [--optimize-vtx]
+mdlc build-qc <model.qc> [--out <dir>] [--optimize-vtx] [--studio-version 48|49]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
                           [--concave] [--vhacd] [--ragdoll]
@@ -727,6 +734,40 @@ it** (official `studiomdl` has no such option), and the two spellings behave dif
   deliberately disables the version flag, so clap does not recognise it.
 
 Crowbar passes neither, so this does not affect drop-in replacement.
+
+### Target studio version (v48 / v49)
+
+The CLI flag `--studio-version`, the TOML key `[model].version` and the QC command `$version` are
+three entry points to the same setting (precedence: CLI > TOML / QC). The default is **49**.
+
+- **49**: the L4D2 / CS:GO family (`STUDIO_VERSION 49`).
+- **48**: the Source 2013 family (**Garry's Mod**, TF2, CS:S, HL2:DM, …).
+
+On disk the two differ in exactly two places:
+
+| Structure | v48 | v49 |
+|---|---|---|
+| `mstudiojigglebone_t` | **140 B** (5 extra `boing*` floats) | **120 B** |
+| surfaceprop of `studiohdr_t` / `mstudiobone_t` | no such field (writes 0) | present |
+
+`mstudiobone_t` (216 B), `mstudioanimdesc_t` (100 B) and `studiohdr_t` (408 B) are the **same
+size** in both, and `.vvd` / `.vtx` are **completely unaffected** — so v48 is not "another
+format", just a different header number plus a different jigglebone record length.
+
+Measured (one and the same QC with a single `$jigglebone`): the official Garry's Mod
+`studiomdl.exe` produces `bonecontrollerindex` = `1668`, and so does mdlc with
+`--studio-version 48` (**the same offset**: `1668`); mdlc's v48 output can be fed straight back into
+`studiomdl.exe -mdlreport`, which prints real Performance Stats instead of
+`is wrong version (49 should be 48)`.
+
+> ⚠️ **The `is_boing` sub-block is not supported yet.** Besides `is_flexible` / `is_rigid` /
+> `has_base_spring`, Garry's Mod's `$jigglebone` also accepts `is_boing { impact_speed … }`;
+> mdlc reports "key written outside any block". Jigglebones without boing work fine, and the 5
+> extra `boing*` slots of v48 are always written as 0.
+
+> ⚠️ **v44 is not supported** (the Dark Messiah / Episode One era). It lacks the whole
+> `studiohdr2_t` / `mstudiolinearbone_t` family and has different field layouts in
+> `mstudioanimdesc_t` / `mstudioseqdesc_t` — that is not something a different number can fix.
 
 ### Help and error localization
 

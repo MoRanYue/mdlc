@@ -498,8 +498,8 @@ _version: 2
 "Not a finite number%{value}":
   zh-CN: "不是有限数%{value}"
 
-"Only 44 / 48 / 49 are supported, but the version is %{version}":
-  zh-CN: "只支持 44 / 48 / 49，实际为 %{version}"
+"only 48 and 49 are supported, but the version is %{version}":
+  zh-CN: "只支持 48 和 49，实际为 %{version}"
 
 "Request failed: %{err}":
   zh-CN: "请求失败：%{err}"
@@ -1706,3 +1706,23 @@ _version: 2
 "the vertex index":
   zh-CN: "顶点下标"
 
+
+"$version needs a number, got %{text}":
+  zh-CN: "$version 需要一个数字，实际 %{text}"
+
+"unsupported studio version %{version} (mdlc writes 48 and 49)":
+  zh-CN: "不支持的 studio 版本 %{version}（mdlc 写 48 和 49）"
+"48|49":
+  zh-CN: "48|49"
+
+"Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod)":
+  zh-CN: "目标 studio 版本：49（L4D2 / CS:GO，默认）或 48（Source 2013 / Garry's Mod）"
+
+"Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod). Takes precedence over the TOML's `version`.":
+  zh-CN: "目标 studio 版本：49（L4D2 / CS:GO，默认）或 48（Source 2013 / Garry's Mod）。优先于 TOML 里的 `version`。"
+
+"mdlc extension: target studio version (49 = L4D2 / CS:GO, default; 48 = Source 2013 / Garry's Mod)":
+  zh-CN: "mdlc 扩展：目标 studio 版本（49 = L4D2 / CS:GO，默认；48 = Source 2013 / Garry's Mod）"
+
+"not a version number: %{s}":
+  zh-CN: "不是版本号：%{s}"

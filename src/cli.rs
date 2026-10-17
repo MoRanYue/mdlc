@@ -122,7 +122,12 @@ const OFFICIAL_FLAGS_NO_VALUE: &[&str] = &[
 ];
 
 /// 官方 `studiomdl` 的**吃一个值**的 flag。
-const OFFICIAL_FLAGS_WITH_VALUE: &[&str] = &["game", "minlod", "t", "a"];
+///
+/// ⚠️ `studio-version` **不是官方 flag**，是 mdlc 扩展 —— 放进这张表是因为
+/// 「归一化层认识的」必须与「clap 接受的」是同一份清单（见
+/// [`build_official_cli`] 的文档）；放进来的副作用正是想要的：
+/// `-studio-version 48` 不会被当成未知选项连同值一起丢掉。
+const OFFICIAL_FLAGS_WITH_VALUE: &[&str] = &["game", "minlod", "t", "a", "studio-version"];
 
 /// 归一化结果。
 #[derive(Debug, PartialEq, Eq)]
@@ -287,6 +292,11 @@ pub struct BuildArgs {
     #[arg(long)]
     #[arg(help = crate::tr("mdlc extension: enable the VTX cache optimization"))]
     pub optimize_vtx: bool,
+    #[arg(long, value_name = "48|49", value_parser = parse_studio_version)]
+    #[arg(help = crate::tr(
+        "Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod). Takes precedence over the TOML's `version`."
+    ))]
+    pub studio_version: Option<crate::format::StudioVersion>,
 }
 
 impl BuildArgs {
@@ -329,6 +339,11 @@ pub struct BuildQcArgs {
     #[arg(long)]
     #[arg(help = crate::tr("mdlc extension: enable the VTX cache optimization"))]
     pub optimize_vtx: bool,
+    #[arg(long, value_name = "48|49", value_parser = parse_studio_version)]
+    #[arg(help = crate::tr(
+        "Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod)"
+    ))]
+    pub studio_version: Option<crate::format::StudioVersion>,
 }
 
 impl BuildQcArgs {
@@ -336,6 +351,22 @@ impl BuildQcArgs {
     pub fn out_root(&self) -> PathBuf {
         self.out.clone().unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+/// 解析 `--studio-version` 的取值（只认 `48` / `49`）。
+///
+/// 走 [`crate::format::StudioVersion::from_i32`] —— 支持哪些版本**只有一份清单**，
+/// 这里不重复写 `matches!`。
+fn parse_studio_version(s: &str) -> Result<crate::format::StudioVersion, String> {
+    let v: i32 = s
+        .parse()
+        .map_err(|_| crate::tr_fmt!("not a version number: %{s}", s = s))?;
+    crate::format::StudioVersion::from_i32(v).ok_or_else(|| {
+        crate::tr_fmt!(
+            "unsupported studio version %{version} (mdlc writes 48 and 49)",
+            version = v
+        )
+    })
 }
 
 /// `mdlc vvd-info <file.vvd>`
@@ -606,8 +637,19 @@ pub fn build_official_cli() -> Command {
                 "Game directory (the official -game); output goes to <gamedir>/models/",
             )),
     );
+    // mdlc 扩展：目标 studio 版本（官方没有这个 flag，见
+    // `OFFICIAL_FLAGS_WITH_VALUE` 的注释）。
+    cmd = cmd.arg(
+        Arg::new("studio-version")
+            .long("studio-version")
+            .value_name(crate::tr("48|49"))
+            .value_parser(parse_studio_version)
+            .help(crate::tr(
+                "mdlc extension: target studio version (49 = L4D2 / CS:GO, default; 48 = Source 2013 / Garry's Mod)",
+            )),
+    );
     for name in OFFICIAL_FLAGS_WITH_VALUE {
-        if *name == "game" {
+        if *name == "game" || *name == "studio-version" {
             continue;
         }
         cmd = cmd.arg(Arg::new(name).long(name).value_name(crate::tr("value")));
@@ -644,6 +686,7 @@ pub fn official_out_root(m: &ArgMatches) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn norm(v: &[&str]) -> Normalized {
         let argv: Vec<String> = v.iter().map(|s| s.to_string()).collect();
@@ -679,6 +722,50 @@ mod tests {
             .expect("必须能解析");
         assert!(m.get_flag("nop4"));
         assert!(m.get_flag("verbose"));
+    }
+
+    /// `--studio-version` 是 mdlc 扩展，两种 CLI 形态都要认。
+    ///
+    /// 官方兼容形态尤其要验：它靠 `OFFICIAL_FLAGS_WITH_VALUE` 归一化。
+    /// 若忘了把 `studio-version` 放进那张表，`-studio-version 48` 会被当成
+    /// 「未知选项 + 它的值」整体丢掉 —— **静默编出 v49**，用户完全看不出来。
+    #[test]
+    fn studio_version_option_parses_in_both_forms() {
+        assert_eq!(parse_studio_version("48").unwrap().as_i32(), 48);
+        assert_eq!(parse_studio_version("49").unwrap().as_i32(), 49);
+        assert!(parse_studio_version("44").is_err(), "44 不在支持范围");
+        assert!(parse_studio_version("abc").is_err(), "非数字应报错");
+
+        // 自有形态（derive）：arg id 是字段名 `studio_version`，挂在子命令上。
+        let m = Cli::command()
+            .try_get_matches_from(["mdlc", "build", "x.toml", "--studio-version", "48"])
+            .expect("自有形态应认 --studio-version");
+        let (name, sub) = m.subcommand().expect("必须有子命令");
+        assert_eq!(name, "build");
+        assert_eq!(
+            sub.get_one::<crate::format::StudioVersion>("studio_version")
+                .copied()
+                .map(|v| v.as_i32()),
+            Some(48)
+        );
+
+        // 官方兼容形态：单横线也要能归一化，且值不能被当未知选项丢掉。
+        let n = norm(&["mdlc", "-game", "C:/g", "-studio-version", "48", "x.qc"]);
+        assert!(
+            n.unknown.is_empty(),
+            "studio-version 是已知选项，不该进 unknown：{:?}",
+            n.unknown
+        );
+        let m = build_official_cli()
+            .try_get_matches_from(&n.argv)
+            .expect("官方形态必须能解析");
+        assert_eq!(
+            m.get_one::<crate::format::StudioVersion>("studio-version")
+                .copied()
+                .map(|v| v.as_i32()),
+            Some(48)
+        );
+        assert_eq!(m.get_one::<String>("qc").map(String::as_str), Some("x.qc"));
     }
 
     #[test]

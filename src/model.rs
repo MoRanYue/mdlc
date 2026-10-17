@@ -5659,11 +5659,15 @@ pub enum DescErrorKind {
         value: String,
     },
 
-    /// 版本号不在支持范围（44 / 48 / 49）。
+    /// 版本号不在支持范围（48 / 49）。
+    ///
+    /// ⚠️ **44 曾经「能过校验」但产物必错** —— 早先 `version` 是纯透传，
+    /// 结构恒按 v49 写。v44 与 v48 的差异远大于 v48 与 v49 的差异
+    /// （见 [`crate::format`]），mdlc 不写 v44。
     #[error(
         "{}",
         crate::tr_fmt!(
-            "Only 44 / 48 / 49 are supported, but the version is %{version}",
+            "only 48 and 49 are supported, but the version is %{version}",
             version = version
         )
     )]
@@ -5799,7 +5803,7 @@ impl ModelDesc {
                     },
             });
         }
-        if !matches!(self.version(), 44 | 48 | 49) {
+        if crate::format::StudioVersion::from_i32(self.version()).is_none() {
             errs.push(DescError {
                 path: "model.version".into(),
                 kind: DescErrorKind::UnsupportedVersion {
@@ -6760,6 +6764,33 @@ pos_weight = 0.25
         let d = ModelDesc::from_toml(&bad).unwrap();
         let errs = d.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.path == "model.version"));
+    }
+
+    /// 只接受 48 / 49 —— 判据就是 [`crate::format::StudioVersion`] 那张表。
+    ///
+    /// ⚠️ 曾经允许 44，但写出器**恒按 v49 布局**写 ⟹ 那是「标称 44、结构 49」，
+    /// 引擎会读错。现在校验与写出共用同一份清单（`format.rs`）。
+    #[test]
+    fn version_accepts_only_48_and_49() {
+        let with_version = |v: i32| {
+            MINIMAL_TOML.replace(
+                "name = \"models/test/minimal.mdl\"",
+                &format!("name = \"models/test/minimal.mdl\"\nversion = {v}"),
+            )
+        };
+        for v in [48, 49] {
+            let d = ModelDesc::from_toml(&with_version(v)).unwrap();
+            assert_eq!(d.version(), v);
+            assert!(d.validate().is_ok(), "version = {v} 应通过校验");
+        }
+        for v in [44, 47, 50] {
+            let d = ModelDesc::from_toml(&with_version(v)).unwrap();
+            let errs = d.validate().unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.path == "model.version"),
+                "version = {v} 应被拒，实际：{errs:?}"
+            );
+        }
     }
 
     #[test]

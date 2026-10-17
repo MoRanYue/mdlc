@@ -181,7 +181,7 @@ QC 脚本  ──┘
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `name` | string | **必填** | 输出路径，相对游戏目录；反斜杠自动规范化为正斜杠 |
-| `version` | int | `49` | 只支持 **44 / 48 / 49** |
+| `version` | int | `49` | 目标 studio 版本，只支持 **48 / 49**（见[目标 studio 版本](#目标-studio-版本v48--v49)） |
 | `checksum` | int | 按模型名生成 | 四件套配对令牌，不是内容哈希 |
 | `static_prop` | bool | `false` | `$staticprop`，自动置头部 `0x10` |
 | `surface_prop` | string | — | `$surfaceprop`；也是每根骨骼的缺省 `surface_prop` |
@@ -504,7 +504,7 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 
 ### mdlc 扩展的 QC 命令
 
-下面 3 条**不是官方命令**，是 mdlc 自己的扩展。命名规则与 TOML 字段一一对应
+下面 4 条**不是官方命令**，是 mdlc 自己的扩展。命名规则与 TOML 字段一一对应
 （字段名去掉下划线、前面加 `$`）：
 
 | 命令 | 等价 TOML | 说明 |
@@ -512,15 +512,17 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 | `$optimizevtx` | `optimize_vtx = true` | 打开顶点缓存优化，等价于命令行 `--optimize-vtx` |
 | `$nosplitoversizedmeshes` | `split_oversized_meshes = false` | 关掉[顶点超限自动拆分](#顶点超限自动拆分)，遇到超限 mesh 直接报错 |
 | `$splitoversizedmeshes` | `split_oversized_meshes = true` | 把上面那条**开回来**（缺省本来就是 `true`；它存在的意义是 `$include` 的 `.qci` 关掉后主 QC 还能改回来） |
+| `$version 48` | `version = 48` | [目标 studio 版本](#目标-studio-版本v48--v49)，等价于命令行 `--studio-version` |
 
-三条都是**裸标志位**（不带参数，只消费自己那一个 token），且**命令名大小写不敏感**
-（与官方取词器一致）。QC 自上而下解释，**后写的赢**。
+前三条是**裸标志位**（不带参数，只消费自己那一个 token），`$version` 带一个参数。
+四条都**命令名大小写不敏感**（与官方取词器一致）。QC 自上而下解释，**后写的赢**。
 
 ```qc
 $modelname "models/mymod/myprop.mdl"
 $body body "myprop.smd"
 $optimizevtx              ; 打开顶点缓存优化
 $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报错）
+$version 48               ; 目标 Source 2013（Garry's Mod）
 ```
 
 > ⚠️ **为什么是 mdlc 扩展而不是官方命令名。** 官方 `studiomdl.exe` 的 QC
@@ -531,8 +533,12 @@ $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报�
 > 把超限模型拆成**新 bodypart**，mdlc 故意不学，理由见
 > [顶点超限自动拆分](#顶点超限自动拆分)）。
 >
-> 所以真 `studiomdl.exe` 对这三条会报 `bad command`。**写了它们的 QC 不能
+> 所以真 `studiomdl.exe` 对这几条会报 `bad command`。**写了它们的 QC 不能
 > 直接拿去跑官方工具**；要跨工具通用请改用 TOML 侧的对应字段。
+>
+> 同理 `$version` 也是扩展（实测 Garry's Mod 的 `studiomdl.exe` 报
+> `bad command $version`）。**要跨工具通用就改用命令行 `--studio-version 48`** ——
+> 它写在 Crowbar 的「编译选项」里即可，QC 本身不必带任何 mdlc 专有命令。
 
 > ⚠️ **`$optimizevtx` 没有反向命令。** `optimize_vtx` 缺省就是 `false`，
 > 一条「关掉」的命令没有实际用途（官方的裸标志位如 `$staticprop` 也都没有
@@ -649,9 +655,9 @@ glTF 侧另有三条自己的提示（见 `docs/gltf-support.md` §6.3）：
 ### mdlc 自有形态
 
 ```text
-mdlc build <model.toml> [--out <目录>] [--optimize-vtx]
+mdlc build <model.toml> [--out <目录>] [--optimize-vtx] [--studio-version 48|49]
 mdlc check <model.toml>
-mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx]
+mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx] [--studio-version 48|49]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
                           [--concave] [--vhacd] [--ragdoll]
@@ -683,6 +689,38 @@ mdlc --version | -V
   刻意关掉了版本标志，clap 于是不认它。
 
 Crowbar 两个都不会传，所以不影响直接替换。
+
+### 目标 studio 版本（v48 / v49）
+
+命令行 `--studio-version`、TOML 的 `[model].version`、QC 的 `$version` 是同一件事的三个入口
+（优先级：命令行 > TOML / QC）。默认 **49**。
+
+- **49**：L4D2 / CS:GO 系（`STUDIO_VERSION 49`）。
+- **48**：Source 2013 系（**Garry's Mod**、TF2、CS:S、HL2:DM …）。
+
+两者在磁盘上只差两处：
+
+| 结构 | v48 | v49 |
+|---|---|---|
+| `mstudiojigglebone_t` | **140 B**（多 5 个 `boing*` float） | **120 B** |
+| `studiohdr_t` / `mstudiobone_t` 的 surfaceprop | 无此字段（写 0） | 有 |
+
+`mstudiobone_t`（216 B）、`mstudioanimdesc_t`（100 B）、`studiohdr_t`（408 B）两边**同尺寸**，
+`.vvd` / `.vtx` **完全不受影响** —— 所以 v48 不是「另一套格式」，只是头部数字加 jigglebone
+记录长度。
+
+实测（同一份带一条 `$jigglebone` 的 QC）：官方 GMod `studiomdl.exe` 产物的
+`bonecontrollerindex` 是 `1668`，mdlc `--studio-version 48` 也是 `1668`（**同位置**）；
+mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真实 Performance Stats 而
+不再报 `is wrong version (49 should be 48)`。
+
+> ⚠️ **`is_boing` 子块暂未支持。** GMod 的 `$jigglebone` 除 `is_flexible` / `is_rigid` /
+> `has_base_spring` 外还认 `is_boing { impact_speed … }`，mdlc 会报「键写在任何块之外」。
+> 不带 boing 的 jigglebone 正常，v48 那多出来的 5 个 `boing*` 槽一律写 0。
+
+> ⚠️ **不支持 v44**（Dark Messiah / Episode One 时代）。它缺 `studiohdr2_t`、
+> `mstudiolinearbone_t` 等一整套结构，`mstudioanimdesc_t` / `mstudioseqdesc_t` 的字段体也不
+> 一样 —— 不是改个数字能解决的。
 
 ### 帮助与错误的多语言
 

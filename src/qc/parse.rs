@@ -359,6 +359,7 @@ impl<'a> Parser<'a> {
         let name = t.text.to_ascii_lowercase();
         match name.as_str() {
             "$modelname" => self.cmd_modelname(),
+            "$version" => self.cmd_version(),
             "$cd" => self.cmd_cd(),
             "$pushd" => self.cmd_pushd(),
             "$popd" => self.cmd_popd(),
@@ -703,6 +704,42 @@ impl<'a> Parser<'a> {
             };
             self.desc.materials.search_paths.push(s.replace('\\', "/"));
         }
+        Ok(())
+    }
+
+    /// `$version <48|49>` —— **mdlc 扩展**：指定目标 studio 版本。
+    ///
+    /// 官方 QC 没有这条命令（官方 studiomdl 的版本是编译期常量），
+    /// 它对应 TOML 的 `version` 字段，效果与命令行的
+    /// `--studio-version` 完全相同。省略时是 mdlc 的默认 **v49**。
+    ///
+    /// 两个版本的差异见 [`crate::format`] —— 只有 `mstudiojigglebone_t`
+    /// 会改变字节布局（v48 多 5 个 `boing*` float），所以这条命令必须
+    /// **只出现一次**；重复出现时后一条覆盖前一条（与 `$modelname` 的
+    /// 「最后一次生效」一致）。
+    fn cmd_version(&mut self) -> Result<(), QcError> {
+        let t = self.tok(false)?;
+        let v: i32 = t.text.parse().map_err(|_| {
+            QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "$version needs a number, got %{text}",
+                    text = format!("{:?}", t.text)
+                ),
+            )
+        })?;
+        let Some(version) = crate::format::StudioVersion::from_i32(v) else {
+            return Err(QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "unsupported studio version %{version} (mdlc writes 48 and 49)",
+                    version = v
+                ),
+            ));
+        };
+        self.desc.model.version = Some(version.as_i32());
         Ok(())
     }
 
@@ -5581,6 +5618,52 @@ end
     fn parse(qc: &str, dir: &std::path::Path) -> crate::model::ModelDesc {
         crate::qc::parse_qc_str(qc, dir)
             .unwrap_or_else(|errs| panic!("QC 应解析成功，实际：{errs:?}"))
+    }
+
+    /// `$version <48|49>` —— **mdlc 扩展**，作用与 TOML 的 `version` 字段相同。
+    ///
+    /// 官方 QC 没有这条命令（官方 studiomdl 的版本是编译期常量）。判据三点：
+    /// 写进去要真的改到 `desc.model.version`（写出器读的就是它）、省略时保持
+    /// 默认 v49、非数字与不支持的版本都要报错（**不能静默忽略**，否则用户以为
+    /// 编出了 v48）。
+    #[test]
+    fn version_command_sets_the_target_studio_version() {
+        let dir = fixture("version");
+        let d = parse(
+            "$modelname \"t.mdl\"\n$version 48\n$body body \"a.smd\"\n",
+            &dir,
+        );
+        assert_eq!(d.version(), 48, "$version 48 应写进 desc.model.version");
+
+        let d = parse("$modelname \"t.mdl\"\n$body body \"a.smd\"\n", &dir);
+        assert_eq!(d.version(), 49, "省略 $version 时默认 v49");
+
+        // 错误文案要锁语言（见 `crate::test_locale` 的说明）。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(
+                "$modelname \"t.mdl\"\n$version 44\n$body body \"a.smd\"\n",
+                &dir,
+            )
+        })
+        .expect_err("44 不在支持范围内");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("unsupported studio version")),
+            "应报不支持的版本，实际：{errs:?}"
+        );
+
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(
+                "$modelname \"t.mdl\"\n$version abc\n$body body \"a.smd\"\n",
+                &dir,
+            )
+        })
+        .expect_err("非数字应报错");
+        assert!(
+            errs.iter().any(|e| e.message.contains("needs a number")),
+            "应报不是数字，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ⚠️ **回归**：`ACT_*` 必须吃掉紧跟其后的**权重** token。

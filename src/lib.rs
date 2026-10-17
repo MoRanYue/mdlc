@@ -43,6 +43,7 @@
 //! | [`ani_writer`] | `.ani` 写出 |
 //! | [`bone_math`] | 骨骼矩阵与四元数工具 |
 //! | [`layout`] | 布局偏移常量 |
+//! | [`mod@format`] | **studio 版本规格**（v48 / v49 的差异表，驱动布局与写出） |
 //! | [`phy`] | **`.phy` 碰撞文件写出**（凸包 → IVP 紧凑表面） |
 //! | [`tangent`] | **切线空间计算**（法线贴图用，对应 studiomdl 的 `CalcModelTangentSpaces`） |
 //! | [`lod`] | **多 LOD 与 fixup 表**（顶点池排序、分段、重映射） |
@@ -63,6 +64,7 @@ pub mod compile;
 pub mod diag;
 pub mod fbx;
 pub mod flex;
+pub mod format;
 pub mod gltf;
 pub mod layout;
 pub mod lod;

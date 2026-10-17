@@ -111,7 +111,7 @@ fn main() -> ExitCode {
         mdlc::cli::Commands::Build(a) => {
             let toml_path = a.toml.clone();
             let out_root = a.out_root();
-            let desc = match load_desc(&toml_path) {
+            let desc = match load_desc(&toml_path, a.studio_version) {
                 Ok(d) => d,
                 Err(c) => return c,
             };
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
         mdlc::cli::Commands::Qc2toml(a) => qc2toml(&a),
         mdlc::cli::Commands::BuildQc(a) => {
             let out = a.out_root();
-            build_qc_from(&a.qc, &out, a.optimize_vtx)
+            build_qc_from(&a.qc, &out, a.optimize_vtx, a.studio_version)
         }
         mdlc::cli::Commands::VvdInfo(a) => vvd_info(&a.file.to_string_lossy()),
         mdlc::cli::Commands::VvdRoundtrip(a) => vvd_roundtrip(&a.file.to_string_lossy()),
@@ -225,11 +225,20 @@ fn run_official(argv: &[String]) -> ExitCode {
     };
 
     let out_root = mdlc::cli::official_out_root(&m);
-    build_qc_from(Path::new(qc), &out_root, m.get_flag("optimize_vtx"))
+    build_qc_from(
+        Path::new(qc),
+        &out_root,
+        m.get_flag("optimize_vtx"),
+        m.get_one::<mdlc::format::StudioVersion>("studio-version")
+            .copied(),
+    )
 }
 
 /// 读入并解析描述文件，打印全部校验错误。
-fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
+fn load_desc(
+    path: &Path,
+    studio_version: Option<mdlc::format::StudioVersion>,
+) -> Result<ModelDesc, ExitCode> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -244,13 +253,18 @@ fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
             return Err(ExitCode::from(2));
         }
     };
-    let desc = match ModelDesc::from_toml(&text) {
+    let mut desc = match ModelDesc::from_toml(&text) {
         Ok(d) => d,
         Err(e) => {
             log::error!("{}", mdlc::tr_fmt!("Error: %{err}", err = e));
             return Err(ExitCode::from(2));
         }
     };
+    // `--studio-version` 覆盖 TOML 的 `version`。**必须在 `validate()` 之前**
+    // —— 否则 TOML 里写了个不支持的版本会先被拒，命令行就没机会纠正它。
+    if let Some(v) = studio_version {
+        desc.model.version = Some(v.as_i32());
+    }
     if let Err(errs) = desc.validate() {
         log::error!(
             "{}",
@@ -268,7 +282,7 @@ fn load_desc(path: &Path) -> Result<ModelDesc, ExitCode> {
 }
 
 fn check(p: &Path) -> ExitCode {
-    let desc = match load_desc(p) {
+    let desc = match load_desc(p, None) {
         Ok(d) => d,
         Err(c) => return c,
     };
@@ -422,11 +436,21 @@ fn qc2toml(a: &mdlc::cli::Qc2tomlArgs) -> ExitCode {
 /// `out_root` 由调用方决定：
 /// - mdlc 自有形态 → `--out`（默认当前目录）；
 /// - 官方兼容形态 → `<gamedir>\models`（见 [`mdlc::cli::official_out_root`]）。
-fn build_qc_from(qc: &Path, out_root: &Path, optimize_vtx: bool) -> ExitCode {
-    let desc = match load_qc(qc) {
+fn build_qc_from(
+    qc: &Path,
+    out_root: &Path,
+    optimize_vtx: bool,
+    studio_version: Option<mdlc::format::StudioVersion>,
+) -> ExitCode {
+    let mut desc = match load_qc(qc) {
         Ok(d) => d,
         Err(c) => return c,
     };
+    // QC 里没有「目标版本」这个概念（官方也没有对应命令），所以只能由
+    // 命令行指定 —— 不指定就是 mdlc 的默认 v49。
+    if let Some(v) = studio_version {
+        desc.model.version = Some(v.as_i32());
+    }
     let base = qc.parent().unwrap_or(Path::new("."));
     compile_and_write(&desc, base, out_root, optimize_vtx)
 }
