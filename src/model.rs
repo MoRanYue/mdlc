@@ -5149,6 +5149,13 @@ impl CompiledModelDesc {
 pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格式）
 # mdlc model description file (native input format)
 #
+# ⚠️ 默认值是「Left 4 Dead 2 的配置」：studio 版本 49、骨骼上限 127 根。
+#    给别的游戏做模型请在 [model] 里写 target（gmod / sdk2013 / tf2 / css / csgo），
+#    否则产物会被引擎直接拒绝（Garry's Mod 报 is wrong version）。
+# ⚠️ The defaults are the Left 4 Dead 2 configuration: studio version 49, at most 127 bones.
+#    Modelling for another game? Set `target` under [model] (gmod / sdk2013 / tf2 / css / csgo),
+#    otherwise the engine will reject the files (Garry's Mod says "is wrong version").
+#
 # 网格**不写在这里** —— 由 SMD 文件承载，本文件只引用它们
 # （与 QC 的 $bodygroup { studio "x.smd" } 一致）。
 # The mesh is **not written here** -- it lives in SMD files, and this file
@@ -6949,6 +6956,12 @@ smd = "minimal-ref.smd"
         assert!(
             TEMPLATE_TOML.contains("generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo"),
             "模板应列出全部预设名"
+        );
+        // 文件开头就要警告「默认值是 L4D2 的配置」——只写在 [model] 里
+        // 已经太靠后了，用户是照着模板从上往下抄的。
+        assert!(
+            TEMPLATE_TOML.contains("默认值是「Left 4 Dead 2 的配置」"),
+            "模板开头应警告默认值属于 L4D2"
         );
     }
 

@@ -35,6 +35,7 @@ cargo build --release
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Pick your target engine](#pick-your-target-engine)
 - [Outputs](#outputs)
 - [Two input formats, one IR](#two-input-formats-one-ir)
 - [TOML descriptor](#toml-descriptor)
@@ -71,15 +72,17 @@ cargo build --release
 The output of `mdlc template` is the **authoritative field reference** — it cannot drift from
 what is actually supported.
 
+> 📌 **Compiling for a game other than Left 4 Dead 2?** Read the next section first — the
+> defaults are the L4D2 configuration, and without a target you get files the engine rejects.
+
 > ⚠️ **Three easy traps (the template spells them out; repeated here):**
 >
 > 1. **`mass` is not in `[model]`, it is in `[physics]`.** Official studiomdl has **no**
 >    top-level `$mass` — it only appears inside `$collisionmodel {}` / `$collisionjoints {}`,
 >    and the same value is written to both `editparams.totalmass` in the `.phy` and `mass`
->    in the `.mdl` header. **Writing `mass = 1.0` under `[model]` is a parse failure**
->    (measured).
-> 2. **`contents` defaults to `1` (`CONTENTS_SOLID`), not `0`.** Compiling a model without
->    `contents` and reading the header gives **1** at `+0x14C` (measured).
+>    in the `.mdl` header. **Writing `mass = 1.0` under `[model]` is a parse failure**.
+> 2. **`contents` defaults to `1` (`CONTENTS_SOLID`), not `0`.** The official constant
+>    `s_nDefaultContents` is `CONTENTS_SOLID`.
 > 3. **`flags` on `[[bones]]` does not default to an unconditional `0x500`** — it is computed
 >    per bone from how the bone is used and propagated up the parent chain (see the
 >    [`[[bones]]`](#bones) section).
@@ -96,6 +99,47 @@ what is actually supported.
 
 ---
 
+## Pick your target engine
+
+**This is the section most likely to be skipped, and the most likely to end in wasted work.**
+mdlc's defaults are "the Left 4 Dead 2 configuration": studio version **49**,
+bone table limit **127**. Modelling for any other game requires naming the target explicitly —
+the most common symptom is the engine refusing the files outright (Garry's Mod reports
+`is wrong version (49 should be 48)`).
+
+| What you are modelling for | What to write | What you get |
+|---|---|---|
+| **Left 4 Dead 2** | nothing — this is the default | v49 · up to 127 bones |
+| **Garry's Mod** | `$target gmod` | v48 · up to 255 bones |
+| **TF2 / CS:S / HL2:DM / SDK 2013** | `$target sdk2013` (or `tf2` / `css`) | v48 · up to 127 bones |
+| **CS:GO** | `$target csgo` | v49 · up to 255 bones (not tested) |
+| Any other Source game | start with `--studio-version 48`; add `--max-bones 256` past 127 bones | as needed |
+
+The three entry points are equivalent; priority is **command line > TOML / QC > `target`
+preset > default**:
+
+```qc
+$target gmod              ; one line in the QC is enough
+```
+
+```toml
+[model]
+target = "gmod"
+```
+
+```text
+mdlc build model.toml --target gmod
+```
+
+**Why the studio version alone is not enough**: the bone limit can differ within one studio
+version (in v49, Left 4 Dead 2 allows 127 and CS:GO allows 255), while the version only
+describes the on-disk layout. So "studio version" and "bone limit" are two independent
+parameters, and `target` is just a preset table that bundles them. Details (per-engine
+limits, the hard format ceiling of 256) are in
+[the bone limit section](#bone-limit-max_bones).
+
+---
+
 ## Outputs
 
 | Extension | Contents | When |
@@ -106,16 +150,14 @@ what is actually supported.
 | `.phy` | IVP collision (convex hulls / `$concave` / `$collisionjoints`) | with `[physics]` or `$collisionmodel` |
 | `.ani` | External animation block | `[model].anim_block_size` or `$animblocksize` written, **and that animation has ≥ 2 frames** |
 
-> ⚠️ **`.ani` is aligned to exactly one `studiomdl` build.** mdlc replicates
-> `Left 4 Dead 2\bin\studiomdl.exe` (2024-06-04 build). `.ani` files floating around elsewhere
-> sometimes come from **earlier builds with a different payload format** (header `+0` is always
-> 28; those are 56/84/88/92) — using them as a baseline only produces an illusion of "all wrong".
-> The container layer (416-byte header / `IDAG` / version 49) is consistent across builds.
+> ⚠️ **`.ani` is aligned to exactly one build of `Left 4 Dead 2\bin\studiomdl.exe`.** `.ani`
+> files produced by earlier `studiomdl` builds use a different payload format; using them as a
+> baseline only produces an illusion of "all wrong".
 
 > ⚠️ **Single-frame animations never go into `.ani`** — the predicate is
 > `anim_block_size > 0 && numframes >= 2`; single-frame animations stay inline in the `.mdl`.
 > The `.ani` filename is **forced** to `models/<modelname>.ani`, because the `.mdl` header
-> stores exactly that path at `+0x15C`; a wrong name means the engine cannot find it.
+> stores exactly that path; a wrong name means the engine cannot find it.
 
 The output root is `--out` (default: the current directory), with the relative path from the
 model name layered on top. So `name = "models/mymod/myprop.mdl"` is written to
@@ -141,10 +183,9 @@ QC script       ──┘
 Both inputs **share a single IR**, so the writers do not care which side the input came from.
 QC support was added later and **changed no writer code**.
 
-Meshes are **not written in the descriptor** — real models have tens of thousands to hundreds of
-thousands of vertices (the official `v_autoshotgun` has 388,765), and inlining them would bloat
-the descriptor to hundreds of MB and make it unusable with text tools. The descriptor only
-**references** mesh sources.
+Meshes are **not written in the descriptor** — real models routinely have hundreds of thousands
+of vertices, and inlining them would bloat the descriptor to hundreds of MB and make it
+unusable with text tools. The descriptor only **references** mesh sources.
 
 A mesh source can be **SMD**, **FBX** (`.fbx`, via `ufbx`, see
 [`docs/fbx-support.md`](docs/fbx-support.md)) or **glTF / GLB** (`.gltf` / `.glb`, via the
@@ -159,10 +200,8 @@ A mesh source can be **SMD**, **FBX** (`.fbx`, via `ufbx`, see
 > (nine `src*` options, see [`### FBX / glTF source options`](#fbx--gltf-source-options-src-9-of-them)).
 >
 > ⚠️ **glTF has no official baseline** (official `studiomdl.exe` does not recognise the format
-> at all); its semantics were pinned down by **transitive comparison** — export the same Blender
-> scene twice as `.fbx` + `.glb`, use the official tool on the `.fbx` as the baseline, then show
-> that the glTF numbers imply the FBX numbers. The provenance of every rule is recorded in
-> `docs/gltf-support.md` §5.
+> at all); the semantics and trade-offs are in
+> [`docs/gltf-support.md`](docs/gltf-support.md).
 >
 > ```qc
 > $modelname "models/mymod/linnea.mdl"
@@ -362,7 +401,7 @@ allocate a `panim`); writing one is rejected.
 > ⚠️ **Known gap: `weight_list` / `num_frames` / `subtract` are silently dropped on blend
 > sequences.** These three options are currently **implemented only on single-animation
 > sequences**: adding them to a blend sequence does not error, but has **no effect whatsoever**
-> (the artifact is **byte-identical** to one without them, measured). So this is **silent data
+> (the artifact is identical to one without them). So this is **silent data
 > loss**, not a parse error — write them on a single-animation sequence if you need them to work.
 
 ### `[[weight_lists]]`
@@ -516,7 +555,7 @@ The QC front end implements full lexing/parsing, `$include`, `$definevariable`,
 | `$fakevta` | The whole block is skipped (no trace in the artifact) |
 | `$scale` | **Accepted but has no effect** (the scale is only recorded, never used in computation). Use `srcscale` instead |
 | `$cbox` / `$maxconvexpieces` / `$phyname`, `height`/`pad`/`floor`/`center` of `$ikchain`, `x_and_z_axes` of `$attachment`, `usesequence` of ikrule | Arguments are consumed but **not written to disk** (or are expressed equivalently by other fields) |
-| A batch of rare commands (`$minlod` `$maxverts` `$renamebone` `$hierarchy` `$collapsebones` `$screenalign` `$upaxis` `$origin` `$maxbones` `$controller` …) | **The line is ignored** (no error, no trace) |
+| A batch of rare commands (`$minlod` `$maxverts` `$renamebone` `$hierarchy` `$collapsebones` `$screenalign` `$upaxis` `$origin` `$controller` …) | **The line is ignored** (no error, no trace) |
 | Any other unknown command | Error (matching the official `bad command`) |
 
 > ⚠️ **An unknown keyword inside a `$sequence` block is treated as an "animation name".** For
@@ -564,18 +603,15 @@ $target gmod              ; engine preset (= version 48 + at most 255 bones)
 $maxbones 200             ; explicit override of the preset's bone limit
 ```
 
-> ⚠️ **Why these are mdlc extensions rather than official command names.** The official
-> `studiomdl.exe` dispatch table has **no** keyword for either feature (`optimize` / `vcache` /
-> `nvtristrip` / `split` / `oversized` all score 0 hits) — the official tool exposes vertex cache
-> optimisation as the **command-line** switch `-nvtristrip`, and **rejects** oversized meshes
-> outright (`ERROR: too many indices in source`). Third-party NekoMDL has neither QC command
-> either (its `$maxverts` does something else: it splits an oversized model into **new
-> bodyparts**, which mdlc deliberately does not copy, see
+> ⚠️ **These are all mdlc extensions; a real `studiomdl.exe` reports `bad command` for them.**
+> The official tool exposes vertex cache optimisation as the **command-line** switch
+> `-nvtristrip`, and **rejects** oversized meshes outright; third-party NekoMDL's `$maxverts`
+> does something else (it splits an oversized model into **new bodyparts**, which mdlc
+> deliberately does not copy, see
 > [automatic splitting of oversized meshes](#automatic-splitting-of-oversized-meshes)).
 >
-> So a real `studiomdl.exe` reports `bad command` for all of them. **A QC containing them cannot
-> be fed to the official tool as-is**; for cross-tool compatibility use the corresponding TOML
-> fields instead.
+> **A QC containing them cannot be fed to the official tool as-is**; for cross-tool
+> compatibility use the corresponding TOML fields instead.
 >
 > `$version` is an extension for the same reason (measured: Garry's Mod's `studiomdl.exe` reports
 > `bad command $version`). **For cross-tool compatibility use the command-line flag
@@ -659,8 +695,8 @@ The three `srcshapekey*` commands are only needed when you want to **filter or r
 > [`docs/fbx-support.md`](docs/fbx-support.md) §4.6.
 
 > ⭐ **The same `.fbx` as both mesh source and animation source: mdlc compiles it normally plus
-> one notice.** The official tool **silently emits only 1 frame** in this combination (measured
-> exit=0, no warning) — but FBX is by design a container holding both mesh and animation, so mdlc
+> one notice.** The official tool **silently emits only 1 frame** in this combination — but FBX is
+> by design a container holding both mesh and animation, so mdlc
 > **does not copy this degenerate behaviour**; it samples all frames and merely notes that "a
 > frame-count difference against the official tool is expected here; split the animation into its
 > own FBX if you want the two to agree". The notice is only emitted when mdlc really sampled
@@ -758,15 +794,9 @@ On disk the two differ in exactly two places:
 | `mstudiojigglebone_t` | **140 B** (5 extra `boing*` floats) | **120 B** |
 | surfaceprop of `studiohdr_t` / `mstudiobone_t` | no such field (writes 0) | present |
 
-`mstudiobone_t` (216 B), `mstudioanimdesc_t` (100 B) and `studiohdr_t` (408 B) are the **same
-size** in both, and `.vvd` / `.vtx` are **completely unaffected** — so v48 is not "another
-format", just a different header number plus a different jigglebone record length.
-
-Measured (one and the same QC with a single `$jigglebone`): the official Garry's Mod
-`studiomdl.exe` produces `bonecontrollerindex` = `1668`, and so does mdlc with
-`--studio-version 48` (**the same offset**: `1668`); mdlc's v48 output can be fed straight back into
-`studiomdl.exe -mdlreport`, which prints real Performance Stats instead of
-`is wrong version (49 should be 48)`.
+`mstudiobone_t`, `mstudioanimdesc_t` and `studiohdr_t` are the **same size** in both, and
+`.vvd` / `.vtx` are **completely unaffected** — so v48 is not "another format", just a different
+header number plus a different jigglebone record length.
 
 > **The `is_boing` sub-block is supported** (v48 only). Besides `is_flexible` / `is_rigid` /
 > `has_base_spring`, Garry's Mod's `$jigglebone` also accepts `is_boing { impact_speed 100 }`
@@ -775,8 +805,7 @@ Measured (one and the same QC with a single `$jigglebone`): the official Garry's
 > `100 / 0.7071 / 0.25 / 30 / 0.35`. Unknown tokens inside the block are **silently skipped**
 > by the official compiler (mdlc does the same), but keys written in any *other* block still
 > error out. Targeting v49 with `is_boing` is a **hard error, not a silent drop** — v49's
-> `mstudiojigglebone_t` simply has no such slots. Measured: the 140-byte v48 record is
-> **byte-for-byte identical** to the official Garry's Mod `studiomdl.exe` output.
+> `mstudiojigglebone_t` simply has no such slots.
 
 > ⚠️ **v44 is not supported** (the Dark Messiah / Episode One era). It lacks the whole
 > `studiohdr2_t` / `mstudiolinearbone_t` family and has different field layouts in
@@ -789,18 +818,16 @@ compiled with different games' `studiomdl.exe` hits different limits — and the
 **even within one studio version** (v49: L4D2 is 127, CS:GO is 255), so the number **cannot be
 derived from `version`**.
 
-Measured (every cell really runs the compiler; the verdict is `numbones` in the output header):
+Measured limits of the official compilers:
 
-| Bones | Official L4D2 (v49) | Official Garry's Mod (v48) |
-|---|---|---|
-| 127 | ✅ | ✅ |
-| 128 | ⛔ `Too many bones used in model, used 128, max 128` | ✅ |
-| 200 | ⛔ same | ✅ |
-| 255 | ⛔ same | ✅ |
-| 256 | ⛔ | ⛔ `used 256, max 256` |
+| Target | Hard limit of the official compiler |
+|---|---|
+| Left 4 Dead 2 (v49) | **127** bones |
+| Garry's Mod (v48) | **255** bones |
 
-> ⚠️ **That `max 128` in the official message is a typo.** The check is `numbones > 0x7f`, so
-> **128 bones is rejected**. That is why mdlc defaults to **127**, not 128.
+> ⚠️ L4D2's error message reads `Too many bones used in model, used 128, max 128`, but that
+> `128` is the official tool's own typo — **128 bones is rejected**. That is why mdlc defaults
+> to **127**.
 
 Three entry points (precedence: command line > TOML / QC > `target` preset > default).
 When an explicit value disagrees with the preset, mdlc logs a warning (**the explicit value
@@ -824,13 +851,14 @@ mdlc build model.toml --target gmod --max-bones 200
 | Preset | Studio version | Bone limit | Notes |
 |---|---|---|---|
 | `generic` | unset | unset | **Default**; both parameters keep their own default |
-| `l4d2` | 49 | 127 | Decompiled + measured |
-| `gmod` | 48 | 255 | Decompiled + measured |
-| `sdk2013` / `tf2` / `css` | 48 | 127 | Inferred (same code lineage, not measured per version) |
-| `csgo` | 49 | 255 | Not measured (that compiler is not installed here); inferred from `mstudioanim_t.bone` being one byte |
+| `l4d2` | 49 | 127 | |
+| `gmod` | 48 | 255 | |
+| `sdk2013` / `tf2` / `css` | 48 | 127 | |
+| `csgo` | 49 | 255 | Not measured |
 
 - **The unit is the bone table length *after* optimisation** — unreferenced bones are dropped
-  (`$attachment` references count as referenced), so 300 nodes may end up as 10 bones.
+  (`$attachment` references count as referenced), so the node count in the SMD is not the final
+  bone count.
 - **The format ceiling is 256**: `mstudioboneweight_t.bone[]` in VVD, `Vertex_t.boneID[]` in VTX
   and `mstudioanim_t.bone` in animations are all one byte. Going over 256 is a hard error,
   **never a silent truncation**.
@@ -862,32 +890,19 @@ to English when there is no match). So on a Chinese system `mdlc -h` prints:
 (The `mdlc --help` **long help** is similar: `-h` / `-V` expand to two lines with full
 descriptions; the `参数:` / `选项:` section headings inside subcommand help are localized too.)
 
-**Translations for mdlc's own text live in [`locales/app.yml`](locales/app.yml)**, using the
-`_version: 2` single-file multi-locale format. The source language is **English** (the key *is* the
-English text), so English users — and any language not covered — get the source string as-is, and
-adding a language means adding one column:
-
-```yaml
-_version: 2
-"Output .phy path":
-  zh-CN: "输出 .phy 路径"
-  de-DE: "Pfad der .phy-Ausgabe"    # a newly added language
-```
-
+**Translations for mdlc's own text live in [`locales/app.yml`](locales/app.yml)** (the
+`_version: 2` single-file multi-locale format; the source language is English).
 This table covers more than help text: **runtime diagnostics and error messages go through it too** —
 the `Error: ` / `Warning: ` / `Note: ` prefixes emitted via `log::error!` / `log::warn!` /
 `log::info!`, plus the `check` / `vvd-info` / `vvd-roundtrip` / `phy` reports. Parameterized lines use
-`%{name}` placeholders (`rust-i18n`'s `replace_patterns` syntax; the names are never translated).
-**One exception**: the comments in the TOML template printed by `mdlc template` (`TEMPLATE_TOML` in
-`src/model.rs`) are **bilingual (Chinese + English)** — it is template file content rather than a
-diagnostic, so it does not go through the translation table.
+`%{name}` placeholders (the names are never translated).
+**One exception**: the comments in the TOML template printed by `mdlc template` are
+**bilingual (Chinese + English)** — template file content rather than a diagnostic, so it does not
+go through the translation table.
 
-> ⚠️ **Language detection goes through `sys-locale`, which on Windows reads the *user-preferred UI
-> language* (`GetUserPreferredUILanguages`) and does *not* read `LC_ALL` / `LANG`.** So switching
-> languages currently means changing the system display language. To force English in a test, call
-> `rust_i18n::set_locale("en")` — but that only affects **mdlc's own strings**; the framework words
-> (`Usage:` / `Arguments:` / `Options:`) come from `clap-i18n-richformatter`'s own
-> `FluentLanguageLoader` and are a separate piece of state.
+> ⚠️ **The language follows the system display language** (on Windows it reads the
+> *user-preferred UI language*, not `LC_ALL` / `LANG`), so switching languages currently means
+> changing the system setting.
 
 > Colour **only appears on a direct terminal** and degrades to plain text when redirected or
 > captured through a pipe — so no ANSI escape codes are ever pushed into host logs such as
@@ -899,8 +914,7 @@ diagnostic, so it does not go through the translation table.
 
 `--optimize-vtx` uses `meshopt` to reorder the indices of each strip group to improve the GPU's
 post-transform vertex cache hit rate. It **only changes index order**; the vertex pool and the
-triangle set are unchanged, so rendering is identical. It defaults to **off**, keeping artifacts
-byte-identical to before.
+triangle set are unchanged, so rendering is identical. It defaults to **off**.
 
 It is an `||` relationship with `[model].optimize_vtx` (either being true turns it on), so it
 **can only be turned on, never off**; the equivalent QC command is `$optimizevtx` (see
@@ -930,78 +944,10 @@ official `studiomdl`, and Crowbar only reads stdout), while mdlc-native subcomma
 
 ## Using as a library
 
-`mdlc` is also a library. To embed the compiler in a third-party GUI or build system, **do not
-hand-wire the pipeline yourself** — use `mdlc::pipeline`:
-
-```rust
-use std::path::Path;
-use mdlc::model::ModelDesc;
-use mdlc::pipeline::{self, PipelineOptions};
-
-let text = std::fs::read_to_string("model.toml")?;
-let desc = ModelDesc::from_toml(&text)?;
-
-// Compile only, touching no filesystem: get the four files' bytes + the compile-time IR.
-let out = pipeline::build(&desc, Path::new("."), PipelineOptions::default())?;
-
-// Or write straight to disk (creating directories from `$modelname`).
-let paths = pipeline::write_files(&out, Path::new("out"))?;
-println!("{}", paths.mdl.display());
-```
-
-`pipeline::build` only reads files; `write_files` only writes them. **The two steps exist so a
-GUI can show a summary or ask for confirmation before writing.**
-
-### Why you must use it
-
-`compile()` only does "descriptor → compile-time IR"; it **does not handle the collision SMD at
-all** and writes no files. The step most easily missed when hand-wiring the pipeline is
-"collision SMD → `physicsbone`":
-
-```rust
-// Miss this and `.mdl`/`.vvd`/`.dx90.vtx` are all correct, but physicsbone is silently all 0.
-if let Some(cs) = &collision_smd {
-    let parents = mdlc::compile::bone_parents(&compiled.desc);
-    compiled.physics_bone = mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
-}
-```
-
-### Errors and exit codes
-
-`PipelineError` is an **enum** — one variant per failure point — and `kind()` maps onto the same
-exit codes as `mdlc.exe`:
-
-| Variant | `kind()` | Exit code | Trigger |
-|---|---|---|---|
-| `Compile(Vec<CompileError>)` | `Build` | 1 | Descriptor/QC validation failure, source SMD unreadable |
-| `ParseCollisionSmd { path, source }` | `Build` | 1 | Collision SMD parse failure |
-| `WriteMdl(WriteError)` | `Build` | 1 | `.mdl` write failure |
-| `BuildVvd` / `EncodeVvd` / `CheckVvd` | `Build` | 1 | VVD build / encode / self-check failure |
-| `WriteVtx` / `CheckVtx` | `Build` | 1 | VTX write / self-check failure |
-| `BuildPhy` / `CheckPhy` | `Build` | 1 | PHY build / self-check failure |
-| `ResolveCollisionSmd(SrcError)` | `Io` | 2 | Collision SMD path resolution failure |
-| `ReadCollisionSmd { path, source }` | `Io` | 2 | Collision SMD unreadable |
-| `CreateDir { path, source }` | `Io` | 2 | Directory creation failure |
-| `WriteFile { path, source }` | `Io` | 2 | File write failure |
-
-`kind()` is **exhaustive** — there is no `_ => Build` fallback, so adding a variant forces the
-compiler to make you classify it.
-
-Underlying errors are **preserved** (`#[source]`) instead of being flattened into a string by
-`format!`: `ReadCollisionSmd`'s `source` is a `std::io::Error`, so you can test
-`.downcast_ref::<std::io::Error>().kind() == ErrorKind::NotFound` rather than matching on
-localized text.
-
-`lines()` yields exactly the same text as the CLI line for line (a compile failure is multiple
-lines, everything else is one); `Display` is them joined together. A GUI can render `lines()`
-straight into its log without assembling strings itself.
-
-### Summary
-
-`PipelineOutput::summary_lines(&paths)` reproduces the table `mdlc.exe` prints on success
-(model / version / checksum / statistics / each artifact's byte count and path / `**编译成功**`).
-The CLI itself just `println!`s it line by line — so what a GUI shows and what the command line
-shows are **word for word identical**.
+`mdlc` is also a library, so it can be embedded in a third-party GUI or build system. For the
+integration details — how to use `mdlc::pipeline`, why you should not hand-wire the pipeline
+yourself, and how `PipelineError` maps onto exit codes — see
+[`docs/library-api.md`](docs/library-api.md).
 
 ---
 
@@ -1011,25 +957,18 @@ shows are **word for word identical**.
 are not constraints of the file format. This implementation **does not replicate** them, keeping
 only the hard limits that follow from **bit widths / offset arithmetic**:
 
-| Dimension | Limit | Basis |
-|---|---|---|
-| **Index** of a **referenced** bone | **127** | Both VVD `mstudioboneweight_t.bone[]` and VTX `Vertex_t.boneID[]` are **signed** `char` |
-| **Total** bones | no limit | The `mstudiobone_t` array length is `int32` (`MAXSTUDIOBONES = 128` is only an engine limit, not a rejection criterion) |
-| Bones an animation chain can **address** | **256** | `mstudioanim_t.bone` is a `byte` (predicate is `≤255`) |
-| Bone palette per **strip** | **127** | VTX `Vertex_t.boneID[]` is a `char` (official `maxBonesPerStrip = 53`) |
-| Vertices per **mesh** | **65536** | VTX `Vertex_t.origMeshVertID` is a `uint16` |
-| Vertices per **model** | **44,739,242** | `vertexindex` is an int32 byte offset ÷ 48 |
-| **Material** table entries | **32768** | `pSkinref[]` is a **signed** `short` |
-| **Triangle** count | no limit | VTX `numIndices` is an int32 |
-| **LOD** levels | **8** | The engine's `MAX_NUM_LODS` |
+| Dimension | Limit |
+|---|---|
+| Bone table length | set by [`max_bones`](#bone-limit-max_bones), hard format ceiling **256** |
+| Vertices per **mesh** | **65536** |
+| Vertices per **model** | **44,739,242** |
+| **Material** table entries | **32768** |
+| **Triangle** count | no limit |
+| **LOD** levels | **8** |
 
 Each writer also runs a **self-check** afterwards (VVD / VTX consistency checks, PHY's 13 hard
 constraints); a failure aborts as "a bug in this implementation" rather than leaving a broken
 file behind.
-
-> ⚠️ **What is constrained is the "index of a referenced bone", not the "total bone count".**
-> **Unreferenced bones do not consume VVD index space** — they appear only in the bone table.
-> So a model with 134 bones that only references up to index 118 is **legal**.
 
 > ⚠️ **The granularity of "≤ 65536 vertices per mesh" is the mesh (= one material)**, not the
 > bodypart: adding a material adds a mesh, and each is counted independently. The predicate is
@@ -1057,11 +996,6 @@ meshes in triangle order** at compile time:
 **Why not split into new bodyparts** (which is what NekoMDL's `$maxverts` does): once the
 bodypart count changes, the engine's `$bodygroup` selection (**by index**) shifts.
 
-> **A real example**: one material of a mod project had 305,703 vertices — compiling **failed**
-> without splitting; after splitting, meshes went from 20 to 24, **the largest single mesh was
-> exactly 65,536**, the triangle total was conserved at 232,099, and the bodypart count **stayed
-> at 2** (unchanged).
-
 For a model that is not oversized this path **is not touched at all** (early return), so it has
 zero effect on existing artifacts.
 
@@ -1082,9 +1016,8 @@ smd = "lod2.smd"
 switch_point = 40.0
 ```
 
-Each LOD is a **complete, independent SMD** (not "some triangles deleted"). This implementation
-merges them into a single vertex pool with exact cross-LOD deduplication, sorts by LOD
-membership, and generates the fixup table — matching studiomdl's `UnifyLODs`.
+Each LOD is a **complete, independent SMD** (not "some triangles deleted"). mdlc merges them
+into a single vertex pool with cross-LOD deduplication, and generates the fixup table.
 
 Three constraints:
 
@@ -1114,7 +1047,7 @@ reused and only the bone options are applied.
 | **DMX input** | Deliberately unimplemented. `$nekomodel` gives an **explicit error**; `studio "x.dmx"` is not specially recognised and fails while reading the file / parsing it as SMD (the official tool also delegates to `dmxconvert.exe`) |
 | `$maxverts` | A non-official NekoMDL extension; ignored. Use automatic splitting instead |
 | `ikrule footstep` (type 3) | Needs the `center` of `$ikchain`, which mdlc does not model yet. Writing it is an **explicit error** rather than silently producing a wrong payload |
-| A number of rare QC commands | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` / `$maxbones` … are ignored |
+| A number of rare QC commands | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … are ignored |
 | Official CLI's `-minlod` / `-striplods` / `-definebones` / `-printbones` / `-t` / `-a` | Arguments are accepted but **warned about and ignored** |
 | `$bodygroup { … blank }` | The `blank` member (an empty model) is an **error** — `BodyModel.smd` is a required field and mdlc has no way to express "a model with no mesh" |
 | **`weightlist` / `numframes` / `subtract` on blend sequences** | **Silently dropped** (see above). They work normally on single-animation sequences |
@@ -1125,8 +1058,7 @@ reused and only the bone options are applied.
 
 ## Further documentation
 
-The `docs/` directory holds eight specification reports whose conclusions all come from
-byte-level analysis of real artifacts:
+The `docs/` directory holds the finer specifications and notes:
 
 | Document | Contents |
 |---|---|
@@ -1138,6 +1070,7 @@ byte-level analysis of real artifacts:
 | [`docs/fbx-support.md`](docs/fbx-support.md) | FBX support semantics and UX plan (design rationale for the nine `src*` commands + deviation table) |
 | [`docs/gltf-support.md`](docs/gltf-support.md) | Where glTF / GLB semantics come from, and the trade-offs (zero new syntax) |
 | [`docs/update-check.md`](docs/update-check.md) | The update check's design and trade-offs (why it is on by default, when it goes online, how to turn it off) |
+| [`docs/library-api.md`](docs/library-api.md) | API usage, errors and exit codes when embedding mdlc as a library |
 
 > ⚠️ **`docs/feature-gap.md` and `docs/qc-coverage-gap.md` are research reports** carrying a
 > snapshot date and **describing the state at the time of writing**; "what is implemented today"

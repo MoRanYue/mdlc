@@ -34,13 +34,14 @@ cargo build --release
 ## 目录
 
 - [快速开始](#快速开始)
+- [先选目标引擎](#先选目标引擎)
 - [产物](#产物)
 - [两套输入格式，一个中间表示](#两套输入格式一个中间表示)
 - [TOML 描述文件](#toml-描述文件)
 - [QC 支持与 Crowbar 直接替换](#qc-支持与-crowbar-直接替换)
 - [命令行参考](#命令行参考)
 - [更新检测](#更新检测)
-- [作为依赖使用](#作为依赖使用)
+- [作为库使用](#作为库使用)
 - [格式上限：只保留格式能表示的那些](#格式上限只保留格式能表示的那些)
 - [顶点超限自动拆分](#顶点超限自动拆分)
 - [多 LOD](#多-lod)
@@ -69,14 +70,17 @@ cargo build --release
 
 `mdlc template` 的输出是**权威的字段参考**，不会和实际支持的字段脱节。
 
+> 📌 **给 Left 4 Dead 2 以外的游戏编译？** 先看下一节 —— 默认值就是 L4D2 的配置，
+> 不指定目标会编出引擎拒绝的版本。
+
 > ⚠️ **三个容易踩的坑（模板里已写明，这里再强调一次）：**
 >
 > 1. **`mass` 不在 `[model]` 里，它在 `[physics]` 里。** 官方 studiomdl **没有**顶层
 >    `$mass` —— 它只出现在 `$collisionmodel {}` / `$collisionjoints {}` 块里，
 >    并且同一个值同时写进 `.phy` 的 `editparams.totalmass` 与 `.mdl` 头部的 `mass`。
->    **在 `[model]` 下写 `mass = 1.0` 会直接解析失败**（实测）。
-> 2. **`contents` 的缺省是 `1`（`CONTENTS_SOLID`），不是 `0`。** 实测编译一个
->    不写 `contents` 的模型，产物头部 `+0x14C` 是 **1**。
+>    **在 `[model]` 下写 `mass = 1.0` 会直接解析失败**。
+> 2. **`contents` 的缺省是 `1`（`CONTENTS_SOLID`），不是 `0`。** 官方常量
+>    `s_nDefaultContents` 就是 `CONTENTS_SOLID`。
 > 3. **`[[bones]]` 的 `flags` 缺省不是无条件的 `0x500`**，而是按用途逐根计算后
 >    沿父链传播的值（详见 [`[[bones]]`](#bones) 一节）。
 >
@@ -92,6 +96,43 @@ cargo build --release
 
 ---
 
+## 先选目标引擎
+
+**这一节最容易被忽略，也最容易白干一场。** mdlc 的默认值是「L4D2 的配置」：
+studio 版本 **49**、骨骼表上限 **127**。给别的游戏做模型时必须显式指定目标 ——
+最典型的症状是产物被游戏直接拒绝（Garry's Mod 会报
+`is wrong version (49 should be 48)`）。
+
+| 你在给谁做模型 | 写什么 | 得到的配置 |
+|---|---|---|
+| **Left 4 Dead 2** | 不用写 —— 这就是默认值 | v49 · 最多 127 根骨骼 |
+| **Garry's Mod** | `$target gmod` | v48 · 最多 255 根骨骼 |
+| **TF2 / CS:S / HL2:DM / SDK 2013** | `$target sdk2013`（也可写 `tf2` / `css`） | v48 · 最多 127 根骨骼 |
+| **CS:GO** | `$target csgo` | v49 · 最多 255 根骨骼（未实测） |
+| 其它 Source 游戏 | `--studio-version 48` 起步；骨骼超过 127 再加 `--max-bones 256` | 按需 |
+
+三个入口完全等价，优先级是 **命令行 > TOML / QC > `target` 预设 > 默认值**：
+
+```qc
+$target gmod              ; QC 里写一行就够
+```
+
+```toml
+[model]
+target = "gmod"
+```
+
+```text
+mdlc build model.toml --target gmod
+```
+
+**为什么不按版本号自动判断**：同一个 studio 版本下骨骼上限也可能不同
+（v49 里 L4D2 是 127、CS:GO 是 255），而版本号只描述磁盘布局。
+所以「studio 版本」和「骨骼上限」是两个独立参数，`target` 只是把两者打包好的预设表。
+细节（含各引擎的实测上限、格式硬上限 256）见[骨骼上限](#骨骼上限max_bones)。
+
+---
+
 ## 产物
 
 | 扩展名 | 内容 | 何时产出 |
@@ -102,14 +143,12 @@ cargo build --release
 | `.phy` | IVP 碰撞体（凸包 / `$concave` / `$collisionjoints`） | 有 `[physics]` 或 `$collisionmodel` |
 | `.ani` | 外置动画块 | 写了 `[model].anim_block_size` 或 `$animblocksize`，**且该动画 ≥ 2 帧** |
 
-> ⚠️ **`.ani` 只对齐一个 `studiomdl` 构建。** mdlc 复刻的是 `Left 4 Dead 2\bin\studiomdl.exe`
-> （2024-06-04 构建）。别处流传的 `.ani` 有些来自**更早的构建、载荷格式不同**
-> （头部 `+0` 恒为 28，那些是 56/84/88/92），拿它们当基准只会得到「全错」的假象。
-> 容器层（416 字节头 / `IDAG` / version 49）各构建一致。
+> ⚠️ **`.ani` 只对齐 `Left 4 Dead 2\bin\studiomdl.exe` 这一个构建。** 更早的
+> `studiomdl` 产出的 `.ani` 载荷格式不同，拿它们当基准只会得到「全错」的假象。
 
 > ⚠️ **单帧动画不进 `.ani`** —— 判据是 `anim_block_size > 0 && numframes >= 2`，
 > 单帧动画留在 `.mdl` 内联。`.ani` 的文件名**强制**是 `models/<模型名>.ani`，
-> 因为 `.mdl` 头部 `+0x15C` 存的就是这个路径，写错名字引擎就找不到。
+> 因为 `.mdl` 头部存的就是这个路径，写错名字引擎就找不到。
 
 产物根目录 = `--out`（默认当前目录），再叠加模型名里的相对路径。所以
 `name = "models/mymod/myprop.mdl"` 会写到 `<out>\models\mymod\myprop.mdl`。
@@ -131,11 +170,10 @@ QC 脚本  ──┘
 ```
 
 两套输入**共用同一个中间表示**，所以写出器完全不关心
-输入来自哪一边。QC 支持是后加的，**没有改动任何写出代码**。
+输入来自哪一边。
 
-网格**不写在描述里** —— 真实模型有几万到几十万个顶点（官方 `v_autoshotgun` 有
-388,765 个），内联会让描述文件膨胀到几百 MB 且无法用文本工具处理。描述文件只
-**引用**网格源。
+网格**不写在描述里** —— 真实模型动辄几十万个顶点，内联会让描述文件膨胀到几百 MB
+且无法用文本工具处理。描述文件只**引用**网格源。
 
 网格源可以是 **SMD**、**FBX**（`.fbx`，走 `ufbx`，见
 [`docs/fbx-support.md`](docs/fbx-support.md)）或 **glTF / GLB**（`.gltf` / `.glb`，走
@@ -148,10 +186,8 @@ QC 脚本  ──┘
 > 而官方那些**静默失败**会被 mdlc 变成显式提示，每个隐式决定都有一个
 > 显式覆盖语法（九条 `src*`，见 [`### FBX / glTF 源选项`](#fbx--gltf-源选项src9-条)）。
 >
-> ⚠️ **glTF 没有官方基准**（官方 `studiomdl.exe` 完全不认这个格式），
-> 它的口径是靠**传递式对照**定的 —— 同一个 Blender 场景双导出 `.fbx` + `.glb`，
-> 官方编 `.fbx` 给基准，再证明「glTF 的数能推出 FBX 的数」。
-> 每一条口径的来源都标在 `docs/gltf-support.md` §5。
+> ⚠️ **glTF 没有官方基准**（官方 `studiomdl.exe` 完全不认这个格式），口径与取舍
+> 见 [`docs/gltf-support.md`](docs/gltf-support.md)。
 >
 > ```qc
 > $modelname "models/mymod/linnea.mdl"
@@ -344,7 +380,7 @@ end = 1.0
 
 > ⚠️ **已知缺口：`weight_list` / `num_frames` / `subtract` 在 blend 序列上被静默丢弃。**
 > 这三个选项目前**只实现在单动画序列上**：加在 blend 序列上不会报错，但**完全不生效**
-> （实测产物与不加**逐字节相同**）。所以这是**静默的数据丢失**，不是解析错误 ——
+> （产物与不加一模一样）。所以这是**静默的数据丢失**，不是解析错误 ——
 > 要这三个选项生效，请把它们写在单动画序列上。
 
 ### `[[weight_lists]]`
@@ -487,7 +523,7 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 | `$fakevta` | 跳过整个块（无产物痕迹） |
 | `$scale` | **接受但无效果**（缩放只被记录、从不参与计算）。请改用 `srcscale` |
 | `$cbox` / `$maxconvexpieces` / `$phyname`、`$ikchain` 的 `height`/`pad`/`floor`/`center`、`$attachment … x_and_z_axes`、ikrule 的 `usesequence` | 参数被消费但**不落盘**（或由其它字段等价表达） |
-| 一批罕见的命令（`$minlod` `$maxverts` `$renamebone` `$hierarchy` `$collapsebones` `$screenalign` `$upaxis` `$origin` `$maxbones` `$controller` …） | **忽略本行**（不报错、不留痕迹） |
+| 一批罕见的命令（`$minlod` `$maxverts` `$renamebone` `$hierarchy` `$collapsebones` `$screenalign` `$upaxis` `$origin` `$controller` …） | **忽略本行**（不报错、不留痕迹） |
 | 其它未知命令 | 报错（对应官方的 `bad command`） |
 
 > ⚠️ **`$sequence` 块里出现未知关键字时，它会被当成「动画名」。** 例如
@@ -532,16 +568,12 @@ $target gmod              ; 引擎预设（= version 48 + 最多 255 根骨骼�
 $maxbones 200             ; 显式覆盖预设的骨骼上限
 ```
 
-> ⚠️ **为什么是 mdlc 扩展而不是官方命令名。** 官方 `studiomdl.exe` 的 QC
-> 分发表里**没有**这两个功能的任何关键字（`optimize` / `vcache` / `nvtristrip` /
-> `split` / `oversized` 全部 0 命中）——官方把顶点缓存优化做成**命令行**开关
-> `-nvtristrip`，超限网格则**直接拒绝**（`ERROR: too many indices in source`）。
-> 第三方 NekoMDL 也没有这两个 QC 命令（它的 `$maxverts` 做的是另一件事：
-> 把超限模型拆成**新 bodypart**，mdlc 故意不学，理由见
-> [顶点超限自动拆分](#顶点超限自动拆分)）。
+> ⚠️ **这几条都是 mdlc 扩展，真 `studiomdl.exe` 对它们会报 `bad command`。**
+> 官方把顶点缓存优化做成**命令行**开关（`-nvtristrip`），超限网格则**直接拒绝**；
+> 第三方 NekoMDL 的 `$maxverts` 做的是另一件事（把超限模型拆成**新 bodypart**，
+> mdlc 故意不学，理由见[顶点超限自动拆分](#顶点超限自动拆分)）。
 >
-> 所以真 `studiomdl.exe` 对这几条会报 `bad command`。**写了它们的 QC 不能
-> 直接拿去跑官方工具**；要跨工具通用请改用 TOML 侧的对应字段。
+> **写了它们的 QC 不能直接拿去跑官方工具**；要跨工具通用请改用 TOML 侧的对应字段。
 >
 > 同理 `$version` 也是扩展（实测 Garry's Mod 的 `studiomdl.exe` 报
 > `bad command $version`）。**要跨工具通用就改用命令行 `--studio-version 48`** ——
@@ -620,7 +652,7 @@ glTF 的 morph target 都会被**自动注册**成 flexdesc + flexcontroller + f
 > 完整清单见 [`docs/fbx-support.md`](docs/fbx-support.md) §4.6 的偏离表。
 
 > ⭐ **同一个 `.fbx` 既作网格源又作动画源：mdlc 正常编译 + 一条提示。**
-> 官方在这个组合下**静默只出 1 帧**（实测 exit=0、无警告）——但 FBX 本来就是
+> 官方在这个组合下**静默只出 1 帧** —— 但 FBX 本来就是
 > 网格与动画合一的容器，所以 mdlc **不复制这个退化行为**，照常采出全部帧，
 > 只提示「与官方对照时帧数不同是预期的；想让两边一致就把动画拆到独立 FBX」。
 > 提示只在 mdlc 真采出 > 1 帧时才发（静态 FBX 两边都是 1 帧，不提示）。
@@ -714,14 +746,9 @@ Crowbar 两个都不会传，所以不影响直接替换。
 | `mstudiojigglebone_t` | **140 B**（多 5 个 `boing*` float） | **120 B** |
 | `studiohdr_t` / `mstudiobone_t` 的 surfaceprop | 无此字段（写 0） | 有 |
 
-`mstudiobone_t`（216 B）、`mstudioanimdesc_t`（100 B）、`studiohdr_t`（408 B）两边**同尺寸**，
+`mstudiobone_t` / `mstudioanimdesc_t` / `studiohdr_t` 两边**同尺寸**，
 `.vvd` / `.vtx` **完全不受影响** —— 所以 v48 不是「另一套格式」，只是头部数字加 jigglebone
 记录长度。
-
-实测（同一份带一条 `$jigglebone` 的 QC）：官方 GMod `studiomdl.exe` 产物的
-`bonecontrollerindex` 是 `1668`，mdlc `--studio-version 48` 也是 `1668`（**同位置**）；
-mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真实 Performance Stats 而
-不再报 `is wrong version (49 should be 48)`。
 
 > **`is_boing` 子块（v48 独有）已支持。** GMod 的 `$jigglebone` 除 `is_flexible` /
 > `is_rigid` / `has_base_spring` 外还认 `is_boing { impact_speed 100 }`，五个键各一个数：
@@ -729,7 +756,7 @@ mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真�
 > `amplitude`。不写键时用官方缺省 `100 / 0.7071 / 0.25 / 30 / 0.35`。块内不认识的 token
 > 官方**静默跳过**（mdlc 照做），但**键写在其他块里仍会报错**。
 > 目标 v49 时写 `is_boing` 会**报错而不是静默丢弃** —— v49 的 `mstudiojigglebone_t`
-> 根本没有那 5 个槽。实测 v48 的 140 字节记录与官方 GMod `studiomdl.exe` **逐字节相同**。
+> 根本没有那 5 个槽。
 
 > ⚠️ **不支持 v44**（Dark Messiah / Episode One 时代）。它缺 `studiohdr2_t`、
 > `mstudiolinearbone_t` 等一整套结构，`mstudioanimdesc_t` / `mstudioseqdesc_t` 的字段体也不
@@ -741,18 +768,15 @@ mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真�
 `studiomdl.exe` 编，上限不一样；而且**同一个 studio 版本号下也可能不同**（v49 里 L4D2 是
 127、CS:GO 是 255），所以这个数**不能由 `version` 推导**。
 
-实测（每一格都真跑编译器，判据是产物头部的 `numbones`）：
+各引擎官方编译器的实测上限：
 
-| 骨骼数 | 官方 L4D2（v49） | 官方 Garry's Mod（v48） |
-|---|---|---|
-| 127 | ✅ | ✅ |
-| 128 | ⛔ `Too many bones used in model, used 128, max 128` | ✅ |
-| 200 | ⛔ 同上 | ✅ |
-| 255 | ⛔ 同上 | ✅ |
-| 256 | ⛔ | ⛔ `used 256, max 256` |
+| 目标 | 官方编译器的硬上限 |
+|---|---|
+| Left 4 Dead 2（v49） | **127** 根 |
+| Garry's Mod（v48） | **255** 根 |
 
-> ⚠️ **那句 `max 128` 是官方文案的笔误。** 它的判据是 `numbones > 0x7f`，
-> **写 128 根会被拒**。所以 mdlc 的缺省取 **127**，不是 128。
+> ⚠️ L4D2 的报错文案写的是 `Too many bones used in model, used 128, max 128`，
+> 但那个 `128` 是官方自己的笔误 —— **写 128 根会被拒**。所以 mdlc 的缺省取 **127**。
 
 三个入口（优先级：命令行 > TOML / QC > `target` 预设 > 缺省）。显式值与预设不一致时
 会打一条告警（**显式值仍然赢**），免得「到底用了哪个」看错。
@@ -775,13 +799,13 @@ mdlc build model.toml --target gmod --max-bones 200
 | 预设 | studio 版本 | 骨骼上限 | 备注 |
 |---|---|---|---|
 | `generic` | 不设定 | 不设定 | **缺省**，两个参数各用自身缺省 |
-| `l4d2` | 49 | 127 | 反编译 + 实测 |
-| `gmod` | 48 | 255 | 反编译 + 实测 |
-| `sdk2013` / `tf2` / `css` | 48 | 127 | 推定（同源、未逐版本实测） |
-| `csgo` | 49 | 255 | 未实测（本机没有该编译器），按 `mstudioanim_t.bone` 是 1 字节推定 |
+| `l4d2` | 49 | 127 | |
+| `gmod` | 48 | 255 | |
+| `sdk2013` / `tf2` / `css` | 48 | 127 | |
+| `csgo` | 49 | 255 | 未实测 |
 
 - **单位是「优化之后」的骨骼表条数** —— 未被引用的骨骼会被丢掉（`$attachment` 引用的
-  也算被引用），所以 300 根节点最后可能只剩 10 根。
+  也算被引用），所以 SMD 里的节点数不等于最终骨骼数。
 - **格式硬上限是 256**：VVD 的 `mstudioboneweight_t.bone[]`、VTX 的 `Vertex_t.boneID[]`、
   动画的 `mstudioanim_t.bone` 都是 1 字节。超过 256 直接报错，**不静默截断**。
 - `$staticprop` 会把骨骼表塌缩成 1 根，所以判据在塌缩**之后** —— 骨骼很多的静态道具不会被误拒。
@@ -810,31 +834,15 @@ mdlc build model.toml --target gmod --max-bones 200
 （`mdlc --help` 是**长帮助**：`-h` / `-V` 会展开成两行并带上完整说明；
 子命令的帮助里 `参数:` / `选项:` 段落标题同样是中文。）
 
-**自有文案的译文在 [`locales/app.yml`](locales/app.yml)**，`_version: 2` 单文件
-多语言格式。源语言是**英文**（键就是英文原文本身），所以英文用户与任何
-未覆盖的语言都拿到源文，加一门语言只需加一列：
-
-```yaml
-_version: 2
-"Output .phy path":
-  zh-CN: "输出 .phy 路径"
-  de-DE: "Pfad der .phy-Ausgabe"    # 新加的语言
-```
-
-这张表覆盖的不只是帮助：**运行时的诊断与错误文案也走它** ——
+**自有文案的译文在 [`locales/app.yml`](locales/app.yml)**（`_version: 2` 单文件多语言，
+源语言是英文）。这张表覆盖的不只是帮助：**运行时的诊断与错误文案也走它** ——
 `log::error!` / `log::warn!` / `log::info!` 发出的 `Error: ` / `Warning: ` /
-`Note: ` 三类前缀，以及 `check` / `vvd-info` / `vvd-roundtrip` / `phy` 的
-报表。带参数的行用 `%{名}` 占位（`rust-i18n` 的 `replace_patterns` 语法，
-名字不翻译）。**例外**：`mdlc template` 打出的 TOML 模板正文
-（`src/model.rs` 的 `TEMPLATE_TOML`）的**注释是中英双语**（正文是模板内容而非诊断，
-不进译文表）。
+`Note: ` 三类前缀，以及 `check` / `vvd-info` / `vvd-roundtrip` / `phy` 的报表。
+带参数的行用 `%{名}` 占位（名字不翻译）。**例外**：`mdlc template` 打出的 TOML
+模板注释是**中英双语**（模板正文不是诊断，不进译文表）。
 
-> ⚠️ **语言探测走 `sys-locale`，Windows 上读的是「用户首选显示语言」
-> （`GetUserPreferredUILanguages`），不读 `LC_ALL` / `LANG`。**
-> 所以想换语言目前只能改系统显示语言。若只是想在测试里切到英文，
-> 用 `rust_i18n::set_locale("en")` —— 但那**只影响自有文案**，
-> `用法:` / `参数:` / `选项:` 这些**框架词**由 `clap-i18n-richformatter`
-> 自己的 `FluentLanguageLoader` 探测，是另一套独立状态。
+> ⚠️ **语言跟随系统显示语言**（Windows 上读的是「用户首选显示语言」，
+> 不读 `LC_ALL` / `LANG`），所以想换语言目前只能改系统设置。
 
 > 颜色**只在直连终端时**才出现，被重定向或管道抓取时自动降级成纯文本 ——
 > 所以不会往 Crowbar 之类的宿主日志里塞 ANSI 转义码。
@@ -845,7 +853,7 @@ _version: 2
 
 `--optimize-vtx` 用 `meshopt` 对每个 strip group 重排索引以提升 GPU 后变换顶点
 缓存命中率。它**只改索引顺序**，顶点池与三角形集合都不变，所以渲染结果相同。
-默认**关闭**，以保持与既有产物逐字节相同。
+默认**关闭**。
 
 它与 `[model].optimize_vtx` 是 `||` 关系（任一为真即生效），所以**只能开、不能关**；
 QC 侧等价命令是 `$optimizevtx`（见 [mdlc 扩展的 QC 命令](#mdlc-扩展的-qc-命令)）。
@@ -871,75 +879,11 @@ Crowbar 只认 stdout），mdlc 自有形态落 stderr。
 
 ---
 
-## 作为依赖使用
+## 作为库使用
 
-`mdlc` 同时是一个库。要给第三方 GUI / 构建系统内置编译器时，**不要自己串一遍
-管线** —— 用 `mdlc::pipeline`：
-
-```rust
-use std::path::Path;
-use mdlc::model::ModelDesc;
-use mdlc::pipeline::{self, PipelineOptions};
-
-let text = std::fs::read_to_string("model.toml")?;
-let desc = ModelDesc::from_toml(&text)?;
-
-// 只编译，不碰文件系统：拿到四件套字节 + 编译期中间结果。
-let out = pipeline::build(&desc, Path::new("."), PipelineOptions::default())?;
-
-// 或者直接落盘（按 `$modelname` 建目录）。
-let paths = pipeline::write_files(&out, Path::new("out"))?;
-println!("{}", paths.mdl.display());
-```
-
-`pipeline::build` 只读文件、不写文件；`write_files` 只写文件。**分两步是为了让
-GUI 能在写盘前显示摘要或让用户确认。**
-
-### 为什么必须用它
-
-`compile()` 只做「描述 → 编译期中间结果」，它**完全不管碰撞 SMD**，也不写任何文件。
-自己串管线最容易漏掉的是「碰撞 SMD → `physicsbone`」这一步：
-
-```rust
-// 这一步漏了，`.mdl`/`.vvd`/`.dx90.vtx` 全对，只有 physicsbone 悄悄全 0。
-if let Some(cs) = &collision_smd {
-    let parents = mdlc::compile::bone_parents(&compiled.desc);
-    compiled.physics_bone = mdlc::phy::physics_bone_table(cs, compiled.desc.bones.len(), &parents);
-}
-```
-
-### 错误与退出码
-
-`PipelineError` 是**枚举**，每个失败点一个变体，`kind()` 映射到与 `mdlc.exe` 相同的退出码：
-
-| 变体 | `kind()` | 退出码 | 触发 |
-|---|---|---|---|
-| `Compile(Vec<CompileError>)` | `Build` | 1 | 描述/QC 校验失败、读不到源 SMD |
-| `ParseCollisionSmd { path, source }` | `Build` | 1 | 碰撞 SMD 解析失败 |
-| `WriteMdl(WriteError)` | `Build` | 1 | `.mdl` 写出失败 |
-| `BuildVvd` / `EncodeVvd` / `CheckVvd` | `Build` | 1 | VVD 构造 / 编码 / 自检失败 |
-| `WriteVtx` / `CheckVtx` | `Build` | 1 | VTX 写出 / 自检失败 |
-| `BuildPhy` / `CheckPhy` | `Build` | 1 | PHY 构造 / 自检失败 |
-| `ResolveCollisionSmd(SrcError)` | `Io` | 2 | 碰撞 SMD 路径解析失败 |
-| `ReadCollisionSmd { path, source }` | `Io` | 2 | 碰撞 SMD 读不到 |
-| `CreateDir { path, source }` | `Io` | 2 | 建目录失败 |
-| `WriteFile { path, source }` | `Io` | 2 | 写文件失败 |
-
-`kind()` 是**穷举**的，没有 `_ => Build` 兜底 —— 新增变体时编译器会强制你归类。
-
-底层错误**原样保留**（`#[source]`），不再被 `format!` 压成字符串：例如
-`ReadCollisionSmd` 的 `source` 是 `std::io::Error`，可以直接
-`.downcast_ref::<std::io::Error>().kind() == ErrorKind::NotFound` 判断「文件不存在」
-而不是去匹配中文文案。
-
-`lines()` 给出与 CLI 逐行相同的文案（编译失败是多行，其余是单行）；`Display`
-就是它们拼起来的。GUI 直接用 `lines()` 渲染日志即可，不必自己拼字符串。
-
-### 摘要
-
-`PipelineOutput::summary_lines(&paths)` 复刻 `mdlc.exe` 成功时打印的那张表
-（模型 / 版本 / checksum / 统计 / 每个产物的字节数与路径 / `**编译成功**`）。
-CLI 自己就是逐行 `println!` 它 —— 所以 GUI 显示的与命令行看到的**逐字相同**。
+`mdlc` 同时是一个库，可以给第三方 GUI / 构建系统内置。集成细节 —— `mdlc::pipeline`
+的用法、为什么不要自己串管线、`PipelineError` 与退出码的对应关系 —— 见
+[`docs/library-api.md`](docs/library-api.md)。
 
 ---
 
@@ -948,24 +892,17 @@ CLI 自己就是逐行 `println!` 它 —— 所以 GUI 显示的与命令行看
 `studiomdl` 里有一批**人为**上限（例如单 model 65536 顶点、材质 32 个），它们不是
 文件格式的约束。本实现**不复刻**这些限制，只保留**位宽 / 偏移算术**推出的硬上限：
 
-| 维度 | 上限 | 依据 |
-|---|---|---|
-| 被**引用**的骨骼**下标** | **127** | VVD `mstudioboneweight_t.bone[]` 与 VTX `Vertex_t.boneID[]` 都是**有符号** `char` |
-| 骨骼**总数** | 无上限 | `mstudiobone_t` 数组长度是 `int32`（`MAXSTUDIOBONES = 128` 只是引擎上限，不作拒绝条件） |
-| 动画链能**寻址**的骨骼数 | **256** | `mstudioanim_t.bone` 是 `byte`（判据是 `≤255`） |
-| 每 **strip** 的骨骼调色板 | **127** | VTX `Vertex_t.boneID[]` 是 `char`（官方 `maxBonesPerStrip = 53`） |
-| 每 **mesh** 顶点 | **65536** | VTX `Vertex_t.origMeshVertID` 是 `uint16` |
-| 每 **model** 顶点 | **44,739,242** | `vertexindex` 是 int32 字节偏移 ÷ 48 |
-| **材质**表条数 | **32768** | `pSkinref[]` 是**有符号** `short` |
-| **三角形**数 | 无上限 | VTX `numIndices` 是 int32 |
-| **LOD** 档数 | **8** | 引擎 `MAX_NUM_LODS` |
+| 维度 | 上限 |
+|---|---|
+| 骨骼表长度 | 由 [`max_bones`](#骨骼上限max_bones) 决定，格式硬上限 **256** |
+| 每 **mesh** 顶点 | **65536** |
+| 每 **model** 顶点 | **44,739,242** |
+| **材质**表条数 | **32768** |
+| **三角形**数 | 无上限 |
+| **LOD** 档数 | **8** |
 
 写出后还会各自跑一次**自检**（VVD / VTX 的自洽性检查、PHY 的 13 条硬约束），
 失败会以「本实现的 bug」中止而不是留下坏文件。
-
-> ⚠️ **约束的是「被引用的骨骼下标」，不是「骨骼总数」。**
-> **没被引用的骨骼不占 VVD 下标空间** —— 它们只出现在骨骼表里。
-> 所以一个 134 根骨骼、只引用到下标 118 的模型是**合法**的。
 
 > ⚠️ **「每 mesh 顶点 ≤ 65536」的粒度是 mesh（= 一个材质）**，不是 bodypart：
 > 加一个材质就多一个 mesh，各自独立计数。判据是 `n > 65536`（**不是 `>=`**）——
@@ -992,10 +929,6 @@ CLI 自己就是逐行 `println!` 它 —— 所以 GUI 显示的与命令行看
 **为什么不拆成新 bodypart**（NekoMDL 的 `$maxverts` 是那样做的）：bodypart 数量
 一变，引擎的 `$bodygroup` 选择（**按下标**）就会错位。
 
-> **一个真实例子**：某改模工程的单个材质有 305,703 顶点 —— 不拆分时编译**失败**；
-> 拆分后 mesh 从 20 个变成 24 个、**最大单 mesh 恰好 65,536**、三角形总数守恒
-> 232,099，bodypart 数**仍是 2**（未变）。
-
 对不超限的模型这条路径**完全不碰**（提前返回），所以对既有产物零影响。
 
 ---
@@ -1015,9 +948,8 @@ smd = "lod2.smd"
 switch_point = 40.0
 ```
 
-每个 LOD 是一个**完整独立的 SMD**（不是「删掉一些三角形」）。本实现把它们跨 LOD
-精确去重合并成一个顶点池，按 LOD 归属排序，并生成 fixup 表 —— 与 studiomdl 的
-`UnifyLODs` 一致。
+每个 LOD 是一个**完整独立的 SMD**（不是「删掉一些三角形」）。mdlc 把它们跨 LOD
+去重合并成一个顶点池，并生成 fixup 表。
 
 三条约束：
 
@@ -1044,7 +976,7 @@ switch_point = 40.0
 | **DMX 输入** | 刻意不实现。`$nekomodel` 会**显式报错**；`studio "x.dmx"` 不会被专门识别，而是在读文件/解析 SMD 时失败（官方也是委托 `dmxconvert.exe`） |
 | `$maxverts` | NekoMDL 的非官方扩展，被忽略。用自动拆分替代 |
 | `ikrule footstep`（type 3） | 需要 `$ikchain` 的 `center`，mdlc 尚未建模该量。写出时会**显式报错**而不是静默产出错误载荷 |
-| 若干罕见的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` / `$maxbones` … 被忽略 |
+| 若干罕见的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … 被忽略 |
 | 官方 CLI 的 `-minlod` / `-striplods` / `-definebones` / `-printbones` / `-t` / `-a` | 参数被接受但**警告并忽略** |
 | `$bodygroup { … blank }` | `blank` 成员（一个空 model）**报错** —— `BodyModel.smd` 是必填字段，mdlc 没有表达「无网格 model」的方式 |
 | **blend 序列上的 `weightlist` / `numframes` / `subtract`** | **被静默丢弃**（见上）。单动画序列上它们正常生效 |
@@ -1055,7 +987,7 @@ switch_point = 40.0
 
 ## 延伸文档
 
-仓库内的 `docs/` 收录了八份规格报告，结论全部来自对真实产物的逐字节分析：
+仓库内的 `docs/` 收录了更细的规格与说明：
 
 | 文档 | 内容 |
 |---|---|
@@ -1067,6 +999,7 @@ switch_point = 40.0
 | [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的口径与 UX 方案（九条 `src*` 语法的设计理由 + 偏离表） |
 | [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持的口径来源与取舍（新增语法 0 条） |
 | [`docs/update-check.md`](docs/update-check.md) | 更新检测的设计与取舍（为什么默认开启、什么时候联网、怎么关掉） |
+| [`docs/library-api.md`](docs/library-api.md) | 作为库集成时的 API 用法、错误与退出码 |
 
 > ⚠️ **`docs/feature-gap.md` 与 `docs/qc-coverage-gap.md` 是调研报告**，
 > 带有快照日期，**描述的是撰写当时的状态**；「当前实现了什么」以本文件为准。
