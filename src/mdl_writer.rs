@@ -66,54 +66,26 @@ pub const STUDIOHDR2_SIZE: usize = 256;
 // **位宽 / 偏移算术**推出的硬上限；studiomdl 的人为上限一律不复刻。
 // 于是：**能表示的都写出来**，超出的报错必须能指出**是哪个字段装不下**。
 
-/// VVD 顶点里**骨骼下标**字段的格式上限。
+/// 官方 L4D2 `studiomdl` 的 `MAXSTUDIOBONES`（**128**，
+/// `hl2sdk-doi/public/studio.h:75`；darkm 是 `:63`）。
 ///
-/// # 为什么约束的是「被引用的下标」而不是「骨骼总数」
+/// # 它**不是**本项目的拒绝条件
 ///
-/// VVD 的 `mstudioboneweight_t.bone[]` 是**有符号** `char`
-/// （`hl2sdk-doi/public/studio.h:1236`，`STUDIO_VERSION 49` —— **与语料版本
-/// 一致**；⚠️ **不是** `hl2sdk-darkm`，那是 v44、不含 `studiohdr2`），
-/// 能表达 `0..=127` ⟹ **被顶点引用的下标必须 ≤ 127**。
+/// 官方判据是 `numbones > 0x7f`（反汇编 `FUN_00434620`）—— **128 根会被真
+/// 编译器拒、127 根通过**，常量名里的 128 是官方自己的笔误。而且这个上限
+/// **随引擎变**：GMod 的同名判据是 `numbones > 0xff`（255）。
 ///
-/// VTX 侧的 `boneID[]` 同样是 `char`（`hl2sdk-doi/public/optimize.h:48`）。
+/// 所以「最多几根骨骼」是**可配置参数**而不是常量 —— 见 [`crate::target`]
+/// （`target` 预设 + `max_bones`）。判据在 `compile.rs` 里按**最终骨骼表
+/// 长度**（`$staticprop` 塌缩之后）做，不在 VVD 写出时做。
 ///
-/// ⚠️ 但**骨骼总数可以超过 128** —— 只要被引用的下标都在范围内。
-/// 这不是推演，是实测（`docs/_probe/diag_bone_use.js`）：
+/// ⚠️ 早先这里有个 `MAX_BONE_INDEX_IN_VERTEX = 127`，理由是「VVD 的
+/// `mstudioboneweight_t.bone[]` 是 `char`，所以下标 ≤ 127」。**那条论据是
+/// 错的**：下标与表长只差 1（都是 1 字节 ⟹ 0..=255），真正的区别是**引擎**
+/// 允许多少，不是格式允许多少。同一个常量还曾让 `linnea-export`（134 根）
+/// 编不过、parity 掉 1 个用例 —— 因为它的判据连「官方卡多少」都记错了。
 ///
-/// | 产物 | 骨骼总数 | 实际用到的最大下标 |
-/// |---|---|---|
-/// | mdlc 的 `linnea-export` | **134** | **118** |
-/// | 官方 NekoMDL 的 `survivor_teenangst` | 122 | **119** |
-///
-/// 两者都**没有**越界。骨骼表里那些没被顶点引用的骨骼
-/// （`ValveBiped.forward`、jigglebone、attachment 等）只出现在
-/// `mstudiobone_t` 数组里，不占 VVD 的下标空间。
-///
-/// # ⚠️ 一个被实测推翻的中间版本（留作教训）
-///
-/// 最初实现的是「骨骼**总数** ≤ 128」（照抄官方 `g_numbones >= MAXSTUDIOBONES`）。
-/// 那让 `linnea-export`（134 根）**编译失败** —— 而它在改动前能编，
-/// 于是 101 个 parity 用例掉了 1 个（53 个产物消失）。
-/// **若没跑全量 parity，这个回归会直接进提交。**
-///
-/// 所以本常量约束**下标**，检查点在 VVD 写出时逐顶点做。
-pub const MAX_BONE_INDEX_IN_VERTEX: usize = 127;
-
-/// `MAXSTUDIOBONES`：骨骼**表**条数在**官方 studiomdl** 里的上限
-/// （`hl2sdk-doi/public/studio.h:75`；darkm 是 `:63`）。
-///
-/// # 这是**引擎**的上限，不是格式上限 —— 所以**不作为拒绝条件**
-///
-/// 官方 `g_numbones >= MAXSTUDIOBONES` 在 **128 根**就报
-/// `Too many bones used in model, used 128, max 128` —— 因为引擎的
-/// `g_bonetable[128]` 会越界。而**文件格式**能装下更多：
-/// `mstudiobone_t` 数组的长度字段是 `int32`。
-///
-/// 本项目只保证「产出格式合法的二进制」，所以**不复刻**这条：
-/// 骨骼总数可以超过 128（实测 `linnea-export` 就是 134 根），
-/// 只要被引用的下标 ≤ [`MAX_BONE_INDEX_IN_VERTEX`]。
-///
-/// 保留该常量供文档/对照使用。
+/// 保留该常量供文档 / 对照官方源码使用。
 pub const MAXSTUDIOBONES: usize = 128;
 
 /// **每 mesh** 顶点数的格式上限：VTX 的 `origMeshVertID` 是 `uint16`。
@@ -7036,12 +7008,13 @@ motionflags = 7
         );
     }
 
-    /// **被引用的骨骼下标**必须 ≤ 127 —— 这才是真正的格式约束。
+    /// **顶点引用的骨骼下标必须落在骨骼表内**。
     ///
-    /// 用 `vvd::Vvd::to_bytes` 直接构造一个越界的顶点来验证：
-    /// 下标 200 会被 `char` 读成 −56。
+    /// 引擎允许多少根骨骼是**可配置**的（见 `crate::target`），所以 VVD 这
+    /// 一层不再按固定常量判；它只保证「下标不越出这张表」—— 重映射写错一位
+    /// 时字节层面完全合法，只有这条不变量能抓住。
     #[test]
-    fn bone_index_in_vertex_is_signed_char_boundary() {
+    fn bone_index_must_stay_inside_the_table() {
         use crate::vvd::{Vvd, VvdHeader, VvdTangent, VvdVertex};
 
         let mk = |bone0: u8| Vvd {
@@ -7074,23 +7047,29 @@ motionflags = 7
             fixups: Vec::new(),
         };
 
-        // 127：合法（`char` 能表达的最大非负值）
+        // 下标 0 + 1 根骨骼：合法
         assert!(
-            mk(MAX_BONE_INDEX_IN_VERTEX as u8).to_bytes().is_ok(),
-            "下标 {MAX_BONE_INDEX_IN_VERTEX} 应当合法"
+            mk(0).check_bone_indices(1).is_ok(),
+            "下标 0 配 1 根骨骼应当合法"
         );
 
-        // 128：非法 —— 会被 `char` 读成 −128
-        // ⚠️ 文案在 `to_bytes()` 那一刻就渲染好了（`crate::tr_fmt!`），
-        // 所以语言必须在**调用**那一刻生效 —— 事后包 `with_english` 是空操作。
-        let msg = crate::test_locale::with_english(|| format!("{}", mk(128).to_bytes().unwrap_err()));
+        // 下标 1 + 1 根骨骼：越界
+        // ⚠️ 文案在**调用**那一刻就渲染好了（`crate::tr_fmt!`），
+        // 所以语言必须在调用那一刻生效 —— 事后包 `with_english` 是空操作。
+        let msg = crate::test_locale::with_english(|| {
+            format!("{}", mk(1).check_bone_indices(1).unwrap_err())
+        });
         assert!(
-            msg.contains("128") && msg.contains("signed char"),
-            "应当拒绝下标 128 并说明原因，实际：{msg}"
+            msg.contains("bone index 1") && msg.contains("only has 1"),
+            "应当拒绝越界下标并说明原因，实际：{msg}"
         );
 
-        // 200：同样非法（会被读成 −56）
-        assert!(mk(200).to_bytes().is_err(), "下标 200 应当被拒绝");
+        // 下标 200 + 201 根骨骼：合法 —— 上限由**引擎**决定（见 `crate::target`），
+        // 格式本身允许 0..=255。
+        assert!(
+            mk(200).check_bone_indices(201).is_ok(),
+            "下标 200 在 201 根骨骼的表里应当合法"
+        );
     }
 
     /// **材质表条数**：上限 32768（skin 表是有符号 short）。

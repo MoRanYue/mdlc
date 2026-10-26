@@ -135,7 +135,7 @@ _version: 2
 # ---------------------------------------------------------------------------
 # `value_name`：也会打给用户看（`mdlc build --help` 里的 `<dir>` / `<目录>`）
 #
-# 只有这两个是**词**；其余 `value_name`（`model.toml` / `in.smd` / `N` / …）
+# 只有这三个是**词**；其余 `value_name`（`model.toml` / `in.smd` / `N` / …）
 # 是格式占位符，不翻译。
 # ---------------------------------------------------------------------------
 
@@ -144,6 +144,9 @@ _version: 2
 
 "value":
   zh-CN: "值"
+
+"name":
+  zh-CN: "名称"
 
 # ---------------------------------------------------------------------------
 # 官方 `studiomdl` 兼容形态（`mdlc -game <gamedir> --help`）
@@ -798,9 +801,6 @@ _version: 2
 
 "unknown `$jigglebone` key %{key} (the official code aborts with `$jigglebone: invalid syntax`)":
   zh-CN: "未知的 `$jigglebone` 键 %{key}（官方会 abort：`$jigglebone: invalid syntax`）"
-
-"vertex %{vertex} references the bone index %{bone}, over the format limit %{max} -- `mstudioboneweight_t.bone[]` in VVD is a **signed char**, so an index >=128 is read as negative by the engine":
-  zh-CN: "顶点 %{vertex} 引用了骨骼下标 %{bone}，超过格式上限 %{max} —— VVD 的 `mstudioboneweight_t.bone[]` 是**有符号 char**，下标 ≥128 会被引擎读成负数"
 
 "VVD header":
   zh-CN: "VVD 头部"
@@ -1729,3 +1729,47 @@ _version: 2
 
 "$jigglebone %{bone}: `is_boing` needs studio version 48 -- v49's mstudiojigglebone_t has no boing fields, so the five boing* slots do not exist. Target 48 (`--studio-version 48` or `$version 48`), or drop the block.":
   zh-CN: "$jigglebone %{bone}：`is_boing` 需要 studio 版本 48 —— v49 的 mstudiojigglebone_t 没有 boing 字段，那五个 boing* 槽不存在。请改为目标 48（`--studio-version 48` 或 `$version 48`），或删掉该块。"
+
+# ---- 骨骼上限（`target` 预设 + `max_bones`）----
+
+"Engine preset: sets the studio version and the bone limit in one go (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo). Explicit --studio-version / --max-bones win over it. Takes precedence over the TOML's `target`.":
+  zh-CN: "引擎预设：一次性设定 studio 版本与骨骼上限（generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo）。显式的 --studio-version / --max-bones 压过它。优先于 TOML 里的 `target`。"
+
+"Engine preset: sets the studio version and the bone limit in one go (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo). Explicit --studio-version / --max-bones win over it. Takes precedence over the QC's `$target`.":
+  zh-CN: "引擎预设：一次性设定 studio 版本与骨骼上限（generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo）。显式的 --studio-version / --max-bones 压过它。优先于 QC 里的 `$target`。"
+
+"Maximum number of bones in the compiled model (default 127; Garry's Mod allows 255). Takes precedence over the TOML's `max_bones`.":
+  zh-CN: "编译后模型最多几根骨骼（默认 127；Garry's Mod 允许 255）。优先于 TOML 里的 `max_bones`。"
+
+"Maximum number of bones in the compiled model (default 127; Garry's Mod allows 255). Takes precedence over the QC's `$maxbones`.":
+  zh-CN: "编译后模型最多几根骨骼（默认 127；Garry's Mod 允许 255）。优先于 QC 里的 `$maxbones`。"
+
+"mdlc extension: engine preset -- sets the studio version and the bone limit (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo)":
+  zh-CN: "mdlc 扩展：引擎预设 —— 一次性设定 studio 版本与骨骼上限（generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo）"
+
+"mdlc extension: maximum number of bones in the compiled model":
+  zh-CN: "mdlc 扩展：编译后模型最多几根骨骼"
+
+"unknown target %{name}; available presets: %{available}":
+  zh-CN: "未知目标 %{name}；可用的预设：%{available}"
+
+"not a bone count: %{s}":
+  zh-CN: "不是骨骼数量：%{s}"
+
+"the bone count must be between 1 and %{max}, but got %{n}":
+  zh-CN: "骨骼数量必须在 1 到 %{max} 之间，实际是 %{n}"
+
+"max_bones = %{value} is out of range; it must be between 1 and %{max}":
+  zh-CN: "max_bones = %{value} 超出范围；必须在 1 到 %{max} 之间"
+
+"the model ends up with %{used} bones after optimisation, over the limit of %{max} -- raise `max_bones`, or pick a `target` whose engine allows more (gmod allows 255)":
+  zh-CN: "优化后模型有 %{used} 根骨骼，超过上限 %{max} —— 请调高 `max_bones`，或换一个允许更多骨骼的 `target`（gmod 允许 255）"
+
+"vertex %{vertex} references the bone index %{bone}, but the bone table only has %{count} entries":
+  zh-CN: "顶点 %{vertex} 引用了骨骼下标 %{bone}，但骨骼表只有 %{count} 项"
+
+"$maxbones needs a number, got %{text}":
+  zh-CN: "$maxbones 需要一个数字，实际是 %{text}"
+
+"$maxbones must be between 1 and %{max}, but got %{n}":
+  zh-CN: "$maxbones 必须在 1 到 %{max} 之间，实际是 %{n}"

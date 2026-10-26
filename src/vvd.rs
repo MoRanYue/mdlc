@@ -357,6 +357,36 @@ impl Vvd {
         })
     }
 
+    /// 每个顶点引用的骨骼下标都必须落在骨骼表内。
+    ///
+    /// 这是**一致性**检查，不是格式检查：下标由重映射产生，写错一位就会让
+    /// 顶点蒙到错误的骨骼上，而字节层面完全合法 —— 那种 bug 只有比对渲染
+    /// 结果才看得出来。
+    ///
+    /// **引擎上限**（L4D2 127 / GMod 255）不在这里判：那是 [`crate::target`]
+    /// 的事，由 `compile.rs` 在骨骼表定稿后按 `bones.len()` 判。
+    pub fn check_bone_indices(&self, bone_count: usize) -> Result<(), VvdError> {
+        for (i, v) in self.vertices.iter().enumerate() {
+            // `bone[]` 是定长 3 元素数组（`MAX_NUM_BONES_PER_VERT`），
+            // 后面的填充槽位无意义（studiomdl 常写 0），不参与语义。
+            let n = (v.bone_count as usize).min(3);
+            for k in 0..n {
+                let b = v.bone[k] as usize;
+                if b >= bone_count {
+                    return Err(VvdError::Inconsistent {
+                        detail: crate::tr_fmt!(
+                            "vertex %{vertex} references the bone index %{bone}, but the bone table only has %{count} entries",
+                            vertex = i,
+                            bone = b,
+                            count = bone_count
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 按头部声明的偏移序列化（支持 fixup 表与多 LOD）。
     ///
     /// 偏移一律**重算**，不沿用读入时的值 —— 这正是「往返必须逐字节相同」
@@ -405,38 +435,18 @@ impl Vvd {
             });
         }
 
-        // ---- 骨骼下标：**格式**上限（有符号 char，0..=127）----
+        // ---- 骨骼下标 ----
         //
-        // ⚠️ 查的是**被顶点引用的下标**，不是骨骼总数。实测
-        // （`docs/_probe/diag_bone_use.js`）：
-        //   · mdlc 的 `linnea-export` 有 **134 根**骨骼，但最大引用下标只 **118**
-        //   · 官方 122 根产物最大引用下标 **119**
-        // 两者都没越界 —— 没被引用的骨骼只存在于 `mstudiobone_t` 数组里。
+        // 这里**不再**按 127 判：引擎上限是**可配置的**（L4D2 127 / GMod 255，
+        // 见 [`crate::target`]），而 `to_bytes` 看不到骨骼表 —— 它只有一个
+        // [`Vvd`]。真正的上限判据在 `compile.rs`（`$staticprop` 塌缩之后量
+        // `bones.len()`），「下标必须落在骨骼表内」这条一致性由
+        // [`Self::check_bone_indices`] 在 `pipeline` 里补。
         //
-        // 所以「骨骼总数 ≤ 128」是**错的**判据（那样会误拒上面两个真实模型），
-        // 真正装不下的是**下标 ≥ 128**：`char` 会把 200 读成 −56。
-        //
-        // 只查前 `bone_count` 个槽位 —— 后面的填充槽位无意义
-        // （studiomdl 常写 0），不参与语义。
-        for (i, v) in self.vertices.iter().enumerate() {
-            // `bone[]` 是定长 3 元素数组（`MAX_NUM_BONES_PER_VERT`）。
-            let n = (v.bone_count as usize).min(3);
-            for k in 0..n {
-                let b = v.bone[k];
-                if b > crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX as u8 {
-                    return Err(VvdError::Inconsistent {
-                        detail: crate::tr_fmt!(
-                            "vertex %{vertex} references the bone index %{bone}, over the format limit %{max} -- \
-                             `mstudioboneweight_t.bone[]` in VVD is a **signed char**, \
-                             so an index >=128 is read as negative by the engine",
-                            vertex = i,
-                            bone = b,
-                            max = crate::mdl_writer::MAX_BONE_INDEX_IN_VERTEX
-                        ),
-                    });
-                }
-            }
-        }
+        // ⚠️ 历史：这里曾按 `MAX_BONE_INDEX_IN_VERTEX == 127` 判，注释还写着
+        // 「查下标不查总数」。**下标与表长其实只差 1**（都是 1 字节 ⟹ 0..=255），
+        // 所以那条「只查下标」的论据从一开始就站不住：真正的区别是**引擎**
+        // 允许多少，而不是格式允许多少。
 
         let fixup_table_start = HEADER_SIZE; // ALIGN4(64) == 64
         let vertex_data_start = align_up(fixup_table_start + self.fixups.len() * FIXUP_SIZE, 16);

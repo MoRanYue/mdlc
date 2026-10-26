@@ -433,6 +433,10 @@ pub fn build(
     let vvd_bytes = hotpath::measure_block!("pipeline: build_vvd + to_bytes", {
         let vvd = crate::lod::build_vvd(&compiled, out.checksum)
             .map_err(PipelineError::BuildVvd)?;
+        // 骨骼下标必须落在骨骼表内（重映射写错一位时，字节层面完全合法，
+        // 只有「下标越出表」这一条能机械地抓住它）。
+        vvd.check_bone_indices(compiled.desc.bones.len())
+            .map_err(PipelineError::CheckVvd)?;
         let bytes = vvd.to_bytes().map_err(PipelineError::EncodeVvd)?;
         // 写出后立刻自检 —— 偏移/长度对不上说明我们的写出器有 bug。
         crate::vvd::check_invariants(&vvd, bytes.len()).map_err(PipelineError::CheckVvd)?;

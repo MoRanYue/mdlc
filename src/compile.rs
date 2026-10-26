@@ -3930,6 +3930,26 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         desc.clone()
     };
 
+    // ---- 骨骼上限：**优化之后**量（与官方同口径）----
+    //
+    // 官方在骨骼表建好之后判 `numbones > 0x7f`（L4D2 的 `FUN_00434620`）或
+    // `> 0xff`（GMod 的 `FUN_00435630`），量的就是 `numbones` —— 也就是
+    // **丢掉未被引用的骨骼之后**的表长。mdlc 的收骨在 QC 前端
+    // （`boneref != 0`），塌缩在上一行，所以这里正是「最终表长」。
+    //
+    // ⚠️ **不能**放进 [`ModelDesc::validate`]：那时 `$staticprop` 还没塌缩，
+    // 200 根骨骼的静态道具（塌缩后只剩 1 根）会被误拒。
+    let max_bones = desc.max_bones();
+    if desc.bones.len() as u32 > max_bones {
+        return Err(vec![CompileError::Desc(crate::model::DescError {
+            path: "bones".into(),
+            kind: crate::model::DescErrorKind::TooManyBones {
+                used: desc.bones.len(),
+                max: max_bones,
+            },
+        })]);
+    }
+
     // ---- 自动生成 hitbox（`SetupHitBoxes`，`simplify.cpp:6849-6973`）----
     //
     // 时序：`SetupHitBoxes()` 在 `simplify.cpp:7319` 被调用，**晚于**
@@ -13388,6 +13408,82 @@ forward_declared = true
         c.bodyparts[0].models[0].mesh_flexes = Vec::new();
         c.bodyparts[0].models[0].lods = None;
         c
+    }
+
+    /// 造一个 `n` 根骨骼的 SMD：链式父子关系，**全部**被三角形引用。
+    ///
+    /// 必须「全部被引用」—— `boneref == 0` 的骨骼会被前端丢掉，那样量出来的
+    /// 表长就不是 `n`，测试会变成空测。
+    fn smd_with_bones(n: usize) -> String {
+        let mut s = String::from("version 1\nnodes\n");
+        for i in 0..n {
+            let parent = if i == 0 { -1 } else { i as i32 - 1 };
+            s.push_str(&format!("{i} \"b{i}\" {parent}\n"));
+        }
+        s.push_str("end\nskeleton\ntime 0\n");
+        for i in 0..n {
+            s.push_str(&format!(
+                "{i} 0.000000 0.000000 {i}.000000 0.000000 0.000000 0.000000\n"
+            ));
+        }
+        s.push_str("end\ntriangles\nmat\n");
+        let b = n - 1;
+        for (x, u) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            s.push_str(&format!(
+                "{b} {x:.6} 0.000000 0.000000 0.000000 0.000000 1.000000 {u:.6} 0.000000 1 {b} 1.000000\n"
+            ));
+        }
+        s.push_str("end\n");
+        s
+    }
+
+    /// **骨骼表上限**：默认 127，可被 `max_bones` / `target` 放宽。
+    ///
+    /// 判据位置必须是**优化之后** —— `$staticprop` 会把骨骼表塌缩成单根，
+    /// 所以「200 根骨骼的静态道具」**不该**被拒。这条测试同时钉住那个顺序。
+    #[test]
+    fn bone_table_limit_is_enforced_after_optimisation() {
+        let d = tmpdir("bonelimit");
+        std::fs::write(d.join("a.smd"), smd_with_bones(200)).unwrap();
+        let qc = "$modelname \"t.mdl\"\n$body body \"a.smd\"\n";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("夹具应当解析成功");
+        assert_eq!(desc.bones.len(), 200, "夹具应当真有 200 根被引用的骨骼");
+
+        // 默认 127 ⟹ 拒绝。
+        let errs = compile(&desc, &d).expect_err("默认 127 应当拒绝 200 根");
+        let hit = errs.iter().any(|e| {
+            matches!(
+                e,
+                CompileError::Desc(crate::model::DescError {
+                    kind: DescErrorKind::TooManyBones {
+                        used: 200,
+                        max: 127
+                    },
+                    ..
+                })
+            )
+        });
+        assert!(
+            hit,
+            "应当报 TooManyBones {{ used: 200, max: 127 }}，实际：{errs:?}"
+        );
+
+        // 显式放宽 ⟹ 编得过。
+        let mut wide = desc.clone();
+        wide.model.max_bones = Some(200);
+        compile(&wide, &d).expect("max_bones = 200 时应当编得过");
+
+        // `target = gmod` ⟹ 255（预设生效）。
+        let mut preset = desc.clone();
+        preset.model.target = Some("gmod".to_string());
+        compile(&preset, &d).expect("target = gmod 时应当编得过");
+
+        // 静态道具：塌缩成 1 根 ⟹ 200 根的夹具不该被拒。
+        let mut prop = desc.clone();
+        prop.model.static_prop = true;
+        compile(&prop, &d).expect("静态道具塌缩后只有 1 根骨骼，不该被 127 拒");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// **不超限时必须是 no-op** —— 这是「默认打开不影响既有产物」的依据。

@@ -193,6 +193,8 @@ Division of responsibility:
 |---|---|---|---|
 | `name` | string | **required** | Output path, relative to the game directory; backslashes are normalised to forward slashes |
 | `version` | int | `49` | Target studio version; only **48 / 49** are supported (see [Target studio version](#target-studio-version-v48--v49)) |
+| `target` | string | `generic` | Engine preset, sets `version` + `max_bones` in one go: `generic` / `l4d2` / `gmod` / `sdk2013` / `tf2` / `css` / `csgo`. Explicit values win over the preset (**mdlc extension**, see [Bone limit](#bone-limit-max_bones)) |
+| `max_bones` | int | **`127`** | Upper bound on the bone table **after optimisation**, `1..=256`. The official studiomdl enforces it per engine (L4D2 127 / GMod 255), see [Bone limit](#bone-limit-max_bones) (**mdlc extension**) |
 | `checksum` | int | derived from the model name | Pairing token for the four files; not a content hash |
 | `static_prop` | bool | `false` | `$staticprop`, sets header bit `0x10` automatically |
 | `surface_prop` | string | — | `$surfaceprop`; also the default `surface_prop` of every bone |
@@ -536,7 +538,7 @@ The QC front end implements full lexing/parsing, `$include`, `$definevariable`,
 
 ### mdlc-extended QC commands
 
-The following 4 are **not official commands**; they are mdlc's own extensions. The naming rule
+The following 6 are **not official commands**; they are mdlc's own extensions. The naming rule
 maps one-to-one onto TOML fields (drop the underscores from the field name and prefix `$`):
 
 | Command | Equivalent TOML | Notes |
@@ -545,10 +547,12 @@ maps one-to-one onto TOML fields (drop the underscores from the field name and p
 | `$nosplitoversizedmeshes` | `split_oversized_meshes = false` | Turns off [automatic splitting of oversized meshes](#automatic-splitting-of-oversized-meshes) and errors out on an oversized mesh |
 | `$splitoversizedmeshes` | `split_oversized_meshes = true` | Turns the previous one **back on** (the default is already `true`; it exists so a main QC can undo what an included `.qci` turned off) |
 | `$version 48` | `version = 48` | [Target studio version](#target-studio-version-v48--v49); equivalent to `--studio-version` |
+| `$target gmod` | `target = "gmod"` | [Engine preset](#bone-limit-max_bones); equivalent to `--target` |
+| `$maxbones 200` | `max_bones = 200` | [Bone table limit](#bone-limit-max_bones); equivalent to `--max-bones` (⚠️ same name as NekoMDL's `$MaxBones`, but that one is its own implementation) |
 
-The first three are **bare flags** (no argument, consuming only their own token); `$version`
-takes one argument. All four have **case-insensitive command names** (matching the official
-tokenizer). QC is interpreted top to bottom, **last write wins**.
+The first three are **bare flags** (no argument, consuming only their own token); `$version` /
+`$target` / `$maxbones` each take one argument. All six have **case-insensitive command names**
+(matching the official tokenizer). QC is interpreted top to bottom, **last write wins**.
 
 ```qc
 $modelname "models/mymod/myprop.mdl"
@@ -556,6 +560,8 @@ $body body "myprop.smd"
 $optimizevtx              ; turn on vertex cache optimisation
 $nosplitoversizedmeshes   ; turn off automatic splitting (error out on an oversized mesh)
 $version 48               ; target Source 2013 (Garry's Mod)
+$target gmod              ; engine preset (= version 48 + at most 255 bones)
+$maxbones 200             ; explicit override of the preset's bone limit
 ```
 
 > ⚠️ **Why these are mdlc extensions rather than official command names.** The official
@@ -700,8 +706,10 @@ glTF has three notices of its own (see `docs/gltf-support.md` §6.3):
 
 ```text
 mdlc build <model.toml> [--out <dir>] [--optimize-vtx] [--studio-version 48|49]
+                        [--target <preset>] [--max-bones 1-256]
 mdlc check <model.toml>
 mdlc build-qc <model.qc> [--out <dir>] [--optimize-vtx] [--studio-version 48|49]
+                        [--target <preset>] [--max-bones 1-256]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
                           [--concave] [--vhacd] [--ragdoll]
@@ -773,6 +781,61 @@ Measured (one and the same QC with a single `$jigglebone`): the official Garry's
 > ⚠️ **v44 is not supported** (the Dark Messiah / Episode One era). It lacks the whole
 > `studiohdr2_t` / `mstudiolinearbone_t` family and has different field layouts in
 > `mstudioanimdesc_t` / `mstudioseqdesc_t` — that is not something a different number can fix.
+
+### Bone limit (`max_bones`)
+
+**"How many bones may a model have" is decided by the engine, not by the format.** The same SMD
+compiled with different games' `studiomdl.exe` hits different limits — and the limit can differ
+**even within one studio version** (v49: L4D2 is 127, CS:GO is 255), so the number **cannot be
+derived from `version`**.
+
+Measured (every cell really runs the compiler; the verdict is `numbones` in the output header):
+
+| Bones | Official L4D2 (v49) | Official Garry's Mod (v48) |
+|---|---|---|
+| 127 | ✅ | ✅ |
+| 128 | ⛔ `Too many bones used in model, used 128, max 128` | ✅ |
+| 200 | ⛔ same | ✅ |
+| 255 | ⛔ same | ✅ |
+| 256 | ⛔ | ⛔ `used 256, max 256` |
+
+> ⚠️ **That `max 128` in the official message is a typo.** The check is `numbones > 0x7f`, so
+> **128 bones is rejected**. That is why mdlc defaults to **127**, not 128.
+
+Three entry points (precedence: command line > TOML / QC > `target` preset > default):
+
+```toml
+[model]
+target = "gmod"     # preset: version 48 + max_bones 255
+# max_bones = 200   # explicit override of the preset
+```
+
+```qc
+$target gmod
+$maxbones 200
+```
+
+```text
+mdlc build model.toml --target gmod --max-bones 200
+```
+
+| Preset | Studio version | Bone limit | Notes |
+|---|---|---|---|
+| `generic` | unset | unset | **Default**; both parameters keep their own default |
+| `l4d2` | 49 | 127 | Decompiled + measured |
+| `gmod` | 48 | 255 | Decompiled + measured |
+| `sdk2013` / `tf2` / `css` | 48 | 127 | Inferred (same code lineage, not measured per version) |
+| `csgo` | 49 | 255 | Not measured (that compiler is not installed here); inferred from `mstudioanim_t.bone` being one byte |
+
+- **The unit is the bone table length *after* optimisation** — unreferenced bones are dropped
+  (`$attachment` references count as referenced), so 300 nodes may end up as 10 bones.
+- **The format ceiling is 256**: `mstudioboneweight_t.bone[]` in VVD, `Vertex_t.boneID[]` in VTX
+  and `mstudioanim_t.bone` in animations are all one byte. Going over 256 is a hard error,
+  **never a silent truncation**.
+- `$staticprop` collapses the bone table down to a single bone, so the check runs **after** that
+  collapse — a static prop with many bones is not rejected by mistake.
+- **The error tells you what to change**: raise `max_bones`, or pick a `target` whose engine
+  allows more.
 
 ### Help and error localization
 

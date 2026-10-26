@@ -213,6 +213,8 @@ impl<'a> Parser<'a> {
                 model: ModelMeta {
                     name: String::new(),
                     version: None,
+                    target: None,
+                    max_bones: None,
                     checksum: None,
                     static_prop: false,
                     surface_prop: None,
@@ -360,6 +362,8 @@ impl<'a> Parser<'a> {
         match name.as_str() {
             "$modelname" => self.cmd_modelname(),
             "$version" => self.cmd_version(),
+            "$target" => self.cmd_target(),
+            "$maxbones" => self.cmd_maxbones(),
             "$cd" => self.cmd_cd(),
             "$pushd" => self.cmd_pushd(),
             "$popd" => self.cmd_popd(),
@@ -570,7 +574,7 @@ impl<'a> Parser<'a> {
             | "$collapsebones" | "$collapsebonesaggressive" | "$alwayscollapse" | "$screenalign"
             | "$renamematerial" | "$renamebone" | "$hierarchy" | "$heirarchy" | "$insertbone"
             | "$limitrotation" | "$controller" | "$root" | "$upaxis" | "$origin" | "$maxverts"
-            | "$maxbones" | "$filebuffersize" | "$fakevta " => {
+            | "$filebuffersize" | "$fakevta " => {
                 self.skip_rest_of_line();
                 Ok(())
             }
@@ -740,6 +744,67 @@ impl<'a> Parser<'a> {
             ));
         };
         self.desc.model.version = Some(version.as_i32());
+        Ok(())
+    }
+
+    /// `$target <名字>` —— **mdlc 扩展**：目标引擎预设。
+    ///
+    /// 等价于 TOML 的 `[model] target` 与命令行的 `--target`：**只是参数
+    /// 预设**（studio 版本 + 骨骼上限），显式的 `$version` / `$maxbones`
+    /// 与命令行参数都压过它。
+    ///
+    /// ⚠️ 官方与 NekoMDL 都**没有**这条命令 —— 它是本项目的扩展，
+    /// 起因是「骨骼上限不能由版本号推出来」（v49 的 L4D2 是 127、
+    /// CS:GO 是 255），见 [`crate::target`]。
+    fn cmd_target(&mut self) -> Result<(), QcError> {
+        let t = self.tok(false)?;
+        let Some(target) = crate::target::Target::from_name(&t.text) else {
+            return Err(QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "unknown target %{name}; available presets: %{available}",
+                    name = format!("{:?}", t.text),
+                    available = crate::target::Target::available()
+                ),
+            ));
+        };
+        self.desc.model.target = Some(target.name.to_string());
+        Ok(())
+    }
+
+    /// `$maxbones <1..=256>` —— 骨骼表最多几条。
+    ///
+    /// 与 NekoMDL 的同名命令**同名同义**（都是骨骼数上限），但量的对象按
+    /// 本项目定：**优化后的骨骼表条数**，与官方判据
+    /// （`numbones > 0x7f`，见 [`crate::target`] 的模块文档）同一个口径。
+    ///
+    /// `0` 与 `> 256` 直接报错 —— 静默 clamp 会产出「看着编过了、
+    /// 实际少骨骼」的模型。
+    fn cmd_maxbones(&mut self) -> Result<(), QcError> {
+        let t = self.tok(false)?;
+        let n: u32 = t.text.parse().map_err(|_| {
+            QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "$maxbones needs a number, got %{text}",
+                    text = format!("{:?}", t.text)
+                ),
+            )
+        })?;
+        if !(1..=crate::target::MAX_BONES_FORMAT).contains(&n) {
+            return Err(QcError::new(
+                t.file.clone(),
+                t.line,
+                crate::tr_fmt!(
+                    "$maxbones must be between 1 and %{max}, but got %{n}",
+                    max = crate::target::MAX_BONES_FORMAT,
+                    n = n
+                ),
+            ));
+        }
+        self.desc.model.max_bones = Some(n);
         Ok(())
     }
 
@@ -5681,6 +5746,74 @@ end
             errs.iter().any(|e| e.message.contains("needs a number")),
             "应报不是数字，实际：{errs:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `$target <预设>` —— **mdlc 扩展**：目标引擎预设。
+    ///
+    /// 官方与 NekoMDL 都没有这条命令。它只是**参数预设**：`$target gmod`
+    /// 应当同时把版本推到 48、骨骼上限推到 255，而**显式** `$version` /
+    /// `$maxbones` 压过预设（见 `crate::target` 的模块文档）。
+    #[test]
+    fn target_command_applies_a_preset() {
+        let dir = fixture("target");
+        let d = parse(
+            "$modelname \"t.mdl\"\n$target gmod\n$body body \"a.smd\"\n",
+            &dir,
+        );
+        assert_eq!(d.version(), 48, "$target gmod 应把版本推到 v48");
+        assert_eq!(d.max_bones(), 255, "$target gmod 应把骨骼上限推到 255");
+
+        // 显式参数压过预设。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$target gmod\n$maxbones 128\n$body body \"a.smd\"\n",
+            &dir,
+        );
+        assert_eq!(d.max_bones(), 128, "显式 $maxbones 应当压过预设");
+
+        // 不认识的预设要硬报错，并列出可用的。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(
+                "$modelname \"t.mdl\"\n$target nope\n$body body \"a.smd\"\n",
+                &dir,
+            )
+        })
+        .expect_err("未知预设应报错");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("unknown target") && e.message.contains("gmod")),
+            "应报未知预设并列出可用项，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `$maxbones <1..=256>` —— 骨骼表最多几条。
+    ///
+    /// 与 NekoMDL 的同名命令同义（都是骨骼数上限）。边界必须**硬报错** ——
+    /// 静默 clamp 会产出「看着编过了、实际少骨骼」的模型。
+    #[test]
+    fn maxbones_command_sets_the_table_limit() {
+        let dir = fixture("maxbones");
+        let d = parse(
+            "$modelname \"t.mdl\"\n$maxbones 200\n$body body \"a.smd\"\n",
+            &dir,
+        );
+        assert_eq!(d.max_bones(), 200);
+
+        for bad in ["0", "257"] {
+            let errs = crate::test_locale::with_english(|| {
+                crate::qc::parse_qc_str(
+                    &format!("$modelname \"t.mdl\"\n$maxbones {bad}\n$body body \"a.smd\"\n"),
+                    &dir,
+                )
+            })
+            .expect_err("越界应报错");
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("between 1 and 256")),
+                "$maxbones {bad} 应报范围错误，实际：{errs:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4834,6 +4834,8 @@ mod tests {
                 model: ModelMeta {
                     name: "test.mdl".into(),
                     version: None,
+                    target: None,
+                    max_bones: None,
                     checksum: None,
                     static_prop: false,
                     surface_prop: None,
@@ -7285,6 +7287,8 @@ mod tests {
                 model: ModelMeta {
                     name: "ikr.mdl".into(),
                     version: None,
+                    target: None,
+                    max_bones: None,
                     checksum: None,
                     static_prop: false,
                     surface_prop: None,

@@ -123,11 +123,19 @@ const OFFICIAL_FLAGS_NO_VALUE: &[&str] = &[
 
 /// 官方 `studiomdl` 的**吃一个值**的 flag。
 ///
-/// ⚠️ `studio-version` **不是官方 flag**，是 mdlc 扩展 —— 放进这张表是因为
-/// 「归一化层认识的」必须与「clap 接受的」是同一份清单（见
-/// [`build_official_cli`] 的文档）；放进来的副作用正是想要的：
+/// ⚠️ `studio-version` / `target` / `max-bones` **不是官方 flag**，是 mdlc
+/// 扩展 —— 放进这张表是因为「归一化层认识的」必须与「clap 接受的」是同一份
+/// 清单（见 [`build_official_cli`] 的文档）；放进来的副作用正是想要的：
 /// `-studio-version 48` 不会被当成未知选项连同值一起丢掉。
-const OFFICIAL_FLAGS_WITH_VALUE: &[&str] = &["game", "minlod", "t", "a", "studio-version"];
+const OFFICIAL_FLAGS_WITH_VALUE: &[&str] = &[
+    "game",
+    "minlod",
+    "t",
+    "a",
+    "studio-version",
+    "target",
+    "max-bones",
+];
 
 /// 归一化结果。
 #[derive(Debug, PartialEq, Eq)]
@@ -297,6 +305,16 @@ pub struct BuildArgs {
         "Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod). Takes precedence over the TOML's `version`."
     ))]
     pub studio_version: Option<crate::format::StudioVersion>,
+    #[arg(long, value_name = crate::tr("name"), value_parser = parse_target)]
+    #[arg(help = crate::tr(
+        "Engine preset: sets the studio version and the bone limit in one go (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo). Explicit --studio-version / --max-bones win over it. Takes precedence over the TOML's `target`."
+    ))]
+    pub target: Option<&'static crate::target::Target>,
+    #[arg(long, value_name = "1-256", value_parser = parse_max_bones)]
+    #[arg(help = crate::tr(
+        "Maximum number of bones in the compiled model (default 127; Garry's Mod allows 255). Takes precedence over the TOML's `max_bones`."
+    ))]
+    pub max_bones: Option<u32>,
 }
 
 impl BuildArgs {
@@ -344,6 +362,16 @@ pub struct BuildQcArgs {
         "Target studio version: 49 (L4D2 / CS:GO, default) or 48 (Source 2013 / Garry's Mod)"
     ))]
     pub studio_version: Option<crate::format::StudioVersion>,
+    #[arg(long, value_name = crate::tr("name"), value_parser = parse_target)]
+    #[arg(help = crate::tr(
+        "Engine preset: sets the studio version and the bone limit in one go (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo). Explicit --studio-version / --max-bones win over it. Takes precedence over the QC's `$target`."
+    ))]
+    pub target: Option<&'static crate::target::Target>,
+    #[arg(long, value_name = "1-256", value_parser = parse_max_bones)]
+    #[arg(help = crate::tr(
+        "Maximum number of bones in the compiled model (default 127; Garry's Mod allows 255). Takes precedence over the QC's `$maxbones`."
+    ))]
+    pub max_bones: Option<u32>,
 }
 
 impl BuildQcArgs {
@@ -367,6 +395,37 @@ fn parse_studio_version(s: &str) -> Result<crate::format::StudioVersion, String>
             version = v
         )
     })
+}
+
+/// 解析 `--target` 的取值（大小写不敏感，认别名）。
+///
+/// 走 [`crate::target::Target::from_name`] —— 预设清单只有一份。
+fn parse_target(s: &str) -> Result<&'static crate::target::Target, String> {
+    crate::target::Target::from_name(s).ok_or_else(|| {
+        crate::tr_fmt!(
+            "unknown target %{name}; available presets: %{available}",
+            name = s,
+            available = crate::target::Target::available()
+        )
+    })
+}
+
+/// 解析 `--max-bones` 的取值（`1..=256`）。
+///
+/// 上限是**格式**上限（骨骼下标是 1 字节），不是某个引擎的上限 ——
+/// 引擎上限由 `--target` 的预设或显式参数决定。
+fn parse_max_bones(s: &str) -> Result<u32, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|_| crate::tr_fmt!("not a bone count: %{s}", s = s))?;
+    if !(1..=crate::target::MAX_BONES_FORMAT).contains(&n) {
+        return Err(crate::tr_fmt!(
+            "the bone count must be between 1 and %{max}, but got %{n}",
+            max = crate::target::MAX_BONES_FORMAT,
+            n = n
+        ));
+    }
+    Ok(n)
 }
 
 /// `mdlc vvd-info <file.vvd>`
@@ -649,11 +708,30 @@ pub fn build_official_cli() -> Command {
             )),
     );
     for name in OFFICIAL_FLAGS_WITH_VALUE {
-        if *name == "game" || *name == "studio-version" {
+        if matches!(*name, "game" | "studio-version" | "target" | "max-bones") {
             continue;
         }
         cmd = cmd.arg(Arg::new(name).long(name).value_name(crate::tr("value")));
     }
+    // mdlc 扩展：引擎预设 / 骨骼上限（官方同样没有这两个 flag）。
+    cmd = cmd.arg(
+        Arg::new("target")
+            .long("target")
+            .value_name(crate::tr("name"))
+            .value_parser(parse_target)
+            .help(crate::tr(
+                "mdlc extension: engine preset -- sets the studio version and the bone limit (generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo)",
+            )),
+    );
+    cmd = cmd.arg(
+        Arg::new("max-bones")
+            .long("max-bones")
+            .value_name("1-256")
+            .value_parser(parse_max_bones)
+            .help(crate::tr(
+                "mdlc extension: maximum number of bones in the compiled model",
+            )),
+    );
     cmd
 }
 
@@ -765,6 +843,64 @@ mod tests {
                 .map(|v| v.as_i32()),
             Some(48)
         );
+        assert_eq!(m.get_one::<String>("qc").map(String::as_str), Some("x.qc"));
+    }
+
+    /// `--target` / `--max-bones` 同样是 mdlc 扩展，两种 CLI 形态都要认。
+    ///
+    /// 与 `--studio-version` 同理：漏进 `OFFICIAL_FLAGS_WITH_VALUE` 会让
+    /// `-target gmod` 被当成「未知选项 + 值」整体丢掉 —— **静默按默认 127 编**。
+    #[test]
+    fn target_and_max_bones_parse_in_both_forms() {
+        assert_eq!(parse_target("GMOD").map(|t| t.name), Ok("gmod"), "应大小写不敏感");
+        assert!(parse_target("nope").is_err(), "未知预设应报错");
+        assert_eq!(parse_max_bones("200"), Ok(200));
+        assert!(parse_max_bones("0").is_err(), "0 应报错");
+        assert!(parse_max_bones("257").is_err(), "257 超格式上限");
+        assert!(parse_max_bones("abc").is_err(), "非数字应报错");
+
+        // 自有形态（derive）：arg id 是字段名 `target` / `max_bones`。
+        let m = Cli::command()
+            .try_get_matches_from([
+                "mdlc",
+                "build",
+                "x.toml",
+                "--target",
+                "gmod",
+                "--max-bones",
+                "200",
+            ])
+            .expect("自有形态应认这两个 flag");
+        let (name, sub) = m.subcommand().expect("必须有子命令");
+        assert_eq!(name, "build");
+        assert_eq!(
+            sub.get_one::<&'static crate::target::Target>("target")
+                .map(|t| t.name),
+            Some("gmod")
+        );
+        assert_eq!(sub.get_one::<u32>("max_bones").copied(), Some(200));
+
+        // 官方兼容形态：单横线要能归一化，且值不能被当未知选项丢掉。
+        let n = norm(&[
+            "mdlc",
+            "-game",
+            "C:/g",
+            "-target",
+            "gmod",
+            "-max-bones",
+            "200",
+            "x.qc",
+        ]);
+        assert!(n.unknown.is_empty(), "两者都是已知选项：{:?}", n.unknown);
+        let m = build_official_cli()
+            .try_get_matches_from(&n.argv)
+            .expect("官方形态必须能解析");
+        assert_eq!(
+            m.get_one::<&'static crate::target::Target>("target")
+                .map(|t| t.name),
+            Some("gmod")
+        );
+        assert_eq!(m.get_one::<u32>("max-bones").copied(), Some(200));
         assert_eq!(m.get_one::<String>("qc").map(String::as_str), Some("x.qc"));
     }
 

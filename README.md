@@ -182,6 +182,8 @@ QC 脚本  ──┘
 |---|---|---|---|
 | `name` | string | **必填** | 输出路径，相对游戏目录；反斜杠自动规范化为正斜杠 |
 | `version` | int | `49` | 目标 studio 版本，只支持 **48 / 49**（见[目标 studio 版本](#目标-studio-版本v48--v49)） |
+| `target` | string | `generic` | 引擎预设，一次设定 `version` + `max_bones`：`generic` / `l4d2` / `gmod` / `sdk2013` / `tf2` / `css` / `csgo`。显式值优先于预设（**mdlc 扩展**，见[骨骼上限](#骨骼上限max_bones)） |
+| `max_bones` | int | **`127`** | **优化后**的骨骼表上限，`1..=256`。官方 studiomdl 按引擎卡（L4D2 127 / GMod 255），见[骨骼上限](#骨骼上限max_bones)（**mdlc 扩展**） |
 | `checksum` | int | 按模型名生成 | 四件套配对令牌，不是内容哈希 |
 | `static_prop` | bool | `false` | `$staticprop`，自动置头部 `0x10` |
 | `surface_prop` | string | — | `$surfaceprop`；也是每根骨骼的缺省 `surface_prop` |
@@ -504,7 +506,7 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 
 ### mdlc 扩展的 QC 命令
 
-下面 4 条**不是官方命令**，是 mdlc 自己的扩展。命名规则与 TOML 字段一一对应
+下面 6 条**不是官方命令**，是 mdlc 自己的扩展。命名规则与 TOML 字段一一对应
 （字段名去掉下划线、前面加 `$`）：
 
 | 命令 | 等价 TOML | 说明 |
@@ -513,9 +515,12 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 | `$nosplitoversizedmeshes` | `split_oversized_meshes = false` | 关掉[顶点超限自动拆分](#顶点超限自动拆分)，遇到超限 mesh 直接报错 |
 | `$splitoversizedmeshes` | `split_oversized_meshes = true` | 把上面那条**开回来**（缺省本来就是 `true`；它存在的意义是 `$include` 的 `.qci` 关掉后主 QC 还能改回来） |
 | `$version 48` | `version = 48` | [目标 studio 版本](#目标-studio-版本v48--v49)，等价于命令行 `--studio-version` |
+| `$target gmod` | `target = "gmod"` | [引擎预设](#骨骼上限max_bones)，等价于命令行 `--target` |
+| `$maxbones 200` | `max_bones = 200` | [骨骼表上限](#骨骼上限max_bones)，等价于命令行 `--max-bones`（⚠️ 与 NekoMDL 的 `$MaxBones` 同名，但那个是它自己的实现） |
 
-前三条是**裸标志位**（不带参数，只消费自己那一个 token），`$version` 带一个参数。
-四条都**命令名大小写不敏感**（与官方取词器一致）。QC 自上而下解释，**后写的赢**。
+前三条是**裸标志位**（不带参数，只消费自己那一个 token），`$version` / `$target` /
+`$maxbones` 各带一个参数。六条都**命令名大小写不敏感**（与官方取词器一致）。
+QC 自上而下解释，**后写的赢**。
 
 ```qc
 $modelname "models/mymod/myprop.mdl"
@@ -523,6 +528,8 @@ $body body "myprop.smd"
 $optimizevtx              ; 打开顶点缓存优化
 $nosplitoversizedmeshes   ; 关掉超限自动拆分（遇到超限 mesh 就报错）
 $version 48               ; 目标 Source 2013（Garry's Mod）
+$target gmod              ; 引擎预设（= version 48 + 最多 255 根骨骼）
+$maxbones 200             ; 显式覆盖预设的骨骼上限
 ```
 
 > ⚠️ **为什么是 mdlc 扩展而不是官方命令名。** 官方 `studiomdl.exe` 的 QC
@@ -656,8 +663,10 @@ glTF 侧另有三条自己的提示（见 `docs/gltf-support.md` §6.3）：
 
 ```text
 mdlc build <model.toml> [--out <目录>] [--optimize-vtx] [--studio-version 48|49]
+                        [--target <预设>] [--max-bones 1-256]
 mdlc check <model.toml>
 mdlc build-qc <model.qc> [--out <目录>] [--optimize-vtx] [--studio-version 48|49]
+                        [--target <预设>] [--max-bones 1-256]
 mdlc qc2toml <model.qc> [--out <path.toml>]
 mdlc phy <in.smd> <out.phy> [--checksum N] [--mass F] [--surfaceprop S]
                           [--concave] [--vhacd] [--ragdoll]
@@ -725,6 +734,57 @@ mdlc 的 v48 产物能直接喂回 `studiomdl.exe -mdlreport`，官方打印真�
 > ⚠️ **不支持 v44**（Dark Messiah / Episode One 时代）。它缺 `studiohdr2_t`、
 > `mstudiolinearbone_t` 等一整套结构，`mstudioanimdesc_t` / `mstudioseqdesc_t` 的字段体也不
 > 一样 —— 不是改个数字能解决的。
+
+### 骨骼上限（`max_bones`）
+
+**「一个模型最多几根骨骼」是引擎给的，不是格式给的。** 同一份 SMD 用不同游戏的
+`studiomdl.exe` 编，上限不一样；而且**同一个 studio 版本号下也可能不同**（v49 里 L4D2 是
+127、CS:GO 是 255），所以这个数**不能由 `version` 推导**。
+
+实测（每一格都真跑编译器，判据是产物头部的 `numbones`）：
+
+| 骨骼数 | 官方 L4D2（v49） | 官方 Garry's Mod（v48） |
+|---|---|---|
+| 127 | ✅ | ✅ |
+| 128 | ⛔ `Too many bones used in model, used 128, max 128` | ✅ |
+| 200 | ⛔ 同上 | ✅ |
+| 255 | ⛔ 同上 | ✅ |
+| 256 | ⛔ | ⛔ `used 256, max 256` |
+
+> ⚠️ **那句 `max 128` 是官方文案的笔误。** 它的判据是 `numbones > 0x7f`，
+> **写 128 根会被拒**。所以 mdlc 的缺省取 **127**，不是 128。
+
+三个入口（优先级：命令行 > TOML / QC > `target` 预设 > 缺省）：
+
+```toml
+[model]
+target = "gmod"     # 预设：version 48 + max_bones 255
+# max_bones = 200   # 显式覆盖预设
+```
+
+```qc
+$target gmod
+$maxbones 200
+```
+
+```text
+mdlc build model.toml --target gmod --max-bones 200
+```
+
+| 预设 | studio 版本 | 骨骼上限 | 备注 |
+|---|---|---|---|
+| `generic` | 不设定 | 不设定 | **缺省**，两个参数各用自身缺省 |
+| `l4d2` | 49 | 127 | 反编译 + 实测 |
+| `gmod` | 48 | 255 | 反编译 + 实测 |
+| `sdk2013` / `tf2` / `css` | 48 | 127 | 推定（同源、未逐版本实测） |
+| `csgo` | 49 | 255 | 未实测（本机没有该编译器），按 `mstudioanim_t.bone` 是 1 字节推定 |
+
+- **单位是「优化之后」的骨骼表条数** —— 未被引用的骨骼会被丢掉（`$attachment` 引用的
+  也算被引用），所以 300 根节点最后可能只剩 10 根。
+- **格式硬上限是 256**：VVD 的 `mstudioboneweight_t.bone[]`、VTX 的 `Vertex_t.boneID[]`、
+  动画的 `mstudioanim_t.bone` 都是 1 字节。超过 256 直接报错，**不静默截断**。
+- `$staticprop` 会把骨骼表塌缩成 1 根，所以判据在塌缩**之后** —— 骨骼很多的静态道具不会被误拒。
+- **超限时的报错会告诉你怎么改**：调 `max_bones`，或选一个允许更多的 `target`。
 
 ### 帮助与错误的多语言
 

@@ -2157,6 +2157,22 @@ pub struct ModelMeta {
     /// MDL 版本，默认 49（L4D2）。
     #[serde(default)]
     pub version: Option<i32>,
+    /// 目标引擎预设（`$target` / `--target`）。
+    ///
+    /// 只是**参数预设** —— 它给出的版本与骨骼上限都会被
+    /// [`Self::version`] / [`Self::max_bones`] 上的显式值覆盖。
+    /// 缺省不写等同于 `generic`（不应用任何值）。
+    #[serde(default)]
+    pub target: Option<String>,
+    /// 骨骼表最多几条（`$maxbones` / `--max-bones`）。
+    ///
+    /// 缺省取 [`crate::target::DEFAULT_MAX_BONES`]（127），
+    /// 合法范围 `1..=`[`crate::target::MAX_BONES_FORMAT`]（256）。
+    ///
+    /// 量的对象是**优化后的骨骼表条数**（与官方一致：先丢没被引用的骨骼，
+    /// 再查表长），不是顶点引用到的最大下标。
+    #[serde(default)]
+    pub max_bones: Option<u32>,
     /// 四件套配对的 checksum。**不写则自动生成**（见 [`ModelDesc::checksum`]）
     /// —— 它不是内容哈希，只是一个配对令牌。
     #[serde(default)]
@@ -5185,9 +5201,28 @@ pub const TEMPLATE_TOML: &str = r#"# mdlc 模型描述文件（自有输入格�
 # 输出路径，相对游戏目录。反斜杠会被自动规范化为正斜杠。
 # Output path, relative to the game directory. Backslashes are normalized to forward slashes.
 name = "models/mymod/myprop.mdl"
-# 可省略，默认 49（L4D2）。支持 44 / 48 / 49。
-# Optional; defaults to 49 (L4D2). 44 / 48 / 49 are supported.
+# 可省略，默认 49（L4D2）。只支持 48 / 49（v44 及更早未实现）。
+# Optional; defaults to 49 (L4D2). Only 48 / 49 are supported (v44 and older are not).
 # version = 49
+# 可省略，默认 "generic"（不套用任何预设）。
+# 引擎预设：一次性设定 studio 版本与骨骼上限。可选
+# generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo。
+# 显式的 version / max_bones（以及 --studio-version / --max-bones）会压过预设。
+# Optional; defaults to "generic" (applies nothing).
+# Engine preset: sets the studio version and the bone limit in one go. One of
+# generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo.
+# An explicit version / max_bones (or --studio-version / --max-bones) wins over it.
+# target = "l4d2"
+# 可省略，默认 127。**优化之后**的骨骼表最多几根。
+# 这不是 mdlc 自定的限制：官方 studiomdl 按目标引擎卡 —— L4D2 超过 127 就报
+# "Too many bones used in model, used N, max 128"，Garry's Mod 放宽到 255。
+# 格式上限是 256（VVD / VTX 里的骨骼下标都是 1 字节），超过直接报错、不静默截断。
+# Optional; defaults to 127. The maximum number of bones **after optimisation**.
+# This is not an mdlc invention: the official studiomdl enforces it per engine --
+# L4D2 rejects more than 127 with "Too many bones used in model, used N, max 128",
+# Garry's Mod allows 255. The format ceiling is 256 (bone indices are one byte in
+# VVD / VTX); exceeding it is a hard error, never a silent clamp.
+# max_bones = 127
 # 可省略；省略时按模型名生成一个稳定值。
 # 它不是内容哈希，只是 .mdl/.vvd/.vtx/.phy 四件套的配对令牌。
 # Optional; when omitted a stable value is derived from the model name.
@@ -5729,6 +5764,54 @@ pub enum DescErrorKind {
     )]
     UnsupportedVersion { version: i32 },
 
+    /// `target` 不是已知的引擎预设。
+    ///
+    /// `available` 是可用预设名（逗号分隔），由
+    /// [`crate::target::Target::available`] 生成 —— 清单只有一份。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "unknown target %{name}; available presets: %{available}",
+            name = format!("{name:?}"),
+            available = available
+        )
+    )]
+    UnknownTarget {
+        name: String,
+        available: String,
+    },
+
+    /// 骨骼上限超出格式上限（或写成 0）。
+    ///
+    /// 格式上限是 [`crate::target::MAX_BONES_FORMAT`]（256）：
+    /// 三个写骨骼下标的地方都是 1 字节，256 之后的骨骼无法被引用。
+    /// **不做静默 clamp** —— 静默改小会产出「看着编过了、实际少骨骼」的模型。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "max_bones = %{value} is out of range; it must be between 1 and %{max}",
+            value = value,
+            max = max
+        )
+    )]
+    BadMaxBones { value: u32, max: u32 },
+
+    /// 优化后的骨骼表超过目标引擎的上限。
+    ///
+    /// 判据与官方一致：量 `numbones`（丢弃未被引用的骨骼**之后**的表长），
+    /// 不是顶点引用到的最大下标。见 [`crate::compile`] 里 `$staticprop`
+    /// 塌缩之后的那处检查。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "the model ends up with %{used} bones after optimisation, over the limit of %{max} \
+             -- raise `max_bones`, or pick a `target` whose engine allows more (gmod allows 255)",
+            used = used,
+            max = max
+        )
+    )]
+    TooManyBones { used: usize, max: u32 },
+
     /// 其余检查：只产出一句话，没有更细的结构。
     ///
     /// ⚠️ `message` 是**运行时 `format!` 出来的**（带数值、带常量），
@@ -5794,9 +5877,39 @@ impl ModelDesc {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    /// MDL 版本（默认 49）。
+    /// MDL 版本（默认 49；显式值 > 目标预设 > 内置默认）。
     pub fn version(&self) -> i32 {
-        self.model.version.unwrap_or(49)
+        if let Some(v) = self.model.version {
+            return v;
+        }
+        self.target()
+            .and_then(|t| t.version)
+            .map_or(49, |v| v.as_i32())
+    }
+
+    /// 目标引擎预设；缺省或写了 `generic` 时是 `None`。
+    ///
+    /// 名字不认识时也返回 `None` —— 拒绝由 [`Self::validate`] 负责，
+    /// 这样 `mdlc check` 能一并提示「可用预设有哪些」。
+    pub fn target(&self) -> Option<&'static crate::target::Target> {
+        self.model
+            .target
+            .as_deref()
+            .and_then(crate::target::Target::from_name)
+    }
+
+    /// 骨骼表允许的最大条数（显式值 > 目标预设 > 127）。
+    ///
+    /// 官方量的是**优化后的骨骼表条数**（`numbones`），不是顶点引用到的
+    /// 最大下标 —— 实测 300 个 SMD 节点、只有 10 根被引用时，官方与 mdlc
+    /// 的产物 `numbones` 都是 10。
+    pub fn max_bones(&self) -> u32 {
+        if let Some(n) = self.model.max_bones {
+            return n;
+        }
+        self.target()
+            .and_then(|t| t.max_bones)
+            .unwrap_or(crate::target::DEFAULT_MAX_BONES)
     }
 
     /// checksum：写了就用写的，否则用模型名的哈希生成一个**稳定**的值。
@@ -5864,6 +5977,33 @@ impl ModelDesc {
                 path: "model.version".into(),
                 kind: DescErrorKind::UnsupportedVersion {
                     version: self.version(),
+                },
+            });
+        }
+        // 目标预设：名字不认识就报错（**不**静默退化成 generic ——
+        // 用户以为「给 GMod 编的」，结果拿到 127 骨骼上限，这个错误
+        // 要到游戏里载入失败才暴露）。
+        if let Some(name) = self.model.target.as_deref()
+            && crate::target::Target::from_name(name).is_none()
+        {
+            errs.push(DescError {
+                path: "model.target".into(),
+                kind: DescErrorKind::UnknownTarget {
+                    name: name.to_string(),
+                    available: crate::target::Target::available(),
+                },
+            });
+        }
+        // 骨骼上限：**不 clamp**。超出格式上限的值只能来自写错的配置，
+        // 静默改小会让产物「看着编过了、实际少骨骼」。
+        if let Some(n) = self.model.max_bones
+            && !(1..=crate::target::MAX_BONES_FORMAT).contains(&n)
+        {
+            errs.push(DescError {
+                path: "model.max_bones".into(),
+                kind: DescErrorKind::BadMaxBones {
+                    value: n,
+                    max: crate::target::MAX_BONES_FORMAT,
                 },
             });
         }
@@ -6518,6 +6658,62 @@ smd = "minimal-ref.smd"
         d.validate().expect("最小描述必须合法");
     }
 
+    /// `[model] target` / `max_bones` —— 目标引擎预设与骨骼上限。
+    ///
+    /// 两者都是 **mdlc 扩展**。`target` 只是**参数预设**（版本 + 骨骼上限），
+    /// 显式字段压过它 —— 这正是用户定的优先级。
+    #[test]
+    fn target_and_max_bones_come_from_the_toml() {
+        // 默认：不应用任何预设，骨骼上限 127。
+        let d = ModelDesc::from_toml(MINIMAL_TOML).expect("最小描述必须能解析");
+        assert_eq!(d.version(), 49, "默认版本仍是 49");
+        assert_eq!(d.max_bones(), 127, "默认骨骼上限 127（官方判据 > 0x7f）");
+        assert!(d.target().is_none(), "默认不应用任何预设");
+
+        // 预设：gmod = v48 + 255。
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace("[model]", "[model]\ntarget = \"gmod\""))
+            .expect("应当能解析");
+        assert_eq!(d.version(), 48, "gmod 预设把版本推到 v48");
+        assert_eq!(d.max_bones(), 255, "gmod 预设把骨骼上限推到 255");
+
+        // 显式字段压过预设。
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace(
+            "[model]",
+            "[model]\ntarget = \"gmod\"\nmax_bones = 128\nversion = 49",
+        ))
+        .expect("应当能解析");
+        assert_eq!(d.version(), 49, "显式 version 压过预设");
+        assert_eq!(d.max_bones(), 128, "显式 max_bones 压过预设");
+    }
+
+    /// 非法的 `target` / `max_bones` 必须在 `validate()` 就报错。
+    ///
+    /// 尤其 `max_bones > 256` —— 静默 clamp 会产出「看着编过了、
+    /// 实际少骨骼」的模型。
+    #[test]
+    fn bad_target_and_max_bones_are_rejected() {
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace("[model]", "[model]\ntarget = \"nope\""))
+            .expect("语法本身应当合法");
+        let errs = crate::test_locale::with_english(|| d.validate()).expect_err("未知预设应报错");
+        assert!(
+            errs.iter().any(|e| e.to_string().contains("unknown target")),
+            "应报未知预设，实际：{errs:?}"
+        );
+
+        for bad in ["0", "257"] {
+            let d = ModelDesc::from_toml(
+                &MINIMAL_TOML.replace("[model]", &format!("[model]\nmax_bones = {bad}")),
+            )
+            .expect("语法本身应当合法");
+            let errs = crate::test_locale::with_english(|| d.validate())
+                .expect_err("越界 max_bones 应报错");
+            assert!(
+                errs.iter().any(|e| e.to_string().contains("out of range")),
+                "max_bones = {bad} 应报范围错误，实际：{errs:?}"
+            );
+        }
+    }
+
     /// **缺省值**必须钉住 —— `serde(default = "default_true")` 一旦写错
     /// （比如漏了 `#[serde(default)]`），字段会变成 `false`：
     /// 超限 mesh 又会**直接报错**，而所有单元测试仍会全绿
@@ -6633,6 +6829,33 @@ smd = "minimal-ref.smd"
         assert!(
             TEMPLATE_TOML.contains("默认 true"),
             "模板应写明 split_oversized_meshes 的缺省是 true"
+        );
+    }
+
+    /// `target` / `max_bones` 必须在模板里**可见**。
+    ///
+    /// 它们的缺省（`generic`、127）不是用户能猜到的，而 127 的来源
+    /// （官方 studiomdl 判 `numbones > 0x7f`）更需要写清楚，否则
+    /// 用 Garry's Mod 的用户会以为 mdlc 在无理取闹。
+    #[test]
+    fn template_documents_target_and_max_bones() {
+        assert!(
+            TEMPLATE_TOML.contains("target = \"l4d2\""),
+            "模板应演示 target 预设"
+        );
+        assert!(
+            TEMPLATE_TOML.contains("max_bones = 127"),
+            "模板应演示 max_bones（缺省 127）"
+        );
+        // 两处都要写缺省值，否则用户看不出「注释掉会怎样」。
+        assert!(
+            TEMPLATE_TOML.contains("默认 127"),
+            "模板应写明 max_bones 的缺省是 127"
+        );
+        // 预设清单要可发现，不能只提一个。
+        assert!(
+            TEMPLATE_TOML.contains("generic / l4d2 / gmod / sdk2013 / tf2 / css / csgo"),
+            "模板应列出全部预设名"
         );
     }
 
