@@ -802,7 +802,9 @@ Measured (every cell really runs the compiler; the verdict is `numbones` in the 
 > ⚠️ **That `max 128` in the official message is a typo.** The check is `numbones > 0x7f`, so
 > **128 bones is rejected**. That is why mdlc defaults to **127**, not 128.
 
-Three entry points (precedence: command line > TOML / QC > `target` preset > default):
+Three entry points (precedence: command line > TOML / QC > `target` preset > default).
+When an explicit value disagrees with the preset, mdlc logs a warning (**the explicit value
+still wins**) so "which one was used" cannot be misread.
 
 ```toml
 [model]

@@ -5912,6 +5912,60 @@ impl ModelDesc {
             .unwrap_or(crate::target::DEFAULT_MAX_BONES)
     }
 
+    /// 显式参数与 `target` 预设**不一致**的项：`(预设的版本, 预设的骨骼上限)`。
+    ///
+    /// `None` 表示这一项不冲突（预设没设它，或显式值与它相同）。
+    /// 拆出来是为了能直接测 —— 告警本身走 `log`，不便在单元测试里抓。
+    pub fn target_conflicts(&self) -> (Option<i32>, Option<u32>) {
+        let Some(preset) = self.target() else {
+            return (None, None);
+        };
+        let version = match (self.model.version, preset.version) {
+            (Some(explicit), Some(from_preset)) if explicit != from_preset.as_i32() => {
+                Some(from_preset.as_i32())
+            }
+            _ => None,
+        };
+        let bones = match (self.model.max_bones, preset.max_bones) {
+            (Some(explicit), Some(from_preset)) if explicit != from_preset => Some(from_preset),
+            _ => None,
+        };
+        (version, bones)
+    }
+
+    /// 显式参数与 `target` 预设冲突时打告警（**显式值仍然赢**）。
+    ///
+    /// 冲突本身不是错误 —— 用户可能就是想在 GMod 预设上只改版本号。
+    /// 但两种写法同时出现时，「到底用了哪个」很容易看错，所以要说一句。
+    pub fn warn_on_target_conflicts(&self) {
+        let Some(preset) = self.target() else {
+            return;
+        };
+        let (version, bones) = self.target_conflicts();
+        if let Some(from_preset) = version {
+            log::warn!(
+                "{}",
+                crate::tr_fmt!(
+                    "target %{target} sets the studio version to %{preset}, but the studio version is explicitly %{explicit}; the explicit value wins",
+                    target = preset.name,
+                    preset = from_preset,
+                    explicit = self.version()
+                )
+            );
+        }
+        if let Some(from_preset) = bones {
+            log::warn!(
+                "{}",
+                crate::tr_fmt!(
+                    "target %{target} sets max_bones to %{preset}, but max_bones is explicitly %{explicit}; the explicit value wins",
+                    target = preset.name,
+                    preset = from_preset,
+                    explicit = self.max_bones()
+                )
+            );
+        }
+    }
+
     /// checksum：写了就用写的，否则用模型名的哈希生成一个**稳定**的值。
     ///
     /// 稳定性很重要：同一份描述两次编译必须得到同一个 checksum，
@@ -6684,6 +6738,45 @@ smd = "minimal-ref.smd"
         .expect("应当能解析");
         assert_eq!(d.version(), 49, "显式 version 压过预设");
         assert_eq!(d.max_bones(), 128, "显式 max_bones 压过预设");
+    }
+
+    /// 显式参数与预设冲突时要能被识别出来（告警靠它决定说不说）。
+    ///
+    /// 三个必须成立的性质：① 不冲突时是 `(None, None)`（否则每次编译都刷告警）；
+    /// ② 只冲突一项时只报那一项；③ 没有 `target` 时永远不报。
+    #[test]
+    fn target_conflicts_are_detected_only_on_real_mismatches() {
+        // 没写 target ⟹ 谈不上冲突。
+        let d = ModelDesc::from_toml(MINIMAL_TOML).expect("最小描述必须能解析");
+        assert_eq!(d.target_conflicts(), (None, None));
+
+        // 预设与显式值一致 ⟹ 不冲突（`l4d2` = 49 + 127 正好是缺省值）。
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace(
+            "[model]",
+            "[model]\ntarget = \"l4d2\"\nversion = 49\nmax_bones = 127",
+        ))
+        .expect("应当能解析");
+        assert_eq!(d.target_conflicts(), (None, None), "一致就不该告警");
+
+        // 两项都冲突：gmod 预设是 48 + 255，这里显式写 49 + 128。
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace(
+            "[model]",
+            "[model]\ntarget = \"gmod\"\nversion = 49\nmax_bones = 128",
+        ))
+        .expect("应当能解析");
+        assert_eq!(
+            d.target_conflicts(),
+            (Some(48), Some(255)),
+            "报的是**预设**的值，不是显式值"
+        );
+
+        // 只冲突一项：只写 version 时，骨骼上限不冲突（预设 255，显式没写）。
+        let d = ModelDesc::from_toml(&MINIMAL_TOML.replace(
+            "[model]",
+            "[model]\ntarget = \"gmod\"\nversion = 49",
+        ))
+        .expect("应当能解析");
+        assert_eq!(d.target_conflicts(), (Some(48), None), "只报冲突的那一项");
     }
 
     /// 非法的 `target` / `max_bones` 必须在 `validate()` 就报错。

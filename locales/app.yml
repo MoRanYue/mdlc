@@ -1750,6 +1750,12 @@ _version: 2
 "mdlc extension: maximum number of bones in the compiled model":
   zh-CN: "mdlc 扩展：编译后模型最多几根骨骼"
 
+"target %{target} sets the studio version to %{preset}, but the studio version is explicitly %{explicit}; the explicit value wins":
+  zh-CN: "target %{target} 把 studio 版本设为 %{preset}，但显式写的是 %{explicit}；以显式值为准"
+
+"target %{target} sets max_bones to %{preset}, but max_bones is explicitly %{explicit}; the explicit value wins":
+  zh-CN: "target %{target} 把 max_bones 设为 %{preset}，但显式写的是 %{explicit}；以显式值为准"
+
 "unknown target %{name}; available presets: %{available}":
   zh-CN: "未知目标 %{name}；可用的预设：%{available}"
 

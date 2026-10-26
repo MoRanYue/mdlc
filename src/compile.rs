@@ -2697,6 +2697,8 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
     if let Err(errs) = desc.validate() {
         return Err(errs.into_iter().map(CompileError::Desc).collect());
     }
+    // 显式参数压过 `target` 预设是对的，但两种写法并存时要说一句「用了哪个」。
+    desc.warn_on_target_conflicts();
 
     let mut errors: Vec<CompileError> = Vec::new();
     let mut bodyparts = Vec::with_capacity(desc.bodyparts.len());
