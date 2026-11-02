@@ -1779,3 +1779,6 @@ _version: 2
 
 "$maxbones must be between 1 and %{max}, but got %{n}":
   zh-CN: "$maxbones 必须在 1 到 %{max} 之间，实际是 %{n}"
+
+"%{option} on the blend sequence %{sequence} would only reach its first cell (%{first}) -- official studiomdl forwards it to animations[0], so every other cell would silently keep the old value; write it on the animation itself instead":
+  zh-CN: "%{option} 写在 blend 序列 %{sequence} 上只会作用到它的第一格（%{first}）——官方把它转交给 animations[0]，其余格不会跟着变；请写在动画本身上"

@@ -398,11 +398,11 @@ and the real animations live in the `anim_<survivor>.mdl` pulled in by `$include
 in by name at load time. An empty shell **must not write `smd`** (the official tool does not even
 allocate a `panim`); writing one is rejected.
 
-> ⚠️ **Known gap: `weight_list` / `num_frames` / `subtract` are silently dropped on blend
-> sequences.** These three options are currently **implemented only on single-animation
-> sequences**: adding them to a blend sequence does not error, but has **no effect whatsoever**
-> (the artifact is identical to one without them). So this is **silent data
-> loss**, not a parse error — write them on a single-animation sequence if you need them to work.
+> ⚠️ **`weight_list` / `num_frames` / `subtract` cannot be written on a blend sequence — that is an
+> error.** The official tool forwards every animation option in a `$sequence` block to
+> `animations[0]`, which for a blend sequence is the **first cell**: only that cell changes and every
+> other cell silently keeps its old value. mdlc would rather fail than half-apply, so write them on
+> **the animation itself** (`[[animations]]`) or on a single-animation sequence.
 
 ### `[[weight_lists]]`
 
@@ -1050,7 +1050,7 @@ reused and only the bone options are applied.
 | A number of rare QC commands | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … are ignored |
 | Official CLI's `-minlod` / `-striplods` / `-definebones` / `-printbones` / `-t` / `-a` | Arguments are accepted but **warned about and ignored** |
 | `$bodygroup { … blank }` | The `blank` member (an empty model) is an **error** — `BodyModel.smd` is a required field and mdlc has no way to express "a model with no mesh" |
-| **`weightlist` / `numframes` / `subtract` on blend sequences** | **Silently dropped** (see above). They work normally on single-animation sequences |
+| **`weightlist` / `numframes` / `subtract` on blend sequences** | **An error** (deliberately stricter than the official tool; see above). The official tool applies them to the first cell only and silently leaves the rest unchanged. They work normally on single-animation sequences |
 | `[[sequences.movements]]` can only be written from TOML | The QC front end has no corresponding keyword (the writer is fully implemented; the QC side simply cannot express it) |
 | DX8 / DX7 fallback variants | The official tool additionally produces `.dx80.vtx` / `.sw.vtx`; L4D2 is a DX9 engine, so only `.dx90.vtx` is produced for now |
 

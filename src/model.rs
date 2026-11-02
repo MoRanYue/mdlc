@@ -5819,6 +5819,34 @@ pub enum DescErrorKind {
     )]
     TooManyBones { used: usize, max: u32 },
 
+    /// `weight_list` / `num_frames` / `subtract` 写在 **blend 序列**上。
+    ///
+    /// 官方把序列块里的「动画选项」一律转交给 `animations[0]`
+    /// （`studiomdl.cpp:2944`）—— 对 blend 序列那只是**第一格**，其余格不跟着变，
+    /// 于是产物「一半生效」。实测（`docs/_probe/` 的 blend 夹具，对照真
+    /// `studiomdl.exe`）：`numframes 90` 只把第一格变成 90 帧、`subtract` 只让
+    /// 第一格偏移，其余格原样。
+    ///
+    /// **这是本项目有意偏离官方的一处**（官方能编过，mdlc 拒绝）：静默半生效
+    /// 比不支持更难查。真实语料（184 个 QC / 1087 条 `$sequence`）里 81 条
+    /// blend 序列**没有一条**用到这三个选项 ⟹ 拒绝不会误伤既有内容。
+    #[error(
+        "{}",
+        crate::tr_fmt!(
+            "%{option} on the blend sequence %{sequence} would only reach its first cell (%{first}) \
+             -- official studiomdl forwards it to animations[0], so every other cell would silently \
+             keep the old value; write it on the animation itself instead",
+            option = option,
+            sequence = format!("{sequence:?}"),
+            first = format!("{first:?}")
+        )
+    )]
+    OptionOnBlendSequence {
+        option: &'static str,
+        sequence: String,
+        first: String,
+    },
+
     /// 其余检查：只产出一句话，没有更细的结构。
     ///
     /// ⚠️ `message` 是**运行时 `format!` 出来的**（带数值、带常量），
@@ -6396,6 +6424,41 @@ impl ModelDesc {
                     },
                 });
             }
+
+            // ---- blend 序列上的「动画选项」----
+            //
+            // `weight_list` / `num_frames` / `subtract` 属于**动画**，不属于序列。
+            // 官方之所以「接受」它们写在 `$sequence` 块里，是因为 `ParseSequence`
+            // 把整个块里的动画选项一律转交给 `ParseAnimationToken(animations[0])`
+            // （`studiomdl.cpp:2944`）—— 单动画序列下 `animations[0]` 就是那条动画，
+            // 所以看着像「序列的选项」；blend 序列下它只是**第一格**。
+            //
+            // 后果是「一半生效」：`numframes 90` 只把第一格拉长到 90 帧
+            // （其余格仍 1 帧）、`subtract` 只让第一格减掉参考（其余格不减，
+            // 混合结果是「一格偏了、两格没偏」）。这比「不支持」更难查，
+            // 所以 mdlc 直接拒绝，并要求写在动画上。
+            //
+            // ⚠️ **有意偏离官方**（官方能编过）。代价可接受：真实语料 184 个 QC /
+            // 1087 条 `$sequence` 里，81 条 blend 序列**没有一条**用到这三个选项。
+            if !s.blends.is_empty() {
+                let first = s.blends.first().map(String::as_str).unwrap_or("");
+                for (option, present) in [
+                    ("weight_list", s.weight_list.is_some()),
+                    ("num_frames", s.num_frames.is_some()),
+                    ("subtract", s.subtract.is_some()),
+                ] {
+                    if present {
+                        errs.push(DescError {
+                            path: format!("{path}.{option}"),
+                            kind: DescErrorKind::OptionOnBlendSequence {
+                                option,
+                                sequence: s.name.clone(),
+                                first: first.to_owned(),
+                            },
+                        });
+                    }
+                }
+            }
         }
 
         // ---- 权重表（`$weightlist`）----
@@ -6812,6 +6875,78 @@ smd = "minimal-ref.smd"
                 "max_bones = {bad} 应报范围错误，实际：{errs:?}"
             );
         }
+    }
+
+    /// blend 序列上的 `weight_list` / `num_frames` / `subtract` 必须被**拒绝**。
+    ///
+    /// 官方会「一半生效」：`ParseSequence` 把序列块里的动画选项一律转交给
+    /// `animations[0]`（`studiomdl.cpp:2944`），对 blend 序列那只是第一格。
+    /// 实测 `numframes 90` 只把第一格拉长、`subtract` 只让第一格偏移 ⟹
+    /// 静默半生效比不支持更难查，见 [`DescErrorKind::OptionOnBlendSequence`]。
+    #[test]
+    fn animation_options_on_a_blend_sequence_are_rejected() {
+        let base = r#"
+[model]
+name = "models/test/blend.mdl"
+
+[materials]
+textures = [{ name = "models/test/blend" }]
+
+[[bones]]
+name = "root"
+
+[[bodyparts]]
+name = "body"
+
+[[bodyparts.models]]
+smd = "blend-ref.smd"
+
+[[animations]]
+name = "a_low"
+smd = "blend-pose.smd"
+
+[[animations]]
+name = "a_high"
+smd = "blend-pose.smd"
+
+[[sequences]]
+name = "look"
+smd = "blend-pose.smd"
+blends = ["a_low", "a_high"]
+blend_width = 2
+"#;
+
+        for (extra, needle) in [
+            ("num_frames = 90", "num_frames"),
+            ("weight_list = \"empty\"", "weight_list"),
+            ("subtract = \"a_low\"", "subtract"),
+        ] {
+            let d = ModelDesc::from_toml(&format!("{base}{extra}\n")).expect("语法本身应当合法");
+            let errs = crate::test_locale::with_english(|| d.validate())
+                .expect_err("blend 序列上的动画选项必须被拒绝");
+            let msg = errs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(msg.contains(needle), "{needle} 应被点名，实际：{msg}");
+            assert!(
+                msg.contains("first cell"),
+                "文案应说明「只到第一格」，实际：{msg}"
+            );
+            assert!(
+                msg.contains("\"look\""),
+                "文案应点名是哪条序列，实际：{msg}"
+            );
+        }
+
+        // 反例：同样的选项写在**单动画**序列上必须放行 —— 那条路径真的会生效。
+        let d = ModelDesc::from_toml(&format!(
+            "{base}[[sequences]]\nname = \"single\"\nsmd = \"a_low\"\nnum_frames = 90\n"
+        ))
+        .expect("语法本身应当合法");
+        d.validate()
+            .expect("单动画序列上的 num_frames 必须合法");
     }
 
     /// **缺省值**必须钉住 —— `serde(default = "default_true")` 一旦写错
