@@ -191,6 +191,23 @@ serde_json = "1"
 # **+116 个包**。冷构建代价见 `docs/update-check.md`。
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
+# ---- DMX 导入 ----
+#
+# BlenderSourceTools 导出的模型是二进制 datamodel，自己解析要重写一套
+# 二进制 v1–v9 + keyvalues2 的读取器（估计 500–700 行）。`datamodel` 已经把
+# 容器层做完，且**保留对象身份**（`element` 属性解析成共享句柄而不是复制子树），
+# 这对「DAG 里同一个 joint 从多条路径可达」是必需的。
+#
+# ⚠️ 钉精确版本：0.x 系列会破坏性发版，且上游 **零单元测试**（3669 行、
+# 无 `tests/`、无 CI）。升级必须先跑 `cargo run --example probe_dmx` 对三种
+# BST 预设（L4D2 binary 4/15、GMod 2/1、SFM 5/18）。
+#
+# 代价：+13 个包（uuid/rand/chacha20/paste/const_format/konst/unicode-xid 等），
+# release 体积 +12.8 KB。实测解析一份 3 KB 的 BST 导出只要 0.07 ms，运行期代价可忽略。
+# `default-features = false` 摘掉 `derive`（我们只用 `deserialize`）—— 带 derive 时
+# 是 +16 个包 / +21.5 KB。
+datamodel = { version = "=0.10.0", default-features = false }
+
 # ---- 仅 Windows：摘掉后台子进程不该继承的 std 句柄 ----
 #
 # `std::process::Command` 在 Windows 上**无条件**用 `bInheritHandles = TRUE`

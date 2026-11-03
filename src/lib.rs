@@ -62,6 +62,7 @@ pub mod bone_math;
 pub mod cli;
 pub mod compile;
 pub mod diag;
+pub mod dmx;
 pub mod fbx;
 pub mod flex;
 pub mod format;

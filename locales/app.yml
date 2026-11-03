@@ -1782,3 +1782,15 @@ _version: 2
 
 "%{option} on the blend sequence %{sequence} would only reach its first cell (%{first}) -- official studiomdl forwards it to animations[0], so every other cell would silently keep the old value; write it on the animation itself instead":
   zh-CN: "%{option} 写在 blend 序列 %{sequence} 上只会作用到它的第一格（%{first}）——官方把它转交给 animations[0]，其余格不会跟着变；请写在动画本身上"
+
+"cannot open %{path}: %{message}":
+  zh-CN: "打不开 %{path}：%{message}"
+
+"%{path} is not a Valve datamodel: %{message}":
+  zh-CN: "%{path} 不是 Valve datamodel：%{message}"
+
+"%{path} is a %{format} datamodel, not a model one":
+  zh-CN: "%{path} 是 %{format} 类型的 datamodel，不是模型"
+
+"%{path}: %{message}":
+  zh-CN: "%{path}：%{message}"
