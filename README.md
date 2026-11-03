@@ -183,8 +183,11 @@ QC 脚本  ──┘
 **格式由扩展名决定，所以必须写全**
 —— 这也是不自动补扩展名的原因之一（见 `## 已知未实现`）。
 
-> **DMX 目前只读网格与骨架**（和 SMD 一样用），文件里若带**动画数据**会明确报错，
-> 提示改指 `.smd`。这不是扩展 —— 官方 `studiomdl.exe` 原生就读 DMX。
+> **DMX 三种用法都支持**：作**网格源**（`$body` / `$model` / `$lod`，含
+> `DmeMesh.deltaStates` 形态键，自动注册成 flex）、作**动画源**
+> （`$sequence` / `$animation`；BlenderSourceTools 把它写成单独一个
+> `anims/<骨架名>.dmx`）、或两者合一。这不是扩展 —— 官方 `studiomdl.exe`
+> 原生就读 DMX。
 >
 > **FBX / glTF 都可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
 > （合并所有网格、恒取第一条 NLA 栈、shape key 自动注册成 flex），
@@ -1001,7 +1004,7 @@ switch_point = 40.0
 | 项 | 说明 |
 |---|---|
 | **LOD 自动生成** | 网格简化 / decimate。多 LOD 的**输入与写出**已支持，但不会替你简化。**这是与官方差距最大的一块** |
-| **DMX 动画** | 刻意不实现。DMX 作为**网格与骨架**源完全可用，但文件里带动画数据时会**显式报错**并提示改指 `.smd` |
+| **DMX 的 `DmeCombinationOperator` 表达式** | 形态键按**下标**与控制器配对（`deltaStates[i]` ↔ `controls[i]`），不读 dominator / 表达式那套 |
 | `$maxverts` | NekoMDL 的非官方扩展，被忽略。用自动拆分替代 |
 | `ikrule footstep`（type 3） | 需要 `$ikchain` 的 `center`，mdlc 尚未建模该量。写出时会**显式报错**而不是静默产出错误载荷 |
 | 若干罕见的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … 被忽略 |

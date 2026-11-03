@@ -646,9 +646,11 @@ pub enum SourceKind {
     /// `.dmx` —— Valve datamodel（走 `datamodel` crate）。
     ///
     /// 官方 studiomdl **原生支持**它（实测 `DMX Model <path>` 后正常出产物），
-    /// 所以这是「官方有、mdlc 补齐」的一格，不是扩展。当前只读网格与骨架
-    /// （阶段 A），动画 / `delta states` / `DmeCombinationOperator` 还没接 ——
-    /// 那些要以动画源的身份使用时会被 [`crate::dmx::read_frames`] 明确拒绝。
+    /// 所以这是「官方有、mdlc 补齐」的一格，不是扩展。
+    ///
+    /// 三种用法都通：**网格源**（`$body` / `$model` / `$lod`，含
+    /// `DmeMesh.deltaStates` 形态键）、**动画源**（`$sequence` / `$animation`，
+    /// BST 把它写成单独一个 `anims/<骨架>.dmx`）、以及两者合一。
     Dmx,
 }
 
@@ -928,12 +930,13 @@ pub fn read_source_geometry(
                 anim_stacks: g.anim_stacks,
             })
             .map_err(|err| e(at, err.to_string())),
-        // 阶段 A 的 DMX 只有几何与骨架：shape key（delta states）还没接，
-        // 所以这四个扩展字段恒为空 —— 与 `.smd` 源同一口径。
-        SourceKind::Dmx => crate::dmx::read(path, at)
+        // DMX 的形态键（`DmeMesh.deltaStates`）与 FBX 的 shape key 是同一概念，
+        // 所以同样带出来；另外三个字段（无材质网格 / 合并网格 / 动画栈）是
+        // FBX 专有的诊断，DMX 侧恒空。
+        SourceKind::Dmx => crate::dmx::read_geometry(path, at)
             .map(|g| SourceGeometry {
                 smd: g.smd,
-                shape_keys: Vec::new(),
+                shape_keys: g.shape_keys,
                 untextured_meshes: Vec::new(),
                 merged_meshes: Vec::new(),
                 anim_stacks: Vec::new(),

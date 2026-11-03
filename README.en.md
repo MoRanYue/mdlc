@@ -195,9 +195,11 @@ A mesh source can be **SMD**, **DMX** (`.dmx`, Valve's datamodel format — what
 **The format is determined by the extension, so it must be written in full**
 — which is one reason extensions are not auto-appended (see `## Known unimplemented`).
 
-> **DMX is read for its mesh and skeleton only** (used just like SMD); a file that carries
-> **animation data** is rejected with a pointer back to `.smd`. This is not an extension —
-> the official `studiomdl.exe` reads DMX natively.
+> **DMX works in all three roles**: as a **mesh source** (`$body` / `$model` / `$lod`,
+> including `DmeMesh.deltaStates` morph targets, which are registered as flex for you), as an
+> **animation source** (`$sequence` / `$animation`; BlenderSourceTools writes those to a
+> separate `anims/<skeleton>.dmx`), or both in one file. This is not an extension — the
+> official `studiomdl.exe` reads DMX natively.
 >
 > **FBX / glTF can be written directly into QC**, with no intermediate conversion. The default
 > behaviour **matches the official tool line by line** (merge every mesh, always take the first
@@ -1075,7 +1077,7 @@ reused and only the bone options are applied.
 | Item | Notes |
 |---|---|
 | **Automatic LOD generation** | Mesh simplification / decimation. Multiple-LOD **input and output** are supported, but it will not simplify for you. **This is the largest gap versus the official tool** |
-| **DMX animation** | Deliberately unimplemented. DMX works fully as a **mesh and skeleton** source, but a file that carries animation data gives an **explicit error** pointing back to `.smd` |
+| **DMX `DmeCombinationOperator` expressions** | Morph targets are paired with controllers **by index** (`deltaStates[i]` ↔ `controls[i]`); dominators and expressions are not read |
 | `$maxverts` | A non-official NekoMDL extension; ignored. Use automatic splitting instead |
 | `ikrule footstep` (type 3) | Needs the `center` of `$ikchain`, which mdlc does not model yet. Writing it is an **explicit error** rather than silently producing a wrong payload |
 | A number of rare QC commands | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … are ignored |

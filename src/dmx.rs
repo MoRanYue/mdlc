@@ -76,12 +76,16 @@ pub struct DmxModel {
     pub materials: Vec<DmxMaterial>,
     /// 网格，一个 `DmeMesh` 一项。
     pub meshes: Vec<DmxMesh>,
-    /// 文件里有没有动画数据（任意 `DmeLog` 元素）。
+    /// 文件里有没有动画数据（任意 `Dme*Log` 元素）。
     ///
-    /// 阶段 A 只读网格与骨架，**不读动画**。有动画的文件被当成几何源用没问题，
-    /// 但被当成**动画源**（`$sequence` 直接指向它）时必须报错，否则会静默产出
-    /// 一帧绑定姿态 —— 用户以为动画编进去了，实际上没有。
+    /// BST 把动画写成**单独一个文件**（`anims/<骨架名>.dmx`），模型文件里没有
+    /// 通道，所以这个标志决定 [`read_frames`] 走哪条路：有动画 ⟹ 逐帧读
+    /// 通道日志；没有 ⟹ 给一帧绑定姿态（静态道具的 DMX 就长这样）。
     pub has_animation: bool,
+    /// 形态键控制器的名字，顺序即 `DmeCombinationOperator.controls`。
+    ///
+    /// `deltaStates[i]` 的 flex 名要取这里的第 `i` 项（见 [`DmxDelta`]）。
+    pub controls: Vec<String>,
     /// 读得下去但值得提醒的事（例如一个网格挂了多个材质）。
     pub warnings: Vec<String>,
 }
@@ -135,6 +139,28 @@ pub struct DmxMesh {
     pub weights: Vec<Vec<(u32, f32)>>,
     /// 三角形，逐角带着自己的法线与 UV。
     pub triangles: Vec<DmxTriangle>,
+    /// 形态键（`DmeMesh.deltaStates`），顺序即文件里的 `deltaStates` 顺序。
+    pub deltas: Vec<DmxDelta>,
+}
+
+/// 一个形态键（`DmeVertexDeltaData`）。
+///
+/// 两条实测结论：
+///
+/// * **数据是增量不是绝对值** —— `positions` 每项要加到基准网格对应的顶点上
+///   （BST 导出的立方体里 `wide` 写的是 `(0, 0, ±3)` 这种纯偏移）。
+/// * **不要拿 `DmeVertexDeltaData.name` 去配控制器**。夹具里名为 `wide` 的
+///   delta 带着另一条形态键的位移（±3 是 `tall` 的、±2.5 是 `wide` 的），
+///   名字与数据对不上。可靠的配对是**下标**：`deltaStates[i]` 对应
+///   `DmeCombinationOperator.controls[i]`，所以名字要取控制器的。
+#[derive(Debug, Clone, Default)]
+pub struct DmxDelta {
+    /// `DmeVertexDeltaData.name`（**只用来做诊断**，不作配对依据）。
+    pub name: String,
+    /// 位置增量，与 [`DmxDelta::position_indices`] 平行。
+    pub positions: Vec<[f32; 3]>,
+    /// 每个增量作用在 [`DmxMesh::positions`] 的哪个下标上。
+    pub position_indices: Vec<u32>,
 }
 
 /// 一个三角形。材质是**逐面集**给的，同一网格里可以混（BST 按材质切 face set）。
@@ -220,15 +246,44 @@ fn read_from<R: BufRead>(reader: &mut R, path: &str) -> Result<DmxModel, DmxErro
 
     let mut out = DmxModel {
         format_version: u32::try_from(header.format_version).unwrap_or_default(),
-        has_animation: flat.iter().any(|e| class_is(e, "DmeLog")),
+        // BST 把动画写成 `DmeChannelsClip` + 每条通道一个 `DmeQuaternionLog` /
+        // `DmeVector3Log`。类名不是 `DmeLog`，是 `Dme*Log` —— 按前缀认。
+        has_animation: flat.iter().any(|e| {
+            let class = e.get_class();
+            class.starts_with("Dme") && class.ends_with("Log")
+        }),
         ..Default::default()
     };
 
     out.materials = collect_materials(&flat);
     out.bones = collect_bones(model);
+    out.controls = collect_control_names(&flat);
     let mesh_transforms = collect_mesh_transforms(model);
     out.meshes = collect_meshes(&flat, &out.materials, &mesh_transforms, &mut out.warnings);
     Ok(out)
+}
+
+/// 形态键控制器的名字，顺序即 `DmeCombinationOperator.controls` 的顺序。
+///
+/// 这就是 `deltaStates[i]` 该叫什么 —— **不能**用 `DmeVertexDeltaData.name`，
+/// 实测两者会对不上（见 [`DmxDelta`]）。
+fn collect_control_names(flat: &[Element]) -> Vec<String> {
+    let Some(operator) = flat
+        .iter()
+        .find(|e| class_is(e, "DmeCombinationOperator"))
+    else {
+        return Vec::new();
+    };
+    element_array_attr(operator, "controls")
+        .iter()
+        .map(|control| {
+            string_array_attr(control, "rawControlNames")
+                .into_iter()
+                .next()
+                .or_else(|| string_attr(control, "name"))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// 每个网格在**模型空间**里的变换（位置 + 四元数），按网格元素 id 索引。
@@ -303,12 +358,16 @@ fn multiply(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 
 /// DMX 转成 SMD 口径之后的结果。
 ///
-/// 阶段 A 只做网格与骨骼：把 `.dmx` 当成 `.smd` 用（`$body` / `$model` / LOD）。
-/// 动画、`delta states`、`DmeCombinationOperator` 都不在这里 —— 它们要接到 IR 的
-/// 另一条路上。
+/// 把 `.dmx` 当成 `.smd` 用（`$body` / `$model` / LOD）：`smd` 里是节点、参考
+/// 姿态与三角形，`shape_keys` 是 `DmeMesh.deltaStates`（形态键）。动画不走这里，
+/// 见 [`read_frames`]。
 #[derive(Debug, Clone)]
 pub struct DmxGeometry {
     pub smd: crate::smd::Smd,
+    /// 形态键（`DmeMesh.deltaStates`），已经换算成 Source 空间与全局控制点号。
+    ///
+    /// 与 FBX 路径口径一致：官方把形态键全自动注册成 flex，所以这份数据不能丢。
+    pub shape_keys: Vec<crate::fbx::FbxShapeKey>,
     pub warnings: Vec<String>,
 }
 
@@ -319,15 +378,27 @@ pub fn read(path: &Path, at: &str) -> Result<DmxGeometry, DmxError> {
     to_smd(&model, at, &label)
 }
 
+/// 读一个 DMX 的**几何**（必须真有三角形）。
+///
+/// 与 [`read`] 的差别只有一条：网格源里一个三角形都没有是错误。
+/// BST 的动画文件（`anims/<骨架>.dmx`）只有骨架，那种文件会被 QC 预解析
+/// 用 [`read`] 打开一次（只取节点名），所以拦在这里而不是拦在读取层。
+pub fn read_geometry(path: &Path, at: &str) -> Result<DmxGeometry, DmxError> {
+    let geometry = read(path, at)?;
+    if geometry.smd.triangles.is_empty() {
+        return Err(DmxError::malformed(
+            &path.display().to_string(),
+            "the model contains no triangles",
+        ));
+    }
+    Ok(geometry)
+}
+
 /// 把一个 DMX 当**动画源**读（`$sequence` / `$animation` 直接指向它）。
 ///
-/// 阶段 A 还没接 `DmeLog`，所以这里只有两种结果：
-///
+/// * 文件里**有**动画数据（`Dme*Log`）⟹ 逐帧读出来（见 `read_animation`）；
 /// * 文件里**没有**动画数据 ⟹ 给一帧绑定姿态，与 `.smd` 只有 `skeleton` 段时一致
-///   （BST 给静态道具导出的 DMX 就长这样）；
-/// * 文件里**有**动画数据 ⟹ 报错。这是有意的：静默给一帧会让用户以为动画编进去了，
-///   而正确的做法是指向 `.smd`（BST 的 SMD 导出带逐帧 `skeleton`）或等 mdlc 接上
-///   `DmeLog`。
+///   （BST 给静态道具导出的 DMX 就长这样）。
 ///
 /// ⚠️ 返回的 [`crate::smd::Smd`] 的 `triangles` 是空的 —— 与
 /// [`crate::fbx::read_frames`] 同一口径，调用方只取 `frames`。
@@ -335,50 +406,285 @@ pub fn read_frames(path: &Path, at: &str) -> Result<crate::smd::Smd, DmxError> {
     let label = path.display().to_string();
     let model = load(path)?;
     if model.has_animation {
-        return Err(DmxError::malformed(
-            &label,
-            crate::tr_fmt!(
-                "the file contains animation data, but mdlc only reads the geometry and skeleton of a .dmx for now; point %{at} at an .smd instead",
-                at = at
-            ),
-        ));
+        let file = File::open(path).map_err(|err| DmxError::Io {
+            path: label.clone(),
+            message: err.to_string(),
+        })?;
+        return read_animation(&mut BufReader::new(file), &label, &model);
     }
     let mut smd = to_smd(&model, at, &label)?.smd;
     smd.triangles.clear();
     Ok(smd)
 }
 
-/// 把 [`DmxModel`] 翻译成 [`crate::smd::Smd`]。
+/// 从动画 DMX 里读出逐帧姿态。
 ///
-/// 三处换算都是实测定的（见 [`DmxBone::position`] / [`DmxBone::orientation`]）：
-/// 平移**原样**、旋转走 [`crate::bone_math::quaternion_angles`]、节点表只留真骨骼。
-fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxError> {
-    use crate::smd::{SmdBoneLink, SmdFrame, SmdNode, SmdPose, SmdTriangle, SmdVertex};
+/// BST 把动画写在**单独的文件**里（`anims/<骨架名>.dmx`），结构与模型文件不同：
+/// 根上是 `animationList` → `DmeAnimationList` → `DmeChannelsClip`，每个通道
+/// （`DmeChannel`）指向一个 `DmeTransform` 和它的 `position` / `orientation` 日志。
+///
+/// 三个实测结论决定了这里的做法：
+///
+/// * **时间单位是 1/10000 秒的 tick**：`frameRate = 20` 时相邻两帧差 500。
+/// * **值已经是骨骼空间的绝对局部变换**（与 `DmeTransform` 逐位相同），所以
+///   逐帧只需要 [`crate::bone_math::quaternion_angles`]，不需要父链矩阵。
+/// * **常量通道会被压成 1 个键**（`times = [0]`），所以取样必须支持「只有一个键
+///   ⟹ 恒定」，不能假设键数等于帧数。
+fn read_animation<R: BufRead>(
+    reader: &mut R,
+    label: &str,
+    model: &DmxModel,
+) -> Result<crate::smd::Smd, DmxError> {
+    use crate::smd::{SmdFrame, SmdPose};
 
-    let mut warnings = model.warnings.clone();
+    let (_, root) = datamodel::deserialize(reader).map_err(|err| DmxError::Parse {
+        path: label.to_owned(),
+        message: err.to_string(),
+    })?;
+    let mut flat = Vec::new();
+    let mut seen = HashSet::new();
+    walk(&root, &mut flat, &mut seen);
 
-    // 槽位 → 节点下标（只留 `DmeJoint`；`DmeDag` 是网格自己的落点，不是骨骼）。
+    let clip = element_attr(&root, "animationList")
+        .and_then(|list| element_array_attr(&list, "animations").into_iter().next())
+        .or_else(|| {
+            flat.iter()
+                .find(|el| class_is(el, "DmeChannelsClip"))
+                .cloned()
+        })
+        .ok_or_else(|| {
+            DmxError::malformed(
+                label,
+                "the file signals animation data but has no DmeChannelsClip",
+            )
+        })?;
+
+    // 帧率决定 tick ↔ 帧的换算。官方写法是 `Integer`，SFM 以后可能是浮点。
+    let fps = int_attr(&clip, "frameRate").unwrap_or(30).max(1) as f32;
+    let ticks_per_frame = 10_000.0 / fps;
+
+    // `DmeTransform` 元素 id → 骨骼槽位。通道的 `toElement` 指向变换本身，
+    // 名字（`root_p` / `root_o`）只是给人看的，**不能**拿来配对。
+    let skeleton = element_attr(&root, "skeleton")
+        .or_else(|| flat.iter().find(|el| class_is(el, "DmeModel")).cloned());
+    let mut transform_slot: HashMap<String, usize> = HashMap::new();
+    if let Some(skeleton) = &skeleton {
+        for (slot, entry) in joint_entries(skeleton).into_iter().enumerate() {
+            let target = element_attr(&entry, "transform")
+                .map(|transform| id_of(&transform))
+                .unwrap_or_else(|| id_of(&entry));
+            transform_slot.insert(target, slot);
+        }
+    }
+
+    let mut positions: HashMap<usize, Track<[f32; 3]>> = HashMap::new();
+    let mut rotations: HashMap<usize, Track<[f32; 4]>> = HashMap::new();
+    let mut last_tick = 0i32;
+    for channel in element_array_attr(&clip, "channels") {
+        let Some(target) = element_attr(&channel, "toElement") else {
+            continue;
+        };
+        let Some(&slot) = transform_slot.get(&id_of(&target)) else {
+            continue;
+        };
+        let Some(log) = element_attr(&channel, "log") else {
+            continue;
+        };
+        let Some(layer) = element_array_attr(&log, "layers").into_iter().next() else {
+            continue;
+        };
+        let times = time_array_attr(&layer, "times");
+        if let Some(tick) = times.last() {
+            last_tick = last_tick.max(*tick);
+        }
+        match string_attr(&channel, "toAttribute").unwrap_or_default().as_str() {
+            "position" => {
+                let values = vector3_array_attr(&layer, "values");
+                if !values.is_empty() {
+                    positions.insert(slot, Track { times, values });
+                }
+            }
+            "orientation" => {
+                let values = quaternion_array_attr(&layer, "values");
+                if !values.is_empty() {
+                    rotations.insert(slot, Track { times, values });
+                }
+            }
+            // 缩放等通道官方也不读，静默跳过。
+            _ => {}
+        }
+    }
+
+    let (nodes, node_of) = joint_node_table(model);
+    if nodes.is_empty() {
+        return Err(DmxError::malformed(
+            label,
+            "the animation file has no joints, so there is no skeleton to animate",
+        ));
+    }
+    let frames = (last_tick as f32 / ticks_per_frame).round() as i32 + 1;
+    let mut out_frames = Vec::with_capacity(frames.max(1) as usize);
+    for frame in 0..frames.max(1) {
+        let tick = (frame as f32 * ticks_per_frame).round() as i32;
+        let mut poses = Vec::new();
+        for (slot, bone) in model.bones.iter().enumerate() {
+            // 没有通道的骨骼用文件里的绑定姿态（常量骨就是这样表达的）。
+            let Some(&node) = node_of.get(slot).and_then(|node| node.as_ref()) else {
+                continue;
+            };
+            let position = positions
+                .get(&slot)
+                .map(|track| track.sample(tick))
+                .unwrap_or(bone.position);
+            let orientation = rotations
+                .get(&slot)
+                .map(|track| track.sample(tick))
+                .unwrap_or(bone.orientation);
+            poses.push(SmdPose {
+                bone: node,
+                position,
+                rotation: crate::bone_math::quaternion_angles(orientation),
+            });
+        }
+        out_frames.push(SmdFrame {
+            time: frame,
+            poses,
+        });
+    }
+
+    Ok(crate::smd::Smd {
+        version: 1,
+        nodes,
+        frames: out_frames,
+        triangles: Vec::new(),
+    })
+}
+
+/// 一条采样曲线：键时刻（tick）+ 值。
+struct Track<V> {
+    times: Vec<i32>,
+    values: Vec<V>,
+}
+
+impl Track<[f32; 3]> {
+    /// 线性取样；只有一个键时恒定；超界时夹到首/末键。
+    fn sample(&self, tick: i32) -> [f32; 3] {
+        let Some((a, b, t)) = bracket(&self.times, tick) else {
+            return self.values.first().copied().unwrap_or_default();
+        };
+        let from = self.values[a];
+        let to = self.values[b];
+        [
+            from[0] + (to[0] - from[0]) * t,
+            from[1] + (to[1] - from[1]) * t,
+            from[2] + (to[2] - from[2]) * t,
+        ]
+    }
+}
+
+impl Track<[f32; 4]> {
+    /// 球面插值；只有一个键时恒定。四元数要处理同向/反向两种等价表示。
+    fn sample(&self, tick: i32) -> [f32; 4] {
+        let Some((a, b, t)) = bracket(&self.times, tick) else {
+            return self
+                .values
+                .first()
+                .copied()
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        };
+        if a == b {
+            return self.values[a];
+        }
+        slerp(self.values[a], self.values[b], t)
+    }
+}
+
+/// 找出 `tick` 落在哪两个键之间，返回 `(左, 右, 比例)`。
+fn bracket(times: &[i32], tick: i32) -> Option<(usize, usize, f32)> {
+    let first = *times.first()?;
+    let last_index = times.len() - 1;
+    let last = times[last_index];
+    if times.len() < 2 || tick <= first {
+        return Some((0, 0, 0.0));
+    }
+    if tick >= last {
+        return Some((last_index, last_index, 0.0));
+    }
+    for index in 1..times.len() {
+        if tick <= times[index] {
+            let span = (times[index] - times[index - 1]) as f32;
+            let t = if span > 0.0 {
+                (tick - times[index - 1]) as f32 / span
+            } else {
+                0.0
+            };
+            return Some((index - 1, index, t));
+        }
+    }
+    Some((last_index, last_index, 0.0))
+}
+
+fn slerp(from: [f32; 4], to: [f32; 4], t: f32) -> [f32; 4] {
+    let mut dot = from[0] * to[0] + from[1] * to[1] + from[2] * to[2] + from[3] * to[3];
+    let mut to = to;
+    if dot < 0.0 {
+        to = [-to[0], -to[1], -to[2], -to[3]];
+        dot = -dot;
+    }
+    if dot > 0.9995 {
+        // 夹角太小，球面插值与线性插值数值上没区别，直接归一化更稳。
+        let mixed = [
+            from[0] + (to[0] - from[0]) * t,
+            from[1] + (to[1] - from[1]) * t,
+            from[2] + (to[2] - from[2]) * t,
+            from[3] + (to[3] - from[3]) * t,
+        ];
+        let len = (mixed[0] * mixed[0]
+            + mixed[1] * mixed[1]
+            + mixed[2] * mixed[2]
+            + mixed[3] * mixed[3])
+            .sqrt();
+        if len > f32::EPSILON {
+            return [
+                mixed[0] / len,
+                mixed[1] / len,
+                mixed[2] / len,
+                mixed[3] / len,
+            ];
+        }
+        return mixed;
+    }
+    let theta0 = dot.clamp(-1.0, 1.0).acos();
+    let theta = theta0 * t;
+    let sin = theta0.sin();
+    let s0 = (theta0 - theta).sin() / sin;
+    let s1 = theta.sin() / sin;
+    [
+        from[0] * s0 + to[0] * s1,
+        from[1] * s0 + to[1] * s1,
+        from[2] * s0 + to[2] * s1,
+        from[3] * s0 + to[3] * s1,
+    ]
+}
+
+/// 骨骼槽位 → SMD 节点下标，并顺带生成 `nodes` 表。
+///
+/// 只留 `DmeJoint`：`jointList` 里混着网格自己的 `DmeDag`（未蒙皮顶点的落点），
+/// 它不是骨骼。父骨骼可能落在被跳过的槽位上，所以顺着 `parent` 链上找最近的真骨骼。
+fn joint_node_table(model: &DmxModel) -> (Vec<crate::smd::SmdNode>, Vec<Option<i32>>) {
     let mut node_of: Vec<Option<i32>> = vec![None; model.bones.len()];
-    let mut nodes: Vec<SmdNode> = Vec::new();
+    let mut nodes: Vec<crate::smd::SmdNode> = Vec::new();
     for (slot, bone) in model.bones.iter().enumerate() {
         if !bone.is_joint {
             continue;
         }
         node_of[slot] = Some(nodes.len() as i32);
-        nodes.push(SmdNode {
+        nodes.push(crate::smd::SmdNode {
             index: nodes.len() as i32,
             name: bone.name.clone(),
             parent: -1,
         });
     }
-    if nodes.is_empty() {
-        return Err(DmxError::malformed(
-            path,
-            "the model has no joints (only DAGs), so there is no skeleton to compile",
-        ));
-    }
-
-    // 父骨骼可能落在被跳过的槽位上，顺着 `parent` 链上找到最近的真骨骼。
     for (slot, bone) in model.bones.iter().enumerate() {
         let Some(node) = node_of[slot] else {
             continue;
@@ -398,6 +704,25 @@ fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxErro
             }
         }
         nodes[node as usize].parent = parent;
+    }
+    (nodes, node_of)
+}
+
+/// 把 [`DmxModel`] 翻译成 [`crate::smd::Smd`]。
+///
+/// 三处换算都是实测定的（见 [`DmxBone::position`] / [`DmxBone::orientation`]）：
+/// 平移**原样**、旋转走 [`crate::bone_math::quaternion_angles`]、节点表只留真骨骼。
+fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxError> {
+    use crate::smd::{SmdBoneLink, SmdFrame, SmdPose, SmdTriangle, SmdVertex};
+
+    let mut warnings = model.warnings.clone();
+
+    let (nodes, node_of) = joint_node_table(model);
+    if nodes.is_empty() {
+        return Err(DmxError::malformed(
+            path,
+            "the model has no joints (only DAGs), so there is no skeleton to compile",
+        ));
     }
 
     let poses: Vec<SmdPose> = model
@@ -436,6 +761,7 @@ fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxErro
     };
 
     let mut triangles: Vec<SmdTriangle> = Vec::new();
+    let mut shape_keys: Vec<crate::fbx::FbxShapeKey> = Vec::new();
     let mut src_index: u32 = 0;
     let mut merged: Vec<String> = Vec::new();
     for mesh in &model.meshes {
@@ -445,6 +771,37 @@ fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxErro
         merged.push(mesh.name.clone());
         let base = src_index;
         src_index += mesh.positions.len() as u32;
+        // 形态键：**名字取控制器、数据取 delta**（下标配对），理由见 [`DmxDelta`]。
+        for (index, delta) in mesh.deltas.iter().enumerate() {
+            let name = model
+                .controls
+                .get(index)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| delta.name.clone());
+            if name.is_empty() {
+                warnings.push(format!(
+                    "the mesh {mesh:?} has a delta state with no name, skipped",
+                    mesh = mesh.name
+                ));
+                continue;
+            }
+            if !delta.name.is_empty() && delta.name != name {
+                // 真实夹具里会撞上（BST 的 `name` 与控制器的顺序对不上）—— 说出来，
+                // 免得用户对着一个方向不对的形态键查半天。
+                warnings.push(format!(
+                    "delta state {index} is named {delta:?} but its controller is {name:?}; mdlc pairs them by index",
+                    delta = delta.name
+                ));
+            }
+            shape_keys.push(crate::fbx::FbxShapeKey {
+                name,
+                position_offsets: delta.positions.clone(),
+                // 官方在 FBX 路径上同样丢弃法线增量（见 [`collect_deltas`]）。
+                normal_offsets: vec![[0.0; 3]; delta.positions.len()],
+                vertex_index: delta.position_indices.iter().map(|&i| base + i).collect(),
+            });
+        }
         for tri in &mesh.triangles {
             let material = tri
                 .material
@@ -505,11 +862,12 @@ fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxErro
         }
     }
 
-    if triangles.is_empty() {
-        return Err(DmxError::malformed(
-            path,
-            "the model contains no triangles",
-        ));
+    // ⚠️ 这里**不**因为「一个三角形都没有」报错：BST 的动画文件
+    // （`anims/<骨架>.dmx`）只有骨架与通道日志，没有网格，而 QC 预解析
+    // 会把它当普通源打开一次（只取节点名）。真正需要几何的入口是
+    // [`read_geometry`]，那里才拦。
+    if triangles.is_empty() && !model.meshes.is_empty() {
+        warnings.push("the model has meshes but none of them produced a triangle".to_owned());
     }
     if model.meshes.len() > 1 {
         // 多个网格合并成一个 SMD：与 FBX 路径同一套口径（按顺序拼起来）。
@@ -528,6 +886,7 @@ fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxErro
             frames: vec![SmdFrame { time: 0, poses }],
             triangles,
         },
+        shape_keys,
         warnings,
     })
 }
@@ -756,9 +1115,40 @@ fn collect_meshes(
             positions,
             weights,
             triangles,
+            deltas: collect_deltas(mesh, orientation),
         });
     }
     out
+}
+
+/// 读一个网格的形态键（`DmeMesh.deltaStates`）。
+///
+/// 只取位置增量：`normals` 是 **loop 空间**的（`normalsIndices` 指向角，不是控制点），
+/// 而下游的 [`crate::fbx::FbxShapeKey`] 按控制点存，两者对不上；官方在 FBX 路径上
+/// 也把这些法线增量整个丢掉。
+///
+/// 增量要跟着网格的**旋转**走（不能加平移：增量是相对量），否则多网格合并之后
+/// 形态会朝着错误的方向变形。
+fn collect_deltas(mesh: &Element, orientation: [f32; 4]) -> Vec<DmxDelta> {
+    element_array_attr(mesh, "deltaStates")
+        .iter()
+        .map(|delta| {
+            let mut positions = Vec::new();
+            let mut position_indices = Vec::new();
+            let values = vector3_array_attr(delta, "positions");
+            for (index, position) in i32_array_attr(delta, "positionsIndices").iter().zip(values) {
+                if let Ok(index) = u32::try_from(*index) {
+                    position_indices.push(index);
+                    positions.push(rotate(orientation, position));
+                }
+            }
+            DmxDelta {
+                name: string_attr(delta, "name").unwrap_or_default(),
+                positions,
+                position_indices,
+            }
+        })
+        .collect()
 }
 
 /// loop 空间的属性表：给一个 loop 下标，取出这个角自己的位置 / 法线 / UV。
@@ -954,6 +1344,16 @@ fn string_attr(el: &Element, name: &str) -> Option<String> {
     }
 }
 
+fn string_array_attr(el: &Element, name: &str) -> Vec<String> {
+    let Some(attr) = el.get_attribute(name) else {
+        return Vec::new();
+    };
+    match attr.get_inner_value() {
+        AttributeValue::StringArray(values) => values.clone(),
+        _ => Vec::new(),
+    }
+}
+
 fn int_attr(el: &Element, name: &str) -> Option<i32> {
     let attr = el.get_attribute(name)?;
     match attr.get_inner_value() {
@@ -1023,6 +1423,29 @@ fn quaternion_attr(el: &Element, name: &str) -> Option<[f32; 4]> {
     match attr.get_inner_value() {
         AttributeValue::Quaternion(q) => Some([q.x, q.y, q.z, q.w]),
         _ => None,
+    }
+}
+
+fn quaternion_array_attr(el: &Element, name: &str) -> Vec<[f32; 4]> {
+    let Some(attr) = el.get_attribute(name) else {
+        return Vec::new();
+    };
+    match attr.get_inner_value() {
+        AttributeValue::QuaternionArray(values) => {
+            values.iter().map(|q| [q.x, q.y, q.z, q.w]).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `TimeArray`（时间戳，单位是 1/10000 秒的 tick）。
+fn time_array_attr(el: &Element, name: &str) -> Vec<i32> {
+    let Some(attr) = el.get_attribute(name) else {
+        return Vec::new();
+    };
+    match attr.get_inner_value() {
+        AttributeValue::TimeArray(values) => values.iter().map(|t| t.0).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1192,5 +1615,100 @@ mod tests {
         for (i, (a, b)) in ours_key.iter().zip(&theirs_key).enumerate() {
             assert_eq!(a, b, "第 {i} 个三角形（按排序后比）不一致");
         }
+    }
+
+    /// 同一场景的**动画** DMX（BST 写在 `anims/<骨架>.dmx` 里）。
+    const BST_ANIM: &[u8] = include_bytes!("dmx_fixtures/blender_anim.dmx");
+    /// 同一场景的动画 SMD（BST 的 SMD 导出），用来当对照真值。
+    const BST_ANIM_SMD: &str = include_str!("dmx_fixtures/blender_anim.smd");
+    /// 带形态键（`deltaStates` + `DmeCombinationOperator`）的模型。
+    const BST_SHAPES: &[u8] = include_bytes!("dmx_fixtures/blender_shapes.dmx");
+
+    #[test]
+    fn reads_blender_source_tools_animation() {
+        let mut reader = Cursor::new(BST_ANIM);
+        let model = read_from(&mut reader, "blender_anim.dmx").expect("应当能解析");
+        assert!(model.has_animation, "这份夹具带 DmeLog");
+
+        let smd = read_animation(
+            &mut Cursor::new(BST_ANIM),
+            "blender_anim.dmx",
+            &model,
+        )
+        .expect("应当能读出动画");
+
+        // 同一场景的 SMD 导出：20 帧（`time 0 .. 19`），4 个节点。
+        let truth = crate::smd::parse_smd(BST_ANIM_SMD).expect("对照夹具应当能解析");
+        assert_eq!(smd.nodes.len(), truth.nodes.len(), "节点数");
+        for (ours, theirs) in smd.nodes.iter().zip(&truth.nodes) {
+            assert_eq!(ours.name, theirs.name, "节点名");
+            assert_eq!(ours.parent, theirs.parent, "节点 {}", ours.name);
+        }
+        assert_eq!(smd.frames.len(), truth.frames.len(), "帧数");
+        assert!(smd.frames.len() > 1, "这份夹具是 20 帧的动画");
+
+        // 逐帧逐骨骼比姿态：DMX 的四元数走 `quaternion_angles`，SMD 里存的也是
+        // 欧拉角，所以两边可以直接比（实测差在 1e-5 量级，SMD 只写 6 位小数）。
+        for (frame, (ours, theirs)) in smd.frames.iter().zip(&truth.frames).enumerate() {
+            for (a, b) in ours.poses.iter().zip(&theirs.poses) {
+                assert_eq!(a.bone, b.bone, "第 {frame} 帧的骨骼下标");
+                for axis in 0..3 {
+                    let (x, y) = (a.position[axis], b.position[axis]);
+                    assert!(
+                        (x - y).abs() < 1e-3,
+                        "第 {frame} 帧骨骼 {} 的位移第 {axis} 轴：DMX {x} vs SMD {y}",
+                        a.bone
+                    );
+                    let (x, y) = (a.rotation[axis], b.rotation[axis]);
+                    assert!(
+                        (x - y).abs() < 1e-3,
+                        "第 {frame} 帧骨骼 {} 的旋转第 {axis} 轴：DMX {x} vs SMD {y}",
+                        a.bone
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reads_delta_states_as_shape_keys() {
+        let model =
+            read_from(&mut Cursor::new(BST_SHAPES), "blender_shapes.dmx").expect("应当能解析");
+        assert_eq!(model.controls, ["wide", "tall"], "控制器顺序");
+        let mesh = &model.meshes[0];
+        assert_eq!(mesh.deltas.len(), 2, "两个 delta state");
+
+        let geometry = to_smd(&model, "test", "blender_shapes.dmx").expect("应当能转成 SMD");
+        assert_eq!(geometry.shape_keys.len(), 2, "两个形态键");
+        // 名字取控制器，数据取下标的 delta state —— 两者在这份夹具里对不上
+        // （`deltaStates[0].name` 是 "wide" 但带着另一条的位移），所以这里钉住
+        // 「按控制器命名」这条口径。
+        let names: Vec<&str> = geometry
+            .shape_keys
+            .iter()
+            .map(|key| key.name.as_str())
+            .collect();
+        assert_eq!(names, ["wide", "tall"]);
+
+        for key in &geometry.shape_keys {
+            assert_eq!(
+                key.position_offsets.len(),
+                key.vertex_index.len(),
+                "{} 的增量与下标必须平行",
+                key.name
+            );
+            assert_eq!(key.position_offsets.len(), 8, "立方体 8 个控制点");
+            assert!(key.vertex_index.iter().all(|&i| i < 8), "下标落在控制点范围内");
+            assert_eq!(key.normal_offsets.len(), key.position_offsets.len());
+        }
+        // 两条形态键的位移方向必须不同（一条竖直、一条横向），否则说明配对错了。
+        assert_ne!(
+            geometry.shape_keys[0].position_offsets, geometry.shape_keys[1].position_offsets
+        );
+        assert!(
+            geometry.warnings.is_empty(),
+            "这份夹具的名字与控制器一致，不该有警告：{:?}",
+            geometry.warnings
+        );
     }
 }
