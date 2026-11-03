@@ -494,7 +494,9 @@ fn build_qc_from(
     optimize_vtx: bool,
     ov: Overrides,
 ) -> ExitCode {
-    let mut desc = match load_qc(qc) {
+    let mut desc = match hotpath::measure_block!("main: load_qc（解析 QC + 读源）", {
+        load_qc(qc)
+    }) {
         Ok(d) => d,
         Err(c) => return c,
     };
@@ -532,7 +534,9 @@ fn compile_and_write(
             return ExitCode::from(e.kind().exit_code());
         }
     };
-    let paths = match mdlc::pipeline::write_files(&out, out_root) {
+    let paths = match hotpath::measure_block!("main: write_files（落盘）", {
+        mdlc::pipeline::write_files(&out, out_root)
+    }) {
         Ok(p) => p,
         Err(e) => {
             for line in e.lines() {

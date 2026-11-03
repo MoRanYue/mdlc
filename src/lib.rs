@@ -75,6 +75,7 @@ pub mod phy;
 pub mod pipeline;
 pub mod qc;
 pub mod smd;
+pub mod source_cache;
 pub mod tangent;
 pub mod target;
 /// 真实素材测试的路径解析（**仅测试**，`#[cfg(test)]`）。

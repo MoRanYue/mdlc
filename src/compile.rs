@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::model::{
     Bone, BodyModel, CompiledBodyPart, CompiledModel, CompiledModelDesc, DescError,
@@ -837,7 +838,7 @@ impl SrcOpts {
     }
 }
 
-/// 读取一个源文件（`.smd` 或 `.fbx`），统一成中立的 [`Smd`]。
+/// 读取一个源文件（`.smd` / `.dmx` / `.fbx` / `.gltf`），统一成中立的 [`Smd`]。
 ///
 /// # 这是**唯一**的格式分派点
 ///
@@ -853,25 +854,30 @@ impl SrcOpts {
 /// 无材质时合成 `debug/debugempty`」—— 逐条对齐官方实测
 /// （`docs/fbx-support.md` §1）。mdlc 扩展语法（`srcpart` / `srcscale` /
 /// `srcaxis` …）由调用方填进 `opts`。
-pub fn read_source(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, CompileError> {
-    match SourceKind::of(path).map_err(|msg| e(at, msg))? {
-        SourceKind::Smd => read_smd(path, at),
-        SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
-            .map(|g| g.smd)
-            .map_err(|err| e(at, err.to_string())),
-        SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
-            .map(|g| g.smd)
-            .map_err(|err| e(at, err.to_string())),
-        SourceKind::Dmx => crate::dmx::read(path, at)
-            .map(|g| g.smd)
-            .map_err(|err| e(at, err.to_string())),
-    }
+///
+/// # 缓存与 [`Arc`]
+///
+/// `.smd` / `.dmx` 读出来是什么只取决于文件本身，所以按
+/// `(路径, 长度, mtime)` 缓存（见 [`crate::source_cache`]）—— QC 的文件
+/// 检查、几何读取、动画读取本来会把同一个文件完整解析三遍。
+/// `.fbx` / `.gltf` 受 `src*` 选项影响，**不进缓存**。
+///
+/// 返回值是 [`Arc`]：25 万三角形的 DMX 读出来是 12.6 万顶点 + 75.7 万个角，
+/// 拷一份与重新解析同量级，所以让调用方按需 `Arc::clone`。
+pub fn read_source(path: &Path, at: &str, opts: &SrcOpts) -> Result<Arc<Smd>, CompileError> {
+    hotpath::measure_block!("源: 读几何（只要 Smd）", {
+        geometry_source(path, at, opts).map(|geometry| Arc::clone(&geometry.smd))
+    })
 }
 
 /// 一个**几何源**读出来的全部内容。
 pub struct SourceGeometry {
     /// 中立几何（节点 / 参考姿态 / 三角形）。
-    pub smd: Smd,
+    ///
+    /// 用 [`Arc`] 是因为这份数据可能很大（25 万三角形的 DMX 有 12.6 万顶点 +
+    /// 75.7 万个角），而「几何」与「帧」两条读取路径常常要的是同一份解析
+    /// 结果 —— `.smd` 的 [`read_source_frames`] 直接复用它。
+    pub smd: Arc<Smd>,
     /// FBX 的 shape key（**已变换到 Source 空间**）。SMD 源恒为空。
     ///
     /// 官方把 FBX 的 shape key 全自动注册成 flex，所以这份数据不能像
@@ -894,54 +900,78 @@ pub struct SourceGeometry {
     pub anim_stacks: Vec<String>,
 }
 
-/// 读取一个**几何源**，保留 FBX 的 shape key。
+/// 读取一个**几何源**，保留 shape key（FBX 的 shape key / DMX 的 delta state）。
 ///
-/// 与 [`read_source`] 的唯一区别就是多带一份 [`SourceGeometry::shape_keys`]；
+/// 与 [`read_source`] 的区别就是多带一份 [`SourceGeometry::shape_keys`]；
 /// 只有 `$body` / `$model` 的主网格需要它，LOD 与 QC 的文件存在性检查走
-/// [`read_source`] 就够（前者官方也不产出 flex，后者根本不看内容）。
+/// [`read_source`] 就够（前者官方也不产出 flex，后者根本不看内容）。两者
+/// **共用** [`geometry_source`]，所以先调哪个都会让另一个命中缓存。
 pub fn read_source_geometry(
     path: &Path,
     at: &str,
     opts: &SrcOpts,
-) -> Result<SourceGeometry, CompileError> {
+) -> Result<Arc<SourceGeometry>, CompileError> {
+    hotpath::measure_block!("源: 读几何（含形态键）", {
+        geometry_source(path, at, opts)
+    })
+}
+
+/// 读几何源的**唯一实现**（[`read_source`] 与 [`read_source_geometry`] 共用）。
+fn geometry_source(
+    path: &Path,
+    at: &str,
+    opts: &SrcOpts,
+) -> Result<Arc<SourceGeometry>, CompileError> {
     match SourceKind::of(path).map_err(|msg| e(at, msg))? {
-        SourceKind::Smd => read_smd(path, at).map(|smd| SourceGeometry {
-            smd,
-            shape_keys: Vec::new(),
-            untextured_meshes: Vec::new(),
-            merged_meshes: Vec::new(),
-            anim_stacks: Vec::new(),
-        }),
-        SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
-            .map(|g| SourceGeometry {
-                smd: g.smd,
-                shape_keys: g.shape_keys,
-                untextured_meshes: g.untextured_meshes,
-                merged_meshes: g.merged_meshes,
-                anim_stacks: g.anim_stacks,
-            })
-            .map_err(|err| e(at, err.to_string())),
-        SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
-            .map(|g| SourceGeometry {
-                smd: g.smd,
-                shape_keys: g.shape_keys,
-                untextured_meshes: g.untextured_meshes,
-                merged_meshes: g.merged_meshes,
-                anim_stacks: g.anim_stacks,
-            })
-            .map_err(|err| e(at, err.to_string())),
-        // DMX 的形态键（`DmeMesh.deltaStates`）与 FBX 的 shape key 是同一概念，
-        // 所以同样带出来；另外三个字段（无材质网格 / 合并网格 / 动画栈）是
-        // FBX 专有的诊断，DMX 侧恒空。
-        SourceKind::Dmx => crate::dmx::read_geometry(path, at)
-            .map(|g| SourceGeometry {
-                smd: g.smd,
-                shape_keys: g.shape_keys,
+        // `.smd`：内容只取决于文件本身 ⟹ 按路径缓存。
+        SourceKind::Smd => crate::source_cache::geometry(path, || {
+            read_smd(path, at).map(|smd| SourceGeometry {
+                smd: Arc::new(smd),
+                shape_keys: Vec::new(),
                 untextured_meshes: Vec::new(),
                 merged_meshes: Vec::new(),
                 anim_stacks: Vec::new(),
             })
+        }),
+        // `.fbx` / `.gltf`：`srcpart` / `srcscale` / `srcaxis` / `srcshapekey*`
+        // 会改变读出来的东西 ⟹ **不进缓存**（宁可慢，也不能让两个带不同选项的
+        // `$model` 共用一份结果）。
+        SourceKind::Fbx => crate::fbx::read(path, at, &opts.fbx)
+            .map(|g| {
+                Arc::new(SourceGeometry {
+                    smd: Arc::new(g.smd),
+                    shape_keys: g.shape_keys,
+                    untextured_meshes: g.untextured_meshes,
+                    merged_meshes: g.merged_meshes,
+                    anim_stacks: g.anim_stacks,
+                })
+            })
             .map_err(|err| e(at, err.to_string())),
+        SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
+            .map(|g| {
+                Arc::new(SourceGeometry {
+                    smd: Arc::new(g.smd),
+                    shape_keys: g.shape_keys,
+                    untextured_meshes: g.untextured_meshes,
+                    merged_meshes: g.merged_meshes,
+                    anim_stacks: g.anim_stacks,
+                })
+            })
+            .map_err(|err| e(at, err.to_string())),
+        // DMX 的形态键（`DmeMesh.deltaStates`）与 FBX 的 shape key 是同一概念，
+        // 所以同样带出来；另外三个字段（无材质网格 / 合并网格 / 动画栈）是
+        // FBX 专有的诊断，DMX 侧恒空。内容只取决于文件本身 ⟹ 按路径缓存。
+        SourceKind::Dmx => crate::source_cache::geometry(path, || {
+            crate::dmx::read_geometry(path, at)
+                .map(|g| SourceGeometry {
+                    smd: Arc::new(g.smd),
+                    shape_keys: g.shape_keys,
+                    untextured_meshes: Vec::new(),
+                    merged_meshes: Vec::new(),
+                    anim_stacks: Vec::new(),
+                })
+                .map_err(|err| e(at, err.to_string()))
+        }),
     }
 }
 
@@ -1022,40 +1052,54 @@ fn emit_fbx_diagnostics(at: &str, geom: &SourceGeometry, shape_keys: &[crate::fb
     }
 }
 
-/// 读取一个**动画源**的帧数据（`.smd` 或 `.fbx`）。
+/// 读取一个**动画源**的帧数据（`.smd` / `.dmx` / `.fbx` / `.gltf`）。
 ///
 /// 与 [`read_source`] 的区别：FBX 的几何读取（[`read_source`]）给的是**参考
 /// 姿态**（每个节点的局部 TRS），而动画读取要走 ufbx 的烘焙路径把
-/// `AnimStack` 采样成逐帧局部变换。对 `.smd` 两者是同一个函数。
+/// `AnimStack` 采样成逐帧局部变换。对 `.smd` 两者是**同一份解析结果**，
+/// 所以这里直接复用几何缓存；`.dmx` 的模型与动画通常是两个文件，帧走自己
+/// 的一张缓存表（见 [`crate::source_cache`]）。
 ///
 /// 官方把 FBX 动画**固定归一化到 30 fps**（实测 24 / 30 / 60 fps 的源全部
 /// 变成同一份 31 帧 —— `docs/fbx-support.md` §1.5），所以这里用
 /// [`crate::fbx::DEFAULT_FPS`]；mdlc 的 `srcfps` 可以覆盖它。
 ///
-/// ⚠️ 返回的 [`Smd`] 的 `triangles` 是空的 —— 调用方只取 `frames`。
-pub fn read_source_frames(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, CompileError> {
-    match SourceKind::of(path).map_err(|msg| e(at, msg))? {
-        SourceKind::Smd => read_smd(path, at),
-        SourceKind::Fbx => crate::fbx::read_frames(
-            path,
-            at,
-            opts.stack.as_deref(),
-            opts.fps_or_default(),
-            &opts.fbx,
-        )
-        .map_err(|err| e(at, err.to_string())),
-        SourceKind::Gltf => crate::gltf::read_frames(
-            path,
-            at,
-            opts.stack.as_deref(),
-            opts.fps_or_default(),
-            &opts.fbx,
-        )
-        .map_err(|err| e(at, err.to_string())),
-        SourceKind::Dmx => {
-            crate::dmx::read_frames(path, at).map_err(|err| e(at, err.to_string()))
+/// ⚠️ FBX / glTF 返回的 [`Smd`] 的 `triangles` 是空的 —— 调用方只取
+/// `frames`。`.smd` 走的是几何缓存，`triangles` 原样带出来（没有人读它，
+/// 也不额外占内存，因为它是同一份 [`Arc`]）。
+pub fn read_source_frames(
+    path: &Path,
+    at: &str,
+    opts: &SrcOpts,
+) -> Result<Arc<Smd>, CompileError> {
+    hotpath::measure_block!("源: 读动画帧", {
+        match SourceKind::of(path).map_err(|msg| e(at, msg))? {
+            // `.smd` 的几何与帧是同一份解析结果 ⟹ 复用几何缓存。
+            SourceKind::Smd => geometry_source(path, at, opts).map(|g| Arc::clone(&g.smd)),
+            SourceKind::Fbx => crate::fbx::read_frames(
+                path,
+                at,
+                opts.stack.as_deref(),
+                opts.fps_or_default(),
+                &opts.fbx,
+            )
+            .map(Arc::new)
+            .map_err(|err| e(at, err.to_string())),
+            SourceKind::Gltf => crate::gltf::read_frames(
+                path,
+                at,
+                opts.stack.as_deref(),
+                opts.fps_or_default(),
+                &opts.fbx,
+            )
+            .map(Arc::new)
+            .map_err(|err| e(at, err.to_string())),
+            // `.dmx`：动画是**单独一个文件**，与几何缓存不冲突。
+            SourceKind::Dmx => crate::source_cache::frames(path, || {
+                crate::dmx::read_frames(path, at).map_err(|err| e(at, err.to_string()))
+            }),
         }
-    }
+    })
 }
 
 /// 收集**几何源**里的 `.fbx` 文件（规范化后的路径）。
@@ -1918,7 +1962,7 @@ fn load_smd_frames(
     at: &str,
     opts: &SrcOpts,
     errs: &mut Vec<CompileError>,
-) -> Option<(Vec<Vec<crate::smd::SmdPose>>, Smd)> {
+) -> Option<(Vec<Vec<crate::smd::SmdPose>>, Arc<Smd>)> {
     let e = |msg: String| CompileError::Message {
         at: at.to_string(),
         message: msg,
@@ -2795,10 +2839,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         continue;
                     }
                 };
-                // ⚠️ 必须在 `let smd = geom.smd;` **之前**调用 —— 那一步会把
-                // `geom` 部分移走，之后就没法再借它的诊断字段了。
+                // `geom` 是 `Arc<SourceGeometry>`：诊断字段与 `smd` 都是借出来
+                // 用的，不需要（也不能）先把 `geom` 拆开。
                 emit_fbx_diagnostics(&at, &geom, &shape_keys);
-                let smd = geom.smd;
+                let smd = Arc::clone(&geom.smd);
 
                 // ⚠️ **不要**因为「网格源 SMD 里有 `[[bones]]` 没有的骨骼」而报错。
                 //
@@ -10053,12 +10097,12 @@ type = "mouth"
         stacks: &[&str],
     ) -> SourceGeometry {
         SourceGeometry {
-            smd: Smd {
+            smd: Arc::new(Smd {
                 version: 1,
                 nodes: Vec::new(),
                 frames: Vec::new(),
                 triangles: Vec::new(),
-            },
+            }),
             shape_keys: Vec::new(),
             untextured_meshes: untextured.iter().map(|s| s.to_string()).collect(),
             merged_meshes: merged.iter().map(|s| s.to_string()).collect(),
