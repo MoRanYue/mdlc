@@ -643,6 +643,13 @@ pub enum SourceKind {
     /// `.gltf` / `.glb` —— glTF 2.0（走 `gltf` crate；官方**完全不支持**这个格式，
     /// 见 `docs/gltf-support.md` §1）。
     Gltf,
+    /// `.dmx` —— Valve datamodel（走 `datamodel` crate）。
+    ///
+    /// 官方 studiomdl **原生支持**它（实测 `DMX Model <path>` 后正常出产物），
+    /// 所以这是「官方有、mdlc 补齐」的一格，不是扩展。当前只读网格与骨架
+    /// （阶段 A），动画 / `delta states` / `DmeCombinationOperator` 还没接 ——
+    /// 那些要以动画源的身份使用时会被 [`crate::dmx::read_frames`] 明确拒绝。
+    Dmx,
 }
 
 impl SourceKind {
@@ -662,6 +669,7 @@ impl SourceKind {
             // 两者走同一条读取路径（`gltf::Gltf::from_slice_without_validation`
             // 自己认头四字节 `glTF`）。
             Some("gltf" | "glb") => Ok(SourceKind::Gltf),
+            Some("dmx") => Ok(SourceKind::Dmx),
             other => Err(SrcError::UnknownFormat {
                 other: other.map(str::to_string),
                 path: path.display().to_string(),
@@ -852,6 +860,9 @@ pub fn read_source(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, Compile
         SourceKind::Gltf => crate::gltf::read(path, at, &opts.fbx)
             .map(|g| g.smd)
             .map_err(|err| e(at, err.to_string())),
+        SourceKind::Dmx => crate::dmx::read(path, at)
+            .map(|g| g.smd)
+            .map_err(|err| e(at, err.to_string())),
     }
 }
 
@@ -915,6 +926,17 @@ pub fn read_source_geometry(
                 untextured_meshes: g.untextured_meshes,
                 merged_meshes: g.merged_meshes,
                 anim_stacks: g.anim_stacks,
+            })
+            .map_err(|err| e(at, err.to_string())),
+        // 阶段 A 的 DMX 只有几何与骨架：shape key（delta states）还没接，
+        // 所以这四个扩展字段恒为空 —— 与 `.smd` 源同一口径。
+        SourceKind::Dmx => crate::dmx::read(path, at)
+            .map(|g| SourceGeometry {
+                smd: g.smd,
+                shape_keys: Vec::new(),
+                untextured_meshes: Vec::new(),
+                merged_meshes: Vec::new(),
+                anim_stacks: Vec::new(),
             })
             .map_err(|err| e(at, err.to_string())),
     }
@@ -1027,6 +1049,9 @@ pub fn read_source_frames(path: &Path, at: &str, opts: &SrcOpts) -> Result<Smd, 
             &opts.fbx,
         )
         .map_err(|err| e(at, err.to_string())),
+        SourceKind::Dmx => {
+            crate::dmx::read_frames(path, at).map_err(|err| e(at, err.to_string()))
+        }
     }
 }
 
@@ -1419,6 +1444,32 @@ impl<'s, 'd> VertexBoneMap<'s, 'd> {
         // 整条父链都不在表里 ⟹ 官方重映射到根骨骼 0。
         if self.bone_count > 0 { Some(0) } else { None }
     }
+}
+
+/// **参考姿态**用：源骨架的 node 下标 → 骨骼表下标，且**只认名字精确命中**。
+///
+/// 与 [`VertexBoneMap::map_bone`] 的区别是刻意的：`map_bone` 供**顶点权重**使用，
+/// 会沿父链上溯、并在整条父链都不在表里时回落到**根骨骼 0**；参考姿态则必须
+/// 与官方 `MapSourcesToGlobalBonetable()`（`simplify.cpp:4148-4217`）同口径 ——
+/// 官方只在 `k != -1`（名字精确命中）的分支里写 `boneGlobalToLocal[k] = j`
+/// （`:4212`），走父链或退根骨骼的那些**不写**。
+///
+/// # 为什么必须分开（实测反例）
+///
+/// BlenderSourceTools 导出的 SMD 常带一个**没被任何顶点引用**的额外根节点
+/// `blender_implicit`（`src\dmx_fixtures\blender_cube.smd` 的 `nodes` 是
+/// `0 blender_implicit -1` / `1 root -1` / `2 spine 1` / `3 head 2`）。
+/// 它的父链里没有一根在骨骼表里 ⟹ `map_bone(0)` 回落到根骨骼 0（= `root`），
+/// 于是 [`SmdPose`] 列表里 `bone == 0` 的**第一条**成了 `blender_implicit`
+/// 的零姿态；而 [`resolve_bone_pose`] 用 `.find()` 取第一条 ⟹ 根骨骼的旋转
+/// 被静默清零（官方同一份夹具写的是 `(1.570796, 0, 0.523599)`）。
+fn reference_bone_of(
+    smd: &Smd,
+    desc_index: &HashMap<&str, usize>,
+    node_ix: usize,
+) -> Option<usize> {
+    let name = smd.nodes.get(node_ix)?.name.as_str();
+    desc_index.get(name).copied()
 }
 
 /// 由 SMD 的三角形构建逐材质的 mesh。
@@ -2855,14 +2906,28 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                         if node_ix >= node_count {
                             continue;
                         }
-                        if let Some(&di) = bone_map.desc_index.get(smd.nodes[node_ix].name.as_str())
-                            && let Some(slot) = source_world.get_mut(di)
-                        {
-                            *slot = Some(src_node_world[node_ix]);
-                        }
-                        let Some(di) = bone_map.map_bone(node_ix) else {
+                        // ⚠️ **参考姿态只认「名字精确命中」**，不能走
+                        // [`VertexBoneMap::map_bone`] 的父链上溯 / 根骨骼兜底 ——
+                        // 那条规则是给**顶点权重**用的（官方
+                        // `MapSourcesToGlobalBonetable` 的 `:4180` 分支同样
+                        // **不写** `boneGlobalToLocal`）。
+                        //
+                        // 实测反例（`src\dmx_fixtures\blender_cube.smd`，BST 导出）：
+                        // `nodes` 是 `0 blender_implicit -1` / `1 root -1` / …，
+                        // 顶点只引用 `root`/`spine`。`blender_implicit` 的父链里
+                        // 没有一根在骨骼表里 ⟹ `map_bone(0)` 回落到**根骨骼 0**
+                        // （= `root`），于是 `poses` 里 `bone == 0` 的**第一条**是
+                        // `blender_implicit` 的零姿态，`resolve_bone_pose` 用
+                        // `.find()` 取第一条 ⟹ 根骨骼的旋转被写成 `(0,0,0)`。
+                        // 官方同一份夹具写的是 `(1.570796, 0, 0.523599)`。
+                        let Some(di) =
+                            reference_bone_of(&smd, &bone_map.desc_index, node_ix)
+                        else {
                             continue;
                         };
+                        if let Some(slot) = source_world.get_mut(di) {
+                            *slot = Some(src_node_world[node_ix]);
+                        }
                         poses.push(SmdPose {
                             bone: di as i32,
                             position: p.position,
@@ -13579,6 +13644,41 @@ forward_declared = true
         c.bodyparts[0].models[0].mesh_flexes = Vec::new();
         c.bodyparts[0].models[0].lods = None;
         c
+    }
+
+    /// 参考姿态只认**名字精确命中**：未被引用的额外根节点不能顶替真根骨骼。
+    ///
+    /// 反例取自 BlenderSourceTools 的导出（`src\dmx_fixtures\blender_cube.smd`）：
+    /// `nodes` 里 `0 "blender_implicit" -1` 排在 `1 "root" -1` 之前，而三角形
+    /// 只引用 `root`/`spine`。旧实现用 [`VertexBoneMap::map_bone`] 决定姿态归属，
+    /// `node 0` 的父链里没有一根在骨骼表里 ⟹ 回落到根骨骼 0（= `root`）⟹
+    /// `poses` 里 `bone == 0` 的第一条成了零姿态，[`resolve_bone_pose`] 的
+    /// `.find()` 取第一条，于是根骨骼的旋转被静默清零。
+    #[test]
+    fn the_reference_pose_ignores_unreferenced_extra_roots() {
+        let text = "version 1\nnodes\n\
+                    0 \"blender_implicit\" -1\n\
+                    1 \"root\" -1\n\
+                    2 \"spine\" 1\n\
+                    end\nskeleton\ntime 0\n\
+                    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000\n\
+                    1 0.000000 0.000000 0.000000 1.570796 0.000000 0.523599\n\
+                    2 0.000000 10.000000 0.000000 0.690464 -1.212062 -1.067027\n\
+                    end\ntriangles\nmat\nend\n";
+        let smd = crate::smd::parse_smd(text).expect("夹具应当能解析");
+        let names = ["root", "spine"];
+        let desc_index: HashMap<&str, usize> =
+            names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+
+        // 名字精确命中的两根真骨骼照常映射。
+        assert_eq!(reference_bone_of(&smd, &desc_index, 1), Some(0));
+        assert_eq!(reference_bone_of(&smd, &desc_index, 2), Some(1));
+        // 额外根节点不是骨骼 —— 必须返回 `None`，不能回落到 0。
+        assert_eq!(
+            reference_bone_of(&smd, &desc_index, 0),
+            None,
+            "未被引用的额外根节点不能顶替根骨骼，否则根骨骼的旋转会被零姿态覆盖"
+        );
     }
 
     /// 造一个 `n` 根骨骼的 SMD：链式父子关系，**全部**被三角形引用。

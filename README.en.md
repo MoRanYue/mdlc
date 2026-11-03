@@ -10,7 +10,7 @@
 
 </div>
 
-It compiles a **TOML descriptor** or a **QC script** plus **SMD / FBX / glTF meshes** into the
+It compiles a **TOML descriptor** or a **QC script** plus **SMD / DMX / FBX / glTF meshes** into the
 `.mdl` + `.vvd` + `.dx90.vtx` that the Source engine loads (plus `.phy` when there is collision
 data, and `.ani` when `$animblocksize` is used).
 
@@ -187,12 +187,18 @@ Meshes are **not written in the descriptor** — real models routinely have hund
 of vertices, and inlining them would bloat the descriptor to hundreds of MB and make it
 unusable with text tools. The descriptor only **references** mesh sources.
 
-A mesh source can be **SMD**, **FBX** (`.fbx`, via `ufbx`, see
+A mesh source can be **SMD**, **DMX** (`.dmx`, Valve's datamodel format — what
+[BlenderSourceTools](https://github.com/Artfunkel/BlenderSourceTools) exports),
+**FBX** (`.fbx`, via `ufbx`, see
 [`docs/fbx-support.md`](docs/fbx-support.md)) or **glTF / GLB** (`.gltf` / `.glb`, via the
 `gltf` crate, see [`docs/gltf-support.md`](docs/gltf-support.md)).
 **The format is determined by the extension, so it must be written in full**
 — which is one reason extensions are not auto-appended (see `## Known unimplemented`).
 
+> **DMX is read for its mesh and skeleton only** (used just like SMD); a file that carries
+> **animation data** is rejected with a pointer back to `.smd`. This is not an extension —
+> the official `studiomdl.exe` reads DMX natively.
+>
 > **FBX / glTF can be written directly into QC**, with no intermediate conversion. The default
 > behaviour **matches the official tool line by line** (merge every mesh, always take the first
 > NLA stack, auto-register shape keys as flex), while the official tool's **silent failures**
@@ -215,8 +221,8 @@ Division of responsibility:
 | Content | Carried by | Corresponding QC |
 |---|---|---|
 | Model name / materials / bones / bodypart tree | TOML descriptor | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
-| **Mesh (vertices, normals, UVs, skinning)** | **SMD / FBX / glTF file** | `studio "x.smd"` / `$body body "x.fbx"` / `$body body "x.glb"` |
-| **Reference pose** | **frame 0 of the SMD `skeleton`** (FBX / glTF use the node's local TRS) | the reference SMD |
+| **Mesh (vertices, normals, UVs, skinning)** | **SMD / DMX / FBX / glTF file** | `studio "x.smd"` / `$body body "x.dmx"` / `$body body "x.fbx"` / `$body body "x.glb"` |
+| **Reference pose** | **frame 0 of the SMD `skeleton`** (DMX `DmeJoint` transforms; FBX / glTF use the node's local TRS) | the reference SMD |
 | **Expressions (flex)** | **frames of a `.vta`**, or **FBX shape keys / glTF morph targets** (auto-registered) | `flexfile` + `flex` |
 
 ---
@@ -550,7 +556,7 @@ The QC front end implements full lexing/parsing, `$include`, `$definevariable`,
 
 | Command | Behaviour |
 |---|---|
-| `$nekomodel` | **Explicit error** — it points at a DMX source, and mdlc does not implement DMX (the official tool also delegates to `dmxconvert.exe`) |
+| `$nekomodel` | **Explicit error** — it is a NekoMDL extension (the official tool says `bad command`). DMX sources can now be written directly as `$body body "x.dmx"` |
 | `$defaultweightlist` | **Explicit error** — it would override **every** sequence without an explicit weightlist, and silently ignoring it produces models that "look right but are semantically wrong". For an equivalent effect use `$weightlist` and reference it explicitly per sequence |
 | `$fakevta` | The whole block is skipped (no trace in the artifact) |
 | `$scale` | **Accepted but has no effect** (the scale is only recorded, never used in computation). Use `srcscale` instead |
@@ -1069,7 +1075,7 @@ reused and only the bone options are applied.
 | Item | Notes |
 |---|---|
 | **Automatic LOD generation** | Mesh simplification / decimation. Multiple-LOD **input and output** are supported, but it will not simplify for you. **This is the largest gap versus the official tool** |
-| **DMX input** | Deliberately unimplemented. `$nekomodel` gives an **explicit error**; `studio "x.dmx"` is not specially recognised and fails while reading the file / parsing it as SMD (the official tool also delegates to `dmxconvert.exe`) |
+| **DMX animation** | Deliberately unimplemented. DMX works fully as a **mesh and skeleton** source, but a file that carries animation data gives an **explicit error** pointing back to `.smd` |
 | `$maxverts` | A non-official NekoMDL extension; ignored. Use automatic splitting instead |
 | `ikrule footstep` (type 3) | Needs the `center` of `$ikchain`, which mdlc does not model yet. Writing it is an **explicit error** rather than silently producing a wrong payload |
 | A number of rare QC commands | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … are ignored |

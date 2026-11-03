@@ -76,6 +76,12 @@ pub struct DmxModel {
     pub materials: Vec<DmxMaterial>,
     /// 网格，一个 `DmeMesh` 一项。
     pub meshes: Vec<DmxMesh>,
+    /// 文件里有没有动画数据（任意 `DmeLog` 元素）。
+    ///
+    /// 阶段 A 只读网格与骨架，**不读动画**。有动画的文件被当成几何源用没问题，
+    /// 但被当成**动画源**（`$sequence` 直接指向它）时必须报错，否则会静默产出
+    /// 一帧绑定姿态 —— 用户以为动画编进去了，实际上没有。
+    pub has_animation: bool,
     /// 读得下去但值得提醒的事（例如一个网格挂了多个材质）。
     pub warnings: Vec<String>,
 }
@@ -87,9 +93,22 @@ pub struct DmxBone {
     /// 父骨骼在 [`DmxModel::bones`] 里的下标；根骨骼是 `None`。
     pub parent: Option<usize>,
     /// 相对父骨骼的平移。
+    ///
+    /// ⚠️ 实测 BST 写出来的值**已经等于 SMD skeleton 行**（`spine` 是 `[0, 10, 0]`、
+    /// `head` 是 `[0, 11.180, 0]`，与 `Collection.smd` 逐位相同），不需要再做
+    /// 「父链矩阵求相对」那一套 —— 那是我原本预想的做法，读真文件才发现多余。
     pub position: [f32; 3],
     /// 相对父骨骼的旋转，`[x, y, z, w]`。
+    ///
+    /// 同一份夹具里 `root` 是 `[0.6830, 0.1830, 0.1830, 0.6830]`，正好是 SMD 欧拉角
+    /// `(90°, 0°, 30°)` 的四元数（`qz(30°) ⊗ qx(90°)`）⟹ 直接
+    /// [`crate::bone_math::quaternion_angles`] 就能换成 SMD 的欧拉角。
     pub orientation: [f32; 4],
+    /// 这个槽位是不是**真骨骼**（`DmeJoint`）。
+    ///
+    /// `jointList` 里会混进网格自己的 `DmeDag`（BST 给未蒙皮的顶点留的落点），
+    /// 它不是骨骼，不能进 SMD 的 `nodes` 表。
+    pub is_joint: bool,
 }
 
 /// 一个材质。
@@ -101,23 +120,41 @@ pub struct DmxMaterial {
     pub material: String,
 }
 
-/// 一个网格。顶点属性按 **position 空间** 存放（DMX 本身是按 loop 空间存的，
-/// 这里已经按下标表摊平）。
+/// 一个网格。
+///
+/// ⚠️ **法线与 UV 不能摊平到 position 空间**。DMX 把它们存在 loop（角）空间：
+/// 立方体有 8 个 position 却有 24 个不同的「位置 + 法线 + UV」组合，每个面一套。
+/// 摊平到 position 只会留下「第一个用到该顶点的角」，于是六个面共用一套法线 ——
+/// 编译出来的模型每个面都朝同一个方向。所以这里按**逐角**存（[`DmxTriangle`]）。
 #[derive(Debug, Clone, Default)]
 pub struct DmxMesh {
     pub name: String,
-    /// 材质在 [`DmxModel::materials`] 里的下标。多材质网格不猜，留 `None`。
-    pub material: Option<usize>,
-    /// 顶点位置。
+    /// 顶点位置（position 空间，去重后的）。
     pub positions: Vec<[f32; 3]>,
-    /// 每顶点的法线；DMX 里缺失时为空。
-    pub normals: Vec<[f32; 3]>,
-    /// 每顶点的 UV；DMX 里缺失时为空。
-    pub uvs: Vec<[f32; 2]>,
     /// 每顶点的权重链：`(jointList 下标, 权重)`，权重为 0 的已剔除。
     pub weights: Vec<Vec<(u32, f32)>>,
-    /// 三角形，元素是 [`DmxMesh::positions`] 的下标。
-    pub triangles: Vec<[u32; 3]>,
+    /// 三角形，逐角带着自己的法线与 UV。
+    pub triangles: Vec<DmxTriangle>,
+}
+
+/// 一个三角形。材质是**逐面集**给的，同一网格里可以混（BST 按材质切 face set）。
+#[derive(Debug, Clone, Default)]
+pub struct DmxTriangle {
+    /// 材质在 [`DmxModel::materials`] 里的下标；该 face set 没有材质时是 `None`。
+    pub material: Option<usize>,
+    /// 三个角，顺序即原文件顺序（Source 的正面是 CW）。
+    pub corners: [DmxCorner; 3],
+}
+
+/// 一个角：它自己的位置、法线、UV。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DmxCorner {
+    /// [`DmxMesh::positions`] 的下标。
+    pub position: u32,
+    /// 该角的法线（loop 空间取出来的）。
+    pub normal: [f32; 3],
+    /// 该角的 UV（已按 `flipVCoordinates` 归一化成 Valve 口径）。
+    pub uv: [f32; 2],
 }
 
 /// 读 DMX 时可能出的错。
@@ -183,13 +220,316 @@ fn read_from<R: BufRead>(reader: &mut R, path: &str) -> Result<DmxModel, DmxErro
 
     let mut out = DmxModel {
         format_version: u32::try_from(header.format_version).unwrap_or_default(),
+        has_animation: flat.iter().any(|e| class_is(e, "DmeLog")),
         ..Default::default()
     };
 
     out.materials = collect_materials(&flat);
     out.bones = collect_bones(model);
-    out.meshes = collect_meshes(&flat, &out.materials, &mut out.warnings);
+    let mesh_transforms = collect_mesh_transforms(model);
+    out.meshes = collect_meshes(&flat, &out.materials, &mesh_transforms, &mut out.warnings);
     Ok(out)
+}
+
+/// 每个网格在**模型空间**里的变换（位置 + 四元数），按网格元素 id 索引。
+///
+/// ⚠️ 不能直接用网格顶点：DMX 的 `positions` 是**网格自身空间**的，而 SMD 的顶点是
+/// **骨架空间**的（BST 导出 SMD 时把物体变换烘进去了）。实测同一份场景：
+/// DMX 顶点 `z ∈ [-4, 4]`，SMD 顶点 `z ∈ [0, 8]` —— 差的正是 `DmeDag` 的
+/// `position = [0, 0, 4]`。不烘这一层，模型会整体偏移（这里是 4 个单位）。
+fn collect_mesh_transforms(
+    model: &Element,
+) -> HashMap<String, ([f32; 3], [f32; 4])> {
+    let mut out: HashMap<String, ([f32; 3], [f32; 4])> = HashMap::new();
+    let mut stack: Vec<(Element, [f32; 3], [f32; 4])> = element_array_attr(model, "children")
+        .into_iter()
+        .map(|child| (child, [0.0; 3], [0.0, 0.0, 0.0, 1.0]))
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some((element, parent_position, parent_orientation)) = stack.pop() {
+        if !seen.insert(id_of(&element)) {
+            continue;
+        }
+        let (local_position, local_orientation) = transform_of(&element);
+        let world_position = add3(
+            parent_position,
+            rotate(parent_orientation, local_position),
+        );
+        let world_orientation = multiply(parent_orientation, local_orientation);
+        if let Some(shape) = element_attr(&element, "shape")
+            && class_is(&shape, "DmeMesh")
+        {
+            out.insert(id_of(&shape), (world_position, world_orientation));
+        }
+        for child in element_array_attr(&element, "children") {
+            stack.push((child, world_position, world_orientation));
+        }
+    }
+    out
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+/// 用四元数转一个向量：`v' = v + 2w(q×v) + 2(q×(q×v))`。
+fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let [x, y, z, w] = q;
+    let t = [
+        2.0 * (y * v[2] - z * v[1]),
+        2.0 * (z * v[0] - x * v[2]),
+        2.0 * (x * v[1] - y * v[0]),
+    ];
+    [
+        v[0] + w * t[0] + (y * t[2] - z * t[1]),
+        v[1] + w * t[1] + (z * t[0] - x * t[2]),
+        v[2] + w * t[2] + (x * t[1] - y * t[0]),
+    ]
+}
+
+/// 四元数乘法 `a ⊗ b`（先 `b` 后 `a` 的复合顺序，与 SMD 的口径一致）。
+fn multiply(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+}
+
+// ---------------------------------------------------------------- 转成 SMD
+
+/// DMX 转成 SMD 口径之后的结果。
+///
+/// 阶段 A 只做网格与骨骼：把 `.dmx` 当成 `.smd` 用（`$body` / `$model` / LOD）。
+/// 动画、`delta states`、`DmeCombinationOperator` 都不在这里 —— 它们要接到 IR 的
+/// 另一条路上。
+#[derive(Debug, Clone)]
+pub struct DmxGeometry {
+    pub smd: crate::smd::Smd,
+    pub warnings: Vec<String>,
+}
+
+/// 读一个 DMX 模型并转成 SMD 口径的几何。
+pub fn read(path: &Path, at: &str) -> Result<DmxGeometry, DmxError> {
+    let label = path.display().to_string();
+    let model = load(path)?;
+    to_smd(&model, at, &label)
+}
+
+/// 把一个 DMX 当**动画源**读（`$sequence` / `$animation` 直接指向它）。
+///
+/// 阶段 A 还没接 `DmeLog`，所以这里只有两种结果：
+///
+/// * 文件里**没有**动画数据 ⟹ 给一帧绑定姿态，与 `.smd` 只有 `skeleton` 段时一致
+///   （BST 给静态道具导出的 DMX 就长这样）；
+/// * 文件里**有**动画数据 ⟹ 报错。这是有意的：静默给一帧会让用户以为动画编进去了，
+///   而正确的做法是指向 `.smd`（BST 的 SMD 导出带逐帧 `skeleton`）或等 mdlc 接上
+///   `DmeLog`。
+///
+/// ⚠️ 返回的 [`crate::smd::Smd`] 的 `triangles` 是空的 —— 与
+/// [`crate::fbx::read_frames`] 同一口径，调用方只取 `frames`。
+pub fn read_frames(path: &Path, at: &str) -> Result<crate::smd::Smd, DmxError> {
+    let label = path.display().to_string();
+    let model = load(path)?;
+    if model.has_animation {
+        return Err(DmxError::malformed(
+            &label,
+            crate::tr_fmt!(
+                "the file contains animation data, but mdlc only reads the geometry and skeleton of a .dmx for now; point %{at} at an .smd instead",
+                at = at
+            ),
+        ));
+    }
+    let mut smd = to_smd(&model, at, &label)?.smd;
+    smd.triangles.clear();
+    Ok(smd)
+}
+
+/// 把 [`DmxModel`] 翻译成 [`crate::smd::Smd`]。
+///
+/// 三处换算都是实测定的（见 [`DmxBone::position`] / [`DmxBone::orientation`]）：
+/// 平移**原样**、旋转走 [`crate::bone_math::quaternion_angles`]、节点表只留真骨骼。
+fn to_smd(model: &DmxModel, at: &str, path: &str) -> Result<DmxGeometry, DmxError> {
+    use crate::smd::{SmdBoneLink, SmdFrame, SmdNode, SmdPose, SmdTriangle, SmdVertex};
+
+    let mut warnings = model.warnings.clone();
+
+    // 槽位 → 节点下标（只留 `DmeJoint`；`DmeDag` 是网格自己的落点，不是骨骼）。
+    let mut node_of: Vec<Option<i32>> = vec![None; model.bones.len()];
+    let mut nodes: Vec<SmdNode> = Vec::new();
+    for (slot, bone) in model.bones.iter().enumerate() {
+        if !bone.is_joint {
+            continue;
+        }
+        node_of[slot] = Some(nodes.len() as i32);
+        nodes.push(SmdNode {
+            index: nodes.len() as i32,
+            name: bone.name.clone(),
+            parent: -1,
+        });
+    }
+    if nodes.is_empty() {
+        return Err(DmxError::malformed(
+            path,
+            "the model has no joints (only DAGs), so there is no skeleton to compile",
+        ));
+    }
+
+    // 父骨骼可能落在被跳过的槽位上，顺着 `parent` 链上找到最近的真骨骼。
+    for (slot, bone) in model.bones.iter().enumerate() {
+        let Some(node) = node_of[slot] else {
+            continue;
+        };
+        let mut cursor = bone.parent;
+        let mut parent = -1;
+        let mut hops = 0usize;
+        while let Some(p) = cursor {
+            if let Some(ix) = node_of.get(p).copied().flatten() {
+                parent = ix;
+                break;
+            }
+            cursor = model.bones[p].parent;
+            hops += 1;
+            if hops > model.bones.len() {
+                break;
+            }
+        }
+        nodes[node as usize].parent = parent;
+    }
+
+    let poses: Vec<SmdPose> = model
+        .bones
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, bone)| {
+            node_of[slot].map(|node| SmdPose {
+                bone: node,
+                position: bone.position,
+                rotation: crate::bone_math::quaternion_angles(bone.orientation),
+            })
+        })
+        .collect();
+
+    // 顶点权重里的 joint 下标也要换到节点空间；指向 DAG 的（未蒙皮顶点）落到父骨骼。
+    let remap_joint = |slot: u32| -> Option<i32> {
+        let slot = usize::try_from(slot).ok()?;
+        if let Some(node) = node_of.get(slot).copied().flatten() {
+            return Some(node);
+        }
+        // 指向 DAG 槽位：顺着 `parent` 链找最近的真骨骼（BST 用它表示「没有蒙皮」）。
+        let mut cursor = model.bones.get(slot)?.parent;
+        let mut hops = 0usize;
+        while let Some(p) = cursor {
+            if let Some(node) = node_of.get(p).copied().flatten() {
+                return Some(node);
+            }
+            cursor = model.bones.get(p)?.parent;
+            hops += 1;
+            if hops > model.bones.len() {
+                break;
+            }
+        }
+        None
+    };
+
+    let mut triangles: Vec<SmdTriangle> = Vec::new();
+    let mut src_index: u32 = 0;
+    let mut merged: Vec<String> = Vec::new();
+    for mesh in &model.meshes {
+        if mesh.triangles.is_empty() {
+            continue;
+        }
+        merged.push(mesh.name.clone());
+        let base = src_index;
+        src_index += mesh.positions.len() as u32;
+        for tri in &mesh.triangles {
+            let material = tri
+                .material
+                .and_then(|i| model.materials.get(i))
+                .map(|m| m.material.clone())
+                .unwrap_or_default();
+            let mut vs: Vec<SmdVertex> = Vec::with_capacity(3);
+            for corner in &tri.corners {
+                let position = mesh
+                    .positions
+                    .get(corner.position as usize)
+                    .copied()
+                    .unwrap_or([0.0; 3]);
+                let mut links: Vec<SmdBoneLink> = mesh
+                    .weights
+                    .get(corner.position as usize)
+                    .map(|chain| {
+                        chain
+                            .iter()
+                            .filter_map(|&(joint, weight)| {
+                                remap_joint(joint).map(|bone| SmdBoneLink { bone, weight })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // ⚠️ 空 `links` 不是「无绑定」：官方把这种顶点绑到它所在的网格节点上
+                // （SMD 解析器对 `links == 0` 也是这么兜底的，见
+                // `docs/_probe/oracle_links_zero.js`）。DMX 路径不经过那个解析器，
+                // 所以这里必须补，否则收骨判据看不到任何顶点引用。
+                let parent_bone = links
+                    .iter()
+                    .max_by(|a, b| {
+                        a.weight
+                            .partial_cmp(&b.weight)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|l| l.bone)
+                    .unwrap_or(0);
+                if links.is_empty() {
+                    links.push(SmdBoneLink {
+                        bone: parent_bone,
+                        weight: 1.0,
+                    });
+                }
+                vs.push(SmdVertex {
+                    parent_bone,
+                    position,
+                    normal: corner.normal,
+                    uv: corner.uv,
+                    links,
+                    src_index: base + corner.position,
+                });
+            }
+            triangles.push(SmdTriangle {
+                material,
+                vertices: [vs[0].clone(), vs[1].clone(), vs[2].clone()],
+            });
+        }
+    }
+
+    if triangles.is_empty() {
+        return Err(DmxError::malformed(
+            path,
+            "the model contains no triangles",
+        ));
+    }
+    if model.meshes.len() > 1 {
+        // 多个网格合并成一个 SMD：与 FBX 路径同一套口径（按顺序拼起来）。
+        warnings.push(format!(
+            "{} meshes were merged into one SMD: {}",
+            merged.len(),
+            merged.join(", ")
+        ));
+    }
+    let _ = at;
+
+    Ok(DmxGeometry {
+        smd: crate::smd::Smd {
+            version: 1,
+            nodes,
+            frames: vec![SmdFrame { time: 0, poses }],
+            triangles,
+        },
+        warnings,
+    })
 }
 
 // ---------------------------------------------------------------- 遍历
@@ -263,6 +603,10 @@ fn collect_bones(model: &Element) -> Vec<DmxBone> {
                 parent: None,
                 position,
                 orientation,
+                // format ≥ 2 的槽位元素本身就是 `DmeJoint` / `DmeDag`；
+                // format 1 的槽位是 `DmeTransform`（真身要看 `children` 里挂的谁，
+                // 由下面的遍历覆盖），先按「是关节」处理。
+                is_joint: !class_is(joint, "DmeDag"),
             }
         })
         .collect();
@@ -299,6 +643,13 @@ fn collect_bones(model: &Element) -> Vec<DmxBone> {
         let here = match slot {
             Some(i) => {
                 bones[i].parent = parent;
+                // 槽位的真身（format 1 里 `jointList` 存的是 `DmeTransform`，
+                // 真身是挂在 `children` 上的 `DmeJoint` / `DmeDag`）。
+                if class_is(&element, "DmeDag") {
+                    bones[i].is_joint = false;
+                } else if class_is(&element, "DmeJoint") {
+                    bones[i].is_joint = true;
+                }
                 Some(i)
             }
             // 不在索引空间里的中间层（例如 `DmeTransformList`）不打断层级。
@@ -343,6 +694,7 @@ fn joint_entries(model: &Element) -> Vec<Element> {
 fn collect_meshes(
     flat: &[Element],
     materials: &[DmxMaterial],
+    mesh_transforms: &HashMap<String, ([f32; 3], [f32; 4])>,
     warnings: &mut Vec<String>,
 ) -> Vec<DmxMesh> {
     let material_index: HashMap<String, usize> = materials
@@ -367,30 +719,41 @@ fn collect_meshes(
         }
         let position_indices = i32_array_attr(&vd, "positionsIndices");
 
-        // 法线 / UV 在 DMX 里是 loop 空间的，按「第一个用到该顶点的 loop」摊平。
-        let normals = expand_loops(
-            &vector3_array_attr(&vd, "normals"),
-            &i32_array_attr(&vd, "normalsIndices"),
-            &position_indices,
-            positions.len(),
-        );
-        let uvs = expand_loops(
-            &vector2_array_attr(&vd, "textureCoordinates"),
-            &i32_array_attr(&vd, "textureCoordinatesIndices"),
-            &position_indices,
-            positions.len(),
-        );
+        // 网格顶点的空间是「网格自己」的，烘上它的世界变换才是骨架空间（见
+        // [`collect_mesh_transforms`]）。
+        let (offset, orientation) = mesh_transforms
+            .get(&id_of(mesh))
+            .copied()
+            .unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+        let positions: Vec<[f32; 3]> = positions
+            .iter()
+            .map(|p| add3(offset, rotate(orientation, *p)))
+            .collect();
+
+        // 法线 / UV 是 loop 空间的（见 [`DmxMesh`] 的文档），交给逐角解析。
+        let loops = LoopAttrs {
+            position_indices: &position_indices,
+            normals: &vector3_array_attr(&vd, "normals"),
+            normal_indices: &i32_array_attr(&vd, "normalsIndices"),
+            uvs: &vector2_array_attr(&vd, "textureCoordinates"),
+            uv_indices: &i32_array_attr(&vd, "textureCoordinatesIndices"),
+            // ⚠️ `flipVCoordinates` 的方向是实测定的，不是查文档定的：BST 在 L4D2
+            // 预设下写 `true`，而它导出的 SMD 里 UV 是 (0.375, 0.000) —— 同一份
+            // 场景的 DMX 里 V 存的是 `1 - v`，所以这里要翻回来。
+            // `docs/_probe/cmp_dmx_vs_smd.js` 与
+            // `read_matches_the_smd_export_of_the_same_scene` 会盯住它。
+            flip_v: bool_attr(&vd, "flipVCoordinates").unwrap_or(false),
+            position_count: positions.len(),
+            orientation,
+        };
 
         let weights = expand_weights(&vd, positions.len(), &name, warnings);
 
-        let (triangles, material) = collect_faces(mesh, &position_indices, &material_index, &name, warnings);
+        let triangles = collect_faces(mesh, &loops, &material_index, &name, warnings);
 
         out.push(DmxMesh {
             name,
-            material,
             positions,
-            normals,
-            uvs,
             weights,
             triangles,
         });
@@ -398,34 +761,52 @@ fn collect_meshes(
     out
 }
 
-/// 把 loop 空间的属性摊平到 position 空间。
-fn expand_loops<T: Copy + Default>(
-    values: &[T],
-    value_indices: &[i32],
-    position_indices: &[i32],
+/// loop 空间的属性表：给一个 loop 下标，取出这个角自己的位置 / 法线 / UV。
+struct LoopAttrs<'a> {
+    position_indices: &'a [i32],
+    normals: &'a [[f32; 3]],
+    normal_indices: &'a [i32],
+    uvs: &'a [[f32; 2]],
+    uv_indices: &'a [i32],
+    flip_v: bool,
     position_count: usize,
-) -> Vec<T> {
-    let mut out = vec![T::default(); position_count];
-    let mut filled = vec![false; position_count];
-    for (loop_index, &position_index) in position_indices.iter().enumerate() {
-        let Ok(position) = usize::try_from(position_index) else {
-            continue;
-        };
-        if position >= position_count || filled[position] {
-            continue;
+    /// 网格的世界朝向；法线跟顶点位置一样要转过去。
+    orientation: [f32; 4],
+}
+
+impl LoopAttrs<'_> {
+    fn corner(&self, loop_index: usize) -> Option<DmxCorner> {
+        let position = *self.position_indices.get(loop_index)?;
+        let position = u32::try_from(position).ok()?;
+        if position as usize >= self.position_count {
+            return None;
         }
-        let Some(&value_index) = value_indices.get(loop_index) else {
-            continue;
-        };
-        let Ok(value_index) = usize::try_from(value_index) else {
-            continue;
-        };
-        if let Some(value) = values.get(value_index) {
-            out[position] = *value;
-            filled[position] = true;
-        }
+        let normal = self
+            .normal_indices
+            .get(loop_index)
+            .and_then(|&i| usize::try_from(i).ok())
+            .and_then(|i| self.normals.get(i).copied())
+            .map(|n| rotate(self.orientation, n))
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let uv = self
+            .uv_indices
+            .get(loop_index)
+            .and_then(|&i| usize::try_from(i).ok())
+            .and_then(|i| self.uvs.get(i).copied())
+            .map(|uv| {
+                if self.flip_v {
+                    [uv[0], 1.0 - uv[1]]
+                } else {
+                    uv
+                }
+            })
+            .unwrap_or([0.0, 0.0]);
+        Some(DmxCorner {
+            position,
+            normal,
+            uv,
+        })
     }
-    out
 }
 
 /// 权重是 position 空间的：每顶点 `jointCount` 条，`jointWeights` 与 `jointIndices` 平行。
@@ -473,79 +854,72 @@ fn expand_weights(
     out
 }
 
-/// 读所有 face set 的三角形；材质只有一个且一致时才返回下标。
+/// 读所有 face set 的三角形。材质是**逐 face set** 给的，所以逐三角形记住。
 fn collect_faces(
     mesh: &Element,
-    position_indices: &[i32],
+    loops: &LoopAttrs<'_>,
     material_index: &HashMap<String, usize>,
     mesh_name: &str,
     warnings: &mut Vec<String>,
-) -> (Vec<[u32; 3]>, Option<usize>) {
-    let mut triangles = Vec::new();
-    let mut material: Option<usize> = None;
-    let mut mixed = false;
+) -> Vec<DmxTriangle> {
+    let mut triangles: Vec<DmxTriangle> = Vec::new();
 
     for face_set in element_array_attr(mesh, "faceSets") {
+        let material = element_attr(&face_set, "material")
+            .and_then(|m| string_attr(&m, "mtlName"))
+            .and_then(|name| material_index.get(&name).copied());
         let faces = i32_array_attr(&face_set, "faces");
-        // ⚠️ `faces` 不是三角形三元组，而是「若干个顶点下标 + `-1` 结束符」的多边形表。
+        // ⚠️ `faces` 不是三角形三元组，而是「若干个 loop 下标 + `-1` 结束符」的多边形表。
         // BST 导出的立方体是 6 个四边形（`[0,1,2,3,-1, 4,5,6,7,-1, …]`），
         // 按三元组硬切会得到 `(0,1,2) (3,-1,4) …` 这种垃圾。官方 `dmxconvert`
         // 也是先按 `-1` 切多边形再三角化。
-        let mut polygon: Vec<u32> = Vec::new();
+        let mut polygon: Vec<usize> = Vec::new();
         let mut dropped = 0usize;
         for &raw in &faces {
             if raw < 0 {
-                triangulate(&mut polygon, &mut triangles);
+                triangulate(&mut polygon, &mut triangles, loops, material);
                 continue;
             }
-            let Ok(loop_index) = usize::try_from(raw) else {
-                polygon.clear();
-                dropped += 1;
-                continue;
-            };
-            let Some(&position_index) = position_indices.get(loop_index) else {
-                polygon.clear();
-                dropped += 1;
-                continue;
-            };
-            let Ok(position_index) = u32::try_from(position_index) else {
-                polygon.clear();
-                dropped += 1;
-                continue;
-            };
-            polygon.push(position_index);
+            let corner = usize::try_from(raw).ok().and_then(|i| loops.corner(i));
+            match corner {
+                Some(_) => polygon.push(usize::try_from(raw).unwrap_or(0)),
+                None => {
+                    polygon.clear();
+                    dropped += 1;
+                }
+            }
         }
-        triangulate(&mut polygon, &mut triangles);
+        triangulate(&mut polygon, &mut triangles, loops, material);
         if dropped > 0 {
             warnings.push(format!(
                 "mesh {mesh_name:?}: {dropped} face indices point outside the index space, those polygons were dropped"
             ));
         }
-
-        let this_material = element_attr(&face_set, "material")
-            .and_then(|m| string_attr(&m, "mtlName"))
-            .and_then(|name| material_index.get(&name).copied());
-        match (material, this_material) {
-            (None, m) => material = m,
-            (Some(existing), Some(m)) if existing != m => mixed = true,
-            _ => {}
-        }
     }
 
-    if mixed {
-        warnings.push(format!(
-            "mesh {mesh_name:?} mixes several materials, the material is left unset"
-        ));
-        material = None;
-    }
-    (triangles, material)
+    triangles
 }
 
 /// 扇形三角化一个多边形（顶点顺序保持原样，绕序不变），然后清空它。
-fn triangulate(polygon: &mut Vec<u32>, triangles: &mut Vec<[u32; 3]>) {
+fn triangulate(
+    polygon: &mut Vec<usize>,
+    triangles: &mut Vec<DmxTriangle>,
+    loops: &LoopAttrs<'_>,
+    material: Option<usize>,
+) {
     if polygon.len() >= 3 {
-        for k in 1..polygon.len() - 1 {
-            triangles.push([polygon[0], polygon[k], polygon[k + 1]]);
+        let first = loops.corner(polygon[0]);
+        if let Some(first) = first {
+            for k in 1..polygon.len() - 1 {
+                let b = loops.corner(polygon[k]);
+                let c = loops.corner(polygon[k + 1]);
+                if let (Some(b), Some(c)) = (b, c) {
+                    triangles.push(DmxTriangle {
+                        material,
+                        corners: [first, b, c],
+                    });
+                }
+            }
         }
     }
     polygon.clear();
@@ -584,6 +958,14 @@ fn int_attr(el: &Element, name: &str) -> Option<i32> {
     let attr = el.get_attribute(name)?;
     match attr.get_inner_value() {
         AttributeValue::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn bool_attr(el: &Element, name: &str) -> Option<bool> {
+    let attr = el.get_attribute(name)?;
+    match attr.get_inner_value() {
+        AttributeValue::Boolean(value) => Some(*value),
         _ => None,
     }
 }
@@ -680,13 +1062,22 @@ mod tests {
         assert_eq!(mesh.positions.len(), 8);
         // 立方体是 6 个四边形 —— 只有按 -1 切开再扇形三角化才得到 12 个三角形。
         assert_eq!(mesh.triangles.len(), 12);
-        assert_eq!(mesh.normals.len(), 8);
-        assert_eq!(mesh.uvs.len(), 8);
+        // 法线 / UV 是逐角存的：8 个 position 配 24 个角，每个面的角各取一套。
+        assert!(
+            mesh.triangles.iter().all(|t| t.material == Some(0)),
+            "每个三角形都该带上材质"
+        );
+        assert!(
+            mesh.triangles
+                .iter()
+                .flat_map(|t| t.corners.iter())
+                .all(|c| (c.position as usize) < mesh.positions.len()),
+            "角的位置下标必须落在 position 表里"
+        );
         assert!(
             mesh.weights.iter().all(|chain| chain.len() == 1),
             "每个顶点应当只有一条权重链"
         );
-        assert_eq!(mesh.material, Some(0));
     }
 
     #[test]
@@ -694,5 +1085,112 @@ mod tests {
         let err =
             read_from(&mut Cursor::new(b"not a dmx".as_slice()), "x.dmx").expect_err("应当报错");
         assert!(matches!(err, DmxError::Parse { .. }), "实际得到 {err:?}");
+    }
+
+    /// 同一份 Blender 场景的 SMD 与 DMX 双导出（3 根骨骼、两材质立方体、
+    /// 单/双权重混合）。
+    const BLENDER_CUBE_DMX: &[u8] = include_bytes!("dmx_fixtures/blender_cube.dmx");
+    const BLENDER_CUBE_SMD: &str = include_str!("dmx_fixtures/blender_cube.smd");
+
+    /// **验收主判据**：DMX 读出来的东西，必须与同一份场景导出的 SMD 一模一样。
+    ///
+    /// 这一条比「跑通不 panic」硬得多：节点表、骨骼姿态、每个角的
+    /// 位置/法线/UV/权重链、逐三角形材质，全部逐项比对。它同时盯住三处换算
+    /// （位置原样、旋转走 `quaternion_angles`、节点表只留真骨骼）与 V 翻转。
+    #[test]
+    fn read_matches_the_smd_export_of_the_same_scene() {
+        let model =
+            read_from(&mut Cursor::new(BLENDER_CUBE_DMX), "blender_cube.dmx").expect("应当能解析");
+        let ours = to_smd(&model, "blender_cube.dmx", "blender_cube.dmx")
+            .expect("应当能转成 SMD")
+            .smd;
+        let theirs = crate::smd::parse_smd(BLENDER_CUBE_SMD).expect("SMD 夹具应当能解析");
+
+        // ---- 节点表 ----
+        assert_eq!(ours.nodes.len(), theirs.nodes.len(), "node 数");
+        for (a, b) in ours.nodes.iter().zip(&theirs.nodes) {
+            assert_eq!(a.name, b.name, "node {} 名字", a.index);
+            assert_eq!(a.parent, b.parent, "node {:?} 的父节点", a.name);
+        }
+
+        // ---- 参考姿态 ----
+        let (a, b) = (&ours.frames[0].poses, &theirs.frames[0].poses);
+        assert_eq!(a.len(), b.len(), "pose 数");
+        for (x, y) in a.iter().zip(b) {
+            for k in 0..3 {
+                assert!(
+                    (x.position[k] - y.position[k]).abs() < 1e-4,
+                    "骨骼 {} 位置分量 {k}：DMX {:?} vs SMD {:?}",
+                    x.bone,
+                    x.position,
+                    y.position
+                );
+            }
+            // 旋转按四元数比会绕开欧拉角的分支问题，但两边都是欧拉角，直接逐分量
+            // 比即可（SMD 夹具是同一台机器导出的，不会跨分支）。
+            for k in 0..3 {
+                assert!(
+                    (x.rotation[k] - y.rotation[k]).abs() < 1e-4,
+                    "骨骼 {} 旋转分量 {k}：DMX {:?} vs SMD {:?}",
+                    x.bone,
+                    x.rotation,
+                    y.rotation
+                );
+            }
+        }
+
+        // ---- 三角形：材质 + 每个角 ----
+        //
+        // ⚠️ **按集合比，不按下标比**。两个导出器给三角形的**顺序**不一样（SMD 按
+        // 多边形写、材质的「分块」也不同：实测 SMD 是 aaa/bbb/aaa/bbb，DMX 是
+        // aaaaaa/bbbbbb），而且四边形三角化的对角线也可以不同。三角形顺序对产物
+        // 没有影响（`compile.rs` 会重新焊接顶点、排序），所以这里比「同一批三角形」。
+        //
+        // 每个三角形做一次**循环旋转**（从字典序最小的角开始），这样既能忽略起点，
+        // 又能保留绕序 —— 绕序反了会被抓出来。
+        fn key(smd: &crate::smd::Smd) -> Vec<String> {
+            let mut out: Vec<String> = smd
+                .triangles
+                .iter()
+                .map(|t| {
+                    let corners: Vec<String> = t
+                        .vertices
+                        .iter()
+                        .map(|v| {
+                            let links: Vec<String> = v
+                                .links
+                                .iter()
+                                .map(|l| format!("{}:{:.5}", l.bone, l.weight))
+                                .collect();
+                            format!(
+                                "({:.4},{:.4},{:.4})|({:.4},{:.4},{:.4})|({:.4},{:.4})|[{}]",
+                                v.position[0],
+                                v.position[1],
+                                v.position[2],
+                                v.normal[0],
+                                v.normal[1],
+                                v.normal[2],
+                                v.uv[0],
+                                v.uv[1],
+                                links.join(",")
+                            )
+                        })
+                        .collect();
+                    // 旋转到字典序最小的角开头（保留循环顺序 ⟹ 保留绕序）。
+                    let start = (0..3).min_by_key(|&i| corners[i].clone()).unwrap_or(0);
+                    let rotated: Vec<String> = (0..3).map(|i| corners[(start + i) % 3].clone()).collect();
+                    format!("{}#{}", t.material, rotated.join(" "))
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let ours_key = key(&ours);
+        let theirs_key = key(&theirs);
+        assert_eq!(ours_key.len(), theirs_key.len(), "三角形数");
+        for (i, (a, b)) in ours_key.iter().zip(&theirs_key).enumerate() {
+            assert_eq!(a, b, "第 {i} 个三角形（按排序后比）不一致");
+        }
     }
 }

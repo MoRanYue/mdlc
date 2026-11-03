@@ -10,7 +10,7 @@
 
 </div>
 
-把 **TOML 描述文件**或 **QC 脚本** + **SMD / FBX / glTF 网格**编译成 Source 引擎能加载的
+把 **TOML 描述文件**或 **QC 脚本** + **SMD / DMX / FBX / glTF 网格**编译成 Source 引擎能加载的
 `.mdl` + `.vvd` + `.dx90.vtx`（带碰撞时另有 `.phy`，用 `$animblocksize` 时另有 `.ani`）。
 
 - **语言**：Rust **1.89+**（`edition 2024`）
@@ -175,12 +175,17 @@ QC 脚本  ──┘
 网格**不写在描述里** —— 真实模型动辄几十万个顶点，内联会让描述文件膨胀到几百 MB
 且无法用文本工具处理。描述文件只**引用**网格源。
 
-网格源可以是 **SMD**、**FBX**（`.fbx`，走 `ufbx`，见
+网格源可以是 **SMD**、**DMX**（`.dmx`，即 Valve 的 datamodel 格式，
+[BlenderSourceTools](https://github.com/Artfunkel/BlenderSourceTools) 的导出就是这种）、
+**FBX**（`.fbx`，走 `ufbx`，见
 [`docs/fbx-support.md`](docs/fbx-support.md)）或 **glTF / GLB**（`.gltf` / `.glb`，走
 `gltf` crate，见 [`docs/gltf-support.md`](docs/gltf-support.md)）。
 **格式由扩展名决定，所以必须写全**
 —— 这也是不自动补扩展名的原因之一（见 `## 已知未实现`）。
 
+> **DMX 目前只读网格与骨架**（和 SMD 一样用），文件里若带**动画数据**会明确报错，
+> 提示改指 `.smd`。这不是扩展 —— 官方 `studiomdl.exe` 原生就读 DMX。
+>
 > **FBX / glTF 都可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
 > （合并所有网格、恒取第一条 NLA 栈、shape key 自动注册成 flex），
 > 而官方那些**静默失败**会被 mdlc 变成显式提示，每个隐式决定都有一个
@@ -201,8 +206,8 @@ QC 脚本  ──┘
 | 内容 | 由谁承载 | 对应 QC |
 |---|---|---|
 | 模型名 / 材质 / 骨骼 / bodypart 树 | TOML 描述文件 | `$modelname` / `$cdmaterials` / `$definebone` / `$bodygroup` |
-| **网格（顶点、法线、UV、蒙皮）** | **SMD / FBX / glTF 文件** | `studio "x.smd"` / `$body body "x.fbx"` / `$body body "x.glb"` |
-| **参考姿态** | **SMD 的 `skeleton` 第 0 帧**（FBX / glTF 用节点的局部 TRS） | 参考 SMD |
+| **网格（顶点、法线、UV、蒙皮）** | **SMD / DMX / FBX / glTF 文件** | `studio "x.smd"` / `$body body "x.dmx"` / `$body body "x.fbx"` / `$body body "x.glb"` |
+| **参考姿态** | **SMD 的 `skeleton` 第 0 帧**（DMX 的 `DmeJoint` 变换；FBX / glTF 用节点的局部 TRS） | 参考 SMD |
 | **表情（flex）** | **`.vta` 的帧**，或 **FBX shape key / glTF morph target**（自动注册） | `flexfile` + `flex` |
 
 ---
@@ -518,7 +523,7 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 
 | 命令 | 行为 |
 |---|---|
-| `$nekomodel` | **显式报错** —— 它指向 DMX 源，mdlc 不实现 DMX（官方也委托 `dmxconvert.exe`） |
+| `$nekomodel` | **显式报错** —— 它是 NekoMDL 的扩展（官方报 `bad command`）。DMX 源现在可以直接写 `$body body "x.dmx"` |
 | `$defaultweightlist` | **显式报错** —— 它会覆盖**所有**未显式指定 weightlist 的序列，静默忽略会产出「看起来对但语义错」的模型。要等价效果请用 `$weightlist` 并在序列上显式引用 |
 | `$fakevta` | 跳过整个块（无产物痕迹） |
 | `$scale` | **接受但无效果**（缩放只被记录、从不参与计算）。请改用 `srcscale` |
@@ -996,7 +1001,7 @@ switch_point = 40.0
 | 项 | 说明 |
 |---|---|
 | **LOD 自动生成** | 网格简化 / decimate。多 LOD 的**输入与写出**已支持，但不会替你简化。**这是与官方差距最大的一块** |
-| **DMX 输入** | 刻意不实现。`$nekomodel` 会**显式报错**；`studio "x.dmx"` 不会被专门识别，而是在读文件/解析 SMD 时失败（官方也是委托 `dmxconvert.exe`） |
+| **DMX 动画** | 刻意不实现。DMX 作为**网格与骨架**源完全可用，但文件里带动画数据时会**显式报错**并提示改指 `.smd` |
 | `$maxverts` | NekoMDL 的非官方扩展，被忽略。用自动拆分替代 |
 | `ikrule footstep`（type 3） | 需要 `$ikchain` 的 `center`，mdlc 尚未建模该量。写出时会**显式报错**而不是静默产出错误载荷 |
 | 若干罕见的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … 被忽略 |
