@@ -905,7 +905,7 @@ pub struct SourceGeometry {
 /// 与 [`read_source`] 的区别就是多带一份 [`SourceGeometry::shape_keys`]；
 /// 只有 `$body` / `$model` 的主网格需要它，LOD 与 QC 的文件存在性检查走
 /// [`read_source`] 就够（前者官方也不产出 flex，后者根本不看内容）。两者
-/// **共用** [`geometry_source`]，所以先调哪个都会让另一个命中缓存。
+/// **共用** `geometry_source`，所以先调哪个都会让另一个命中缓存。
 pub fn read_source_geometry(
     path: &Path,
     at: &str,
