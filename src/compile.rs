@@ -2882,6 +2882,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     mesh_flexes: Vec::new(),
                     mesh_src_index,
                     shape_keys,
+                    // `srcnoautorules` 只影响形态键的**注册**（见
+                    // `resolve_shape_key_flexes`），编译出的几何与它无关。
+                    src_no_auto_rules: m.src_no_auto_rules,
                 });
             }
             bodyparts.push(CompiledBodyPart {
@@ -6732,6 +6735,13 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
         .map(|bp| bp.models.iter().map(|m| m.shape_keys.clone()).collect())
         .collect();
 
+    // 与 `specs` 同形：哪个 model 关了自动注册（`srcnoautorules`）。
+    let no_auto_rules: Vec<Vec<bool>> = compiled
+        .bodyparts
+        .iter()
+        .map(|bp| bp.models.iter().map(|m| m.src_no_auto_rules).collect())
+        .collect();
+
     // 没有 shape key 就直接返回 —— 保证非 FBX 工程的产物**逐字节不变**。
     let any = specs.iter().any(|bp| bp.iter().any(|m| !m.is_empty()));
     if !any {
@@ -6789,27 +6799,37 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
                         i
                     }
                 };
-                if !fc_index.contains_key(&k.name) {
-                    compiled
-                        .desc
-                        .flex_controllers
-                        .push(crate::model::FlexController {
-                            name: k.name.clone(),
-                            kind: k.name.clone(),
-                            min: 0.0,
-                            max: 1.0,
-                        });
-                    fc_index.insert(k.name.clone(), compiled.desc.flex_controllers.len() - 1);
+                // ⚠️ `srcnoautorules`（官方 QC 别名 `NoAutoDMXRules`）只为
+                // 「别替我接控制器」而存在：flexdesc 照建（形态键本身要留），
+                // 自动 flexcontroller 与自动 `fetch1` 规则都不建。
+                //
+                // 实测（`docs/_probe/oracle_noautodmxrules.js`，`morph.fbx`）：
+                // 无此开关 desc/ctrl/rules = 2/2/2；有此开关 **2/0/0**；
+                // 「开关 + 手写 1 控制器 + 1 规则」= 2/1/1 ⟹ 手写的保留。
+                let skip_auto = no_auto_rules[bi][mi];
+                if !skip_auto {
+                    if !fc_index.contains_key(&k.name) {
+                        compiled
+                            .desc
+                            .flex_controllers
+                            .push(crate::model::FlexController {
+                                name: k.name.clone(),
+                                kind: k.name.clone(),
+                                min: 0.0,
+                                max: 1.0,
+                            });
+                        fc_index.insert(k.name.clone(), compiled.desc.flex_controllers.len() - 1);
+                    }
+                    compiled.desc.flex_rules.push(crate::model::FlexRule {
+                        flex: k.name.clone(),
+                        ops: vec![crate::model::FlexOp {
+                            op: crate::model::FlexOpKind::Fetch1,
+                            value: None,
+                            controller: Some(k.name.clone()),
+                            flexdesc: None,
+                        }],
+                    });
                 }
-                compiled.desc.flex_rules.push(crate::model::FlexRule {
-                    flex: k.name.clone(),
-                    ops: vec![crate::model::FlexOp {
-                        op: crate::model::FlexOpKind::Fetch1,
-                        value: None,
-                        controller: Some(k.name.clone()),
-                        flexdesc: None,
-                    }],
-                });
                 row.push(d);
             }
             per_model.push(row);
@@ -9608,6 +9628,72 @@ type = "mouth"
         }
     }
 
+    /// ⭐ **`srcnoautorules`（官方 `NoAutoDMXRules`）：形态键留下，控制器与规则不建。**
+    ///
+    /// 官方实测（`docs/_probe/oracle_noautodmxrules.js`，`morph.fbx` 自带
+    /// `wide` / `tall`）：
+    ///
+    /// | `$model` 块 | numflexdesc | numflexcontrollers | numflexrules |
+    /// |---|---|---|---|
+    /// | 空（自动） | 2 | 2 | 2 |
+    /// | `NoAutoDMXRules` | **2** | **0** | **0** |
+    /// | 手写 1 控制器 + 1 规则 | 2 | 3 | 3 |
+    /// | `NoAutoDMXRules` + 手写 1 控制器 + 1 规则 | **2** | **1** | **1** |
+    ///
+    /// 所以「载荷照写、desc 照建、控制器与规则不建」三件事要一起测。
+    #[test]
+    fn no_auto_rules_keeps_flexdesc_but_skips_controller_and_rule() {
+        let mut c = ir_with_src_index(&[0, 1, 2, 3]);
+        c.bodyparts[0].models[0].shape_keys = vec![
+            key("wide", &[(0, [2.5, 0.0, 0.0]), (1, [2.5, 0.0, 0.0])]),
+            key("tall", &[(2, [0.0, 2.5, 0.0]), (3, [0.0, -2.5, 0.0])]),
+        ];
+        c.bodyparts[0].models[0].src_no_auto_rules = true;
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        let descs: Vec<&str> = c
+            .desc
+            .flex_descriptors
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            descs,
+            ["wide", "tall"],
+            "形态键本身要留（官方 numflexdesc 仍是 2）"
+        );
+        assert!(
+            c.desc.flex_controllers.is_empty(),
+            "不该自动建控制器（官方 0）"
+        );
+        assert!(c.desc.flex_rules.is_empty(), "不该自动建规则（官方 0）");
+        assert!(
+            !c.bodyparts[0].models[0].mesh_flexes.is_empty(),
+            "载荷照写 —— 开关只挡「自动接控制器」这一路"
+        );
+    }
+
+    /// 同一个 model 上「`srcnoautorules` + 用户已经显式写过同名控制器」：
+    /// 不该再补一条警告或重复建，控制器保持 1 条、规则仍然 0 条。
+    #[test]
+    fn no_auto_rules_leaves_explicit_controllers_alone() {
+        let mut c = ir_with_src_index(&[0, 1]);
+        c.bodyparts[0].models[0].shape_keys = vec![key("wide", &[(1, [2.5, 0.0, 0.0])])];
+        c.desc.flex_controllers.push(crate::model::FlexController {
+            name: "cheek".into(),
+            kind: "cheek".into(),
+            min: 0.0,
+            max: 1.0,
+        });
+        c.bodyparts[0].models[0].src_no_auto_rules = true;
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        assert_eq!(c.desc.flex_descriptors.len(), 1, "desc 照建");
+        assert_eq!(c.desc.flex_controllers.len(), 1, "只该剩下手写的那一条");
+        assert_eq!(c.desc.flex_controllers[0].name, "cheek");
+        assert!(c.desc.flex_rules.is_empty(), "规则仍然是 0 条");
+    }
+
     /// ⭐⭐⭐ **载荷逐字段复刻**：`targets = [0,1,10,11]`、`flexpair = 0`、
     /// `vertanimtype = 0`、`speed = side = 255`、`ndelta = 0`、`delta` 原样。
     ///
@@ -10050,6 +10136,7 @@ type = "mouth"
             src_shape_keys: vec!["wide".into()],
             src_shape_key_order: Vec::new(),
             src_shape_key_ignore: false,
+            src_no_auto_rules: false,
         };
         let o = SrcOpts::of_model(&m).unwrap();
         assert_eq!(o.fbx.parts, ["body"]);

@@ -1111,6 +1111,7 @@ impl<'a> Parser<'a> {
         let mut src_shape_keys: Vec<String> = Vec::new();
         let mut src_shape_key_order: Vec<String> = Vec::new();
         let mut src_shape_key_ignore = false;
+        let mut src_no_auto_rules = false;
 
         // 行内选项。
         while self.avail() {
@@ -1183,6 +1184,10 @@ impl<'a> Parser<'a> {
                     src_shape_key_order.push(self.tok(false)?.text);
                 }
                 "srcshapekeyignore" => src_shape_key_ignore = true,
+                "srcnoautorules" | "noautodmxrules" => {
+                    self.warn_no_auto_rules_position(&o);
+                    src_no_auto_rules = true;
+                }
                 "{" => {
                     self.lex.unget(o);
                     break;
@@ -1232,6 +1237,7 @@ impl<'a> Parser<'a> {
             src_shape_keys,
             src_shape_key_order,
             src_shape_key_ignore,
+            src_no_auto_rules,
         })
     }
 
@@ -1408,6 +1414,10 @@ impl<'a> Parser<'a> {
                 "srcshapekeyignore" => {
                     model.src_shape_key_ignore = true;
                 }
+                "srcnoautorules" | "noautodmxrules" => {
+                    self.warn_no_auto_rules_position(&t);
+                    model.src_no_auto_rules = true;
+                }
                 other => {
                     // ⚠️ 规则名必须取**原始大小写**的 `t.text`，**不能**用 `low`。
                     //
@@ -1490,6 +1500,30 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(o)
+    }
+
+    /// `srcnoautorules` / `NoAutoDMXRules` 的位置提醒（**警告，不是错误**）。
+    ///
+    /// 官方在**它出现的位置**把已登记的 flexcontroller 整批清空
+    /// （`FUN_0045c6e0`：`DAT_016e1b9c = 0;`，wiki 也写了
+    /// "Remove any flexcontrollers already created"），所以官方 QC 里
+    /// 「先写控制器、再写这个开关」会让控制器**静默消失**。
+    ///
+    /// mdlc 不做清零 —— 顺序无关对用户更安全 —— 但那样产物会与官方不同
+    /// ⟹ 写在 `flexcontroller` 之后时提醒一句。**不报错**：用户 2026-11-03
+    /// 定「写在控制器后弹编译时警告便可」。移到块首两边就一致。
+    fn warn_no_auto_rules_position(&self, t: &Token) {
+        if self.desc.flex_controllers.is_empty() {
+            return;
+        }
+        log::warn!(
+            "{}",
+            crate::tr_fmt!(
+                "%{file}:%{line}: `srcnoautorules` (official name `NoAutoDMXRules`) comes after a `flexcontroller`: official studiomdl wipes the controllers registered before this point, so its output loses them while mdlc keeps them. Move this line to the top of the `$model` block to match the official compiler",
+                file = t.file.as_str(),
+                line = t.line
+            )
+        );
     }
 
     /// `Option_Flex`：把一条 VTA 形状绑定推入当前 model。
@@ -8182,6 +8216,79 @@ $sequence \"idle\" \"a.smd\" fps 30
             Some("my/fallback"),
             "`srcmaterial` 必须被当成选项解析，而不是第二个形状名"
         );
+    }
+
+    /// `srcnoautorules`（官方别名 `NoAutoDMXRules`）—— 两个名字都认，
+    /// 且**位置**有要求。
+    ///
+    /// 官方 `FUN_0045c6e0` 在命中这个词时执行 `DAT_016e1b9c = 0;`，把**此前
+    /// 登记的** flexcontroller 整批清空（wiki 的 "Remove any flexcontrollers
+    /// already created" 说的就是它）。mdlc 不做清零，所以「写在控制器之后」
+    /// 必须报错 —— 否则用户以为控制器还在，而官方产物里没有。
+    #[test]
+    fn no_auto_rules_accepts_both_names_and_rejects_late_placement() {
+        let dir = fixture("noautodmxrules");
+
+        // ① 通用名（TOML 里叫 `src_no_auto_rules`，QC 用同一个词）。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$body body \"a.smd\" srcnoautorules\n",
+            &dir,
+        );
+        assert!(
+            d.bodyparts[0].models[0].src_no_auto_rules,
+            "`srcnoautorules` 应生效"
+        );
+        assert!(
+            !d.bodyparts[0].models[0].src_shape_key_ignore,
+            "与 `srcshapekeyignore` 不是一回事，不能互相置位"
+        );
+
+        // ② 官方拼写，大小写不敏感。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$body body \"a.smd\" NoAutoDMXRules\n",
+            &dir,
+        );
+        assert!(
+            d.bodyparts[0].models[0].src_no_auto_rules,
+            "`NoAutoDMXRules` 是别名"
+        );
+
+        // ③ `$model` 块里的写法（另一条解析路径）。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$model body \"a.smd\" { NoAutoDMXRules }\n",
+            &dir,
+        );
+        assert!(
+            d.bodyparts[0].models[0].src_no_auto_rules,
+            "$model 块内也应生效"
+        );
+
+        // ④ 写在 `flexcontroller` 之后：**只警告、不报错**（用户 2026-11-03
+        //    定「写在控制器后弹编译时警告便可」），控制器必须原样保留 ——
+        //    mdlc 不复刻官方的「整批清零」。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$model body \"a.smd\" {\n    flexcontroller \"cheek\" \"aaa\"\n    NoAutoDMXRules\n}\n",
+            &dir,
+        );
+        assert!(
+            d.bodyparts[0].models[0].src_no_auto_rules,
+            "写在后面也要生效（开关本身的语义与位置无关）"
+        );
+        assert_eq!(
+            d.flex_controllers.len(),
+            1,
+            "mdlc 不清零：官方会丢掉这一条，mdlc 保留（警告已提示）"
+        );
+
+        // ⑤ 顺序反过来，控制器同样保留。
+        let d = parse(
+            "$modelname \"t.mdl\"\n$model body \"a.smd\" {\n    NoAutoDMXRules\n    flexcontroller \"cheek\" \"aaa\"\n}\n",
+            &dir,
+        );
+        assert_eq!(d.flex_controllers.len(), 1, "开关之后的控制器要保留");
+        assert!(d.bodyparts[0].models[0].src_no_auto_rules);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `srcpart` 可重复写，效果是**累加**（等价于一次给多个名字）。

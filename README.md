@@ -184,7 +184,7 @@ QC 脚本  ──┘
 > **FBX / glTF 都可以直接写进 QC**，不需要中间转换。默认行为**逐条对齐官方**
 > （合并所有网格、恒取第一条 NLA 栈、shape key 自动注册成 flex），
 > 而官方那些**静默失败**会被 mdlc 变成显式提示，每个隐式决定都有一个
-> 显式覆盖语法（九条 `src*`，见 [`### FBX / glTF 源选项`](#fbx--gltf-源选项src9-条)）。
+> 显式覆盖语法（十条 `src*`，见 [`### FBX / glTF 源选项`](#fbx--gltf-源选项src10-条)）。
 >
 > ⚠️ **glTF 没有官方基准**（官方 `studiomdl.exe` 完全不认这个格式），口径与取舍
 > 见 [`docs/gltf-support.md`](docs/gltf-support.md)。
@@ -583,14 +583,14 @@ $maxbones 200             ; 显式覆盖预设的骨骼上限
 > 一条「关掉」的命令没有实际用途（官方的裸标志位如 `$staticprop` 也都没有
 > 反向命令）。同理命令行 `--optimize-vtx` 也只能开、不能关。
 
-### FBX / glTF 源选项（`src*`，9 条）
+### FBX / glTF 源选项（`src*`，10 条）
 
 网格源是 `.fbx` 或 `.gltf` / `.glb` 时，导入器会替你做一串**隐式决定**，而且
 **全部静默**：合并所有网格、恒取第一条 NLA 栈、材质名直接用文件里的、
 轴向原样搬运。mdlc 的默认行为**逐条对齐官方**，
 但把这些决定变成**显式语法**——不写就等于默认行为，写了就能改。
 
-⭐ **九条语法在 glTF 上逐条都适用**，因为它们是**按概念命名**的
+⭐ **十条语法在 glTF 上逐条都适用**，因为它们是**按概念命名**的
 （格式由文件扩展名决定）：所以叫 `srcpart` 而不是 `fbxpart`。
 加 glTF 支持时**新增语法 0 条**。
 
@@ -615,6 +615,22 @@ $maxbones 200             ; 显式覆盖预设的骨骼上限
 | `srcshapekey "名"` | `$model` 块内 | 只取这些 shape key / morph target，**并定序**；可重复写 | 全部，按文件顺序 |
 | `srcshapekeyorder "名"` | 同上 | 只定序，不筛 | 文件顺序 |
 | `srcshapekeyignore` | 同上 | 全部忽略（不注册 flex） | 全部注册 |
+| `srcnoautorules` | 同上 | 只建形变目标本身，**不自动建控制器与规则**（官方名 `NoAutoDMXRules`，QC 里两个名字都认） | 每个 shape key 自动配一个控制器 + 一条 `fetch1` 规则 |
+
+> ⭐ **`srcnoautorules` 是给「自己想写规则」的人用的**。默认会自动注册
+> 「控制器 + `%名 = fetch1 名`」，而自动规则**追加在最后**，引擎按顺序求值、
+> 后写的赢 ⟹ 手写规则会被静默覆盖。加上这一条之后控制器与规则都留给你：
+>
+> ```qc
+> $model face "face.fbx" {
+>     srcnoautorules                      // 或官方拼写 NoAutoDMXRules
+>     flexcontroller "cheek" "cheek"
+>     %wide = cheek * 1.0                 // 左值是形态键名，不是控制器名
+> }
+> ```
+>
+> 与官方的一处**有意差异**：官方在这一行出现的位置会把**此前登记的**控制器
+> 整批清空，mdlc 不清（只打一条警告），所以**把这一行写在块首**两边才一致。
 
 ```qc
 $modelname "models/mymod/linnea.mdl"
@@ -996,7 +1012,7 @@ switch_point = 40.0
 | [`docs/coordinate-systems.md`](docs/coordinate-systems.md) | 坐标系约定与 `$staticprop` 几何旋转 |
 | [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | 以 L4D2 `studiomdl.exe` 的 **137 条分发表**为基准的 QC 覆盖对照 |
 | [`docs/feature-gap.md`](docs/feature-gap.md) | 相对官方 `studiomdl` 的特性差距清单与优先级 |
-| [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的口径与 UX 方案（九条 `src*` 语法的设计理由 + 偏离表） |
+| [`docs/fbx-support.md`](docs/fbx-support.md) | FBX 支持的口径与 UX 方案（`src*` 语法的设计理由 + 偏离表） |
 | [`docs/gltf-support.md`](docs/gltf-support.md) | glTF / GLB 支持的口径来源与取舍（新增语法 0 条） |
 | [`docs/update-check.md`](docs/update-check.md) | 更新检测的设计与取舍（为什么默认开启、什么时候联网、怎么关掉） |
 | [`docs/library-api.md`](docs/library-api.md) | 作为库集成时的 API 用法、错误与退出码 |

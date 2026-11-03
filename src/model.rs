@@ -3424,6 +3424,62 @@ pub struct BodyModel {
     /// `srcshapekeyignore`：**完全忽略形变目标**（不产出任何 flex）。
     #[serde(default)]
     pub src_shape_key_ignore: bool,
+    /// `srcnoautorules`：**不为这个源的形变目标自动建控制器与规则**。
+    ///
+    /// QC 里同时接受官方拼写 **`NoAutoDMXRules`** 作为别名（官方只有这一个名字，
+    /// 但它的作用与 DMX 无关 —— FBX / glTF 的形态键走同一条自动注册路径）。
+    ///
+    /// # 默认（`false`）时 mdlc 会自动注册什么
+    ///
+    /// 每个形态键一条 flexdesc + 一条同名 flexcontroller + 一条 `fetch1 <名字>` 规则
+    /// （见 [`crate::compile`] 的 `resolve_shape_key_flexes`）。好处是「开箱即用」，
+    /// 坏处是**用户没法自己接管**：自动规则是**追加在最后**的，而引擎按顺序求值、
+    /// 后写的赢 ⟹ 手写规则会被静默盖掉。
+    ///
+    /// # 打开之后
+    ///
+    /// | | 无此开关 | 有此开关 |
+    /// |---|---|---|
+    /// | flexdescriptor（形态键本身） | 建 | **照建** |
+    /// | 自动 flexcontroller | 建 | **不建** |
+    /// | 自动 `fetch1` 规则 | 建 | **不建** |
+    /// | 手写 `flexcontroller` / `%规则` | 保留 | **保留** |
+    ///
+    /// 实测（`docs/_probe/oracle_noautodmxrules.js`，`morph.fbx` 自带
+    /// `wide` / `tall` 两条形态键）：
+    ///
+    /// | `$model` 块 | numflexdesc | numflexcontrollers | numflexrules |
+    /// |---|---|---|---|
+    /// | 空（自动） | 2 | 2 | 2 |
+    /// | `NoAutoDMXRules` | **2** | **0** | **0** |
+    /// | 手写 1 控制器 + 1 规则 | 2 | 3 | 3 |
+    /// | `NoAutoDMXRules` + 手写 1 控制器 + 1 规则 | **2** | **1** | **1** |
+    ///
+    /// 所以「不要自动规则、自己写」的标准写法是：
+    ///
+    /// ```text
+    /// $model face "face.fbx" {
+    ///     NoAutoDMXRules            ← 先关自动那一路
+    ///     flexcontroller "cheek" "cheek"
+    ///     %wide = cheek * 1.0        ← 左值必须是形态键名，不是控制器名
+    /// }
+    /// ```
+    ///
+    /// # 与 [`Self::src_shape_key_ignore`] 的区别
+    ///
+    /// 那个是「这个源的形态数据**一点都不要**」（连 flexdesc 和载荷都不建），
+    /// 这个是「形态键要，但**别替我接控制器**」。两者不是一回事，可以同时写
+    /// （此时前者赢 —— 没有形态键也就无所谓规则）。
+    ///
+    /// # ⚠️ 与官方的一处**有意**差异
+    ///
+    /// 官方在**它出现的位置**把**已登记的** flexcontroller 整批清空
+    /// （`FUN_0045c6e0`：`DAT_016e1b9c = 0`），所以官方 QC 里
+    /// 「先写控制器、再写这个开关」会让控制器**静默消失**。mdlc 不做这个清零
+    /// （顺序无关更安全），改为在 QC 解析时打一条**警告**（带 `文件:行号`），
+    /// 提醒「官方会丢掉这一条、mdlc 保留」。把开关移到块首之后两边产物一致。
+    #[serde(default)]
+    pub src_no_auto_rules: bool,
 }
 
 /// 一条 VTA 形状绑定（QC 的 `flexfile "<vta>" flex "<名>" frame <n>`）。
@@ -3962,6 +4018,11 @@ pub struct CompiledModel {
     /// 官方把 FBX 的 shape key **全自动**注册成 flex（`docs/fbx-support.md`
     /// §1.6b），所以这里不需要 QC 写任何 flex 语法。
     pub shape_keys: Vec<crate::fbx::FbxShapeKey>,
+    /// 该 model 关了「自动注册形态键」吗（[`BodyModel::src_no_auto_rules`]）。
+    ///
+    /// 存在的理由同 [`Self::shape_keys`]：flex 注册跑在 bodypart 循环之后，
+    /// 那时拿不到原始 [`BodyModel`]，所以要把这一位带过来。
+    pub src_no_auto_rules: bool,
 }
 
 /// 一个 body part 的编译结果。

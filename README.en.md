@@ -197,7 +197,7 @@ A mesh source can be **SMD**, **FBX** (`.fbx`, via `ufbx`, see
 > behaviour **matches the official tool line by line** (merge every mesh, always take the first
 > NLA stack, auto-register shape keys as flex), while the official tool's **silent failures**
 > become explicit messages in mdlc, and every implicit decision has an explicit override
-> (nine `src*` options, see [`### FBX / glTF source options`](#fbx--gltf-source-options-src-9-of-them)).
+> (ten `src*` options, see [`### FBX / glTF source options`](#fbx--gltf-source-options-src-10-of-them)).
 >
 > ⚠️ **glTF has no official baseline** (official `studiomdl.exe` does not recognise the format
 > at all); the semantics and trade-offs are in
@@ -622,7 +622,7 @@ $maxbones 200             ; explicit override of the preset's bone limit
 > "turn it off" command would have no use (the official bare flags such as `$staticprop` have no
 > inverse either). Likewise the command-line `--optimize-vtx` can only turn it on, never off.
 
-### FBX / glTF source options (`src*`, 9 of them)
+### FBX / glTF source options (`src*`, 10 of them)
 
 When the mesh source is `.fbx` or `.gltf` / `.glb`, the importer makes a series of **implicit
 decisions**, all of them **silent**: merge every mesh, always take the first NLA stack, use the
@@ -630,7 +630,7 @@ material names straight from the file, carry the axes over verbatim. mdlc's defa
 **matches the official tool line by line**, but turns those decisions into **explicit syntax** —
 not writing them means the default, writing them changes it.
 
-⭐ **All nine work on glTF too**, because they are **named after concepts** (the format comes from
+⭐ **All ten work on glTF too**, because they are **named after concepts** (the format comes from
 the file extension): that is why it is `srcpart` and not `fbxpart`. Adding glTF support **added
 zero new syntax**.
 
@@ -657,6 +657,24 @@ zero new syntax**.
 | `srcshapekey "name"` | inside a `$model` block | take only these shape keys / morph targets, **and order them**; repeatable | all of them, in file order |
 | `srcshapekeyorder "name"` | same | order only, no filtering | file order |
 | `srcshapekeyignore` | same | ignore all of them (register no flex) | register all |
+| `srcnoautorules` | same | keep the morph targets but **build no controllers or rules for them** (official name `NoAutoDMXRules`; QC accepts both) | one controller plus one `fetch1` rule per shape key |
+
+> ⭐ **`srcnoautorules` is for people who want to write the rules themselves.** By default each
+> shape key gets a controller and a `%name = fetch1 name` rule, and auto rules are **appended last**
+> — the engine evaluates in order and later wins, so a hand-written rule would be silently
+> overridden. With this line both are left to you:
+>
+> ```qc
+> $model face "face.fbx" {
+>     srcnoautorules                      // or the official spelling, NoAutoDMXRules
+>     flexcontroller "cheek" "cheek"
+>     %wide = cheek * 1.0                 // the left side is the shape key, not the controller
+> }
+> ```
+>
+> One **deliberate** divergence from the official tool: wherever this line appears, the official
+> compiler wipes the controllers registered **before** it; mdlc does not (it only warns), so write
+> this line at the top of the block to get identical results.
 
 ```qc
 $modelname "models/mymod/linnea.mdl"
@@ -1067,7 +1085,7 @@ The `docs/` directory holds the finer specifications and notes:
 | [`docs/coordinate-systems.md`](docs/coordinate-systems.md) | Coordinate-system conventions and the `$staticprop` geometry rotation |
 | [`docs/qc-coverage-gap.md`](docs/qc-coverage-gap.md) | QC coverage against the **137-entry dispatch table** of L4D2's `studiomdl.exe` |
 | [`docs/feature-gap.md`](docs/feature-gap.md) | Feature gap list and priorities versus official `studiomdl` |
-| [`docs/fbx-support.md`](docs/fbx-support.md) | FBX support semantics and UX plan (design rationale for the nine `src*` commands + deviation table) |
+| [`docs/fbx-support.md`](docs/fbx-support.md) | FBX support semantics and UX plan (design rationale for the `src*` commands + deviation table) |
 | [`docs/gltf-support.md`](docs/gltf-support.md) | Where glTF / GLB semantics come from, and the trade-offs (zero new syntax) |
 | [`docs/update-check.md`](docs/update-check.md) | The update check's design and trade-offs (why it is on by default, when it goes online, how to turn it off) |
 | [`docs/library-api.md`](docs/library-api.md) | API usage, errors and exit codes when embedding mdlc as a library |
