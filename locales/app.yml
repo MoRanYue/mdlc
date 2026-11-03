@@ -1262,6 +1262,9 @@ _version: 2
 "the shape key name is empty and cannot be registered as a flexdesc":
   zh-CN: "shape key 的名字是空的，不能注册成 flexdesc"
 
+"the shape key %{name} also has a hand-written flex rule: mdlc puts automatic rules first, so the hand-written one wins (official studiomdl appends them last, where it would be overwritten)":
+  zh-CN: "形态键 %{name} 也有手写的 flex 规则：mdlc 把自动规则放在最前，所以你的手写规则生效（官方把它们追加在最后，你的规则会被盖掉）"
+
 "the skeleton section of %{path} has no frame at all":
   zh-CN: "%{path} 的 skeleton 段没有任何帧"
 

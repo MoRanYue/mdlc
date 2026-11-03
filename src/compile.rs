@@ -6771,6 +6771,22 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
     // 每个 `(bodypart, model, shape key)` 的 flexdesc 下标。
     let mut desc_of: Vec<Vec<Vec<usize>>> = Vec::new();
 
+    // 用户手写的规则改的是哪些 flexdesc（进本函数之前就已经在表里了）。
+    //
+    // 用来做两件事：① 把自动规则**插到最前**，让手写的赢；② 撞名时打警告。
+    // 官方相反 —— `FUN_0044e8d0` 在 `$model` 块解析**之后**才跑，自动规则
+    // 追加在末尾，因此同名的 `fetch1` 会盖掉手写规则（这也是官方要留
+    // `NoAutoDMXRules` 的原因）。
+    let user_rule_targets: std::collections::HashSet<String> = compiled
+        .desc
+        .flex_rules
+        .iter()
+        .map(|r| r.flex.clone())
+        .collect();
+
+    // 自动生成的规则先攒着，注册完再整段插到表头（见循环后的 `splice`）。
+    let mut auto_rules: Vec<crate::model::FlexRule> = Vec::new();
+
     for (bi, bp) in specs.iter().enumerate() {
         let mut per_model = Vec::new();
         for (mi, keys) in bp.iter().enumerate() {
@@ -6820,7 +6836,18 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
                             });
                         fc_index.insert(k.name.clone(), compiled.desc.flex_controllers.len() - 1);
                     }
-                    compiled.desc.flex_rules.push(crate::model::FlexRule {
+                    if user_rule_targets.contains(&k.name) {
+                        log::warn!(
+                            "{}",
+                            crate::tr_fmt!(
+                                "the shape key %{name} also has a hand-written flex rule: mdlc puts \
+                                 automatic rules first, so the hand-written one wins (official \
+                                 studiomdl appends them last, where it would be overwritten)",
+                                name = k.name
+                            )
+                        );
+                    }
+                    auto_rules.push(crate::model::FlexRule {
                         flex: k.name.clone(),
                         ops: vec![crate::model::FlexOp {
                             op: crate::model::FlexOpKind::Fetch1,
@@ -6835,6 +6862,20 @@ fn resolve_shape_key_flexes(compiled: &mut CompiledModelDesc) -> Result<(), Vec<
             per_model.push(row);
         }
         desc_of.push(per_model);
+    }
+
+    // ---- 1b. 把自动规则整段插到最前 ----
+    //
+    // 与官方**有意不同**：官方 `FUN_0044e8d0` 在 `$model` 块解析之后才跑，
+    // 自动规则排在所有手写规则**之后**，于是它的 `fetch1` 会把手写的同名规则
+    // 盖掉（`mstudioflexrule_t` 顺序求值、后写的赢），这也是官方要有
+    // `NoAutoDMXRules` 的原因。mdlc 反过来把自动规则放最前 ⟹ 手写的赢。
+    //
+    // 只影响「同一个 flexdesc 既有形态键又有手写规则」这一种情况；纯 FBX
+    // 工程（只有自动规则）里 `auto_rules` 就是全部内容，顺序与官方一致，
+    // 产物逐字节不变。
+    if !auto_rules.is_empty() {
+        compiled.desc.flex_rules.splice(0..0, auto_rules);
     }
 
     // ---- 2. 算载荷 ----
@@ -9692,6 +9733,47 @@ type = "mouth"
         assert_eq!(c.desc.flex_controllers.len(), 1, "只该剩下手写的那一条");
         assert_eq!(c.desc.flex_controllers[0].name, "cheek");
         assert!(c.desc.flex_rules.is_empty(), "规则仍然是 0 条");
+    }
+
+    /// ⭐⭐⭐ **用户规则优先**：自动规则插在表头，手写的排在它后面。
+    ///
+    /// `mstudioflexrule_t` 是**顺序求值**的（后写的赢），官方把自动规则
+    /// 追加在末尾 ⟹ 同名的 `fetch1` 会盖掉手写规则。mdlc 反过来把自动规则
+    /// 放最前，于是 `%wide = cheek * 1.0` 一定生效。
+    ///
+    /// 这条测试盯的是**顺序**，不是数量 —— 数量在
+    /// [`shape_keys_register_official_desc_controller_rule`] 里已经钉过。
+    #[test]
+    fn automatic_rules_go_first_so_user_rules_win() {
+        let mut c = ir_with_src_index(&[0, 1]);
+        c.bodyparts[0].models[0].shape_keys = vec![key("wide", &[(1, [2.5, 0.0, 0.0])])];
+        // 用户手写的同名规则（解析期就已经在表里）。
+        c.desc.flex_rules.push(crate::model::FlexRule {
+            flex: "wide".into(),
+            ops: vec![crate::model::FlexOp {
+                op: crate::model::FlexOpKind::Mul,
+                value: Some(1.0),
+                controller: Some("cheek".into()),
+                flexdesc: None,
+            }],
+        });
+        resolve_shape_key_flexes(&mut c).expect("不该报错");
+
+        assert_eq!(c.desc.flex_rules.len(), 2, "自动 1 条 + 手写 1 条");
+        let auto = &c.desc.flex_rules[0];
+        assert_eq!(auto.flex, "wide");
+        assert_eq!(
+            auto.ops[0].op.code(),
+            2,
+            "表头是自动的 STUDIO_FETCH1（官方是排在末尾）"
+        );
+        let user = &c.desc.flex_rules[1];
+        assert_eq!(user.flex, "wide");
+        assert_eq!(
+            user.ops[0].op,
+            crate::model::FlexOpKind::Mul,
+            "手写规则排在最后 ⟹ 顺序求值时它赢"
+        );
     }
 
     /// ⭐⭐⭐ **载荷逐字段复刻**：`targets = [0,1,10,11]`、`flexpair = 0`、

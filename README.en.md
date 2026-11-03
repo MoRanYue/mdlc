@@ -659,10 +659,17 @@ zero new syntax**.
 | `srcshapekeyignore` | same | ignore all of them (register no flex) | register all |
 | `srcnoautorules` | same | keep the morph targets but **build no controllers or rules for them** (official name `NoAutoDMXRules`; QC accepts both) | one controller plus one `fetch1` rule per shape key |
 
-> ⭐ **`srcnoautorules` is for people who want to write the rules themselves.** By default each
-> shape key gets a controller and a `%name = fetch1 name` rule, and auto rules are **appended last**
-> — the engine evaluates in order and later wins, so a hand-written rule would be silently
-> overridden. With this line both are left to you:
+> ⭐ **Automatic rules go first in the rule table, so a hand-written rule always wins.** By default
+> each shape key gets a controller and a `%name = fetch1 name` rule, and that automatic rule is
+> inserted at the **front**; the engine evaluates in order and later wins, so your own
+> `%wide = …` sits after it, overrides the automatic value, and is never silently clobbered.
+>
+> One **deliberate** divergence from the official tool: it appends the automatic rules **last**, so
+> a same-named `fetch1` overrides the hand-written rule (which is exactly why the official compiler
+> has `NoAutoDMXRules`). mdlc does the opposite, and warns you when a shape key has both an
+> automatic rule and a hand-written one.
+>
+> If you do not even want the automatic controllers (you bring your own), add `srcnoautorules`:
 >
 > ```qc
 > $model face "face.fbx" {
@@ -672,9 +679,9 @@ zero new syntax**.
 > }
 > ```
 >
-> One **deliberate** divergence from the official tool: wherever this line appears, the official
-> compiler wipes the controllers registered **before** it; mdlc does not (it only warns), so write
-> this line at the top of the block to get identical results.
+> A second **deliberate** divergence: wherever the official tool sees this line it wipes the
+> controllers registered **before** it; mdlc does not (it only warns), so write this line at the top
+> of the block to get identical results.
 
 ```qc
 $modelname "models/mymod/linnea.mdl"
