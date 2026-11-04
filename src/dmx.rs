@@ -386,12 +386,18 @@ pub fn read(path: &Path, at: &str) -> Result<DmxGeometry, DmxError> {
 pub fn read_geometry(path: &Path, at: &str) -> Result<DmxGeometry, DmxError> {
     let geometry = read(path, at)?;
     if geometry.smd.triangles.is_empty() {
-        return Err(DmxError::malformed(
-            &path.display().to_string(),
-            "the model contains no triangles",
-        ));
+        return Err(no_triangles_error(path));
     }
     Ok(geometry)
+}
+
+/// 「这个 DMX 里没有三角形」的错误。
+///
+/// 独立成一个函数是因为「有没有三角形」这件事**不能拦在读取层**：同一份
+/// 解析结果既可能被当成网格源（必须拦），也可能被 QC 预解析打开（不能拦）。
+/// 缓存因此只存「读得出来」的那一层，由调用方按自己的用途补这一道检查。
+pub fn no_triangles_error(path: &Path) -> DmxError {
+    DmxError::malformed(&path.display().to_string(), "the model contains no triangles")
 }
 
 /// 把一个 DMX 当**动画源**读（`$sequence` / `$animation` 直接指向它）。

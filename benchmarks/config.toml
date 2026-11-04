@@ -1,0 +1,135 @@
+# Configuration for the mdlc benchmark suite.
+#
+# Usage:
+#   python benchmarks/bench.py               # run every combination in this file
+#   python benchmarks/bench.py --list        # show what is in here first
+#
+# Every key is documented in benchmarks/README.md.
+
+[general]
+# Working directory (relative to this file); fixtures and outputs live here.
+# Created automatically.
+work_dir = "work"
+# Measured runs per combination. The median is steadier than the mean, but with
+# too few runs neither is trustworthy.
+repeat = 5
+# Warm-up runs (not counted). The first run has to read from disk and warm the
+# CPU caches, so it is noticeably slower.
+warmup = 1
+# Per-compile timeout in seconds. Very large fixtures may need more.
+timeout = 1800
+# Hash the outputs with SHA256? This is what makes "are the outputs identical
+# across runs" visible, but it reads every produced file back (a 250k-triangle
+# model is several hundred MB), so it is off by default.
+hash_outputs = false
+
+[blender]
+# Leave empty to try, in order: the MDLC_BENCH_BLENDER environment variable ->
+# `blender` on PATH -> common install locations. If you have several versions
+# installed, or Blender is not on PATH, put an absolute path here.
+executable = ""
+# Generating a very large fixture can take minutes.
+timeout = 7200
+
+[game]
+# For compilers that need `-game <dir>`, such as studiomdl.
+dir = ""
+
+
+# -- fixtures ---------------------------------------------------------------
+#
+# The size is set by subdivisions: vertices (n+1)^2, triangles 2n^2.
+#   32 ->     2,178 triangles (smoke test)
+#  112 ->    25,088 triangles
+#  355 ->   252,050 triangles (about 4 minutes and 452 MB of DMX)
+#
+# format is DMX / SMD / FBX.
+# morphs is the number of morph targets (DMX turns them into delta states, SMD
+# emits an extra .vta file).
+# sequence_frames > 0 also exports an animation; BlenderSourceTools writes the
+# DMX/SMD animation into a separate file.
+
+[[fixtures]]
+name = "smoke"
+format = "DMX"
+subdivisions = 32
+morphs = 0
+sequence_frames = 2
+note = "quickest smoke check, results in seconds"
+
+[[fixtures]]
+name = "dmx-25k"
+format = "DMX"
+subdivisions = 112
+note = "mid-sized DMX (25,088 triangles)"
+
+[[fixtures]]
+name = "dmx-25k-m30"
+format = "DMX"
+subdivisions = 112
+morphs = 30
+note = "same, with 30 morph targets (the heaviest path: delta states + flex registration)"
+
+[[fixtures]]
+name = "smd-25k"
+format = "SMD"
+subdivisions = 112
+note = "same size as SMD, to compare against the DMX path"
+
+[[fixtures]]
+name = "fbx-25k"
+format = "FBX"
+subdivisions = 112
+note = "same size as FBX, to compare against the other two paths"
+
+# Uncomment these two to measure 250k triangles (generation takes a while):
+#
+# [[fixtures]]
+# name = "dmx-252k"
+# format = "DMX"
+# subdivisions = 355
+# note = "250k triangles"
+#
+# [[fixtures]]
+# name = "dmx-252k-m30"
+# format = "DMX"
+# subdivisions = 355
+# morphs = 30
+# note = "250k triangles + 30 morph targets"
+
+
+# -- compilers --------------------------------------------------------------
+#
+# command is an argv array; {braces} are expanded from these placeholders:
+#   {bin}      this entry's bin field
+#   {qc}       the fixture's .qc path
+#   {fixture}  the fixture directory
+#   {out}      this run's output directory (wiped before every run)
+#   {work} {bench} {repo} {game}   see the README
+#
+# search / expect decide what counts as an output: files are globbed from the
+# search directory with expect. An exit code of 0 with no output found is a
+# failure -- that catches "the flags were wrong and nothing compiled".
+
+[[compilers]]
+id = "mdlc"
+bin = "{repo}/target/release/mdlc"
+command = ["{bin}", "build-qc", "{qc}", "--out", "{out}"]
+search = ["{out}"]
+expect = ["*.mdl", "*.vvd"]
+note = "this repository's compiler; run cargo build --release first"
+
+# Official studiomdl (Windows). Point bin and [game] dir at your install, then
+# uncomment.
+#
+# [[compilers]]
+# id = "studiomdl"
+# bin = "E:/SteamLibrary/steamapps/common/Left 4 Dead 2/bin/studiomdl.exe"
+# command = ["{bin}", "-game", "{game}", "-nop4", "{qc}"]
+# # studiomdl writes its outputs under <game>/models/<$modelname>/
+# search = ["{game}/models/bench"]
+# expect = ["*.mdl", "*.vvd"]
+# note = "without -nop4 a Perforce environment may interfere"
+#
+# Any other compiler works the same way (any exe configured in Crowbar, any
+# other mdl compiler): add one entry, fill in command, change no code.

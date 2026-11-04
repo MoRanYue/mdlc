@@ -912,7 +912,16 @@ pub fn read_source_geometry(
     opts: &SrcOpts,
 ) -> Result<Arc<SourceGeometry>, CompileError> {
     hotpath::measure_block!("源: 读几何（含形态键）", {
-        geometry_source(path, at, opts)
+        let geometry = geometry_source(path, at, opts)?;
+        // 「网格源必须真有三角形」只对**当网格用**的调用成立：BST 的动画
+        // `.dmx` 只有骨架，它会先被 QC 预解析用 `read_source` 打开一次。
+        // 缓存里存的是宽松结果，所以这道检查放在缓存之外。
+        if matches!(SourceKind::of(path), Ok(SourceKind::Dmx))
+            && geometry.smd.triangles.is_empty()
+        {
+            return Err(e(at, crate::dmx::no_triangles_error(path).to_string()));
+        }
+        Ok(geometry)
     })
 }
 
@@ -961,8 +970,12 @@ fn geometry_source(
         // DMX 的形态键（`DmeMesh.deltaStates`）与 FBX 的 shape key 是同一概念，
         // 所以同样带出来；另外三个字段（无材质网格 / 合并网格 / 动画栈）是
         // FBX 专有的诊断，DMX 侧恒空。内容只取决于文件本身 ⟹ 按路径缓存。
+        //
+        // ⚠️ 这里用**宽松**的 `dmx::read`：BST 把动画写成只有骨架、没有网格的
+        // `.dmx`，而 QC 预解析（[`read_source`]）需要能打开它。「网格源必须
+        // 真有三角形」这条由 [`read_source_geometry`] 在缓存之外补一次检查。
         SourceKind::Dmx => crate::source_cache::geometry(path, || {
-            crate::dmx::read_geometry(path, at)
+            crate::dmx::read(path, at)
                 .map(|g| SourceGeometry {
                     smd: Arc::new(g.smd),
                     shape_keys: g.shape_keys,
@@ -13691,6 +13704,38 @@ forward_declared = true
         c.bodyparts[0].models[0].mesh_flexes = Vec::new();
         c.bodyparts[0].models[0].lods = None;
         c
+    }
+
+    /// 只带动画的 `.dmx` 能当**源**打开，但不能当**网格源**用。
+    ///
+    /// BlenderSourceTools 把动画写成单独一个 `anims/<骨架>.dmx`：里面只有骨架，
+    /// 一个三角形都没有。QC 预解析（[`read_source`]）会打开每一个被引用的文件
+    /// （只为取节点名），所以它必须能读；而同一个文件被 `$body` 当网格源时必须
+    /// 报错 ——「没有三角形」是**网格源**的要求，不是读取层的要求。
+    ///
+    /// 这条测试守的是一个真实回归：把「有没有三角形」的判断挪进共用读取路径后，
+    /// 带 `$sequence` 的 DMX 工程会在 QC 预解析阶段就失败。
+    #[test]
+    fn an_animation_only_dmx_reads_as_a_source_but_not_as_geometry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/dmx_fixtures/blender_anim.dmx");
+        let at = "fixture.qc:3";
+        let opts = SrcOpts::default();
+
+        let source = read_source(&path, at, &opts).expect("动画 DMX 必须能当源打开");
+        assert!(
+            !source.nodes.is_empty(),
+            "节点表应当来自那份骨架，不能是空的"
+        );
+
+        let err = match read_source_geometry(&path, at, &opts) {
+            Ok(_) => panic!("网格源必须有三角形，但读成功了"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no triangles"),
+            "报错要说清是「没有三角形」：{err}"
+        );
     }
 
     /// 参考姿态只认**名字精确命中**：未被引用的额外根节点不能顶替真根骨骼。

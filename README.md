@@ -45,6 +45,7 @@ cargo build --release
 - [格式上限：只保留格式能表示的那些](#格式上限只保留格式能表示的那些)
 - [顶点超限自动拆分](#顶点超限自动拆分)
 - [多 LOD](#多-lod)
+- [基准测试](#基准测试)
 - [已知未实现](#已知未实现)
 - [延伸文档](#延伸文档)
 
@@ -996,6 +997,20 @@ switch_point = 40.0
 `[[bodyparts.models.lods]]` 还接受 `bone_tree_collapse` / `replace_bone` /
 `no_facial`（对应 `$lod` 的这些选项）。`smd` 可省略 —— 省略时复用 LOD 0 的网格，
 只应用骨骼选项。
+
+---
+
+## 基准测试
+
+`benchmarks/` 下有一套可以独立跑的基准套件：自动用 Blender 生成同规模的 DMX / SMD / FBX 夹具，每个组合跑若干次取中位数，再按夹具并列比较。
+
+```bash
+python benchmarks/bench.py --list           # 看看有哪些夹具与编译器
+python benchmarks/bench.py -f dmx-25k       # 只跑一个夹具
+python benchmarks/bench.py --json out.json  # 跑全部，结果另存一份
+```
+
+想量别的编译器（Crowbar 里配的任何 exe、别家的 mdl 编译器），只要在 `benchmarks/config.toml` 里加一条命令行模板，不用改代码。见 [`benchmarks/README.md`](benchmarks/README.md)。
 
 ---
 

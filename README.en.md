@@ -46,6 +46,7 @@ cargo build --release
 - [Format limits: only what the format can express](#format-limits-only-what-the-format-can-express)
 - [Automatic splitting of oversized meshes](#automatic-splitting-of-oversized-meshes)
 - [Multiple LODs](#multiple-lods)
+- [Benchmarks](#benchmarks)
 - [Known unimplemented](#known-unimplemented)
 - [Further documentation](#further-documentation)
 
@@ -1069,6 +1070,20 @@ Three constraints:
 `[[bodyparts.models.lods]]` also accepts `bone_tree_collapse` / `replace_bone` / `no_facial`
 (corresponding to those `$lod` options). `smd` may be omitted — when it is, the LOD 0 mesh is
 reused and only the bone options are applied.
+
+---
+
+## Benchmarks
+
+`benchmarks/` holds a self-contained benchmark suite: it generates same-scale DMX / SMD / FBX fixtures with Blender, runs each combination several times and reports the median, then compares compilers side by side per fixture.
+
+```bash
+python benchmarks/bench.py --list           # show the configured fixtures and compilers
+python benchmarks/bench.py -f dmx-25k       # run a single fixture
+python benchmarks/bench.py --json out.json  # run everything and save the result
+```
+
+To measure another compiler (any exe you have configured in Crowbar, another mdl compiler), add one command template to `benchmarks/config.toml` — no code changes needed. See [`benchmarks/README.md`](benchmarks/README.md).
 
 ---
 
