@@ -290,7 +290,8 @@ pub fn read_frames(
     opts: &FbxOpts,
 ) -> Result<Smd, FbxError> {
     let scene = load_scene(path, at)?;
-    let kept = kept_nodes(&scene, opts);
+    // ⚠️ 动画用**整条骨架**，几何仍用「被几何引用」的那组（见 [`animation_nodes`]）。
+    let kept = animation_nodes(&scene, opts);
     let nodes = smd_nodes(&kept);
 
     // ⭐ **没有动画栈不是错误**：官方对「文件里根本没有 `AnimStack`」照样产出
@@ -815,6 +816,33 @@ fn node_selected(n: &ufbx::Node, opts: &FbxOpts) -> bool {
 /// ⚠️ **叶节点且零权重 ⟹ 丢弃**（`helper_forward` 在 `rig.fbx` 里被丢），
 /// 这与 `$bonemerge` 无关 —— 它不创造骨骼。
 fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node> {
+    let used = used_node_ids(scene, opts, false);
+    order_kept(scene, used)
+}
+
+/// 动画帧要覆盖的节点：几何引用的骨骼 **加上整条骨架**（`scene.bones`）。
+///
+/// ⚠️ **为什么不能复用 [`kept_nodes`]**：它只保留「被蒙皮簇 `num_weights > 0`
+/// 引用」的骨骼，而模型的骨骼表里还有大量由 `$definebone` 定义、却**没有**被
+/// 这份 FBX 的网格蒙皮的骨骼（典型：第一人称视图模型的手臂）。这些骨骼在动画
+/// SMD 里一行都没有，`load_smd_frames` 就会每帧回落到静态的 `$definebone`
+/// 姿态 —— 表现正是「枪的骨骼在动、手臂骨骼一动不动」。
+///
+/// 多出来的骨骼（模型骨骼表里没有的）由编译侧按**名字**丢弃
+/// （`load_smd_frames` 里 `desc_index.get(...)` 查不到就 `continue`），
+/// 所以放宽节点集合不会污染产物，只会让每一个「源里确实有动画」的骨骼都拿到帧。
+fn animation_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node> {
+    let used = used_node_ids(scene, opts, true);
+    order_kept(scene, used)
+}
+
+/// 收集要保留的节点 id：几何引用的骨骼，加上（可选）`scene.bones` 里的全部骨骼，
+/// 最后沿父链上溯补齐祖先。
+fn used_node_ids(
+    scene: &ufbx::Scene,
+    opts: &FbxOpts,
+    all_bones: bool,
+) -> std::collections::HashSet<u32> {
     let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for i in 0..scene.nodes.len() {
@@ -836,6 +864,18 @@ fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node>
                         used.insert(b.element.element_id);
                     }
                 }
+            }
+        }
+    }
+
+    // 动画帧额外收全部骨骼（见 [`animation_nodes`]）：`bone` 是节点属性，
+    // 它与节点的 `element_id` 不是同一个（属性有自己的 element），所以只能按
+    // `Node::bone` 判「这个节点是不是骨骼」，不能拿 `scene.bones` 的 id 去对。
+    if all_bones {
+        for i in 0..scene.nodes.len() {
+            let n = &scene.nodes[i];
+            if n.bone.is_some() {
+                used.insert(n.element.element_id);
             }
         }
     }
@@ -864,6 +904,20 @@ fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node>
         }
     }
     used.extend(extra);
+    used
+}
+
+/// 把保留的 id 按官方骨骼表的顺序排好：**深度优先先序**（见 [`dfs_preorder`]）。
+fn order_kept(
+    scene: &ufbx::Scene,
+    used: std::collections::HashSet<u32>,
+) -> Vec<&ufbx::Node> {
+    let by_id: HashMap<u32, &ufbx::Node> = (0..scene.nodes.len())
+        .map(|i| {
+            let n = &scene.nodes[i];
+            (n.element.element_id, n)
+        })
+        .collect();
 
     // 排列顺序：官方是**深度优先先序**，而 `scene.nodes` 是逐层顺序（BFS）。
     let ids: Vec<(u32, Option<u32>)> = (0..scene.nodes.len())
@@ -876,7 +930,10 @@ fn kept_nodes<'a>(scene: &'a ufbx::Scene, opts: &FbxOpts) -> Vec<&'a ufbx::Node>
         })
         .collect();
     let order = dfs_preorder(&ids, &used);
-    order.into_iter().filter_map(|id| by_id.get(&id).copied()).collect()
+    order
+        .into_iter()
+        .filter_map(|id| by_id.get(&id).copied())
+        .collect()
 }
 
 /// 把**逐层顺序**（BFS，即 `ufbx::Scene::nodes` 的顺序）重排成官方骨骼表的

@@ -13012,6 +13012,94 @@ end
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// ⭐⭐ **动画必须覆盖整条骨架，而不只是「被几何引用」的骨骼**。
+    ///
+    /// 用户实测（`v_desert_rifle_processed.qc`）：枪的骨骼在动画里正常运动，
+    /// 手臂骨骼却纹丝不动 —— 因为 `kept_nodes` 只收「网格节点自身 + 蒙皮簇里
+    /// `num_weights > 0` 的骨骼」，手臂那 65 根由 `$definebone` 定义的骨骼在
+    /// 动画 SMD 里**一行都没有**，`load_smd_frames` 于是每帧回落到静态的
+    /// `$definebone` 姿态。
+    ///
+    /// 夹具 = [`MIN_FBX`] 派生：加一个**零权重**的 `Model::arm`（`LimbNode`），
+    /// 并把 `T.X` 曲线改接到它身上。修复前节点表里只有网格节点 `box`，
+    /// 修复后必须同时有 `arm`，且它的位移逐帧变化。
+    ///
+    /// ⚠️ FBX 7x00 起「节点属性」是**独立对象**：光有 `Model: …, "LimbNode"`
+    /// 只会得到一个 `attrib_type = Unknown` 的普通节点（`ufbxi_read_object`
+    /// 只在 `version < 7000` 时才走 `ufbxi_read_synthetic_attribute`）；
+    /// 必须再写一个 `NodeAttribute: …, "LimbNode"` 并用 `C: "OO"` 连到 Model，
+    /// ufbx 才会把节点认成骨骼（`n.bone.is_some()`）。
+    #[test]
+    fn fbx_animation_covers_bones_that_no_mesh_weights() {
+        let d = tmpdir("fbxanimunweighted");
+        let fbx = MIN_FBX
+            .replace(
+                "ObjectType: \"Model\" { Count: 1 }",
+                "ObjectType: \"Model\" { Count: 2 }",
+            )
+            .replace(
+                "\tAnimationStack: 300,",
+                "\tModel: 201, \"Model::arm\", \"LimbNode\" {\n\
+                 \t\tVersion: 232\n\
+                 \t\tProperties70:  {\n\
+                 \t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,1,0\n\
+                 \t\t}\n\
+                 \t}\n\
+                 \tNodeAttribute: 202, \"NodeAttribute::arm\", \"LimbNode\" {\n\
+                 \t\tTypeFlags: \"Skeleton\"\n\
+                 \t}\n\
+                 \tAnimationStack: 300,",
+            )
+            .replace(
+                "C: \"OO\",300,0",
+                "C: \"OO\",201,0\n\tC: \"OO\",202,201\n\tC: \"OO\",300,0",
+            )
+            .replace(
+                "C: \"OP\",500,200, \"Lcl Translation\"",
+                "C: \"OP\",500,201, \"Lcl Translation\"",
+            );
+        assert!(fbx.contains("Model::arm"), "夹具派生失败:\n{fbx}");
+        write(&d, "rig.fbx", &fbx);
+
+        let smd = crate::fbx::read_frames(
+            &d.join("rig.fbx"),
+            "test",
+            None,
+            30.0,
+            &crate::fbx::FbxOpts::default(),
+        )
+        .expect("派生夹具必须能被 ufbx 读出来");
+
+        let names: Vec<&str> = smd.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"arm"),
+            "零权重骨骼也必须进动画节点表（否则手臂永远不动），实际是 {names:?}"
+        );
+        assert!(smd.frames.len() > 1, "夹具必须有多帧");
+
+        let idx = smd
+            .nodes
+            .iter()
+            .position(|n| n.name == "arm")
+            .expect("arm 应在节点表里");
+        let xs: Vec<f32> = smd
+            .frames
+            .iter()
+            .filter_map(|f| {
+                f.poses
+                    .iter()
+                    .find(|p| p.bone as usize == idx)
+                    .map(|p| p.position[0])
+            })
+            .collect();
+        assert!(xs.len() > 1, "臂骨必须每帧都有一行：{} 行", xs.len());
+        assert!(
+            xs.iter().any(|x| (*x - xs[0]).abs() > 1e-4),
+            "arm 的位移必须逐帧变化（动画真的作用到它身上），实际 {xs:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// SMD 同文件必须**能编过**（端到端钉住「陷阱是 FBX 专属」这条结论）。
     ///
     /// `docs/_probe/oracle_samefile_smd.js` 实测：`$body ab_z8.smd` +

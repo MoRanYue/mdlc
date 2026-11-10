@@ -141,6 +141,27 @@ numbones=4
 ⚠️ **单链样本上 DFS 与层序恰好重合** —— 这就是这条 bug 躲过 `rig.fbx` 等 7 个原用例的原因，
 **只有「分叉」样本能分开**。mdlc 修前给的是层序（`Skeleton, R, A, B, A1, B1`）。
 
+#### 1.4d ⭐⭐ 动画帧的节点集合 = **整条骨架**（0.7.x 修复）
+
+上面 1.4a~c 的过滤规则**只适用于几何/参考姿态**。动画帧曾经也复用它（`read_frames` 直接
+拿 `kept_nodes`），后果是：**源里有、但没被蒙皮权重引用**的骨骼不会出现在逐帧姿态里；
+编译侧 `load_smd_frames` 对「desc 里有、动画 SMD 里没有」的骨骼逐帧回落成静态
+
+- 用户工程：一个 FBX 同时提供枪与手臂，几何只引用枪的 9 根骨骼，手臂 65 根来自
+  `bones.qci` 的 `$definebone` ⟹ 产物里**枪在动、手臂一动不动**。
+- 修法：`read_frames` 改用 `animation_nodes()`（= `used_node_ids(all_bones = true)` +
+  `order_kept`），把 `scene.nodes` 里所有 `n.bone.is_some()` 的节点并进集合；几何仍走
+  `kept_nodes()`，参考姿态与 `$unlockdefinebones` 语义都不变。多余的骨骼由编译侧按名字丢弃。
+- 判据（用户那个 QC）：节点表 **9 → 109**、帧数 90；`ValveBiped.Bip01_L_UpperArm` 逐帧
+  旋转跨度 `[0.1039, 0.0069, 0.1085]` rad，`Bip01_L_Hand` `[4.2e-7, 1.5e-7, 0.0015]`；
+  MDL 136,272 → **428,308 B**，VVD/VTX **逐字节不变**。
+
+> ⚠️ **造测试夹具的坑（FBX ≥ 7000）**：只写 `Model: 201, "Model::arm", "LimbNode"` 只会得到
+> `attrib_type = Unknown` 的普通节点 —— 现代 FBX 的节点属性是**独立对象**
+> （`ufbxi_read_object` 只在 `version < 7000` 时走 `ufbxi_read_synthetic_attribute`）。
+> 必须再写 `NodeAttribute: 202, "NodeAttribute::arm", "LimbNode" { TypeFlags: "Skeleton" }`
+> 并用 `C: "OO",202,201` 连到 Model，`n.bone` 才是 `Some`。
+
 ### 1.5 ⭐⭐ 官方把 FBX 动画**固定归一化到 30 fps**
 
 同一段 1 秒动画分别以 24 / 30 / 60 fps 场景导出（`_fbxresearch\gen_fbx_fps.py`）：
@@ -1020,7 +1041,7 @@ $ mdlc build-qc a_body.qc --out outA
 | `animdesc.fps` 字段 | 取 `$sequence ... fps N` | **同官方** | ⚠️ 与重采样率不等时告警 |
 | 单位/缩放 | **顶点尺寸**丢缩放、**顶点位置**与**骨骼位移**保留 ⟹ 骨骼比网格大 100 倍 + 网格位置在厘米 | ⚠️ **有意偏离**：顶点与骨骼都不进缩放（见 §4.6 偏离 12） | §1.7.3 官方的 bug |
 | 轴向 | **不干预**（原样搬运根变换） | **同官方** | §1.7b |
-| 骨骼过滤 | 丢网格节点与空叶节点 | **同官方** | §1.4，但需复验例外 |
+| 骨骼过滤 | 丢网格节点与空叶节点 | **同官方**（仅几何/参考姿态；**动画帧用整条骨架**，见 §1.4d） | §1.4 |
 | **shape key → flex** | **自动注册**（desc + controller + rule + 载荷） | **同官方** | §1.6b；**零 QC 语法** |
 | **FBX 上写 `flexfile "<x.fbx>"` + `flex`** | **崩溃** | **报错**（见 §4.4 陷阱 4） | ⚠️ 默认偏离 |
 | **FBX 上只写 `flexfile "<x.fbx>"`** | 不崩，但**静默空操作** | **报错** | ⚠️ 默认偏离（用户以为生效了，其实没有） |
