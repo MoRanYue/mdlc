@@ -1046,15 +1046,27 @@ impl<'a> Parser<'a> {
                     bp.models.push(m);
                 }
                 "blank" => {
-                    // `Option_Blank`：一个空 model。mdlc 用「无网格的 model」
-                    // 表达 —— 但 `BodyModel.smd` 是必填，所以这里报错更诚实。
-                    return Err(QcError::new(
-                        t.file.clone(),
-                        t.line,
-                        crate::tr(
-                            "`blank` bodygroup member: mdlc's BodyModel requires an SMD, so blank is not supported yet",
-                        ),
-                    ));
+                    // `Option_Blank`（`studiomdl.cpp:971-986`）：追加一个
+                    // **不引用任何源文件**的 model —— `nummodels++`，但不读盘。
+                    // 它照样占一个 bodygroup 选项位，所以下面的 `base`
+                    // （`prev.base * prev.models.len()`）会自动把它算进去。
+                    bp.models.push(BodyModel {
+                        smd: String::new(),
+                        blank: true,
+                        name: None,
+                        flip_triangles: true,
+                        lods: Vec::new(),
+                        eyeballs: Vec::new(),
+                        flexes: Vec::new(),
+                        src_parts: Vec::new(),
+                        src_material: None,
+                        src_scale: None,
+                        src_axis: None,
+                        src_shape_keys: Vec::new(),
+                        src_shape_key_order: Vec::new(),
+                        src_shape_key_ignore: false,
+                        src_no_auto_rules: false,
+                    });
                 }
                 other => {
                     return Err(QcError::new(
@@ -1188,6 +1200,21 @@ impl<'a> Parser<'a> {
                     self.warn_no_auto_rules_position(&o);
                     src_no_auto_rules = true;
                 }
+                // ⚠️ 官方 `Option_Studio` 的选项循环用 `TokenAvailable()`
+                //（`scriplib.cpp:730`）—— **只看本行**，遇到换行就停。
+                // 所以 `$bodygroup { studio "a.smd" blank }` 写在同一行时，
+                // `blank` 会被当成 studio 的未知选项（官方报
+                // `unknown command "blank"`）；`blank` 必须**另起一行**。
+                // 这里给一句能直接照做的提示，而不是让用户去猜。
+                "blank" => {
+                    return Err(QcError::new(
+                        o.file.clone(),
+                        o.line,
+                        crate::tr(
+                            "`blank` must start a new line inside `$bodygroup` -- studio's inline options are read only on the same line (official `TokenAvailable`), so `{ studio \"a.smd\" blank }` written on one line is an error",
+                        ),
+                    ));
+                }
                 "{" => {
                     self.lex.unget(o);
                     break;
@@ -1225,6 +1252,7 @@ impl<'a> Parser<'a> {
         self.mesh_sources.insert(smd.clone());
         Ok(BodyModel {
             smd,
+            blank: false,
             name: model_name.take(),
             flip_triangles,
             lods: Vec::new(),
@@ -5823,6 +5851,55 @@ end
     fn parse(qc: &str, dir: &std::path::Path) -> crate::model::ModelDesc {
         crate::qc::parse_qc_str(qc, dir)
             .unwrap_or_else(|errs| panic!("QC 应解析成功，实际：{errs:?}"))
+    }
+
+    /// `$bodygroup "x" { studio "a.smd" blank }`：`blank` 是**没有网格的
+    /// model**，但照样占一个选项位（`Option_Blank`，`studiomdl.cpp:971-986`）。
+    ///
+    /// 判据：① 两个 model，第二个 `blank == true` 且 `smd` 为空；
+    /// ② 下一个 bodypart 的 `base` 把它算进去（官方 `base = prev.base *
+    /// prev.nummodels`，`studiomdl.cpp:999`）⟹ `1 * 2 = 2`。
+    ///
+    /// ② 最要紧 —— 漏算 `blank` 会让后续 bodygroup 的编号整体前移，
+    /// 用户按选项号选中的部件就变成别的部件。
+    #[test]
+    fn bodygroup_blank_member_occupies_a_model_slot() {
+        let dir = fixture("bodygroup_blank");
+        let d = parse(
+            "$modelname \"t.mdl\"\n\
+             $bodygroup \"hat\" { studio \"a.smd\"\n\
+             blank }\n\
+             $body \"body\" \"b.smd\"\n",
+            &dir,
+        );
+        assert_eq!(d.bodyparts.len(), 2);
+        let hat = &d.bodyparts[0];
+        assert_eq!(hat.models.len(), 2, "blank 必须占一个 model 槽");
+        assert!(!hat.models[0].blank);
+        assert_eq!(hat.models[0].smd, "a.smd");
+        assert!(hat.models[1].blank, "第二个成员应是 blank");
+        assert!(hat.models[1].smd.is_empty(), "blank 不引用任何源文件");
+        assert_eq!(
+            d.bodyparts[1].base,
+            Some(2),
+            "下一个 bodypart 的 base 必须把 blank 算进去"
+        );
+
+        // `blank` 写在同一行会被 studio 的行内选项循环吃掉 —— 官方同样报错
+        // （`Option_Studio` 的 `TokenAvailable()` 只看本行）。mdlc 给一句
+        // 能直接照做的提示，别只说「unknown studio option」。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(
+                "$modelname \"t.mdl\"\n$bodygroup \"hat\" { studio \"a.smd\" blank }\n",
+                &dir,
+            )
+            .expect_err("同一行的 blank 必须报错")
+        });
+        assert!(
+            errs[0].message.contains("must start a new line"),
+            "应提示 blank 要另起一行，实际：{:?}",
+            errs[0].message
+        );
     }
 
     /// `$version <48|49>` —— **mdlc 扩展**，作用与 TOML 的 `version` 字段相同。

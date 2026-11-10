@@ -523,6 +523,12 @@ QC 前端已实现完整的词法/语法分析、`$include`、`$definevariable`�
 `$noforcedfade` `$casttextureshadows` `$ambientboost` `$donotcastshadows`
 `$forcephonemecrossfade` `$constantdirectionallight`）。
 
+`$bodygroup` 里可以写 `blank` 成员 —— 它是一个**不引用任何源文件**的 model，
+照样占一个选项位（`$bodygroup "hat" { studio "hat.smd"
+blank }` 的 0 = 戴帽子、1 = 空；GMod 的皮肤/脚本就是靠选到 1 把部件隐藏掉）。
+⚠️ `blank` 必须**另起一行**：官方 `Option_Studio` 的行内选项只读同一行
+（`TokenAvailable()`），写在同一行会被当成 studio 的未知选项。
+
 **已知但故意不支持的**：
 
 | 命令 | 行为 |
@@ -1025,7 +1031,6 @@ python benchmarks/bench.py --json out.json  # 跑全部，结果另存一份
 | `ikrule footstep`（type 3） | 需要 `$ikchain` 的 `center`，mdlc 尚未建模该量。写出时会**显式报错**而不是静默产出错误载荷 |
 | 若干罕见的 QC 命令 | `$renamebone` / `$hierarchy` / `$insertbone` / `$collapsebones` / `$screenalign` / `$upaxis` / `$origin` … 被忽略 |
 | 官方 CLI 的 `-minlod` / `-striplods` / `-definebones` / `-printbones` / `-t` / `-a` | 参数被接受但**警告并忽略** |
-| `$bodygroup { … blank }` | `blank` 成员（一个空 model）**报错** —— `BodyModel.smd` 是必填字段，mdlc 没有表达「无网格 model」的方式 |
 | **blend 序列上的 `weightlist` / `numframes` / `subtract`** | **报错**（有意比官方严格，见上）。官方只让第一格生效、其余格静默不变；单动画序列上它们正常生效 |
 | `[[sequences.movements]]` 只能从 TOML 写 | QC 前端没有对应关键字（写出是完整实现的，只是 QC 侧无法表达） |
 | DX8 / DX7 回退变体 | 官方额外产出 `.dx80.vtx` / `.sw.vtx`；L4D2 是 DX9 引擎，目前只产 `.dx90.vtx` |

@@ -3311,7 +3311,25 @@ pub struct BodyPart {
 pub struct BodyModel {
     /// 源 SMD 路径，**相对描述文件所在目录**（也接受绝对路径）。
     /// 也是 **LOD 0**（最精细）的网格。
+    ///
+    /// `blank` model 留空 —— 它按定义不引用任何源文件（见 [`Self::blank`]）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub smd: String,
+    /// **是否是 `$bodygroup` 里的 `blank` 选项**（无网格，只占一个选项位）。
+    ///
+    /// 官方 `Option_Blank`（`studiomdl.cpp:971-986`）给 bodypart 追加一个
+    /// 「源为空」的 model：`nummodels++`，但不读任何文件。于是
+    /// `$bodygroup "hat" { studio "hat.smd" blank }` 有了两个选项 ——
+    /// 0 = 戴帽子，1 = 空。GMod 的皮肤/脚本正是靠选到 1 把部件隐藏掉。
+    ///
+    /// 产物侧它是一条正常的 `mstudiomodel_t`：`nummeshes == 0`、
+    /// `numvertices == 0`、名字为空（官方写的是 `g_model[i]->filename`，
+    /// 而 blank 的 `filename` 是空串；语料里 39 个零 mesh model 全部如此）。
+    ///
+    /// 为 `true` 时 `smd` 必须为空，而且不能再带 `name` / `lods` /
+    /// `eyeballs` / `flexes` / `src_*` —— 那些都要读源文件。
+    #[serde(default)]
+    pub blank: bool,
     /// 该 model 的名字（内联 `char[64]`）。
     ///
     /// 实测 studiomdl 写的是**源 SMD 的文件名**（如 `myprop-ref.smd`）；
@@ -6278,7 +6296,50 @@ impl ModelDesc {
             for (mi, m) in bp.models.iter().enumerate() {
                 let mpath = format!("{bpath}.models[{mi}]");
                 // 网格在 SMD 里，这里只校验引用本身是否说得通。
-                if m.smd.trim().is_empty() {
+                if m.blank {
+                    // `blank` 是「无网格 model」：它不能带任何需要源文件的东西。
+                    if !m.smd.trim().is_empty() {
+                        errs.push(DescError {
+                            path: format!("{mpath}.smd"),
+                            kind: DescErrorKind::Other {
+                                message: "must be empty for a `blank` model -- it references no source file"
+                                    .into(),
+                            },
+                        });
+                    }
+                    if m.name.is_some() {
+                        errs.push(DescError {
+                            path: format!("{mpath}.name"),
+                            kind: DescErrorKind::Other {
+                                message: "must not be set for a `blank` model -- studiomdl writes an empty name"
+                                    .into(),
+                            },
+                        });
+                    }
+                    for (field, present) in [
+                        ("lods", !m.lods.is_empty()),
+                        ("eyeballs", !m.eyeballs.is_empty()),
+                        ("flexes", !m.flexes.is_empty()),
+                        ("src_parts", !m.src_parts.is_empty()),
+                        ("src_material", m.src_material.is_some()),
+                        ("src_scale", m.src_scale.is_some()),
+                        ("src_axis", m.src_axis.is_some()),
+                        ("src_shape_keys", !m.src_shape_keys.is_empty()),
+                        ("src_shape_key_order", !m.src_shape_key_order.is_empty()),
+                        ("src_shape_key_ignore", m.src_shape_key_ignore),
+                        ("src_no_auto_rules", m.src_no_auto_rules),
+                    ] {
+                        if present {
+                            errs.push(DescError {
+                                path: format!("{mpath}.{field}"),
+                                kind: DescErrorKind::Other {
+                                    message: "must not be set for a `blank` model -- it has no source file"
+                                        .into(),
+                                },
+                            });
+                        }
+                    }
+                } else if m.smd.trim().is_empty() {
                     errs.push(DescError {
                         path: format!("{mpath}.smd"),
                         kind: DescErrorKind::Empty {
@@ -7323,6 +7384,37 @@ pos_weight = 0.25
             errs.iter().any(|e| e.path.ends_with(".smd")),
             "空 smd 应报错：{errs:?}"
         );
+    }
+
+    /// `blank = true` 是「无网格 model」：不能带 `smd`，也不能带任何需要源
+    /// 文件的字段；反过来，`smd` 留空的 blank 必须合法。
+    #[test]
+    fn blank_model_rejects_source_dependent_fields() {
+        let bad = MINIMAL_TOML.replace(
+            "smd = \"minimal-ref.smd\"",
+            "smd = \"minimal-ref.smd\"\nblank = true",
+        );
+        let d = ModelDesc::from_toml(&bad).unwrap();
+        let errs = crate::test_locale::with_english(|| d.validate().unwrap_err());
+        assert!(
+            errs.iter().any(|e| e.path.ends_with(".smd")),
+            "blank 带 smd 应报错：{errs:?}"
+        );
+
+        let with_lods = MINIMAL_TOML.replace(
+            "smd = \"minimal-ref.smd\"",
+            "blank = true\n\n[[bodyparts.models.lods]]\nswitch_point = 20.0",
+        );
+        let d = ModelDesc::from_toml(&with_lods).unwrap();
+        let errs = crate::test_locale::with_english(|| d.validate().unwrap_err());
+        assert!(
+            errs.iter().any(|e| e.path.ends_with(".lods")),
+            "blank 带 lods 应报错：{errs:?}"
+        );
+
+        let good = MINIMAL_TOML.replace("smd = \"minimal-ref.smd\"", "blank = true");
+        let d = ModelDesc::from_toml(&good).unwrap();
+        d.validate().expect("smd 留空的 blank 必须合法");
     }
 
     #[test]

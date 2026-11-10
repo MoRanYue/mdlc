@@ -2865,6 +2865,29 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
             let mut models = Vec::with_capacity(bp.models.len());
             for (mi, m) in bp.models.iter().enumerate() {
                 let at = format!("bodyparts[{bi}].models[{mi}]");
+                // `blank`（`Option_Blank`，`studiomdl.cpp:971-986`）：没有源文件
+                // 的 model。官方在这里也只是 `nummodels++`、不读盘，产物里它是
+                // 一条 `nummeshes == 0`、`numvertices == 0`、名字为空的记录。
+                //
+                // 它**照样占一个 bodygroup 选项位** —— 这正是
+                // `$bodygroup "hat" { studio "hat.smd" blank }` 能当「显示/隐藏」
+                // 开关用的原因，所以这里必须 push 一个空 model 而不是跳过。
+                if m.blank {
+                    models.push(CompiledModel {
+                        smd_path: PathBuf::new(),
+                        name: String::new(),
+                        poses: Vec::new(),
+                        source_world: Vec::new(),
+                        meshes: Vec::new(),
+                        lods: None,
+                        eyeballs: Vec::new(),
+                        mesh_flexes: Vec::new(),
+                        mesh_src_index: Vec::new(),
+                        shape_keys: Vec::new(),
+                        src_no_auto_rules: false,
+                    });
+                    continue;
+                }
                 let smd_path = match resolve_smd_path(base_dir, &m.smd) {
                     Ok(p) => p,
                     Err(msg) => {
@@ -10423,6 +10446,7 @@ type = "mouth"
     fn of_model_maps_ir_fields_and_validates_axis() {
         let mut m = crate::model::BodyModel {
             smd: "x.fbx".into(),
+            blank: false,
             name: None,
             flip_triangles: true,
             lods: Vec::new(),

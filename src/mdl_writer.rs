@@ -4950,6 +4950,54 @@ end
         assert_eq!(&b[at..at + end], b"body");
     }
 
+    /// `blank` model 写出的是**一条零网格记录**：`nummeshes == 0`、
+    /// `numvertices == 0`、名字为空 —— 与官方 `Option_Blank` 的产物一致
+    /// （语料里 39 个零 mesh model 全部如此；见 `PROGRESS.md`）。
+    ///
+    /// 同时钉住「它照样占一个 model 槽」：bodypart 的 `nummodels == 2`，
+    /// 否则 `$bodygroup` 的选项编号会整体前移。
+    #[test]
+    fn blank_model_writes_a_zero_mesh_record() {
+        let toml = format!("{TEST_TOML}\n[[bodyparts.models]]\nblank = true\n");
+        let c = compile_desc(&toml, "mdlc-writer-blank");
+        assert_eq!(c.bodyparts[0].models.len(), 2);
+        assert_eq!(c.bodyparts[0].models[1].name, "");
+        assert!(c.bodyparts[0].models[1].meshes.is_empty());
+
+        let out = write_mdl(&c).unwrap();
+        let b = &out.bytes;
+        let bp_abs = i32::from_le_bytes(
+            b[off::BODY_PART_OFFSET..off::BODY_PART_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let num_models = i32::from_le_bytes(
+            b[bp_abs + bp_off::NUM_MODELS..bp_abs + bp_off::NUM_MODELS + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(num_models, 2, "blank 必须占一个 model 槽");
+        let model_rel = i32::from_le_bytes(
+            b[bp_abs + bp_off::MODEL_INDEX..bp_abs + bp_off::MODEL_INDEX + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let m1 = bp_abs + model_rel + MODEL_SIZE;
+        let num_meshes = i32::from_le_bytes(
+            b[m1 + model_off::NUM_MESHES..m1 + model_off::NUM_MESHES + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let num_vertices = i32::from_le_bytes(
+            b[m1 + model_off::NUM_VERTICES..m1 + model_off::NUM_VERTICES + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(num_meshes, 0, "blank 的 model 不能有 mesh");
+        assert_eq!(num_vertices, 0, "blank 的 model 不能有顶点");
+        assert_eq!(b[m1 + model_off::NAME], 0, "blank 的 model 名必须是空串");
+    }
+
     #[test]
     fn texture_name_index_is_relative() {
         let out = write_mdl(&minimal()).unwrap();

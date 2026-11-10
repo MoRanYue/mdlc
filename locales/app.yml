@@ -1382,8 +1382,8 @@ _version: 2
 "%{what} is missing controls (the official code says missing controls on %{what2})":
   zh-CN: "%{what} 缺少控制位（官方报 missing controls on %{what2}）"
 
-"`blank` bodygroup member: mdlc's BodyModel requires an SMD, so blank is not supported yet":
-  zh-CN: "`blank` bodygroup 成员：mdlc 的 BodyModel 必须有 SMD，暂不支持 blank"
+"`blank` must start a new line inside `$bodygroup` -- studio's inline options are read only on the same line (official `TokenAvailable`), so `{ studio \"a.smd\" blank }` written on one line is an error":
+  zh-CN: "`blank` 在 `$bodygroup` 里必须**另起一行** —— studio 的行内选项只读同一行（官方 `TokenAvailable`），所以 `{ studio \"a.smd\" blank }` 写在一行会报错"
 
 "`srcshapekeyignore` cannot be given together with `srcshapekey` / `srcshapekeyorder`: the former means \"no morph targets at all\", the latter two mean \"take them by name\"":
   zh-CN: "`srcshapekeyignore` 与 `srcshapekey` / `srcshapekeyorder` 不能同时给出：前者是「一个形变目标都不要」，后两者是「按名单取」"
