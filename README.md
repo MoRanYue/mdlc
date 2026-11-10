@@ -621,6 +621,7 @@ $maxbones 200             ; 显式覆盖预设的骨骼上限
 | `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | 不干预（原样搬运根变换） |
 | `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条动画栈 | **第一条**（glTF 按 `animation.name()` 选） |
 | `srcfps 30` | 同上 | 动画重采样率 | 30 |
+| `srcscale 1.0` / `srcaxis "y"` | 同上 | 覆写**这条动画源**的单位与上轴 | 继承「同文件作网格源」的 `$model` 的 `srcscale` / `srcaxis` |
 | `srcshapekey "名"` | `$model` 块内 | 只取这些 shape key / morph target，**并定序**；可重复写 | 全部，按文件顺序 |
 | `srcshapekeyorder "名"` | 同上 | 只定序，不筛 | 文件顺序 |
 | `srcshapekeyignore` | 同上 | 全部忽略（不注册 flex） | 全部注册 |

@@ -2026,6 +2026,8 @@ impl<'a> Parser<'a> {
             // `$declaresequence` 只声明名字，动画侧选项留空（默认 = 官方行为）。
             src_stack: None,
             src_fps: None,
+            src_axis: None,
+            src_scale: None,
         });
         Ok(())
     }
@@ -2081,6 +2083,8 @@ impl<'a> Parser<'a> {
             num_frames: None,
             src_stack: None,
             src_fps: None,
+            src_axis: None,
+            src_scale: None,
         };
 
         self.parse_sequence_body(&mut seq, &name_t, false)?;
@@ -2150,6 +2154,8 @@ impl<'a> Parser<'a> {
             // 同上：`$continue` 是追加语义，动画侧选项也从 `seq` 播种。
             src_stack: seq.src_stack.clone(),
             src_fps: seq.src_fps,
+            src_axis: seq.src_axis.clone(),
+            src_scale: seq.src_scale,
         };
         loop {
             let t = if depth > 0 {
@@ -2473,6 +2479,47 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     seq.src_fps = Some(v);
+                }
+                // 轴向与单位：动画源自己的坐标系，需要能显式覆写
+                // （省略时由 [`crate::compile::anim_src_opts`] 从同文件的
+                // `$model` 继承）。
+                "srcaxis" => {
+                    let t = self.tok(false)?;
+                    if crate::fbx::ForcedAxis::parse(&t.text).is_none() {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            crate::tr_fmt!(
+                                "srcaxis only accepts \"y\" / \"z\" (also yup / y-up / zup / z-up, case-insensitive), got %{text}",
+                                text = format!("{:?}", t.text)
+                            ),
+                        ));
+                    }
+                    seq.src_axis = Some(t.text);
+                }
+                "srcscale" => {
+                    let t = self.tok(false)?;
+                    let v: f32 = t.text.parse().map_err(|_| {
+                        QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            crate::tr_fmt!(
+                                "srcscale needs a number, got %{text}",
+                                text = format!("{:?}", t.text)
+                            ),
+                        )
+                    })?;
+                    if !v.is_finite() || v <= 0.0 {
+                        return Err(QcError::new(
+                            t.file.clone(),
+                            t.line,
+                            crate::tr_fmt!(
+                                "srcscale must be a positive finite number, got %{v}",
+                                v = v
+                            ),
+                        ));
+                    }
+                    seq.src_scale = Some(v);
                 }
                 other if other.starts_with("act_") => {
                     // 官方 `strnicmp(token,"ACT_",4)==0` 时 `UnGetToken()`
@@ -2860,6 +2907,8 @@ impl<'a> Parser<'a> {
             rotation: None,
             src_stack: None,
             src_fps: None,
+            src_axis: None,
+            src_scale: None,
         };
         let mut depth = 0i32;
         loop {
@@ -3011,6 +3060,45 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 anim.src_fps = Some(v);
+            }
+            // 轴向与单位：与 `$sequence` 块同名同义（见 [`Sequence::src_axis`]）。
+            "srcaxis" => {
+                let t = self.tok(false)?;
+                if crate::fbx::ForcedAxis::parse(&t.text).is_none() {
+                    return Err(QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        crate::tr_fmt!(
+                            "srcaxis only accepts \"y\" / \"z\" (also yup / y-up / zup / z-up, case-insensitive), got %{text}",
+                            text = format!("{:?}", t.text)
+                        ),
+                    ));
+                }
+                anim.src_axis = Some(t.text);
+            }
+            "srcscale" => {
+                let t = self.tok(false)?;
+                let v: f32 = t.text.parse().map_err(|_| {
+                    QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        crate::tr_fmt!(
+                            "srcscale needs a number, got %{text}",
+                            text = format!("{:?}", t.text)
+                        ),
+                    )
+                })?;
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(QcError::new(
+                        t.file.clone(),
+                        t.line,
+                        crate::tr_fmt!(
+                            "srcscale must be a positive finite number, got %{v}",
+                            v = v
+                        ),
+                    ));
+                }
+                anim.src_scale = Some(v);
             }
             other => {
                 // 官方 `:2224-2271` 的前缀匹配组 —— 顺序即语义
@@ -5779,6 +5867,41 @@ end
         assert!(
             errs.iter().any(|e| e.message.contains("needs a number")),
             "应报不是数字，实际：{errs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `srcaxis` / `srcscale`：动画侧的两个 `src*` 选项（mdlc 扩展）。
+    ///
+    /// 它们描述**这份动画文件自己的坐标系与单位**。省略时由
+    /// `compile::anim_src_opts` 从「同文件作网格源」的 `$model` 继承；
+    /// 显式写了就以它为准。这里只钉解析落位与非法值报错。
+    #[test]
+    fn animation_and_sequence_accept_src_axis_and_scale() {
+        let dir = fixture("srcaxis");
+        let d = parse(
+            "$modelname \"t.mdl\"\n$body body \"a.smd\"\n\
+             $animation \"a1\" \"a.smd\" {\n    srcaxis \"y\"\n    srcscale 0.01\n}\n\
+             $sequence \"idle\" \"a.smd\" {\n    srcaxis \"z-up\"\n    srcscale 2\n}\n",
+            &dir,
+        );
+        assert_eq!(d.animations[0].src_axis.as_deref(), Some("y"));
+        assert_eq!(d.animations[0].src_scale, Some(0.01));
+        assert_eq!(d.sequences[0].src_axis.as_deref(), Some("z-up"));
+        assert_eq!(d.sequences[0].src_scale, Some(2.0));
+
+        // 非法轴向必须硬报错（静默忽略会让人以为转了轴）。
+        let errs = crate::test_locale::with_english(|| {
+            crate::qc::parse_qc_str(
+                "$modelname \"t.mdl\"\n$body body \"a.smd\"\n\
+                 $animation \"a1\" \"a.smd\" {\n    srcaxis \"sideways\"\n}\n",
+                &dir,
+            )
+        })
+        .expect_err("非法轴向应报错");
+        assert!(
+            errs.iter().any(|e| e.message.contains("srcaxis")),
+            "应报 srcaxis，实际：{errs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

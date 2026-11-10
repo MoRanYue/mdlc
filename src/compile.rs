@@ -1173,13 +1173,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
 ///
 /// 解析不到对应 `$model`（动画专属文件，或路径写不出对应关系）时退回
 /// [`SrcOpts::default()`]，与旧行为一致。
+///
+/// `axis` / `scale` 是**动画源自己的** `srcaxis` / `srcscale`：显式写了就以
+/// 它为准，否则沿用上面继承来的几何侧值。
 fn anim_src_opts(
     desc: &ModelDesc,
     base_dir: &Path,
     smd: &str,
     stack: Option<&str>,
     fps: Option<f32>,
-) -> SrcOpts {
+    axis: Option<&str>,
+    scale: Option<f32>,
+) -> Result<SrcOpts, SrcError> {
     let want = resolve_smd_path(base_dir, smd).ok();
     let model = desc
         .bodyparts
@@ -1192,7 +1197,16 @@ fn anim_src_opts(
     let base = model
         .and_then(|m| SrcOpts::of_model(m).ok())
         .unwrap_or_default();
-    base.with_anim(stack, fps)
+    let mut o = base.with_anim(stack, fps);
+    if let Some(a) = axis {
+        o.fbx.axis = Some(crate::fbx::ForcedAxis::parse(a).ok_or_else(|| SrcError::BadAxis {
+            value: a.to_string(),
+        })?);
+    }
+    if let Some(s) = scale {
+        o.fbx.scale = s;
+    }
+    Ok(o)
 }
 
 /// 「同一个 FBX 既作网格源又作动画源」的**差异提示**（见 [`fbx_geometry_sources`]）。
@@ -3120,7 +3134,21 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         //
         // `srcstack` / `srcfps` 是**动画侧**的选项；`srcaxis` / `srcscale` 却
         // 属于**这份文件**，几何与动画必须一致 —— 见 [`anim_src_opts`]。
-        let aopts = anim_src_opts(desc, base_dir, &a.smd, a.src_stack.as_deref(), a.src_fps);
+        let aopts = match anim_src_opts(
+            desc,
+            base_dir,
+            &a.smd,
+            a.src_stack.as_deref(),
+            a.src_fps,
+            a.src_axis.as_deref(),
+            a.src_scale,
+        ) {
+            Ok(o) => o,
+            Err(err) => {
+                seq_errors.push(e(format!("{at}.src_axis"), err.to_string()));
+                continue;
+            }
+        };
         let loaded = load_smd_frames(
             &p,
             desc,
@@ -3243,8 +3271,24 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             .unwrap_or(sq.smd.as_str());
                         // 现场读的这条源属于**这个序列**，所以动画侧选项取它的
                         // —— 但 `srcaxis` / `srcscale` 要跟几何侧一致。
-                        let sopts =
-                            anim_src_opts(desc, base_dir, &sq.smd, sq.src_stack.as_deref(), sq.src_fps);
+                        let sopts = match anim_src_opts(
+                            desc,
+                            base_dir,
+                            &sq.smd,
+                            sq.src_stack.as_deref(),
+                            sq.src_fps,
+                            sq.src_axis.as_deref(),
+                            sq.src_scale,
+                        ) {
+                            Ok(o) => o,
+                            Err(err) => {
+                                seq_errors.push(e(
+                                    format!("sequences[{}].src_axis", ref_name),
+                                    err.to_string(),
+                                ));
+                                SrcOpts::default()
+                            }
+                        };
                         match anim_index.get(cell) {
                             Some(&j) => Some(anims[j].frames.clone()),
                             None => match resolve_smd_path(base_dir, &sq.smd) {
@@ -3674,7 +3718,21 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                     };
                     // 隐含动画的源就是**序列自己**的源，所以动画侧选项取序列的
                     // —— 但 `srcaxis` / `srcscale` 要跟几何侧一致。
-                    let sopts = anim_src_opts(desc, base_dir, &s.smd, s.src_stack.as_deref(), s.src_fps);
+                    let sopts = match anim_src_opts(
+                        desc,
+                        base_dir,
+                        &s.smd,
+                        s.src_stack.as_deref(),
+                        s.src_fps,
+                        s.src_axis.as_deref(),
+                        s.src_scale,
+                    ) {
+                        Ok(o) => o,
+                        Err(err) => {
+                            seq_errors.push(e(format!("{at}.src_axis"), err.to_string()));
+                            continue;
+                        }
+                    };
                     let Some((frames, _smd)) = load_smd_frames(
                         &smd_path,
                         desc,
@@ -10418,16 +10476,51 @@ type = "mouth"
         let desc = ModelDesc::from_toml(&toml).unwrap();
 
         // 同一文件既作网格源又作动画源 ⟹ 继承几何侧的轴与缩放。
-        let o = anim_src_opts(&desc, &d, "anim.fbx", Some("take"), Some(60.0));
+        let o = anim_src_opts(
+            &desc,
+            &d,
+            "anim.fbx",
+            Some("take"),
+            Some(60.0),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(o.fbx.axis, Some(crate::fbx::ForcedAxis::Y));
         assert_eq!(o.fbx.scale, 2.0);
         assert_eq!(o.stack.as_deref(), Some("take"));
         assert_eq!(o.fps, 60.0);
 
+        // 动画侧显式写了 `srcaxis` / `srcscale` ⟹ 以它为准（覆写继承来的值）。
+        let o = anim_src_opts(
+            &desc,
+            &d,
+            "anim.fbx",
+            None,
+            None,
+            Some("z-up"),
+            Some(0.5),
+        )
+        .unwrap();
+        assert_eq!(o.fbx.axis, Some(crate::fbx::ForcedAxis::Z));
+        assert_eq!(o.fbx.scale, 0.5);
+
         // 动画专属文件（不是任何 `$model` 的网格源）⟹ 退回旧行为，不凭空造轴。
-        let other = anim_src_opts(&desc, &d, "solo.fbx", None, None);
+        let other = anim_src_opts(&desc, &d, "solo.fbx", None, None, None, None).unwrap();
         assert_eq!(other.fbx.axis, None);
         assert_eq!(other.fbx.scale, 1.0);
+
+        // 非法轴向不能静默忽略。
+        let bad = anim_src_opts(
+            &desc,
+            &d,
+            "anim.fbx",
+            None,
+            None,
+            Some("sideways"),
+            None,
+        );
+        assert!(bad.is_err(), "非法 src_axis 必须报错");
     }
 
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----
@@ -13417,6 +13510,8 @@ weight = 0.5
             num_frames: None,
             src_stack: None,
             src_fps: None,
+            src_axis: None,
+            src_scale: None,
         });
         let errs = d.validate().unwrap_err();
         assert!(

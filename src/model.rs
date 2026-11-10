@@ -1942,6 +1942,21 @@ pub struct Sequence {
     /// （`docs/fbx-support.md` §1.5）。
     #[serde(default)]
     pub src_fps: Option<f32>,
+    /// `srcaxis "y"`：**这条动画源**文件的轴向（仅 FBX / DMX 有意义）。
+    ///
+    /// 为什么动画也需要它：轴向描述的是**文件自己的坐标系**，参考姿态与
+    /// 逐帧姿态必须用同一套，否则「静置姿态正确、一播动画就歪 90°」。
+    ///
+    /// 省略 = 沿用「同一个文件作网格源」的那个 `$model` 的 `src_axis`
+    /// （`docs/fbx-support.md` §1.10 的实测口径）；那边也没有 = 不干预。
+    /// 显式写在这里时以这里为准。
+    #[serde(default)]
+    pub src_axis: Option<String>,
+    /// `srcscale 0.01`：**这条动画源**文件的单位缩放。
+    ///
+    /// 语义同 [`Self::src_axis`]：省略则继承同文件 `$model` 的 `src_scale`。
+    #[serde(default)]
+    pub src_scale: Option<f32>,
 }
 
 /// blend 网格的**一格** —— 指向 [`ModelDesc::animations`] 里的一个动画。
@@ -4447,6 +4462,12 @@ pub struct Animation {
     /// `srcfps 30`：FBX 动画的**重采样率**。见 [`Sequence::src_fps`]。
     #[serde(default)]
     pub src_fps: Option<f32>,
+    /// `srcaxis "y"`：**这条动画源**文件的轴向。见 [`Sequence::src_axis`]。
+    #[serde(default)]
+    pub src_axis: Option<String>,
+    /// `srcscale 0.01`：**这条动画源**文件的单位缩放。见 [`Sequence::src_scale`]。
+    #[serde(default)]
+    pub src_scale: Option<f32>,
 }
 
 /// 一个**已编译的动画**（animdesc 的载荷）。
