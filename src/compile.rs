@@ -1163,6 +1163,38 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// 动画帧该用的 `src*` 选项。
+///
+/// `srcaxis` / `srcscale` 描述的是**这份文件所处的坐标系与单位**，参考姿态与
+/// 动画帧必须用同一套 —— 转了参考姿态却不转动画帧，表现就是「静置姿态正确、
+/// 一播动画就歪 90°」。所以：只要这条动画源同时也是某个 `$model` 的网格源，
+/// 就沿用那份几何侧选项（`srcpart` / `srcmaterial` 一并带上，node 集合才与
+/// 几何侧对齐），只覆写动画侧的 `srcstack` / `srcfps`。
+///
+/// 解析不到对应 `$model`（动画专属文件，或路径写不出对应关系）时退回
+/// [`SrcOpts::default()`]，与旧行为一致。
+fn anim_src_opts(
+    desc: &ModelDesc,
+    base_dir: &Path,
+    smd: &str,
+    stack: Option<&str>,
+    fps: Option<f32>,
+) -> SrcOpts {
+    let want = resolve_smd_path(base_dir, smd).ok();
+    let model = desc
+        .bodyparts
+        .iter()
+        .flat_map(|bp| bp.models.iter())
+        .find(|m| match (&want, resolve_smd_path(base_dir, &m.smd)) {
+            (Some(a), Ok(b)) => same_file(a, &b),
+            _ => m.smd == smd,
+        });
+    let base = model
+        .and_then(|m| SrcOpts::of_model(m).ok())
+        .unwrap_or_default();
+    base.with_anim(stack, fps)
+}
+
 /// 「同一个 FBX 既作网格源又作动画源」的**差异提示**（见 [`fbx_geometry_sources`]）。
 ///
 /// 返回 `Some(提示文案)` 表示应当告知用户「这里与官方产物不一致」。
@@ -3086,9 +3118,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
         // 判据要 `n_frames`，所以先读帧再判（读一个 FBX 两次的代价可接受：
         // 只有「同文件」这一种情形会走到第二次）。
         //
-        // `srcstack` / `srcfps` 是**动画侧**的选项，所以基准是
-        // `SrcOpts::default()`（几何侧的 `srcpart` 之类对动画源无意义）。
-        let aopts = SrcOpts::default().with_anim(a.src_stack.as_deref(), a.src_fps);
+        // `srcstack` / `srcfps` 是**动画侧**的选项；`srcaxis` / `srcscale` 却
+        // 属于**这份文件**，几何与动画必须一致 —— 见 [`anim_src_opts`]。
+        let aopts = anim_src_opts(desc, base_dir, &a.smd, a.src_stack.as_deref(), a.src_fps);
         let loaded = load_smd_frames(
             &p,
             desc,
@@ -3209,8 +3241,10 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             .first()
                             .map(|n| n.as_str())
                             .unwrap_or(sq.smd.as_str());
-                        // 现场读的这条源属于**这个序列**，所以动画侧选项取它的。
-                        let sopts = SrcOpts::default().with_anim(sq.src_stack.as_deref(), sq.src_fps);
+                        // 现场读的这条源属于**这个序列**，所以动画侧选项取它的
+                        // —— 但 `srcaxis` / `srcscale` 要跟几何侧一致。
+                        let sopts =
+                            anim_src_opts(desc, base_dir, &sq.smd, sq.src_stack.as_deref(), sq.src_fps);
                         match anim_index.get(cell) {
                             Some(&j) => Some(anims[j].frames.clone()),
                             None => match resolve_smd_path(base_dir, &sq.smd) {
@@ -3638,9 +3672,9 @@ pub fn compile(desc: &ModelDesc, base_dir: &Path) -> Result<CompiledModelDesc, V
                             continue;
                         }
                     };
-                    // 隐含动画的源就是**序列自己**的源，所以动画侧选项取序列的。
-                    let sopts =
-                        SrcOpts::default().with_anim(s.src_stack.as_deref(), s.src_fps);
+                    // 隐含动画的源就是**序列自己**的源，所以动画侧选项取序列的
+                    // —— 但 `srcaxis` / `srcscale` 要跟几何侧一致。
+                    let sopts = anim_src_opts(desc, base_dir, &s.smd, s.src_stack.as_deref(), s.src_fps);
                     let Some((frames, _smd)) = load_smd_frames(
                         &smd_path,
                         desc,
@@ -10361,6 +10395,39 @@ type = "mouth"
             panic!("应是 BadAxis，实际：{err:?}");
         };
         assert_eq!(value, "sideways");
+    }
+
+    /// `srcaxis` / `srcscale` 必须从**几何源**传播到同一文件的**动画帧**读取上。
+    ///
+    /// 复现用户报的那个 bug：`$model { srcaxis "y" }` + 同一 FBX 的 `$animation`
+    /// 时参考姿态被转了、动画帧没转 ⟹ 一播动画整体歪 90°（修法见
+    /// [`anim_src_opts`]）。这里直接钉住「选项确实来自 `$model`」这个前提：
+    /// 若有人把它改回 `SrcOpts::default()`，两个断言会立刻变红。
+    #[test]
+    fn anim_opts_inherit_axis_and_scale_from_the_geometry_source() {
+        let d = tmpdir("animaxis");
+        write(&d, "anim.fbx", MIN_FBX);
+        let toml = format!(
+            "{}\n[[animations]]\nname = \"a1\"\nsmd = \"anim.fbx\"\n",
+            desc_toml("anim.fbx").replacen(
+                "smd = \"anim.fbx\"",
+                "smd = \"anim.fbx\"\nsrc_axis = \"y\"\nsrc_scale = 2.0",
+                1,
+            )
+        );
+        let desc = ModelDesc::from_toml(&toml).unwrap();
+
+        // 同一文件既作网格源又作动画源 ⟹ 继承几何侧的轴与缩放。
+        let o = anim_src_opts(&desc, &d, "anim.fbx", Some("take"), Some(60.0));
+        assert_eq!(o.fbx.axis, Some(crate::fbx::ForcedAxis::Y));
+        assert_eq!(o.fbx.scale, 2.0);
+        assert_eq!(o.stack.as_deref(), Some("take"));
+        assert_eq!(o.fps, 60.0);
+
+        // 动画专属文件（不是任何 `$model` 的网格源）⟹ 退回旧行为，不凭空造轴。
+        let other = anim_src_opts(&desc, &d, "solo.fbx", None, None);
+        assert_eq!(other.fbx.axis, None);
+        assert_eq!(other.fbx.scale, 1.0);
     }
 
     // ---- jigglebone（`$jigglebone` → `mstudiojigglebone_t`）----
