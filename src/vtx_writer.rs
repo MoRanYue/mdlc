@@ -836,8 +836,13 @@ fn write_vtx_single(
             bp_abs + 4,
             (model_off + model_cursor * MODEL_SIZE) as i32 - bp_abs as i32,
         );
-        let model_abs = model_off + model_cursor * MODEL_SIZE;
         for m in &bp.models {
+            // ⚠️ **必须在内层算**：一个 bodypart 可以有多个 model
+            // （`$bodygroup { studio "a.smd" studio "b.smd" }`，或
+            // `{ studio "a.smd" blank }`）。写在循环外会让同 bodypart 的
+            // 每条 model 头都写向**第一条**的地址，其余的留成全 0 ⟹
+            // 引擎读到 `numLODs == 0`，该选项的网格整个不渲染。
+            let model_abs = model_off + model_cursor * MODEL_SIZE;
             put_i32(&mut buf, model_abs, 1); // numLODs
             put_i32(
                 &mut buf,
@@ -1289,8 +1294,9 @@ fn write_vtx_multi(
             bp_abs + 4,
             (model_off + model_cursor * MODEL_SIZE) as i32 - bp_abs as i32,
         );
-        let model_abs = model_off + model_cursor * MODEL_SIZE;
         for m in &bp.models {
+            // ⚠️ 同单 LOD 路径：`model_abs` 必须按**当前 model**算。
+            let model_abs = model_off + model_cursor * MODEL_SIZE;
             let model_lods = m.lods.as_ref().map_or(1, |l| l.num_lods);
             let switch_points: Vec<f32> = m
                 .lods
@@ -1805,6 +1811,67 @@ smd = "myprop-ref.smd"
         let mut s = *t;
         s.sort_unstable();
         s
+    }
+
+    /// **一个 bodypart 里的每个 model 各有自己的 `ModelHeader_t`**。
+    ///
+    /// `$bodygroup { studio "a.smd" studio "b.smd" }` 与 `{ studio "a.smd"
+    /// blank }` 都要求这一点：`BodyPartHeader_t.numModels` 之后是**每 model
+    /// 一条** `ModelHeader_t`，`lodOffset` 相对各自的 model 起点。
+    ///
+    /// 曾经的 bug：`model_abs` 算在外层循环上 ⟹ 同 bodypart 的每条 model 头
+    /// 都覆写**第一条**、其余留成全 0（`numLODs == 0`）⟹ 引擎里第 2 个以后的
+    /// 选项整个不渲染。单 model 的 bodypart 完全看不出来。
+    #[test]
+    fn vtx_writes_one_model_header_per_bodygroup_option() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mdlc-vtx2m-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // 一个三角形、一根骨骼的最小 SMD（每顶点都是 12 token 的全定义行）。
+        let smd = "version 1\nnodes\n 0 \"root\" -1\nend\nskeleton\n  time 0\n    0 0 0 0 0 0 0\nend\ntriangles\nmyprop\n\
+ 0 0 0 0 0 0 1 0 0 1 0 1.0\n\
+ 0 1 0 0 0 0 1 1 0 1 0 1.0\n\
+ 0 0 1 0 0 0 1 0 1 1 0 1.0\nend\n";
+        std::fs::write(d.join("s.smd"), smd).unwrap();
+        let toml = r#"
+[model]
+name = "models/test/two.mdl"
+surface_prop = "metal"
+
+[materials]
+search_paths = ["models/test"]
+textures = [{ name = "models/test/myprop" }]
+
+[[bones]]
+name = "root"
+
+[[bodyparts]]
+name = "g"
+
+[[bodyparts.models]]
+smd = "s.smd"
+
+[[bodyparts.models]]
+smd = "s.smd"
+"#;
+        let desc = ModelDesc::from_toml(toml).unwrap();
+        let c = compile(&desc, &d).expect("两 model 的 bodypart 应能编译");
+        std::fs::remove_dir_all(&d).ok();
+
+        let out = write_vtx(&c).unwrap();
+        let b = &out.bytes;
+        let g = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+        let bp = g(0x20);
+        assert_eq!(g(bp), 2, "bodypart 应有两个 model");
+        let m1 = bp + g(bp + 4) + MODEL_SIZE;
+        assert_eq!(g(m1), 1, "model[1] 的 numLODs 必须是 1（不能是 0）");
+        let lod1 = m1 + g(m1 + 4);
+        assert_eq!(g(lod1), 1, "model[1] 的 LOD 应有一个 mesh");
+        let mesh1 = lod1 + g(lod1 + 4);
+        assert_eq!(g(mesh1), 1, "model[1] 的 mesh 应有一个 strip group");
     }
 
     /// **默认必须与加本特性之前逐字节相同** —— 即 `write_vtx` 不做优化。
