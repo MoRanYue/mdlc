@@ -35,11 +35,9 @@
 //!    `mesh.vertex_position[corner]` 与 `mesh.vertex_indices[corner]` 是
 //!    两套下标，混用会静默错位（原型里踩过一次）。
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
-use std::time::SystemTime;
 
 use crate::smd::{Smd, SmdBoneLink, SmdFrame, SmdNode, SmdPose, SmdTriangle, SmdVertex};
 
@@ -822,116 +820,19 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
         .collect()
 }
 
-/// 解析后的 scene 的缓存键：路径 + 长度 + mtime（与 [`crate::source_cache`]
-/// 同一套理由：只认路径会在「编一个模型 → 改源文件 → 再编」时拿到旧数据）。
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SceneKey {
-    path: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-/// 缓存最多留几份**解析结果**。
-///
-/// 一份 scene 的常驻内存通常是源文件的数倍（64 MB 的 FBX 解析出来是几百 MB），
-/// 而一次编译里常见的形状是「1~2 个 FBX，其中一个被几十个动画栈引用」。
-/// 留 2 份既覆盖「网格与动画来自两个不同文件」，又把常驻内存钉死在两份。
-const SCENE_CACHE_CAP: usize = 2;
-
-/// 解析结果缓存（带 FIFO 淘汰，保证常驻内存有上界）。
-struct SceneCache {
-    scenes: HashMap<SceneKey, Rc<ufbx::SceneRoot>>,
-    /// 插入顺序，只用来淘汰最老的那一份。
-    order: VecDeque<SceneKey>,
-}
-
-impl SceneCache {
-    fn new() -> Self {
-        Self {
-            scenes: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn get(&self, key: &SceneKey) -> Option<Rc<ufbx::SceneRoot>> {
-        self.scenes.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: SceneKey, scene: Rc<ufbx::SceneRoot>) {
-        if self.scenes.insert(key.clone(), scene).is_none() {
-            self.order.push_back(key);
-            while self.scenes.len() > SCENE_CACHE_CAP {
-                match self.order.pop_front() {
-                    Some(old) => {
-                        self.scenes.remove(&old);
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.scenes.clear();
-        self.order.clear();
-    }
-
-    /// 当前缓存了几份（测试用；`release` 构建里没有调用点）。
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.scenes.len()
-    }
-}
-
-thread_local! {
-    /// **解析结果**（`ufbx::Scene`）的缓存，与 `src*` 选项无关。
-    ///
-    /// # 为什么需要
-    ///
-    /// 一个工程里同一个 FBX 通常既是网格源、又被每个 `$animation` /
-    /// `$sequence` 当动画源：几何读 1 遍、`srcstack` 有几个就读几遍。
-    /// 用户那个 64 MB 的枪械 FBX 有 25 个动画栈 ⟹ 解析 26 遍，
-    /// 实测整次编译 8.5 s 里绝大部分耗在这。
-    ///
-    /// 缓存的是**选项之前**的 scene：`srcpart` / `srcaxis` / `srcscale` /
-    /// `srcshapekey*` 都在 [`from_scene`] 与 [`read_frames`] 里才应用，
-    /// 所以不同选项的读取可以安全共用同一份解析结果。
-    ///
-    /// # 为什么是 thread-local
-    ///
-    /// `compile()` 全程单线程，测试又是多线程并行的；全局锁既没必要，
-    /// 也会让并行的测试互相污染（理由与 [`crate::source_cache`] 相同）。
-    /// `ufbx::SceneRoot` 是裸指针 + `PhantomData`，本来也不是 `Send`。
-    static SCENES: RefCell<SceneCache> = RefCell::new(SceneCache::new());
-}
-
 /// 取（或算）某个 FBX 的解析结果。
+///
+/// 缓存本身在 [`crate::source_cache`]（与 `.smd` / `.dmx` 的缓存同一个模块、
+/// 同一套 `(路径, 长度, mtime)` 失效口径、同一份 `clear()`）：这里只负责
+/// 「未命中时怎么读」。
 fn load_scene(path: &Path, at: &str) -> Result<Rc<ufbx::SceneRoot>, FbxError> {
-    let meta = std::fs::metadata(path).ok();
-    let key = SceneKey {
-        path: path.to_path_buf(),
-        len: meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0),
-        modified: meta.and_then(|m| m.modified().ok()),
-    };
-    if let Some(hit) = SCENES.with(|cache| cache.borrow().get(&key)) {
-        return Ok(hit);
-    }
-    let scene = Rc::new(load_scene_uncached(path, at)?);
-    SCENES.with(|cache| {
-        cache.borrow_mut().insert(key, Rc::clone(&scene));
-    });
-    Ok(scene)
-}
-
-/// 清空本线程的 scene 缓存（与 [`crate::source_cache::clear`] 一起被库用户调用）。
-pub(crate) fn clear_scene_cache() {
-    SCENES.with(|cache| cache.borrow_mut().clear());
+    crate::source_cache::scene(path, || load_scene_uncached(path, at))
 }
 
 /// 本线程缓存了几份解析结果（只给测试用：验证「同一文件只解析一次」）。
 #[cfg(test)]
 pub(crate) fn scene_cache_len() -> usize {
-    SCENES.with(|cache| cache.borrow().len())
+    crate::source_cache::scene_count()
 }
 
 /// 真正读盘 + 解析的实现（缓存未命中时才会跑）。

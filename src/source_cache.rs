@@ -29,14 +29,23 @@
 //!
 //! # 只缓存「与选项无关」的格式
 //!
-//! `.smd` / `.dmx` 读出来是什么只取决于文件本身。`.fbx` / `.gltf` 不是 ——
-//! `srcpart` / `srcscale` / `srcaxis` / `srcshapekey*` 这些选项会改变读出来
-//! 的东西（见 [`crate::compile::SrcOpts`]），所以它们**不进缓存**：宁可慢，
-//! 也不能让两个带不同 `src*` 选项的 `$model` 共用一份结果。
+//! `.smd` / `.dmx` 读出来是什么只取决于文件本身 ⟹ 缓存**最终结果**。
+//!
+//! `.fbx` / `.gltf` 不是 —— `srcpart` / `srcscale` / `srcaxis` / `srcshapekey*`
+//! 这些选项会改变读出来的东西（见 [`crate::compile::SrcOpts`]），所以它们的
+//! **最终结果**不进缓存：宁可慢，也不能让两个带不同 `src*` 选项的 `$model`
+//! 共用一份结果。
+//!
+//! 但**解析**这一步与选项无关（选项在 `from_scene` / `read_frames` 里才应用），
+//! 所以为 FBX 单独留了第三张表 [`scene`]：缓存解析出来的 `ufbx::Scene`。
+//! 一个工程里同一个 FBX 往往既是网格源、又被每个 `$animation` / `$sequence`
+//! 当动画源，几何读 1 遍、`srcstack` 有几个就读几遍；用户那个 64 MB 的枪械
+//! FBX 有 25 个动画栈，整次编译 8.5 s 里绝大部分耗在重复解析上，缓存后是 1.1 s。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -66,6 +75,60 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// 动画读取的结果（`.dmx`；`.smd` 与几何是同一份，不走这张表）。
     static FRAMES: RefCell<HashMap<Key, Arc<crate::smd::Smd>>> = RefCell::new(HashMap::new());
+    /// **解析结果**（目前只有 FBX）：与 `src*` 选项无关的那一步。
+    static SCENES: RefCell<SceneCache> = RefCell::new(SceneCache::new());
+}
+
+/// 解析结果最多留几份。
+///
+/// 一份 scene 的常驻内存通常是源文件的数倍（64 MB 的 FBX 解析出来是几百 MB），
+/// 而一次编译里常见的形状是「1~2 个 FBX，其中一个被几十个动画栈引用」。
+/// 留 2 份既覆盖「网格与动画来自两个不同文件」，又把常驻内存钉死在两份。
+const SCENE_CAP: usize = 2;
+
+/// 解析结果缓存（FIFO 淘汰，保证常驻内存有上界）。
+struct SceneCache {
+    scenes: HashMap<Key, Rc<ufbx::SceneRoot>>,
+    /// 插入顺序，只用来淘汰最老的那一份。
+    order: VecDeque<Key>,
+}
+
+impl SceneCache {
+    fn new() -> Self {
+        Self {
+            scenes: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &Key) -> Option<Rc<ufbx::SceneRoot>> {
+        self.scenes.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: Key, scene: Rc<ufbx::SceneRoot>) {
+        if self.scenes.insert(key.clone(), scene).is_none() {
+            self.order.push_back(key);
+            while self.scenes.len() > SCENE_CAP {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.scenes.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.scenes.clear();
+        self.order.clear();
+    }
+
+    /// 当前缓存了几份（测试用；`release` 构建里没有调用点）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.scenes.len()
+    }
 }
 
 /// 取（或算）某个源文件的**几何**读取结果。
@@ -103,6 +166,33 @@ pub(crate) fn frames<E>(
     Ok(value)
 }
 
+/// 取（或算）某个源文件的**解析结果**（目前只有 FBX 有这一层）。
+///
+/// 与 [`geometry`] / [`frames`] 的区别：那两张表存的是**最终结果**，只有
+/// 「读出来是什么只取决于文件」的格式（`.smd` / `.dmx`）能进；`.fbx` 的
+/// 结果依赖 `srcpart` / `srcaxis` / `srcscale` 等选项，但**解析**这一步
+/// 不依赖 —— 所以这里只缓存解析出来的 scene，选项留给调用方逐次应用。
+pub(crate) fn scene<E>(
+    path: &Path,
+    load: impl FnOnce() -> Result<ufbx::SceneRoot, E>,
+) -> Result<Rc<ufbx::SceneRoot>, E> {
+    let key = key_of(path);
+    if let Some(hit) = SCENES.with(|cache| cache.borrow().get(&key)) {
+        return Ok(hit);
+    }
+    let value = Rc::new(load()?);
+    SCENES.with(|cache| {
+        cache.borrow_mut().insert(key, Rc::clone(&value));
+    });
+    Ok(value)
+}
+
+/// 本线程缓存了几份解析结果（测试用：验证「同一文件只解析一次」）。
+#[cfg(test)]
+pub(crate) fn scene_count() -> usize {
+    SCENES.with(|cache| cache.borrow().len())
+}
+
 /// 清空本线程的源文件缓存。
 ///
 /// `mdlc` 自己不需要它（一次编译一个进程），但**库用户**在长驻进程里反复
@@ -111,9 +201,7 @@ pub(crate) fn frames<E>(
 pub fn clear() {
     GEOMETRY.with(|cache| cache.borrow_mut().clear());
     FRAMES.with(|cache| cache.borrow_mut().clear());
-    // `.fbx` / `.gltf` 的**几何结果**不进缓存（受 `src*` 选项影响），但它们的
-    // **解析结果**（`ufbx::Scene`）会 —— 那份与选项无关，见 `crate::fbx`。
-    crate::fbx::clear_scene_cache();
+    SCENES.with(|cache| cache.borrow_mut().clear());
 }
 
 #[cfg(test)]
