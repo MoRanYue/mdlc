@@ -658,7 +658,7 @@ FBX 路径产物尺寸**逐字节不变**（MDL 223580 / VVD 573440 / VTX 145762
 2. glTF 路径**原样输出自洽的模型**（顶点 ±3、骨骼 10/20）；
 3. ⚠️ **不要试图用 `srcscale` 去「对齐」两套输入 —— 它做不到** [实测]。
    `srcscale` 是**整体缩放**：顶点乘 `s`（`opts.point` = `M·p`）、骨骼位移也乘 `s`
-   （`opts.local` 的平移列 = `s·R·t`）⟹ **两者的比值不变**，那个 100× 的不一致
+   （骨骼局部量的平移 = `s·R·t`）⟹ **两者的比值不变**，那个 100× 的不一致
    被原样保留。实测（同一 `dual\rig.fbx`，探针 `docs\_probe\cmp_scale_pair.js`）：
 
    | QC | 顶点 bbox | `Spine` | `Head1` |
@@ -992,7 +992,7 @@ master 上它仍然是 `None`（修复是在 reader 层返回全零迭代器，�
    否则 handler 抛 `AttributeError: 'Scene' object has no attribute 'vs'` / `PermissionError`）。
 7. **Blender 5.2 已移除 `GLTF_EMBEDDED`**（只剩 `'GLB'` / `'GLTF_SEPARATE'`）⟹ 内嵌版只能手工合成。
 8. **「某个旋钮能补偿差异」是必须实测的断言，不能靠读代码推断。**
-   §5.2 初稿凭 `opts.point` / `opts.local` 的公式推断「`srcscale 100` 能对齐两套输入」，
+   §5.2 初稿凭 `opts.point` / 骨骼局部换算的公式推断「`srcscale 100` 能对齐两套输入」，
    实测后**被推翻** —— `srcscale` 是整体缩放，顶点与骨骼同乘，比值恒定。
    教训：**当两条口径只差一个比例因子时，任何「也乘同一个因子」的旋钮都补偿不了它**；
    要证明补偿有效，必须看到**比值变化**，而不只是某一侧的数字变好看。

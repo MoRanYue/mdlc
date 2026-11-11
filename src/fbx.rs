@@ -209,23 +209,6 @@ impl FbxOpts {
         let Some(a) = self.axis else { return v };
         ufbx::transform_direction(&a.rotation(), v)
     }
-
-    /// 骨骼的**局部**变换用：`M · L · M⁻¹`。
-    ///
-    /// 推导：世界变换 `W_i = L_parent · L_i`。要求 `W'_i = M · W_i`，于是
-    /// `L'_i = M · L_i · M⁻¹`（`M` 是「均匀缩放 + 旋转」时这个式子成立，
-    /// 非均匀缩放才会引入剪切）。旋转部分是 `R·Q·R⁻¹`，平移是 `M·T`。
-    pub(crate) fn local(&self, t: ufbx::Transform) -> (ufbx::Vec3, ufbx::Quat) {
-        if self.is_identity() {
-            return (t.translation, t.rotation);
-        }
-        let m = self.matrix();
-        let mi = ufbx::matrix_invert(&m);
-        let l = ufbx::transform_to_matrix(&t);
-        let out = ufbx::matrix_mul(&ufbx::matrix_mul(&m, &l), &mi);
-        let r = ufbx::matrix_to_transform(&out);
-        (r.translation, r.rotation)
-    }
 }
 
 /// 文件自己声明的上轴 → 归一化到 Source（Z-up）要用的强制轴。
@@ -1502,46 +1485,6 @@ mod tests {
         };
         assert!(near(o.point(v(0.0, 1.0, 0.0)), (0.0, 0.0, 1.0)));
         assert!(near(o.direction(v(0.0, 1.0, 0.0)), (0.0, 0.0, 1.0)));
-    }
-
-    /// `local` 是 `M·L·M⁻¹`：缩放进了平移，旋转被共轭。
-    #[test]
-    fn local_transform_is_conjugated_by_the_option_matrix() {
-        let o = FbxOpts {
-            scale: 3.0,
-            ..Default::default()
-        };
-        let t = ufbx::Transform {
-            translation: v(1.0, 0.0, 0.0),
-            rotation: ufbx::Quat {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 1.0,
-            },
-            scale: v(1.0, 1.0, 1.0),
-        };
-        let (p, _) = o.local(t);
-        assert!(near(p, (3.0, 0.0, 0.0)), "缩放应进平移：{p:?}");
-    }
-
-    /// 恒等选项下 `local` 原样返回（零成本路径）。
-    #[test]
-    fn local_is_passthrough_when_identity() {
-        let o = FbxOpts::default();
-        let t = ufbx::Transform {
-            translation: v(7.0, 8.0, 9.0),
-            rotation: ufbx::Quat {
-                x: 0.1,
-                y: 0.2,
-                z: 0.3,
-                w: 0.9,
-            },
-            scale: v(1.0, 1.0, 1.0),
-        };
-        let (p, q) = o.local(t);
-        assert_eq!(p.x, 7.0);
-        assert_eq!(q.x, 0.1, "恒等路径不该走四元数往返（会有精度损失）");
     }
 
     /// `rotation_of` 逐列归一化 —— 100× 缩放被丢掉，平移被清零。

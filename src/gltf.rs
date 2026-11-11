@@ -619,6 +619,31 @@ impl World {
             m23: self.t[2],
         }
     }
+
+    /// 从 [`crate::fbx`] 的矩阵类型转回来（[`Self::to_ufbx`] 的逆）。
+    fn from_ufbx(v: ufbx::Matrix) -> Self {
+        Self {
+            m: [
+                [v.m00, v.m10, v.m20],
+                [v.m01, v.m11, v.m21],
+                [v.m02, v.m12, v.m22],
+            ],
+            t: [v.m03, v.m13, v.m23],
+        }
+    }
+
+    /// 场景级轴换算：所有世界矩阵统一左乘一次 `M = S(scale)·R(axis)`。
+    ///
+    /// 与 FBX 侧同一条口径（见 `docs/fbx-support.md` §1.7b-2）：换算必须作用在
+    /// **世界矩阵**上，不能去共轭每根骨骼的局部量 —— 否则 `$definebone`
+    /// （文件原生空间）与动画帧会差一个轴旋转。
+    fn convert(&self, opts: &GltfOpts) -> Self {
+        if opts.is_identity() {
+            return *self;
+        }
+        let m = opts.matrix();
+        Self::from_ufbx(ufbx::matrix_mul(&m, &self.to_ufbx()))
+    }
 }
 
 /// 一个场景节点的局部变换（从 `Node::transform()` 归一化出来）。
@@ -1448,11 +1473,16 @@ fn reference_poses(
     // 有绑定姿态就用绑定姿态，没有就退回节点自己的 rest 世界矩阵。
     let pose_world: Vec<World> = (0..world.len())
         .map(|i| bind.get(&i).copied().unwrap_or(world[i]))
+        .map(|w| w.convert(opts))
         .collect();
+    // 与 FBX 侧同一口径：父链只认**输出骨骼**，否则挂在骨架根节点（不是骨骼）
+    // 下面的骨骼永远被当成子骨骼，`M` 落不到它身上。
+    let kept_ids: std::collections::HashSet<usize> = kept.iter().copied().collect();
     kept.iter()
         .enumerate()
         .map(|(i, &id)| {
-            let (pos, rot) = match parent[id] {
+            let parent_ix = parent[id].filter(|p| kept_ids.contains(p));
+            let (pos, rot) = match parent_ix {
                 Some(p) => (
                     crate::fbx::bone_offset(&pose_world[p].to_ufbx(), &pose_world[id].to_ufbx()),
                     crate::fbx::local_rotation(&pose_world[p].to_ufbx(), &pose_world[id].to_ufbx()),
@@ -1464,15 +1494,6 @@ fn reference_poses(
                     ufbx::matrix_to_transform(&pose_world[id].to_ufbx()).rotation,
                 ),
             };
-            let (pos, rot) = opts.local(ufbx::Transform {
-                translation: pos,
-                rotation: rot,
-                scale: ufbx::Vec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            });
             SmdPose {
                 bone: i as i32,
                 position: [pos.x as f32, pos.y as f32, pos.z as f32],
@@ -1777,23 +1798,26 @@ pub fn read_frames(
             }
         }
         let locals: Vec<World> = trs.iter().map(|t| t.to_world()).collect();
-        let world = accumulate(&locals, &parent);
+        let world: Vec<World> = accumulate(&locals, &parent)
+            .into_iter()
+            .map(|w| w.convert(opts))
+            .collect();
+        let kept_ids: std::collections::HashSet<usize> = kept.iter().copied().collect();
 
         let mut poses: Vec<SmdPose> = Vec::with_capacity(kept.len());
         for (i, &id) in kept.iter().enumerate() {
-            let pos = match parent[id] {
-                Some(p) => crate::fbx::bone_offset(&world[p].to_ufbx(), &world[id].to_ufbx()),
-                None => crate::fbx::normalized_translation(&world[id].to_ufbx()),
+            let parent_ix = parent[id].filter(|p| kept_ids.contains(p));
+            let (pos, rot) = match parent_ix {
+                Some(p) => (
+                    crate::fbx::bone_offset(&world[p].to_ufbx(), &world[id].to_ufbx()),
+                    trs[id].rotation,
+                ),
+                // 根骨骼：局部量就是自己的世界矩阵，换算后的朝向直接取世界。
+                None => (
+                    crate::fbx::normalized_translation(&world[id].to_ufbx()),
+                    ufbx::matrix_to_transform(&world[id].to_ufbx()).rotation,
+                ),
             };
-            let (pos, rot) = opts.local(ufbx::Transform {
-                translation: pos,
-                rotation: trs[id].rotation,
-                scale: ufbx::Vec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            });
             poses.push(SmdPose {
                 bone: i as i32,
                 position: [pos.x as f32, pos.y as f32, pos.z as f32],
@@ -3070,6 +3094,55 @@ mod tests {
         assert!(
             (y - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
             "第 30 帧 arm 应绕 Z 转 90°，实际 {y}"
+        );
+    }
+
+    /// 轴换算必须作用在**世界矩阵**上：根骨骼（父节点不是关节）的局部量
+    /// 在换算后应等于「换算后的世界平移」，而不是原样透传 —— 否则
+    /// `$definebone`（文件原生空间）与动画帧（换算后空间）会差 90°。
+    #[test]
+    fn read_frames_converts_root_joint_positions() {
+        let d = tmpdir("gltfaxisroot");
+        let p = skinned_anim_fixture(&d);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let text = text.replace(
+            "\"name\": \"bone\"",
+            "\"name\": \"bone\", \"translation\": [0, 10, 0]",
+        );
+        assert!(
+            text.contains("\"translation\": [0, 10, 0]"),
+            "夹具改写失败:\n{text}"
+        );
+        std::fs::write(&p, text).unwrap();
+
+        let pos = |opts: &GltfOpts| {
+            let smd = read_frames(&p, "skinned_anim.gltf", None, 30.0, opts).unwrap();
+            let idx = smd
+                .nodes
+                .iter()
+                .position(|n| n.name == "bone")
+                .expect("bone 应在节点表里");
+            let pose = smd.frames[0]
+                .poses
+                .iter()
+                .find(|q| q.bone as usize == idx)
+                .expect("bone 必须有帧 0");
+            (pose.position[0], pose.position[1], pose.position[2])
+        };
+
+        let (x, y, z) = pos(&GltfOpts {
+            axis: Some(crate::fbx::ForcedAxis::Y),
+            ..Default::default()
+        });
+        assert!(
+            x.abs() < 1e-3 && y.abs() < 1e-3 && (z - 10.0).abs() < 1e-3,
+            "srcaxis y 时根骨骼的 (0,10,0) 应变成 (0,0,10)，实际 ({x},{y},{z})"
+        );
+
+        let (x, y, z) = pos(&z_up());
+        assert!(
+            x.abs() < 1e-3 && (y - 10.0).abs() < 1e-3 && z.abs() < 1e-3,
+            "默认（不额外转）根骨骼应保持 (0,10,0)，实际 ({x},{y},{z})"
         );
     }
 
