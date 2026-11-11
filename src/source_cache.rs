@@ -75,43 +75,49 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// 动画读取的结果（`.dmx`；`.smd` 与几何是同一份，不走这张表）。
     static FRAMES: RefCell<HashMap<Key, Arc<crate::smd::Smd>>> = RefCell::new(HashMap::new());
-    /// **解析结果**（目前只有 FBX）：与 `src*` 选项无关的那一步。
-    static SCENES: RefCell<SceneCache> = RefCell::new(SceneCache::new());
+    /// **解析结果**（FBX 的 `ufbx::Scene`）：与 `src*` 选项无关的那一步。
+    static SCENES: RefCell<ParseCache<ufbx::SceneRoot>> = RefCell::new(ParseCache::new());
 }
 
-/// 解析结果最多留几份。
+/// 每种格式的解析结果最多留几份。
 ///
-/// 一份 scene 的常驻内存通常是源文件的数倍（64 MB 的 FBX 解析出来是几百 MB），
-/// 而一次编译里常见的形状是「1~2 个 FBX，其中一个被几十个动画栈引用」。
-/// 留 2 份既覆盖「网格与动画来自两个不同文件」，又把常驻内存钉死在两份。
-const SCENE_CAP: usize = 2;
+/// 一份解析结果的常驻内存通常是源文件的数倍（64 MB 的 FBX 解析出来是几百 MB），
+/// 而一次编译里常见的形状是「1~2 个源文件，其中一个被几十个动画栈引用」。
+/// 留 2 份既覆盖「网格与动画来自两个不同文件」，又把常驻内存钉死；
+/// 每张表各自计上限（FBX / glTF 互不挤占）。
+const PARSED_CAP: usize = 2;
 
-/// 解析结果缓存（FIFO 淘汰，保证常驻内存有上界）。
-struct SceneCache {
-    scenes: HashMap<Key, Rc<ufbx::SceneRoot>>,
+/// 「解析结果」缓存：按 `(路径, 长度, mtime)` 存 `Rc<T>`，带 FIFO 淘汰。
+///
+/// 只用于**与读取选项无关**的那一步：FBX 的 `ufbx::Scene`、glTF 的
+/// `(Document, buffers)`。最终结果（几何 / 帧）依赖 `src*` 选项，
+/// 不能进这类表。
+pub(crate) struct ParseCache<T> {
+    parsed: HashMap<Key, Rc<T>>,
     /// 插入顺序，只用来淘汰最老的那一份。
     order: VecDeque<Key>,
 }
 
-impl SceneCache {
-    fn new() -> Self {
+impl<T> ParseCache<T> {
+    pub(crate) fn new() -> Self {
         Self {
-            scenes: HashMap::new(),
+            parsed: HashMap::new(),
             order: VecDeque::new(),
         }
     }
 
-    fn get(&self, key: &Key) -> Option<Rc<ufbx::SceneRoot>> {
-        self.scenes.get(key).cloned()
+    pub(crate) fn get(&self, path: &Path) -> Option<Rc<T>> {
+        self.parsed.get(&key_of(path)).cloned()
     }
 
-    fn insert(&mut self, key: Key, scene: Rc<ufbx::SceneRoot>) {
-        if self.scenes.insert(key.clone(), scene).is_none() {
+    pub(crate) fn insert(&mut self, path: &Path, value: Rc<T>) {
+        let key = key_of(path);
+        if self.parsed.insert(key.clone(), value).is_none() {
             self.order.push_back(key);
-            while self.scenes.len() > SCENE_CAP {
+            while self.parsed.len() > PARSED_CAP {
                 match self.order.pop_front() {
                     Some(old) => {
-                        self.scenes.remove(&old);
+                        self.parsed.remove(&old);
                     }
                     None => break,
                 }
@@ -119,15 +125,15 @@ impl SceneCache {
         }
     }
 
-    fn clear(&mut self) {
-        self.scenes.clear();
+    pub(crate) fn clear(&mut self) {
+        self.parsed.clear();
         self.order.clear();
     }
 
     /// 当前缓存了几份（测试用；`release` 构建里没有调用点）。
     #[cfg(test)]
-    fn len(&self) -> usize {
-        self.scenes.len()
+    pub(crate) fn len(&self) -> usize {
+        self.parsed.len()
     }
 }
 
@@ -166,7 +172,7 @@ pub(crate) fn frames<E>(
     Ok(value)
 }
 
-/// 取（或算）某个源文件的**解析结果**（目前只有 FBX 有这一层）。
+/// 取（或算）某个源文件的**解析结果**（FBX 的 `ufbx::Scene`）。
 ///
 /// 与 [`geometry`] / [`frames`] 的区别：那两张表存的是**最终结果**，只有
 /// 「读出来是什么只取决于文件」的格式（`.smd` / `.dmx`）能进；`.fbx` 的
@@ -176,13 +182,12 @@ pub(crate) fn scene<E>(
     path: &Path,
     load: impl FnOnce() -> Result<ufbx::SceneRoot, E>,
 ) -> Result<Rc<ufbx::SceneRoot>, E> {
-    let key = key_of(path);
-    if let Some(hit) = SCENES.with(|cache| cache.borrow().get(&key)) {
+    if let Some(hit) = SCENES.with(|cache| cache.borrow().get(path)) {
         return Ok(hit);
     }
     let value = Rc::new(load()?);
     SCENES.with(|cache| {
-        cache.borrow_mut().insert(key, Rc::clone(&value));
+        cache.borrow_mut().insert(path, Rc::clone(&value));
     });
     Ok(value)
 }
@@ -202,6 +207,8 @@ pub fn clear() {
     GEOMETRY.with(|cache| cache.borrow_mut().clear());
     FRAMES.with(|cache| cache.borrow_mut().clear());
     SCENES.with(|cache| cache.borrow_mut().clear());
+    // glTF 的解析结果表在 `crate::gltf` 里（类型是私有的），由它自己清。
+    crate::gltf::clear_document_cache();
 }
 
 #[cfg(test)]

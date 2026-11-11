@@ -462,6 +462,23 @@ gltf = { git = "https://github.com/gltf-rs/gltf", rev = "50d65229477fe5f785c2c90
 ⟹ **建议先用方案 A**；把方案 B 记为「等上游发版后切换」——
 届时两条好处（免绕校验 + panic 修复）都会自动到手，且**没有任何一条代价**。
 
+### 4.5 运行时：解析结果按文件缓存（0.7.1 起）
+
+`read` 与 `read_frames` 共用同一份解析结果（`source_cache::ParseCache<LoadedGltf>`）：
+同一个 `.gltf` / `.glb` 在一次编译里只做一次 `Gltf::from_slice_without_validation` +
+`load_buffers`，几何读取与每个 `srcstack` 的动画读取都复用它。
+
+| 项 | 说明 |
+|---|---|
+| 缓存键 | `(路径, 文件长度, mtime)` —— 与 `.smd` / `.dmx` 的结果缓存同一套失效口径 |
+| 缓存粒度 | **选项之前**的文档：`srcpart` / `srcaxis` / `srcscale` / `srcshapekey*` 仍在每次读取时应用 ⟹ 不同 `$model` 的选项不会串味 |
+| 常驻内存 | 最多 **2** 份（FIFO，`source_cache::PARSED_CAP`），与 FBX 的 scene 缓存**各自计数** |
+| 清空 | `source_cache::clear()` 会一并清掉（库用户在长驻进程里重复编译时用） |
+
+> 为什么缓存整份 `LoadedGltf` 而不是只缓存 buffer 字节：`.glb` 的二进制块与 JSON 索引
+> 是解析开销的大头，缓存「文档 + buffers」才能把「每个动画栈重读一遍」真正变成「一次」。
+> 只缓存 buffer 会在每个动画栈上重新跑一遍 `from_slice` 与 `load_buffers` 的索引工作。
+
 ---
 
 ## 5. 数据口径

@@ -48,8 +48,10 @@
 //! | 形变目标名 | `shape.element.name` | `mesh.extras()["targetNames"]` |
 //! | 动画 | 关键帧 + 固定 30 fps | 秒轴 + 三种插值 |
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use gltf::animation::Interpolation;
 use gltf::buffer::Source;
@@ -346,11 +348,48 @@ fn check_extensions(doc: &gltf::Document, at: &str) -> Result<(), GltfError> {
     Ok(())
 }
 
-/// 解析文件 + 装 buffer + 补校验，返回 `(文档, buffer 字节, 提示)`。
-fn load_document(
-    path: &Path,
-    at: &str,
-) -> Result<(gltf::Document, Vec<Vec<u8>>, GltfNotes), GltfError> {
+/// 一次解析的全部产物（文档 + buffer 字节 + 提示）。
+///
+/// 解析本身与 `src*` 选项无关（选项在 [`read`] / [`read_frames`] 里才应用），
+/// 所以可以按文件缓存 —— 同一个 `.gltf` / `.glb` 既作网格源、又被每个
+/// `$animation` / `$sequence` 当动画源时只解析一次。
+struct LoadedGltf {
+    doc: gltf::Document,
+    buffers: Vec<Vec<u8>>,
+    notes: GltfNotes,
+}
+
+thread_local! {
+    /// 解析结果缓存（与 FBX 的 `ufbx::Scene` 同一套 `(路径, 长度, mtime)` 口径）。
+    static DOCUMENTS: RefCell<crate::source_cache::ParseCache<LoadedGltf>> =
+        RefCell::new(crate::source_cache::ParseCache::new());
+}
+
+/// 清空本线程的 glTF 解析缓存（由 [`crate::source_cache::clear`] 调用）。
+pub(crate) fn clear_document_cache() {
+    DOCUMENTS.with(|cache| cache.borrow_mut().clear());
+}
+
+/// 本线程缓存了几份解析结果（测试用：验证「同一文件只解析一次」）。
+#[cfg(test)]
+pub(crate) fn document_cache_len() -> usize {
+    DOCUMENTS.with(|cache| cache.borrow().len())
+}
+
+/// 取（或算）某个 glTF / GLB 的解析结果。
+fn load_document(path: &Path, at: &str) -> Result<Rc<LoadedGltf>, GltfError> {
+    if let Some(hit) = DOCUMENTS.with(|cache| cache.borrow().get(path)) {
+        return Ok(hit);
+    }
+    let value = Rc::new(load_document_uncached(path, at)?);
+    DOCUMENTS.with(|cache| {
+        cache.borrow_mut().insert(path, Rc::clone(&value));
+    });
+    Ok(value)
+}
+
+/// 解析文件 + 装 buffer + 补校验（缓存未命中时才会跑）。
+fn load_document_uncached(path: &Path, at: &str) -> Result<LoadedGltf, GltfError> {
     let bytes = std::fs::read(path).map_err(|err| {
         ferr(crate::tr_fmt!(
             "%{at}: cannot read %{path}: %{err}",
@@ -387,7 +426,11 @@ fn load_document(
         ..Default::default()
     };
     notes.cubic_spline_channels = count_cubic_spline(&doc);
-    Ok((doc, buffers, notes))
+    Ok(LoadedGltf {
+        doc,
+        buffers,
+        notes,
+    })
 }
 
 /// 数一下有多少个通道用了 `CubicSpline`（只为发一条提示）。
@@ -1500,7 +1543,10 @@ fn buffer_getter<'a, 's>(
 /// `skin.joints`，没有 FBX 那套「蒙皮簇 + 祖先上溯」的推断，也就没有
 /// 「某个节点被丢掉了」这种需要解释的情形。
 pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, GltfError> {
-    let (doc, buffers, notes) = load_document(path, at)?;
+    let loaded = load_document(path, at)?;
+    let doc = &loaded.doc;
+    let buffers = &loaded.buffers;
+    let notes = &loaded.notes;
     for line in notes.lines(at) {
         log::info!("{line}");
     }
@@ -1513,18 +1559,18 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
     let opts = &opts.resolved(crate::fbx::ForcedAxis::Z);
 
     // accessor → 字节 的闭包（`Iter::new` 要吃它）。按 `Buffer::index()` 取。
-    let get = buffer_getter(&buffers);
+    let get = buffer_getter(buffers);
 
-    let parent = parent_table(&doc);
-    let kept = kept_joints(&doc, &parent, opts);
-    let nodes = smd_nodes(&doc, &parent, &kept);
+    let parent = parent_table(doc);
+    let kept = kept_joints(doc, &parent, opts);
+    let nodes = smd_nodes(doc, &parent, &kept);
     let idx_of: HashMap<usize, i32> = kept
         .iter()
         .enumerate()
         .map(|(i, &id)| (id, i as i32))
         .collect();
-    let world = world_transforms(&doc, &parent);
-    let bind = bind_worlds(&doc, get.clone());
+    let world = world_transforms(doc, &parent);
+    let bind = bind_worlds(doc, get.clone());
     let poses = reference_poses(&parent, &world, &bind, &kept, opts);
 
     let mut triangles: Vec<SmdTriangle> = Vec::new();
@@ -1538,7 +1584,7 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
     let mut cp_base: u32 = 0;
     let mut cp_done: HashMap<usize, u32> = HashMap::new();
 
-    for (node_ix, mesh_ix) in mesh_instances(&doc, opts) {
+    for (node_ix, mesh_ix) in mesh_instances(doc, opts) {
         let node = doc.nodes().nth(node_ix).expect("下标来自 nodes()");
         let mesh = doc.meshes().nth(mesh_ix).expect("下标来自 meshes()");
         let mesh_name = mesh
@@ -1594,7 +1640,7 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
             triangles,
         },
         shape_keys,
-        anim_stacks: anim_names(&doc),
+        anim_stacks: anim_names(doc),
         untextured_meshes,
         merged_meshes,
     })
@@ -1625,7 +1671,10 @@ pub fn read_frames(
     fps: f32,
     opts: &GltfOpts,
 ) -> Result<Smd, GltfError> {
-    let (doc, buffers, notes) = load_document(path, at)?;
+    let loaded = load_document(path, at)?;
+    let doc = &loaded.doc;
+    let buffers = &loaded.buffers;
+    let notes = &loaded.notes;
     for line in notes.lines(at) {
         log::info!("{line}");
     }
@@ -1633,11 +1682,11 @@ pub fn read_frames(
     // 与 [`read`] 同一条默认：+Y up 已由场景根节点的旋转表达，网格空间不再转。
     let opts = &opts.resolved(crate::fbx::ForcedAxis::Z);
 
-    let parent = parent_table(&doc);
-    let get = buffer_getter(&buffers);
-    let reference_world = world_transforms(&doc, &parent);
+    let parent = parent_table(doc);
+    let get = buffer_getter(buffers);
+    let reference_world = world_transforms(doc, &parent);
 
-    let names = anim_names(&doc);
+    let names = anim_names(doc);
     let anim = match stack {
         None => {
             // ⭐ 多栈而用户没点名时发提示。**与 FBX 不同**：glTF 的栈有名字，
@@ -1679,9 +1728,9 @@ pub fn read_frames(
             )));
         }
         // 没有动画 ⟹ 静态骨骼集合（与几何口径一致）。
-        let kept = kept_joints(&doc, &parent, opts);
-        let nodes = smd_nodes(&doc, &parent, &kept);
-        let bind = bind_worlds(&doc, get.clone());
+        let kept = kept_joints(doc, &parent, opts);
+        let nodes = smd_nodes(doc, &parent, &kept);
+        let bind = bind_worlds(doc, get.clone());
         let reference: Vec<SmdPose> =
             reference_poses(&parent, &reference_world, &bind, &kept, opts);
         return Ok(Smd {
@@ -1702,8 +1751,8 @@ pub fn read_frames(
     // 骨骼（典型：与网格共用一份文件的手臂骨架）。漏掉的骨骼在 `load_smd_frames`
     // 里会逐帧回落成静态 `$definebone` 姿态 —— 表现就是「枪在动、手臂不动」
     // （与 FBX 路径同一条根因，见 [`animation_joints`] 与 `docs/fbx-support.md` §1.4d）。
-    let kept = animation_joints(&doc, &parent, opts, &channels);
-    let nodes = smd_nodes(&doc, &parent, &kept);
+    let kept = animation_joints(doc, &parent, opts, &channels);
+    let nodes = smd_nodes(doc, &parent, &kept);
     // ⭐ 逐帧表情权重 mdlc 不做（表情只由 QC 的 `flex` 控制）。这里只统计条数
     // 用来发一条提示 —— 静默忽略会让用户以为「glTF 里的表情动画生效了」。
     let morph_notes = GltfNotes {
@@ -2088,6 +2137,34 @@ mod tests {
             axis: Some(crate::fbx::ForcedAxis::Z),
             ..Default::default()
         }
+    }
+
+    /// 同一个文件读两次只解析一次（几何与动画共用同一份解析结果）。
+    ///
+    /// 缓存的是**选项之前**的文档：`srcpart` / `srcaxis` 等仍在 [`read`] /
+    /// [`read_frames`] 里逐次应用，所以这里连读两次的结果必须完全一致。
+    #[test]
+    fn the_same_gltf_is_parsed_once() {
+        let d = tmpdir("parse_once");
+        let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
+        crate::source_cache::clear();
+
+        let first = read(&p, "tri.gltf", &z_up()).expect("第一次读");
+        assert_eq!(document_cache_len(), 1, "第一次读必须解析一次");
+
+        let second = read(&p, "tri.gltf", &z_up()).expect("第二次读");
+        assert_eq!(document_cache_len(), 1, "第二次必须命中缓存，不再解析");
+        assert_eq!(
+            first.smd.triangles.len(),
+            second.smd.triangles.len(),
+            "共用解析结果不能改变读出来的东西"
+        );
+
+        // 文件变了（长度变了）就必须重新解析。
+        let text = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, text + "\n").unwrap();
+        let _ = read(&p, "tri.gltf", &z_up()).expect("改完再读");
+        assert_eq!(document_cache_len(), 2, "文件变了必须重读");
     }
 
     // -----------------------------------------------------------------
