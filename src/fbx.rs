@@ -315,7 +315,7 @@ pub fn read(path: &Path, at: &str, opts: &FbxOpts) -> Result<FbxGeometry, FbxErr
     let scene = load_scene(path, at)?;
     // 没写 `srcaxis` ⟹ 跟随文件自己声明的上轴（`settings.axes.up`）。
     let opts = &opts.resolved(file_up_axis(&scene, path));
-    from_scene(&scene, opts, path, at)
+    from_scene(&scene, opts)
 }
 
 /// 读一个 FBX 文件的动画，转成 SMD 帧。
@@ -1064,12 +1064,7 @@ fn smd_nodes(kept: &[&ufbx::Node]) -> Vec<SmdNode> {
         .collect()
 }
 
-fn from_scene(
-    scene: &ufbx::Scene,
-    opts: &FbxOpts,
-    path: &Path,
-    at: &str,
-) -> Result<FbxGeometry, FbxError> {
+fn from_scene(scene: &ufbx::Scene, opts: &FbxOpts) -> Result<FbxGeometry, FbxError> {
     let kept = kept_nodes(scene, opts);
     let nodes = smd_nodes(&kept);
     let idx_of: HashMap<u32, i32> = kept
@@ -1202,14 +1197,9 @@ fn from_scene(
         }
     }
 
-    if triangles.is_empty() {
-        return Err(ferr(crate::tr_fmt!(
-            "%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.",
-            at = at,
-            path = path.display()
-        )));
-    }
-
+    // ⚠️ **不在这里**拒绝「没有三角形」：同一个 FBX 可能只当**动画源**用
+    // （纯骨架、没有网格），QC 预解析也会把它当源打开。这条要求属于
+    // **网格源**，由 `compile::read_source_geometry` 统一判（与 `.dmx` 同口径）。
     Ok(FbxGeometry {
         smd: Smd {
             version: 1,

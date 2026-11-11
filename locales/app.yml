@@ -1541,8 +1541,8 @@ _version: 2
 "unknown variable \"$%{name}$\"":
   zh-CN: "未知的变量 \"$%{name}$\""
 
-"%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.":
-  zh-CN: "%{at}：%{path} 里没有任何三角形（网格）。若写了 `srcpart`，请核对网格名字是否与文件里的一致。"
+"%{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.":
+  zh-CN: "%{path} 里没有任何三角形（网格）。若写了 `srcpart`，请核对网格名字是否与文件里的一致。"
 
 "%{at}: `extensionsUsed` lists %{ext}; mdlc does not support it, so the geometry it reads may be incomplete. Turn off mesh compression and re-export.":
   zh-CN: "%{at}：`extensionsUsed` 里有 %{ext}；mdlc 不支持它，读出来的几何可能不完整。请关掉网格压缩后重导。"

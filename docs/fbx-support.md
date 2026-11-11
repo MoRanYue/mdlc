@@ -1339,6 +1339,17 @@ mdlc 的判据因此**必须按源格式分流**，只对 `.fbx` 提示。
 > `box.fbx` 的网格节点成了骨骼，边界需要更多样本）。在规则稳定之前报
 > 「丢了哪些」会给出**可能是错的**提示。
 
+**纯动画源（没有网格的 FBX）**
+
+`$animation` / `$sequence` 引用的文件可以是**纯骨架**（没有 `Geometry`）：读取层
+不要求有三角形，只有**网格源**（`$model` / `$body`）才要求「真有三角形」，判据在
+`compile::read_source_geometry`（与 `.dmx` 同口径，报错文案
+`… contains no triangles (meshes)`）。于是「一份网格 FBX + 一份纯动画 FBX」的
+拆分工作流可行，而误把纯骨架当网格源时仍有明确报错。
+
+> 回归测试：`compile::tests::pure_animation_fbx_and_gltf_read_as_sources_but_not_as_geometry`
+> （读取层 Ok 且 0 三角形、读帧正常、当网格源用时必须报错）。
+
 ### 4.5 逐问题方案
 
 | 问题 | 方案 |

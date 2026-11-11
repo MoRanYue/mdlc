@@ -914,12 +914,28 @@ pub fn read_source_geometry(
     hotpath::measure_block!("源: 读几何（含形态键）", {
         let geometry = geometry_source(path, at, opts)?;
         // 「网格源必须真有三角形」只对**当网格用**的调用成立：BST 的动画
-        // `.dmx` 只有骨架，它会先被 QC 预解析用 `read_source` 打开一次。
-        // 缓存里存的是宽松结果，所以这道检查放在缓存之外。
-        if matches!(SourceKind::of(path), Ok(SourceKind::Dmx))
-            && geometry.smd.triangles.is_empty()
-        {
-            return Err(e(at, crate::dmx::no_triangles_error(path).to_string()));
+        // `.dmx` 只有骨架、FBX / glTF 的纯动画也常常没有网格，它们都会先被
+        // QC 预解析用 `read_source` 打开一次。缓存里存的是宽松结果，所以这道
+        // 检查放在缓存之外。
+        if geometry.smd.triangles.is_empty() {
+            match SourceKind::of(path) {
+                // DMX 有自己的文案（它区分几种 malformed 情形）。
+                Ok(SourceKind::Dmx) => {
+                    return Err(e(at, crate::dmx::no_triangles_error(path).to_string()));
+                }
+                // `.fbx` / `.gltf` 的读取层是**宽松**的（纯骨架动画必须能当源
+                // 打开），只有**当网格源**时才要求有三角形。
+                Ok(SourceKind::Fbx) | Ok(SourceKind::Gltf) => {
+                    return Err(e(
+                        at,
+                        crate::tr_fmt!(
+                            "%{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.",
+                            path = path.display()
+                        ),
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(geometry)
     })
@@ -16871,25 +16887,15 @@ GlobalSettings:  {
 }
 Definitions:  {
     Version: 100
-    Count: 6
+    Count: 5
     ObjectType: "Model" { Count: 1 }
-    ObjectType: "Geometry" { Count: 1 }
     ObjectType: "AnimationStack" { Count: 1 }
     ObjectType: "AnimationLayer" { Count: 1 }
     ObjectType: "AnimationCurveNode" { Count: 1 }
     ObjectType: "AnimationCurve" { Count: 1 }
 }
 Objects:  {
-    Geometry: 100, "Geometry::box", "Mesh" {
-        Vertices: *24 {
-            a: -1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,-1,-1,1,1,-1,1,1,1,1,-1,1,1
-        }
-        PolygonVertexIndex: *24 {
-            a: 0,3,2,-2,4,5,6,-8,0,1,5,-5,3,7,6,-3,0,4,7,-4,1,2,6,-6
-        }
-        GeometryVersion: 124
-    }
-    Model: 200, "Model::tip", "Mesh" {
+    Model: 200, "Model::tip", "Null" {
         Version: 232
         Properties70:  {
             P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
@@ -16927,7 +16933,6 @@ Objects:  {
     }
 }
 Connections:  {
-    C: "OO",100,200
     C: "OO",300,0
     C: "OO",400,300
     C: "OO",500,400
@@ -16980,8 +16985,8 @@ Connections:  {
         .replace("{B64}", &base64::encode(&bin))
     }
 
-    /// 一个 `tip` 节点（带一块三角形）+ 绕 Z 转 90° 的两帧旋转动画
-    /// （`$animation` 用；QC 预解析会把它当几何源打开，所以**必须**有三角形）。
+    /// 一个 `tip` 节点 + 绕 Z 转 90° 的两帧旋转动画，**没有 `meshes`** ——
+    /// 纯动画 glTF 必须能当 `$animation` 源用（读取层宽松）。
     fn mix_gltf_clip() -> String {
         let mut bin = Vec::new();
         bin.extend(mix_f32_bytes(&[0.0, 0.1]));
@@ -16995,39 +17000,19 @@ Connections:  {
             std::f32::consts::FRAC_1_SQRT_2,
             std::f32::consts::FRAC_1_SQRT_2,
         ]));
-        bin.extend(mix_f32_bytes(&[
-            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
-        ]));
-        bin.extend(mix_f32_bytes(&[
-            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
-        ]));
-        bin.extend(mix_f32_bytes(&[0.0, 1.0, 1.0, 0.0, 0.5, 1.0]));
-        bin.extend(mix_u16_bytes(&[0, 1, 2]));
-        assert_eq!(bin.len(), 142);
+        assert_eq!(bin.len(), 40);
         r#"{
   "asset": {"version": "2.0"},
-  "buffers": [{"byteLength": 142, "uri": "data:application/octet-stream;base64,{B64}"}],
+  "buffers": [{"byteLength": 40, "uri": "data:application/octet-stream;base64,{B64}"}],
   "bufferViews": [
     {"buffer": 0, "byteOffset": 0, "byteLength": 8},
-    {"buffer": 0, "byteOffset": 8, "byteLength": 32},
-    {"buffer": 0, "byteOffset": 40, "byteLength": 36},
-    {"buffer": 0, "byteOffset": 76, "byteLength": 36},
-    {"buffer": 0, "byteOffset": 112, "byteLength": 24},
-    {"buffer": 0, "byteOffset": 136, "byteLength": 6}
+    {"buffer": 0, "byteOffset": 8, "byteLength": 32}
   ],
   "accessors": [
     {"bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0.0], "max": [0.1]},
-    {"bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC4"},
-    {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3"},
-    {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC3"},
-    {"bufferView": 4, "componentType": 5126, "count": 3, "type": "VEC2"},
-    {"bufferView": 5, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    {"bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC4"}
   ],
-  "materials": [{"name": "mat_gltf_clip"}],
-  "meshes": [{"name": "mesh_gltf_clip", "primitives": [
-    {"attributes": {"POSITION": 2, "NORMAL": 3, "TEXCOORD_0": 4}, "indices": 5, "material": 0}
-  ]}],
-  "nodes": [{"name": "tip", "mesh": 0}],
+  "nodes": [{"name": "tip"}],
   "animations": [{
     "name": "ClipGltf",
     "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}],
@@ -17145,6 +17130,51 @@ $sequence \"shoot\" \"a_fbx\"
         };
         assert_eq!(rd(0xE8), 3, "numbodyparts");
         assert_eq!(rd(0xBC), 3, "numlocalseq");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 纯动画源（没有网格）必须能当 `$animation` / `$sequence` 打开，
+    /// 但**当网格源**用时要报「没有三角形」。
+    ///
+    /// 这条判据从读取层（`fbx::read` / `gltf::read`）挪到了
+    /// [`read_source_geometry`]（与 `.dmx` 同口径）：否则纯骨架 / 纯动画
+    /// 的文件在 QC 预解析阶段就会被拒，用户根本走不到动画读取。
+    #[test]
+    fn pure_animation_fbx_and_gltf_read_as_sources_but_not_as_geometry() {
+        let d = tmpdir("pure-anim");
+        write(&d, "clip_fbx.fbx", MIX_FBX_CLIP);
+        write(&d, "clip_gltf.gltf", &mix_gltf_clip());
+        let at = "pure_anim.qc:2";
+        let opts = SrcOpts::default();
+
+        for (name, min_frames) in [("clip_fbx.fbx", 3usize), ("clip_gltf.gltf", 2usize)] {
+            let path = d.join(name);
+
+            let source = read_source(&path, at, &opts)
+                .unwrap_or_else(|err| panic!("{name} 必须能当动画源打开：{err}"));
+            assert!(
+                source.triangles.is_empty(),
+                "{name} 是纯动画源，不该有三角形"
+            );
+
+            let frames = read_source_frames(&path, at, &opts)
+                .unwrap_or_else(|err| panic!("{name} 必须能读帧：{err}"));
+            assert!(
+                frames.frames.len() >= min_frames,
+                "{name} 应当至少 {min_frames} 帧，实际 {}",
+                frames.frames.len()
+            );
+
+            let err = match read_source_geometry(&path, at, &opts) {
+                Ok(_) => panic!("{name} 没有网格，不该被接受为网格源"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("contains no triangles"),
+                "{name} 的报错要说清是「没有三角形」：{err}"
+            );
+        }
 
         std::fs::remove_dir_all(&d).ok();
     }

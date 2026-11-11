@@ -731,6 +731,15 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 
 ⭐ 好处：glTF 的 `Step`/`Linear` 语义**比 FBX 的关键帧更明确**，重采样逻辑反而更好写。
 
+**纯动画 glTF（`meshes` 为空）**
+
+`$animation` / `$sequence` 可以直接指向一份**没有 `meshes`** 的 glTF（只有
+`nodes` + `animations`）：读取层不要求有三角形，只有**网格源**（`$model` /
+`$body`）才要求「真有三角形」，判据在 `compile::read_source_geometry`（与
+`.dmx` 同口径）。这让「一份绑定/网格模型 + 一份纯动画」的拆分工作流可行。
+
+> 回归测试：`compile::tests::pure_animation_fbx_and_gltf_read_as_sources_but_not_as_geometry`。
+
 ### 5.7 材质 [实测]
 
 `material.name()` 直接拿得到（`uv_mat.glb` → `Some("face")`）。

@@ -1624,14 +1624,10 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
         }
     }
 
-    if triangles.is_empty() {
-        return Err(ferr(crate::tr_fmt!(
-            "%{at}: %{path} contains no triangles (meshes). If `srcpart` is set, check that the mesh names match the ones in the file.",
-            at = at,
-            path = path.display()
-        )));
-    }
-
+    // ⚠️ **不在这里**拒绝「没有三角形」：glTF 的纯动画（只有 `animations`、
+    // 没有 `meshes`）必须能被 `$animation` / `$sequence` 打开，QC 预解析也会
+    // 把它当源读一次。这条要求属于**网格源**，由
+    // `compile::read_source_geometry` 统一判（与 `.dmx` 同口径）。
     Ok(GltfGeometry {
         smd: Smd {
             version: 1,
@@ -2785,12 +2781,11 @@ mod tests {
             parts: vec!["nope".to_string()],
             ..Default::default()
         };
-        // ⚠️ 文案在 `read` 里就渲染好了，所以语言必须在那一刻生效。
-        let err = crate::test_locale::with_english(|| read(&p, "tri.gltf", &opts)).unwrap_err();
-        assert!(
-            err.to_string().contains("contains no triangles"),
-            "选不中时要报错而不是静默出空模型：{err}"
-        );
+        // ⚠️ 读取层是**宽松**的：`srcpart` 一个都没选中时返回空三角形，而不是
+        // 在这里报错 —— 纯动画 glTF 也要能走这条读取路径。
+        // 「网格源必须真有三角形」由 `compile::read_source_geometry` 判。
+        let g = read(&p, "tri.gltf", &opts).expect("读取层不校验有没有三角形");
+        assert!(g.smd.triangles.is_empty(), "选不中时应当没有三角形");
     }
 
     /// 没写材质的网格要落到 `debug/debugempty` 并进「无材质」清单。
