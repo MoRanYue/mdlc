@@ -16800,4 +16800,352 @@ $model \"body\" \"b.smd\" {\n\
              会把它截断"
         );
     }
+
+    // -----------------------------------------------------------------
+    // 一个 QC 里**混用** SMD / FBX / glTF
+    // -----------------------------------------------------------------
+    //
+    // 同一个 QC 里 `$model` / `$animation` / `$sequence` 分别来自不同格式：
+    // 三条读取路径（`read_smd` / `fbx::read_frames` / `gltf::read_frames`）
+    // 各自独立，但**骨架合并**、**动画池**、**序列解析**与**写出**共用同一条
+    // 管线，所以要有一条端到端夹具同时覆盖。
+    //
+    // 三份源共用同一根骨骼 `tip` —— 断言「骨骼表里有 tip」就不依赖哪份源
+    // 胜出；各用各的骨骼名时，合并顺序会让断言变成实现细节。
+
+    /// 单骨骼 `tip` 的 SMD 网格（一个三角形）。
+    const MIX_SMD: &str = r#"version 1
+nodes
+  0 "tip" -1
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+end
+triangles
+mat_smd
+  0 -8.000000 -8.000000 0.000000  0.000000 0.000000 1.000000  0.000000 1.000000  1 0 1.000000
+  0 8.000000 -8.000000 0.000000  0.000000 0.000000 1.000000  1.000000 0.000000  1 0 1.000000
+  0 0.000000 8.000000 0.000000  0.000000 0.000000 1.000000  0.500000 1.000000  1 0 1.000000
+end
+"#;
+
+    /// 同一根骨骼 `tip` 的 3 帧 SMD 动画（`$animation` 用）。
+    const MIX_SMD_ANIM: &str = r#"version 1
+nodes
+  0 "tip" -1
+end
+skeleton
+  time 0
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000
+  time 1
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 0.500000
+  time 2
+    0 0.000000 0.000000 0.000000 0.000000 0.000000 1.000000
+end
+triangles
+mat_smd
+  0 -8.000000 -8.000000 0.000000  0.000000 0.000000 1.000000  0.000000 1.000000  1 0 1.000000
+  0 8.000000 -8.000000 0.000000  0.000000 0.000000 1.000000  1.000000 0.000000  1 0 1.000000
+  0 0.000000 8.000000 0.000000  0.000000 0.000000 1.000000  0.500000 1.000000  1 0 1.000000
+end
+"#;
+
+    /// 只有一个 `Model::tip`（**没有几何**）的 FBX，带 3 个关键帧的位移动画。
+    const MIX_FBX_CLIP: &str = r#"; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+    FBXHeaderVersion: 1003
+    FBXVersion: 7400
+}
+GlobalSettings:  {
+    Version: 1000
+    Properties70:  {
+        P: "UpAxis", "int", "Integer", "",1
+        P: "UpAxisSign", "int", "Integer", "",1
+        P: "FrontAxis", "int", "Integer", "",2
+        P: "FrontAxisSign", "int", "Integer", "",1
+        P: "CoordAxis", "int", "Integer", "",0
+        P: "CoordAxisSign", "int", "Integer", "",1
+        P: "UnitScaleFactor", "double", "Number", "",1
+    }
+}
+Definitions:  {
+    Version: 100
+    Count: 6
+    ObjectType: "Model" { Count: 1 }
+    ObjectType: "Geometry" { Count: 1 }
+    ObjectType: "AnimationStack" { Count: 1 }
+    ObjectType: "AnimationLayer" { Count: 1 }
+    ObjectType: "AnimationCurveNode" { Count: 1 }
+    ObjectType: "AnimationCurve" { Count: 1 }
+}
+Objects:  {
+    Geometry: 100, "Geometry::box", "Mesh" {
+        Vertices: *24 {
+            a: -1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,-1,-1,1,1,-1,1,1,1,1,-1,1,1
+        }
+        PolygonVertexIndex: *24 {
+            a: 0,3,2,-2,4,5,6,-8,0,1,5,-5,3,7,6,-3,0,4,7,-4,1,2,6,-6
+        }
+        GeometryVersion: 124
+    }
+    Model: 200, "Model::tip", "Mesh" {
+        Version: 232
+        Properties70:  {
+            P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+            P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+            P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+        }
+    }
+    AnimationStack: 300, "AnimStack::MixClip", "" {
+        Properties70:  {
+            P: "LocalStart", "KTime", "Time", "",0
+            P: "LocalStop", "KTime", "Time", "",3079077200
+        }
+    }
+    AnimationLayer: 400, "AnimLayer::BaseLayer", "" {
+    }
+    AnimationCurveNode: 500, "AnimCurveNode::T", "" {
+        Properties70:  {
+            P: "d|X", "Number", "", "A",0
+            P: "d|Y", "Number", "", "A",0
+            P: "d|Z", "Number", "", "A",0
+        }
+    }
+    AnimationCurve: 600, "AnimCurve::T.X", "" {
+        Default: 0
+        KeyVer: 4009
+        KeyTime: *3 {
+            a: 0,1539538600,3079077200
+        }
+        KeyValueFloat: *3 {
+            a: 0,1,2
+        }
+        KeyAttrFlags: *1 { a: 24836 }
+        KeyAttrDataFloat: *4 { a: 0,0,0,0 }
+        KeyAttrRefCount: *1 { a: 3 }
+    }
+}
+Connections:  {
+    C: "OO",100,200
+    C: "OO",300,0
+    C: "OO",400,300
+    C: "OO",500,400
+    C: "OP",600,500, "d|X"
+    C: "OP",500,200, "Lcl Translation"
+}
+"#;
+
+    fn mix_f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn mix_u16_bytes(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// 一个 `tip` 节点 + 一块三角形的 `.gltf`（buffer 内嵌 base64）。
+    fn mix_gltf_mesh() -> String {
+        let mut bin = Vec::new();
+        bin.extend(mix_f32_bytes(&[
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ]));
+        bin.extend(mix_f32_bytes(&[
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+        ]));
+        bin.extend(mix_f32_bytes(&[0.0, 1.0, 1.0, 0.0, 0.5, 1.0]));
+        bin.extend(mix_u16_bytes(&[0, 1, 2]));
+        assert_eq!(bin.len(), 102);
+        r#"{
+  "asset": {"version": "2.0"},
+  "buffers": [{"byteLength": 102, "uri": "data:application/octet-stream;base64,{B64}"}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 72, "byteLength": 24},
+    {"buffer": 0, "byteOffset": 96, "byteLength": 6}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+    {"bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR"},
+    {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC2"},
+    {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"}
+  ],
+  "materials": [{"name": "mat_gltf"}],
+  "meshes": [{"name": "mesh_gltf", "primitives": [
+    {"attributes": {"POSITION": 0, "NORMAL": 3, "TEXCOORD_0": 2}, "indices": 1, "material": 0}
+  ]}],
+  "nodes": [{"name": "tip", "mesh": 0}]
+}"#
+        .replace("{B64}", &base64::encode(&bin))
+    }
+
+    /// 一个 `tip` 节点（带一块三角形）+ 绕 Z 转 90° 的两帧旋转动画
+    /// （`$animation` 用；QC 预解析会把它当几何源打开，所以**必须**有三角形）。
+    fn mix_gltf_clip() -> String {
+        let mut bin = Vec::new();
+        bin.extend(mix_f32_bytes(&[0.0, 0.1]));
+        bin.extend(mix_f32_bytes(&[
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ]));
+        bin.extend(mix_f32_bytes(&[
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ]));
+        bin.extend(mix_f32_bytes(&[
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+        ]));
+        bin.extend(mix_f32_bytes(&[0.0, 1.0, 1.0, 0.0, 0.5, 1.0]));
+        bin.extend(mix_u16_bytes(&[0, 1, 2]));
+        assert_eq!(bin.len(), 142);
+        r#"{
+  "asset": {"version": "2.0"},
+  "buffers": [{"byteLength": 142, "uri": "data:application/octet-stream;base64,{B64}"}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 8},
+    {"buffer": 0, "byteOffset": 8, "byteLength": 32},
+    {"buffer": 0, "byteOffset": 40, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 76, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 112, "byteLength": 24},
+    {"buffer": 0, "byteOffset": 136, "byteLength": 6}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0.0], "max": [0.1]},
+    {"bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC4"},
+    {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3"},
+    {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC3"},
+    {"bufferView": 4, "componentType": 5126, "count": 3, "type": "VEC2"},
+    {"bufferView": 5, "componentType": 5123, "count": 3, "type": "SCALAR"}
+  ],
+  "materials": [{"name": "mat_gltf_clip"}],
+  "meshes": [{"name": "mesh_gltf_clip", "primitives": [
+    {"attributes": {"POSITION": 2, "NORMAL": 3, "TEXCOORD_0": 4}, "indices": 5, "material": 0}
+  ]}],
+  "nodes": [{"name": "tip", "mesh": 0}],
+  "animations": [{
+    "name": "ClipGltf",
+    "samplers": [{"input": 0, "output": 1, "interpolation": "LINEAR"}],
+    "channels": [{"sampler": 0, "target": {"node": 0, "path": "rotation"}}]
+  }]
+}"#
+        .replace("{B64}", &base64::encode(&bin))
+    }
+
+    /// 一个 QC 里 SMD / FBX / glTF 分别作为 `$body` / `$bodygroup` /
+    /// `$animation` / `$sequence` 的源，端到端应当都能走到。
+    #[test]
+    fn one_qc_mixes_smd_fbx_and_gltf_sources() {
+        let d = tmpdir("mix-formats");
+        write(&d, "body.smd", MIX_SMD);
+        write(&d, "anim_smd.smd", MIX_SMD_ANIM);
+        write(&d, "mix_gltf.gltf", &mix_gltf_mesh());
+        write(
+            &d,
+            "mix_fbx.fbx",
+            &MIN_FBX.replace("\"Model::box\"", "\"Model::tip\""),
+        );
+        write(&d, "clip_gltf.gltf", &mix_gltf_clip());
+        write(&d, "clip_fbx.fbx", MIX_FBX_CLIP);
+
+        let qc = "\
+$modelname \"mix.mdl\"
+$body \"body\" \"body.smd\"
+$bodygroup \"gltf_part\" {
+\tstudio \"mix_gltf.gltf\"
+}
+$bodygroup \"fbx_part\" {
+\tstudio \"mix_fbx.fbx\"
+}
+$animation \"a_smd\" \"anim_smd.smd\" fps 30
+$animation \"a_gltf\" \"clip_gltf.gltf\" fps 30
+$animation \"a_fbx\" \"clip_fbx.fbx\" fps 30
+$sequence \"idle\" \"a_smd\"
+$sequence \"run\" \"a_gltf\"
+$sequence \"shoot\" \"a_fbx\"
+";
+        let desc = crate::qc::parse_qc_str(qc, &d).expect("三格式混用的 QC 应当解析成功");
+        let compiled = compile(&desc, &d).expect("三格式混用应当能编译");
+
+        let names: Vec<&str> = compiled
+            .bodyparts
+            .iter()
+            .map(|bp| bp.name.as_str())
+            .collect();
+        assert_eq!(names, ["body", "gltf_part", "fbx_part"], "三个 bodypart");
+
+        let triangles: Vec<usize> = compiled
+            .bodyparts
+            .iter()
+            .map(|bp| {
+                assert_eq!(bp.models.len(), 1, "{} 应当只有一个 model", bp.name);
+                assert_eq!(bp.models[0].meshes.len(), 1, "{} 应当只有一块网格", bp.name);
+                bp.models[0].meshes[0].triangles.len()
+            })
+            .collect();
+        assert_eq!(triangles[0], 1, "SMD 一个三角形");
+        assert_eq!(triangles[1], 1, "glTF 一个三角形");
+        assert_eq!(triangles[2], 12, "FBX 立方体 = 6 个四边形 = 12 个三角形");
+
+        assert!(
+            compiled.desc.bones.iter().any(|b| b.name == "tip"),
+            "三份源共用的骨骼 `tip` 应当进骨骼表，实际 {:?}",
+            compiled
+                .desc
+                .bones
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(compiled.animations.len(), 3, "三条显式 `$animation`");
+        let anim = |name: &str| {
+            compiled
+                .animations
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap_or_else(|| panic!("动画 {name} 应当存在"))
+        };
+        assert_eq!(anim("a_smd").frames.len(), 3, "SMD 的 3 帧");
+        assert!(
+            anim("a_gltf").frames.len() >= 2,
+            "glTF 应当采样出多帧，实际 {}",
+            anim("a_gltf").frames.len()
+        );
+        assert_eq!(anim("a_fbx").frames.len(), 3, "FBX 的 3 个关键帧");
+
+        assert_eq!(compiled.sequences.len(), 3, "三条 `$sequence`");
+        let seq = |name: &str| {
+            compiled
+                .sequences
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("序列 {name} 应当存在"))
+        };
+        for (seq_name, file) in [
+            ("idle", "anim_smd.smd"),
+            ("run", "clip_gltf.gltf"),
+            ("shoot", "clip_fbx.fbx"),
+        ] {
+            let path = seq(seq_name).smd_path.to_string_lossy().to_string();
+            assert!(
+                path.contains(file),
+                "序列 {seq_name} 的来源应当是 {file}，实际 {path}"
+            );
+        }
+
+        let out = crate::mdl_writer::write_mdl(&compiled).expect("混用结果应当能写出 MDL");
+        let rd = |offset: usize| {
+            i32::from_le_bytes(out.bytes[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(rd(0xE8), 3, "numbodyparts");
+        assert_eq!(rd(0xBC), 3, "numlocalseq");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
