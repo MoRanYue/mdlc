@@ -686,6 +686,36 @@ fn kept_joints(
     parent: &[Option<usize>],
     opts: &GltfOpts,
 ) -> Vec<usize> {
+    order_joints(doc, parent, joint_seed(doc, opts))
+}
+
+/// 动画帧要覆盖的节点：静态骨骼集合 **加上动画通道指向的节点**。
+///
+/// ⚠️ **为什么不能复用 [`kept_joints`]**：它只收 `skin.joints`（= 被这个蒙皮
+/// 引用到的骨骼），而动画通道完全可能驱动**不被它引用**的骨骼 —— 典型是
+/// 「网格只蒙皮了枪、手臂骨架在同一个文件里」。这些节点不会被写进逐帧姿态，
+/// 编译侧 `load_smd_frames` 就会每帧回落成静态 `$definebone` 姿态，表现正是
+/// 「枪的骨骼在动、手臂骨骼一动不动」。与 FBX 路径同一条根因
+/// （`docs/fbx-support.md` §1.4d）。
+///
+/// 多出来的节点（模型骨骼表里没有的）由编译侧按**名字**丢弃，不会污染产物。
+fn animation_joints(
+    doc: &gltf::Document,
+    parent: &[Option<usize>],
+    opts: &GltfOpts,
+    channels: &[Channel],
+) -> Vec<usize> {
+    let mut used = joint_seed(doc, opts);
+    for ch in channels {
+        if let Some(node) = ch.node {
+            used.insert(node as u32);
+        }
+    }
+    order_joints(doc, parent, used)
+}
+
+/// 静态骨骼集合的**种子**（还没上溯祖先、还没排序）。
+fn joint_seed(doc: &gltf::Document, opts: &GltfOpts) -> HashSet<u32> {
     let mut used: HashSet<u32> = HashSet::new();
 
     for node in doc.nodes() {
@@ -707,7 +737,15 @@ fn kept_joints(
             }
         }
     }
+    used
+}
 
+/// 上溯祖先 + 按 **DFS 先序**排好（见 [`kept_joints`] 的说明）。
+fn order_joints(
+    doc: &gltf::Document,
+    parent: &[Option<usize>],
+    mut used: HashSet<u32>,
+) -> Vec<usize> {
     // 祖先上溯：`skin.joints` 只列被引用的，父节点可能不在里面。
     let mut extra: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = used.iter().copied().collect();
@@ -1548,14 +1586,8 @@ pub fn read_frames(
     }
 
     let parent = parent_table(&doc);
-    let kept = kept_joints(&doc, &parent, opts);
-    let nodes = smd_nodes(&doc, &parent, &kept);
     let get = buffer_getter(&buffers);
-
-    // 参考姿态（= 没有动画时的姿态，也是每条通道缺省时的取值）。
     let reference_world = world_transforms(&doc, &parent);
-    let bind = bind_worlds(&doc, get.clone());
-    let reference: Vec<SmdPose> = reference_poses(&parent, &reference_world, &bind, &kept, opts);
 
     let names = anim_names(&doc);
     let anim = match stack {
@@ -1598,6 +1630,12 @@ pub fn read_frames(
                 names = format!("{names:?}")
             )));
         }
+        // 没有动画 ⟹ 静态骨骼集合（与几何口径一致）。
+        let kept = kept_joints(&doc, &parent, opts);
+        let nodes = smd_nodes(&doc, &parent, &kept);
+        let bind = bind_worlds(&doc, get.clone());
+        let reference: Vec<SmdPose> =
+            reference_poses(&parent, &reference_world, &bind, &kept, opts);
         return Ok(Smd {
             version: 1,
             nodes,
@@ -1611,6 +1649,13 @@ pub fn read_frames(
 
     let fps = if fps > 0.0 { fps } else { DEFAULT_FPS };
     let channels = sample_channels(&anim, &get);
+    // ⚠️ 动画帧必须覆盖**通道指向的所有节点**，不能只用 `skin.joints`：
+    // `skin.joints` 只列被这个蒙皮引用到的骨骼，而动画完全可能驱动不被它引用的
+    // 骨骼（典型：与网格共用一份文件的手臂骨架）。漏掉的骨骼在 `load_smd_frames`
+    // 里会逐帧回落成静态 `$definebone` 姿态 —— 表现就是「枪在动、手臂不动」
+    // （与 FBX 路径同一条根因，见 [`animation_joints`] 与 `docs/fbx-support.md` §1.4d）。
+    let kept = animation_joints(&doc, &parent, opts, &channels);
+    let nodes = smd_nodes(&doc, &parent, &kept);
     // ⭐ 逐帧表情权重 mdlc 不做（表情只由 QC 的 `flex` 控制）。这里只统计条数
     // 用来发一条提示 —— 静默忽略会让用户以为「glTF 里的表情动画生效了」。
     let morph_notes = GltfNotes {
@@ -2755,6 +2800,88 @@ mod tests {
              \"samplers\": [{\"input\": 4, \"output\": 5, \"interpolation\": \"LINEAR\"}]}]",
         );
         write_gltf(dir, "anim.gltf", &bin, &body)
+    }
+
+    /// 一个「蒙皮只列了部分骨骼、动画却驱动骨骼外节点」的夹具。
+    ///
+    /// 节点 0 = `arm`（动画目标，**不在** `skin.joints` 里），
+    /// 节点 1 = `bone`（`skin.joints` 里那根），
+    /// 节点 2 = `Body.001`（带 `skin: 0` 的网格节点）。
+    fn skinned_anim_fixture(dir: &Path) -> PathBuf {
+        let mut bin = tri_bytes();
+        // 逆绑定矩阵：单位阵（`bone` 的 rest 世界 = 单位阵）。
+        bin.extend(f32s(&[
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]));
+        // 时间轴 0..1 秒。
+        bin.extend(f32s(&[0.0, 1.0]));
+        // 两帧四元数：单位 → 绕 Z 转 90°。
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        bin.extend(f32s(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, s, s]));
+
+        // 几何 102 B ⟹ IBM 在 102（64 B）、时间轴在 166、四元数在 174。
+        let body = add_accessor(
+            TRI_BODY,
+            "{\"bufferView\": 4, \"componentType\": 5126, \"count\": 1, \"type\": \"MAT4\"},\n    \
+             {\"bufferView\": 5, \"componentType\": 5126, \"count\": 2, \"type\": \"SCALAR\"},\n    \
+             {\"bufferView\": 6, \"componentType\": 5126, \"count\": 2, \"type\": \"VEC4\"}",
+        );
+        let body = add_view(&add_view(&add_view(&body, 102, 64), 166, 8), 174, 32);
+
+        let body = body.replace(
+            "\"nodes\": [{\"name\": \"Body.001\", \"mesh\": 0}]",
+            "\"nodes\": [{\"name\": \"arm\"}, {\"name\": \"bone\"}, \
+             {\"name\": \"Body.001\", \"mesh\": 0, \"skin\": 0}],\n  \
+             \"skins\": [{\"joints\": [1], \"inverseBindMatrices\": 4}],\n  \
+             \"animations\": [{\"name\": \"SkeletonAction\", \"channels\": [\
+             {\"sampler\": 0, \"target\": {\"node\": 0, \"path\": \"rotation\"}}], \
+             \"samplers\": [{\"input\": 5, \"output\": 6, \"interpolation\": \"LINEAR\"}]}]",
+        );
+        write_gltf(dir, "skinned_anim.gltf", &bin, &body)
+    }
+
+    /// 动画节点表必须覆盖**通道指向的节点**，不只是 `skin.joints`。
+    ///
+    /// 只按 `skin.joints` 取样时 `arm` 不会写进逐帧姿态 ⟹ 编译侧
+    /// `load_smd_frames` 每帧用 `$definebone` 兜底 ⟹ 表现是「枪的骨骼在动、
+    /// 手臂骨骼一动不动」（FBX 路径的同一条根因）。
+    #[test]
+    fn read_frames_covers_bones_that_no_skin_lists() {
+        let d = tmpdir("animunbound");
+        let p = skinned_anim_fixture(&d);
+        let smd = read_frames(
+            &p,
+            "skinned_anim.gltf",
+            None,
+            30.0,
+            &GltfOpts::default(),
+        )
+        .unwrap();
+
+        let names: Vec<&str> = smd.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"arm"),
+            "动画通道指向的骨骼也必须进节点表（否则它永远不动），实际是 {names:?}"
+        );
+        assert!(
+            names.contains(&"bone"),
+            "`skin.joints` 里的骨骼也不能丢：{names:?}"
+        );
+
+        let arm = smd.nodes.iter().find(|n| n.name == "arm").unwrap();
+        let yaw = |i: usize| {
+            smd.frames[i]
+                .poses
+                .iter()
+                .find(|q| q.bone == arm.index)
+                .map(|q| q.rotation[2].abs())
+        };
+        assert_eq!(yaw(0), Some(0.0), "第 0 帧 arm 应是单位四元数");
+        let y = yaw(30).expect("arm 必须逐帧出 pose");
+        assert!(
+            (y - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
+            "第 30 帧 arm 应绕 Z 转 90°，实际 {y}"
+        );
     }
 
     /// 动画按**秒轴**重采样到 `fps`，帧数 = `round(时长 × fps) + 1`。
