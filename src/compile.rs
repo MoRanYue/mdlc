@@ -13002,6 +13002,59 @@ end
         );
     }
 
+    /// 同一个 FBX 在一次编译里**只解析一次**：几何读 1 遍、每个 `srcstack`
+    /// 再读 1 遍，但解析结果（[`crate::fbx::read`] 与 [`crate::fbx::read_frames`]
+    /// 之前那一步）必须复用。
+    ///
+    /// 用户那个 64 MB 的枪械 FBX 有 25 个动画栈：不缓存时整次编译 **8.5 s**，
+    /// 缓存后 **1.1 s**，产物逐字节相同。
+    #[test]
+    fn the_same_fbx_is_parsed_once_per_compile() {
+        let d = tmpdir("fbxparsedonce");
+        write(&d, "anim.fbx", MIN_FBX);
+        let p = d.join("anim.fbx");
+        crate::source_cache::clear();
+        let before = crate::fbx::scene_cache_len();
+
+        let opts = SrcOpts::default();
+        read_source_geometry(&p, "t", &opts).expect("几何读取应成功");
+        let after_geometry = crate::fbx::scene_cache_len();
+        assert_eq!(after_geometry, before + 1, "几何读取必须解析一次并进缓存");
+
+        read_source_frames(&p, "t", &opts).expect("动画读取应成功");
+        assert_eq!(
+            crate::fbx::scene_cache_len(),
+            after_geometry,
+            "动画读取必须复用几何那次解析，不能再解析一遍"
+        );
+    }
+
+    /// 文件变了就必须重新解析 —— 否则「编一次 → 改源 → 再编」会拿到旧场景。
+    #[test]
+    fn a_changed_fbx_is_parsed_again() {
+        let d = tmpdir("fbxparsedagain");
+        write(&d, "anim.fbx", MIN_FBX);
+        let p = d.join("anim.fbx");
+        crate::source_cache::clear();
+        let before = crate::fbx::scene_cache_len();
+        let opts = SrcOpts::default();
+        read_source_geometry(&p, "t", &opts).expect("第一次读取应成功");
+        assert_eq!(crate::fbx::scene_cache_len(), before + 1);
+
+        let changed = MIN_FBX.replace(
+            "P: \"UnitScaleFactor\", \"double\", \"Number\", \"\",1",
+            "P: \"UnitScaleFactor\", \"double\", \"Number\", \"\",1000",
+        );
+        assert_ne!(changed, MIN_FBX, "替换必须命中夹具里的单位缩放");
+        write(&d, "anim.fbx", &changed);
+        read_source_geometry(&p, "t", &opts).expect("第二次读取应成功");
+        assert_eq!(
+            crate::fbx::scene_cache_len(),
+            before + 2,
+            "文件变了必须重新解析"
+        );
+    }
+
     /// 与上一个测试配对。⭐ 断言刻意**不写死帧数**（[`MIN_FBX`] 的 6 个关键帧
     /// 跨 5 秒，30 fps 重采样后是 151 帧 —— 写死数字会让测试与夹具的时间轴
     /// 耦合），而是**两次编译对比**：

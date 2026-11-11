@@ -988,6 +988,27 @@ cargo build --release   ⟹   Finished in 49.8s   BUILD_EXIT=0
 ⟹ **「引入 ufbx 会破坏纯 Rust 构建」的担忧被实测否定。**
 （`ufbx` 单独用更轻：`ufbxraw` 探针 3.32 s。许可 `MIT OR Unlicense`。）
 
+### 3.1 运行时：解析结果按文件缓存（0.7.1 起）
+
+同一个 FBX 在一个工程里通常既是网格源、又被每个 `$animation` / `$sequence`
+当动画源。`ufbx` 解析一次 64 MB 的 FBX 要几百毫秒，而**每个 `srcstack`
+都会把同一个文件重新读一遍**——用户那个枪械工程有 25 个动画栈，整次编译
+8.5 s 里有 7 s 以上耗在重复解析上。
+
+现在 `src\fbx.rs` 把 `ufbx::SceneRoot` 按 `(路径, 长度, mtime)` 缓存在
+thread-local 里（与 `src\source_cache.rs` 同一套键与理由）：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 同一 QC（25 个 `srcstack` / 64 MB FBX） | 8759 / 8380 / 8774 ms | **1300 / 1110 / 1111 ms** |
+| 产物 | — | **逐字节相同** |
+
+缓存的是**选项之前**的 scene：`srcpart` / `srcaxis` / `srcscale` /
+`srcshapekey*` 仍在 `from_scene` / `read_frames` 里应用，所以两个带不同
+`src*` 选项的 `$model` 可以共用同一份解析结果。常驻内存有上界：**最多留 2 份**
+（FIFO 淘汰，见 `SCENE_CACHE_CAP`），进程退出即释放；`source_cache::clear()`
+会一并清掉它。
+
 ---
 
 ## 4. UX 设计：QC 里直接引用 FBX

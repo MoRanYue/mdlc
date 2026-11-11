@@ -111,6 +111,9 @@ pub(crate) fn frames<E>(
 pub fn clear() {
     GEOMETRY.with(|cache| cache.borrow_mut().clear());
     FRAMES.with(|cache| cache.borrow_mut().clear());
+    // `.fbx` / `.gltf` 的**几何结果**不进缓存（受 `src*` 选项影响），但它们的
+    // **解析结果**（`ufbx::Scene`）会 —— 那份与选项无关，见 `crate::fbx`。
+    crate::fbx::clear_scene_cache();
 }
 
 #[cfg(test)]
