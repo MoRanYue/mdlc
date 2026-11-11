@@ -436,6 +436,13 @@ pub fn read_frames(
     let node_ix: HashMap<u32, usize> = (0..scene.nodes.len())
         .map(|i| (scene.nodes[i].element.element_id, i))
         .collect();
+    // 场景级换算的矩阵：整棵节点的**世界矩阵**统一左乘一次 `M`。
+    let m = (!opts.is_identity()).then(|| opts.matrix());
+    // 「输出骨骼」集合：父节点不在这里面的，就当作**根骨骼**处理 ——
+    // 否则 `RootNode` 之类的非骨骼父节点会把 `M` 挡在门外（它是单位阵，
+    // 相对量不变，于是根骨骼的 −90° 永远不被换算）。
+    let kept_ids: std::collections::HashSet<u32> =
+        kept.iter().map(|n| n.element.element_id).collect();
     for fi in 0..n_frames {
         let t = bake.playback_time_begin + (fi as f64) / f64::from(fps);
         for i in 0..scene.nodes.len() {
@@ -469,31 +476,43 @@ pub fn read_frames(
             });
         }
         let world = accumulate_worlds(&scene, &locals);
+        // **场景级换算**：世界矩阵左乘一次 `M = S(scale)·R(axis)`。
+        //
+        // 为什么不逐骨骼共轭局部量：父相对位移对「全局旋转」天然不变
+        // （`R_pᵀ·(t_c − t_p)`），逐骨骼共轭等于把所有骨骼**绕自身**转一遍，
+        // 根骨骼以外的姿态一个都不变，于是 `$definebone`（文件原生空间）
+        // 与动画帧就永远差那 90°。按世界矩阵换算只改根骨骼的朝向/位置，
+        // 子骨骼保持原值，正好与 `$definebone` 同空间。
+        let world: Vec<ufbx::Matrix> = match m {
+            Some(m) => world.iter().map(|w| ufbx::matrix_mul(&m, w)).collect(),
+            None => world,
+        };
         let mut poses: Vec<SmdPose> = Vec::with_capacity(kept.len());
         for (i, n) in kept.iter().enumerate() {
             let mi = node_ix.get(&n.element.element_id).copied();
             // 位移口径与参考姿态完全一致（见 [`bone_offset`]）：父链的缩放
             // 会随动画变化，所以这里也必须逐帧重算，不能沿用局部平移。
-            let pos = match mi {
-                Some(mi) => match n.parent.as_ref().and_then(|p| node_ix.get(&p.element.element_id))
-                {
-                    Some(&pi) => bone_offset(&world[pi], &world[mi]),
-                    // 根骨骼没有父链可除，但自己那份累积缩放仍要除掉（见
-                    // [`normalized_translation`]）。
-                    None => normalized_translation(&world[mi]),
+            // 父链只认**输出骨骼**里的父节点：`RootNode` / `$srcpart` 之外
+            // 的中间节点都不该让根骨骼「变成子骨骼」而漏掉场景级换算。
+            let parent_ix = n
+                .parent
+                .as_ref()
+                .and_then(|p| node_ix.get(&p.element.element_id).copied())
+                .filter(|&pi| kept_ids.contains(&scene.nodes[pi].element.element_id));
+            let (pos, rot) = match mi {
+                Some(mi) => match parent_ix {
+                    // 父相对量在「世界矩阵已左乘 M」之后保持不变（见上），
+                    // 所以位移用换算后的世界算、旋转直接用原始局部量。
+                    Some(pi) => (bone_offset(&world[pi], &world[mi]), rots[mi]),
+                    // 根骨骼没有父链：它的局部量等于自己的世界矩阵，
+                    // 换算后的朝向/位置直接取自 `world[mi]`。
+                    None => (
+                        normalized_translation(&world[mi]),
+                        ufbx::matrix_to_transform(&world[mi]).rotation,
+                    ),
                 },
-                None => n.local_transform.translation,
+                None => (n.local_transform.translation, n.local_transform.rotation),
             };
-            let rot = mi.map_or(n.local_transform.rotation, |mi| rots[mi]);
-            let (pos, rot) = opts.local(ufbx::Transform {
-                translation: pos,
-                rotation: rot,
-                scale: ufbx::Vec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            });
             poses.push(SmdPose {
                 bone: i as i32,
                 position: [pos.x as f32, pos.y as f32, pos.z as f32],
@@ -783,13 +802,28 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
                 .unwrap_or(world[i])
         })
         .collect();
+    // 与 [`read_frames`] 同一口径：换算只作用在**世界矩阵**上。
+    let pose_world: Vec<ufbx::Matrix> = if opts.is_identity() {
+        pose_world
+    } else {
+        let m = opts.matrix();
+        pose_world.iter().map(|w| ufbx::matrix_mul(&m, w)).collect()
+    };
+    // 与 [`read_frames`] 同一口径：父链只认输出骨骼。
+    let kept_ids: std::collections::HashSet<u32> =
+        kept.iter().map(|n| n.element.element_id).collect();
     kept.iter()
         .enumerate()
         .map(|(i, n)| {
             let mi = ix.get(&n.element.element_id).copied();
+            let parent_ix = n
+                .parent
+                .as_ref()
+                .and_then(|p| ix.get(&p.element.element_id).copied())
+                .filter(|&pi| kept_ids.contains(&scene.nodes[pi].element.element_id));
             let (pos, rot) = match mi {
-                Some(mi) => match n.parent.as_ref().and_then(|p| ix.get(&p.element.element_id)) {
-                    Some(&pi) => (
+                Some(mi) => match parent_ix {
+                    Some(pi) => (
                         bone_offset(&pose_world[pi], &pose_world[mi]),
                         local_rotation(&pose_world[pi], &pose_world[mi]),
                     ),
@@ -802,15 +836,6 @@ fn reference_poses(scene: &ufbx::Scene, kept: &[&ufbx::Node], opts: &FbxOpts) ->
                 },
                 None => (n.local_transform.translation, n.local_transform.rotation),
             };
-            let (pos, rot) = opts.local(ufbx::Transform {
-                translation: pos,
-                rotation: rot,
-                scale: ufbx::Vec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            });
             SmdPose {
                 bone: i as i32,
                 position: [pos.x as f32, pos.y as f32, pos.z as f32],

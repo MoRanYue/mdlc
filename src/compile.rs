@@ -13215,6 +13215,70 @@ end
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// 轴换算必须作用在**世界矩阵**上：根骨骼（FBX 里挂在非骨骼节点下）的
+    /// 局部量在换算后应等于「换算后的世界平移」，而不是原样透传 ——
+    /// 否则 `$definebone`（文件原生空间）与动画帧（换算后空间）会差 90°。
+    #[test]
+    fn fbx_axis_conversion_reaches_root_bones() {
+        let d = tmpdir("fbxaxisroot");
+        let fbx = MIN_FBX
+            .replace(
+                "ObjectType: \"Model\" { Count: 1 }",
+                "ObjectType: \"Model\" { Count: 2 }",
+            )
+            .replace(
+                "\tAnimationStack: 300,",
+                "\tModel: 201, \"Model::arm\", \"LimbNode\" {\n\
+                 \t\tVersion: 232\n\
+                 \t\tProperties70:  {\n\
+                 \t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,10,0\n\
+                 \t\t}\n\
+                 \t}\n\
+                 \tNodeAttribute: 202, \"NodeAttribute::arm\", \"LimbNode\" {\n\
+                 \t\tTypeFlags: \"Skeleton\"\n\
+                 \t}\n\
+                 \tAnimationStack: 300,",
+            )
+            .replace(
+                "C: \"OO\",300,0",
+                "C: \"OO\",201,0\n\tC: \"OO\",202,201\n\tC: \"OO\",300,0",
+            );
+        assert!(fbx.contains("Model::arm"), "夹具派生失败:\n{fbx}");
+        write(&d, "rig.fbx", &fbx);
+
+        let pos = |opts: &crate::fbx::FbxOpts| {
+            let smd = crate::fbx::read_frames(&d.join("rig.fbx"), "test", None, 30.0, opts)
+                .expect("派生夹具必须能被 ufbx 读出来");
+            let idx = smd
+                .nodes
+                .iter()
+                .position(|n| n.name == "arm")
+                .expect("arm 应在节点表里");
+            let p = smd.frames[0]
+                .poses
+                .iter()
+                .find(|p| p.bone as usize == idx)
+                .expect("arm 必须有帧 0");
+            (p.position[0], p.position[1], p.position[2])
+        };
+
+        let (x0, y0, z0) = pos(&crate::fbx::FbxOpts::default());
+        assert!(
+            x0.abs() < 1e-3 && y0.abs() < 1e-3 && (z0 - 10.0).abs() < 1e-3,
+            "跟文件 UpAxis=+Y 换算后，根骨骼的 (0,10,0) 应变成 (0,0,10)，实际 ({x0},{y0},{z0})"
+        );
+
+        let (x1, y1, z1) = pos(&crate::fbx::FbxOpts {
+            axis: Some(crate::fbx::ForcedAxis::Z),
+            ..Default::default()
+        });
+        assert!(
+            x1.abs() < 1e-3 && (y1 - 10.0).abs() < 1e-3 && z1.abs() < 1e-3,
+            "显式 srcaxis z 时根骨骼应保持 (0,10,0)，实际 ({x1},{y1},{z1})"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// SMD 同文件必须**能编过**（端到端钉住「陷阱是 FBX 专属」这条结论）。
     ///
     /// `docs/_probe/oracle_samefile_smd.js` 实测：`$body ab_z8.smd` +
