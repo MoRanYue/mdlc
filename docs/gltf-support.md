@@ -733,7 +733,17 @@ glTF 的 `rotation` 是**四元数**，FBX 的 `local_transform.rotation` 也是
 ⚠️ 骨骼侧同理：`zup.glb` 的 `Pelvis` 额外带一份 `Rx(90°)`
 （`rot=[1.5708,0,0]`，而 `rig.glb` 的 `Pelvis` 是单位）⟹ **轴向选错时骨骼也会错**。
 
-`srcaxis` 仍然是那个旋钮（`ForcedAxis`），默认不施加任何变换。
+⭐⭐ **默认不额外施加旋转**（0.7.1 明确化，行为与 0.7.0 相同）：glTF 规范是 **+Y up**，
+但 Blender 的默认导出把这件事写在**场景根节点的旋转**上 —— 根 `Skeleton` 带
+`Rx(+90°)`，网格 `POSITION` 仍是 Z-up 的网格空间坐标（`full.glb` 实测
+`[-3,-3,0]..[3,45,3]`，`generator = Khronos glTF Blender I/O v5.2.40`）。
+mdlc 的几何路径读的就是网格空间 ⟹ **再转一次会把模型放倒**（实测默认加 +90° 时
+包围盒变成 `[-3,-45,-3]..[3,0,3]`）。所以默认值等价于 `srcaxis "z"`。
+
+显式 `srcaxis "y"` 会把**顶点 / 法线 / morph 偏移 / 骨骼参考姿态 / 动画帧**统一转一次
+（0.7.1 补齐了前三个 —— 之前只转骨骼，症状是「静置对、网格歪 90°」）。手写「Y-up 数据
++ 无根旋转」的 glTF 才需要它；`export_yup=False` 的 Blender 导出（数据本身 Y-long）
+也可以用它校正。
 
 ---
 

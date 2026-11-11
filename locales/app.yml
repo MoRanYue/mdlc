@@ -1798,5 +1798,8 @@ _version: 2
 "%{path}: %{message}":
   zh-CN: "%{path}：%{message}"
 
+"Note: %{path} declares up axis %{axis}; only +Y / +Z are supported, treating it as Z-up (no conversion). Write `srcaxis \"y\"` or `srcaxis \"z\"` to force one.":
+  zh-CN: "提示：%{path} 声明的上轴是 %{axis}；只支持 +Y / +Z，按 Z-up 处理（不做转换）。要强制指定就写 `srcaxis \"y\"` 或 `srcaxis \"z\"`。"
+
 "%{file}:%{line}: `srcnoautorules` (official name `NoAutoDMXRules`) comes after a `flexcontroller`: official studiomdl wipes the controllers registered before this point, so its output loses them while mdlc keeps them. Move this line to the top of the `$model` block to match the official compiler":
   zh-CN: "%{file}:%{line}: `srcnoautorules`（官方名 `NoAutoDMXRules`）写在 `flexcontroller` 之后：官方 studiomdl 会把此前的控制器整批清空，mdlc 则保留 —— 两边产物会不同。想与官方一致，请把这一行移到 `$model` 块的开头。"

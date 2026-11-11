@@ -624,7 +624,7 @@ $maxbones 200             ; 显式覆盖预设的骨骼上限
 | `srcpart "名"` | `$body` / `$model` 行内或块内 | 只取这些名字的网格；**可重复写** | 全部网格合并进同一个部件 |
 | `srcmaterial "名"` | 同上 | 文件里没有材质时的兜底名 | `debug/debugempty` |
 | `srcscale 1.0` | 同上 | 统一缩放（顶点与骨骼同乘，**比值不变**） | 1.0 |
-| `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | 不干预（原样搬运根变换） |
+| `srcaxis "z"` | 同上 | 强制上轴（`y` / `z`） | **FBX：跟随文件 `UpAxis`**（`+Y` 自动转 Z-up，`+Z` 不转）；glTF：不额外转（+Y up 已在根节点旋转里） |
 | `srcstack "名"` | `$sequence` / `$animation` 块内 | 用哪条动画栈 | **第一条**（glTF 按 `animation.name()` 选） |
 | `srcfps 30` | 同上 | 动画重采样率 | 30 |
 | `srcscale 1.0` / `srcaxis "y"` | 同上 | 覆写**这条动画源**的单位与上轴 | 继承「同文件作网格源」的 `$model` 的 `srcscale` / `srcaxis` |

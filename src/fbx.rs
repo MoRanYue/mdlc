@@ -154,8 +154,25 @@ impl Default for FbxOpts {
 
 impl FbxOpts {
     /// 是否有任何「会改变几何」的选项被设置（用于决定要不要做矩阵变换）。
+    ///
+    /// `Z` 与「没写」等价（都是不转），所以不必为它算一遍单位矩阵。
     pub(crate) fn is_identity(&self) -> bool {
-        self.axis.is_none() && (self.scale - 1.0).abs() < f32::EPSILON
+        matches!(self.axis, None | Some(ForcedAxis::Z))
+            && (self.scale - 1.0).abs() < f32::EPSILON
+    }
+
+    /// 把「没写 `srcaxis`」解析成 `default` —— **默认值跟随文件**。
+    ///
+    /// * `.fbx`：`default` = 文件自己声明的上轴（[`file_up_axis`]）；
+    /// * `.gltf` / `.glb`：`+Y up` 已经写在**场景根节点的旋转**里（网格空间是
+    ///   Z-up），所以 `default` = [`ForcedAxis::Z`]，不再额外转一次。
+    ///
+    /// 显式写了 `srcaxis` 就尊重它，不再看文件 —— 这正是「覆盖」的含义。
+    pub(crate) fn resolved(&self, default: ForcedAxis) -> FbxOpts {
+        FbxOpts {
+            axis: Some(self.axis.unwrap_or(default)),
+            ..self.clone()
+        }
     }
 
     /// 归一化到 Z-up 的完整变换 `M = S(s) · R(axis)`。
@@ -207,6 +224,29 @@ impl FbxOpts {
         let out = ufbx::matrix_mul(&ufbx::matrix_mul(&m, &l), &mi);
         let r = ufbx::matrix_to_transform(&out);
         (r.translation, r.rotation)
+    }
+}
+
+/// 文件自己声明的上轴 → 归一化到 Source（Z-up）要用的强制轴。
+///
+/// 只认 `+Y`（FBX 的常见默认，也是 glTF 规范）与 `+Z`（本来就是 Source 的约定）。
+/// `±X` / `−Y` / `−Z` / `Unknown` 没有「一次旋转」的等价表达，按「不干预」（Z）处理
+/// 并告警 —— 悄悄转 90° 比不转更难排查。
+fn file_up_axis(scene: &ufbx::Scene, path: &Path) -> ForcedAxis {
+    match scene.settings.axes.up {
+        ufbx::CoordinateAxis::PositiveY => ForcedAxis::Y,
+        ufbx::CoordinateAxis::PositiveZ => ForcedAxis::Z,
+        other => {
+            log::warn!(
+                "{}",
+                crate::tr_fmt!(
+                    "Note: %{path} declares up axis %{axis}; only +Y / +Z are supported, treating it as Z-up (no conversion). Write `srcaxis \"y\"` or `srcaxis \"z\"` to force one.",
+                    path = path.display(),
+                    axis = format!("{other:?}")
+                )
+            );
+            ForcedAxis::Z
+        }
     }
 }
 
@@ -272,6 +312,8 @@ impl FbxGeometry {
 /// 读一个 FBX 文件，转成中立 SMD。
 pub fn read(path: &Path, at: &str, opts: &FbxOpts) -> Result<FbxGeometry, FbxError> {
     let scene = load_scene(path, at)?;
+    // 没写 `srcaxis` ⟹ 跟随文件自己声明的上轴（`settings.axes.up`）。
+    let opts = &opts.resolved(file_up_axis(&scene, path));
     from_scene(&scene, opts, path, at)
 }
 
@@ -290,6 +332,8 @@ pub fn read_frames(
     opts: &FbxOpts,
 ) -> Result<Smd, FbxError> {
     let scene = load_scene(path, at)?;
+    // 与 [`read`] 同一条默认：没写 `srcaxis` ⟹ 跟随文件声明的上轴。
+    let opts = &opts.resolved(file_up_axis(&scene, path));
     // ⚠️ 动画用**整条骨架**，几何仍用「被几何引用」的那组（见 [`animation_nodes`]）。
     let kept = animation_nodes(&scene, opts);
     let nodes = smd_nodes(&kept);

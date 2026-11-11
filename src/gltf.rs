@@ -841,6 +841,36 @@ fn material_name(node: &gltf::Node, prim: &gltf::Primitive, opts: &GltfOpts) -> 
         .unwrap_or_else(|| FALLBACK_MATERIAL.to_string())
 }
 
+/// 顶点位置：按 `srcaxis` / `srcscale` 归一化到 Source 空间。
+///
+/// glTF 的顶点是**网格空间**的（[`push_primitive`] 不乘节点世界矩阵，蒙皮交给
+/// 编译侧），所以整个坐标系换基时必须在这里一起转 —— 只转骨骼会让网格与
+/// 骨架错开 90°。
+fn point3(opts: &GltfOpts, p: [f32; 3]) -> [f32; 3] {
+    if opts.is_identity() {
+        return p;
+    }
+    let v = opts.point(ufbx::Vec3 {
+        x: f64::from(p[0]),
+        y: f64::from(p[1]),
+        z: f64::from(p[2]),
+    });
+    [v.x as f32, v.y as f32, v.z as f32]
+}
+
+/// 法线 / 形变偏移：只转不缩（与 FBX 侧 `FbxOpts::direction` 同口径）。
+fn direction3(opts: &GltfOpts, n: [f32; 3]) -> [f32; 3] {
+    if opts.is_identity() {
+        return n;
+    }
+    let v = opts.direction(ufbx::Vec3 {
+        x: f64::from(n[0]),
+        y: f64::from(n[1]),
+        z: f64::from(n[2]),
+    });
+    [v.x as f32, v.y as f32, v.z as f32]
+}
+
 /// 把一个 primitive 的三角形追加到 `out`。
 ///
 /// 与 FBX 侧 `from_scene` 的三角形循环同构，差别只在数据来源：
@@ -865,6 +895,7 @@ fn push_primitive<'a, 's, F>(
     idx_of: &HashMap<usize, i32>,
     parent: &[Option<usize>],
     get: F,
+    opts: &GltfOpts,
     out: &mut Vec<SmdTriangle>,
 ) where
     F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
@@ -909,11 +940,14 @@ fn push_primitive<'a, 's, F>(
         let mut vs: Vec<SmdVertex> = Vec::with_capacity(3);
         for &vi in &t {
             let vi = vi as usize;
-            let p = positions.get(vi).copied().unwrap_or([0.0; 3]);
-            let nrm = normals
-                .as_ref()
-                .and_then(|n| n.get(vi).copied())
-                .unwrap_or([0.0, 0.0, 1.0]);
+            let p = point3(opts, positions.get(vi).copied().unwrap_or([0.0; 3]));
+            let nrm = direction3(
+                opts,
+                normals
+                    .as_ref()
+                    .and_then(|n| n.get(vi).copied())
+                    .unwrap_or([0.0, 0.0, 1.0]),
+            );
             // ⚠️ **glTF 路径不翻 V**（`docs/gltf-support.md` §5.1）——
             // Blender 的 glTF 导出器写的就是最终值，而 SMD 解析器那次翻转
             // 发生在**解析 SMD** 时，glTF 不经过它。
@@ -1208,6 +1242,7 @@ fn shape_keys_of<'a, 's, F>(
     names: &[String],
     cp_off: u32,
     get: F,
+    opts: &GltfOpts,
 ) -> Vec<FbxShapeKey>
 where
     F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
@@ -1234,8 +1269,11 @@ where
             if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= MIN_DELTA_SQR {
                 continue;
             }
-            position_offsets.push(*d);
-            normal_offsets.push(normals.get(vi).copied().unwrap_or([0.0; 3]));
+            position_offsets.push(direction3(opts, *d));
+            normal_offsets.push(direction3(
+                opts,
+                normals.get(vi).copied().unwrap_or([0.0; 3]),
+            ));
             vertex_index.push(cp_off + vi as u32);
         }
         if vertex_index.is_empty() {
@@ -1467,6 +1505,13 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
         log::info!("{line}");
     }
 
+    // ⭐ glTF 的 **+Y up** 已经写在文件里了 —— 但写在**场景根节点的旋转**上
+    // （Blender 默认导出：根 `Skeleton` 带 `Rx(+90°)`，网格 `POSITION` 仍是
+    // Z-up 的网格空间坐标，`full.glb` 实测 `[-3,-3,0]..[3,45,3]`）。
+    // mdlc 的几何路径读的就是网格空间，所以**默认不加任何额外旋转**；
+    // 只有「Y-up 数据 + 没有根旋转」的手写文件才需要 `srcaxis "y"` 强制转一次。
+    let opts = &opts.resolved(crate::fbx::ForcedAxis::Z);
+
     // accessor → 字节 的闭包（`Iter::new` 要吃它）。按 `Buffer::index()` 取。
     let get = buffer_getter(&buffers);
 
@@ -1525,9 +1570,9 @@ pub fn read(path: &Path, at: &str, opts: &GltfOpts) -> Result<GltfGeometry, Gltf
             // ⚠️ 形变目标的名字是**网格级**的（`mesh.extras.targetNames`），
             // 而 morph target 挂在 primitive 上。多 primitive 的网格里每个
             // primitive 各有一份 target 列表，但名字表是共享的。
-            shape_keys.extend(shape_keys_of(&prim, &names, cp_off, get.clone()));
+            shape_keys.extend(shape_keys_of(&prim, &names, cp_off, get.clone(), opts));
             push_primitive(
-                &prim, &node, &mat, cp_off, bone_ix, &idx_of, &parent, get.clone(),
+                &prim, &node, &mat, cp_off, bone_ix, &idx_of, &parent, get.clone(), opts,
                 &mut triangles,
             );
         }
@@ -1584,6 +1629,9 @@ pub fn read_frames(
     for line in notes.lines(at) {
         log::info!("{line}");
     }
+
+    // 与 [`read`] 同一条默认：+Y up 已由场景根节点的旋转表达，网格空间不再转。
+    let opts = &opts.resolved(crate::fbx::ForcedAxis::Z);
 
     let parent = parent_table(&doc);
     let get = buffer_getter(&buffers);
@@ -2033,6 +2081,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// 多数用例测的是解析/语义，不是轴向；钉死「不转」让坐标断言保持可读。
+    /// 默认值（glTF 规范 = +Y up ⟹ 转成 Z-up）由 [`spec_default_axis_is_y_up`] 单独覆盖。
+    fn z_up() -> GltfOpts {
+        GltfOpts {
+            axis: Some(crate::fbx::ForcedAxis::Z),
+            ..Default::default()
+        }
+    }
+
     // -----------------------------------------------------------------
     // 夹具
     // -----------------------------------------------------------------
@@ -2444,12 +2501,72 @@ mod tests {
     // 端到端（`read`）
     // -----------------------------------------------------------------
 
+    /// glTF 的 **+Y up** 写在场景根节点的旋转里（Blender 默认导出），网格空间
+    /// 本身是 Z-up —— 所以默认**不再额外转一次**（与 0.7.0 的行为一致）。
+    #[test]
+    fn default_axis_keeps_mesh_space() {
+        let d = tmpdir("tri_default_axis");
+        let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
+        let g = read(&p, "tri.gltf", &GltfOpts::default()).expect("应能读出三角形");
+
+        let t = &g.smd.triangles[0];
+        assert!(
+            near3(t.vertices[2].position, [0.0, 1.0, 0.0]),
+            "默认不该动网格空间坐标"
+        );
+        assert!(near3(t.vertices[0].normal, [0.0, 0.0, 1.0]));
+    }
+
+    /// 显式 `srcaxis "y"` 要连**几何顶点、法线、morph 偏移**一起转
+    /// （0.7.1 之前只转骨骼参考姿态，会「静置对、网格歪 90°」）。
+    #[test]
+    fn explicit_axis_rotates_geometry_and_morph() {
+        let d = tmpdir("tri_y_axis");
+        let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
+        let opts = GltfOpts {
+            axis: Some(crate::fbx::ForcedAxis::Y),
+            ..Default::default()
+        };
+        let g = read(&p, "tri.gltf", &opts).expect("应能读出三角形");
+        let t = &g.smd.triangles[0];
+        assert!(
+            near3(t.vertices[2].position, [0.0, 0.0, 1.0]),
+            "Y-up 的 +Y 要变成 Z-up 的 +Z"
+        );
+        assert!(near3(t.vertices[0].normal, [0.0, -1.0, 0.0]), "法线跟着转");
+
+        let dm = tmpdir("morph_y_axis");
+        let mut bin = tri_bytes();
+        bin.extend(f32s(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]));
+        let body = add_target(
+            &add_view(
+                &add_accessor(
+                    TRI_BODY,
+                    "{\"bufferView\": 4, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\"}",
+                ),
+                102,
+                36,
+            ),
+            4,
+        );
+        let body = body.replace(
+            "\"meshes\": [{\"name\": \"hat\"",
+            "\"meshes\": [{\"name\": \"hat\", \"extras\": {\"targetNames\": [\"wide\"]}",
+        );
+        let pm = write_gltf(&dm, "morph.gltf", &bin, &body);
+        let gm = read(&pm, "morph.gltf", &opts).expect("应能读出 morph");
+        assert!(
+            near3(gm.shape_keys[0].position_offsets[0], [0.0, -1.0, 0.0]),
+            "morph 偏移也要跟着转"
+        );
+    }
+
     /// 最小三角形：几何 / 节点表 / 材质名都要对。
     #[test]
     fn read_builds_geometry_from_an_inline_gltf() {
         let d = tmpdir("tri");
         let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
-        let g = read(&p, "tri.gltf", &GltfOpts::default()).expect("应能读出三角形");
+        let g = read(&p, "tri.gltf", &z_up()).expect("应能读出三角形");
 
         assert_eq!(g.smd.nodes.len(), 1);
         assert_eq!(g.smd.nodes[0].name, "Body.001");
@@ -2510,7 +2627,7 @@ mod tests {
              \"skins\": [{\"joints\": [1], \"inverseBindMatrices\": 4}]",
         );
         let p = write_gltf(&d, "ibm.gltf", &bin, &body);
-        let g = read(&p, "ibm.gltf", &GltfOpts::default()).expect("应能读出蒙皮网格");
+        let g = read(&p, "ibm.gltf", &z_up()).expect("应能读出蒙皮网格");
 
         assert_eq!(g.smd.nodes.len(), 1, "只有 `skin.joints` 里那根被收进来");
         assert_eq!(g.smd.nodes[0].name, "Joint");
@@ -2538,7 +2655,7 @@ mod tests {
              \"skins\": [{\"joints\": [1]}]",
         );
         let p = write_gltf(&d, "noibm.gltf", &tri_bytes(), &body);
-        let g = read(&p, "noibm.gltf", &GltfOpts::default()).expect("应能读出蒙皮网格");
+        let g = read(&p, "noibm.gltf", &z_up()).expect("应能读出蒙皮网格");
 
         assert_eq!(g.smd.nodes.len(), 1);
         let pos = g.smd.frames[0].poses[0].position;
@@ -2557,7 +2674,7 @@ mod tests {
     fn read_uv_is_not_flipped() {
         let d = tmpdir("uv");
         let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
-        let g = read(&p, "tri.gltf", &GltfOpts::default()).unwrap();
+        let g = read(&p, "tri.gltf", &z_up()).unwrap();
         let v = &g.smd.triangles[0].vertices;
         assert!(
             near2(v[0].uv, [0.0, 1.0]),
@@ -2607,7 +2724,7 @@ mod tests {
         // `material: -1` 不是合法的 glTF 索引，所以改成整个删掉 `material`。
         let body = body.replace(", \"material\": -1", "");
         let p = write_gltf(&d, "tri.gltf", &tri_bytes(), &body);
-        let g = read(&p, "tri.gltf", &GltfOpts::default()).unwrap();
+        let g = read(&p, "tri.gltf", &z_up()).unwrap();
         assert_eq!(g.smd.triangles[0].material, FALLBACK_MATERIAL);
         assert_eq!(g.untextured_meshes, vec!["hat".to_string()]);
     }
@@ -2651,7 +2768,7 @@ mod tests {
             "\"meshes\": [{\"name\": \"hat\", \"extras\": {\"targetNames\": [\"wide\"]}",
         );
         let p = write_gltf(&d, "morph.gltf", &bin, &body);
-        let g = read(&p, "morph.gltf", &GltfOpts::default()).unwrap();
+        let g = read(&p, "morph.gltf", &z_up()).unwrap();
 
         assert_eq!(g.shape_keys.len(), 1, "应有一个 shape key：{:?}", g.shape_keys);
         let k = &g.shape_keys[0];
@@ -2686,7 +2803,7 @@ mod tests {
             4,
         );
         let p = write_gltf(&d, "morphzero.gltf", &bin, &body);
-        let g = read(&p, "morphzero.gltf", &GltfOpts::default()).unwrap();
+        let g = read(&p, "morphzero.gltf", &z_up()).unwrap();
         assert!(
             g.shape_keys.is_empty(),
             "全零偏移的 target 不该产出 flex：{:?}",
@@ -2723,7 +2840,7 @@ mod tests {
             "\"targets\": [{\"POSITION\": 4, \"NORMAL\": 5}]",
         );
         let p = write_gltf(&d, "noview.gltf", &bin, &body);
-        let g = read(&p, "noview.gltf", &GltfOpts::default())
+        let g = read(&p, "noview.gltf", &z_up())
             .expect("无 bufferView 的 accessor 必须放行（规范 = 全零）");
 
         // 位置偏移照常读出来。
@@ -2744,7 +2861,7 @@ mod tests {
             let d = tmpdir("ext");
             let body = format!("{TRI_BODY},\n  \"extensionsRequired\": [\"{ext}\"]");
             let p = write_gltf(&d, "ext.gltf", &tri_bytes(), &body);
-            let err = read(&p, "ext.gltf", &GltfOpts::default()).unwrap_err();
+            let err = read(&p, "ext.gltf", &z_up()).unwrap_err();
             assert!(
                 err.to_string().contains(ext),
                 "报错文案要点名是哪个扩展：{err}"
@@ -2766,7 +2883,7 @@ mod tests {
         );
         let p = d.join("short.gltf");
         std::fs::write(&p, json).unwrap();
-        let err = read(&p, "short.gltf", &GltfOpts::default()).unwrap_err();
+        let err = read(&p, "short.gltf", &z_up()).unwrap_err();
         assert!(
             err.to_string().contains("9999"),
             "报错应说明声明了多少字节：{err}"
@@ -2854,7 +2971,7 @@ mod tests {
             "skinned_anim.gltf",
             None,
             30.0,
-            &GltfOpts::default(),
+            &z_up(),
         )
         .unwrap();
 
@@ -2889,7 +3006,7 @@ mod tests {
     fn read_frames_samples_the_animation_axis() {
         let d = tmpdir("anim");
         let p = anim_fixture(&d);
-        let smd = read_frames(&p, "anim.gltf", None, 30.0, &GltfOpts::default()).unwrap();
+        let smd = read_frames(&p, "anim.gltf", None, 30.0, &z_up()).unwrap();
 
         assert_eq!(smd.nodes.len(), 1);
         assert_eq!(
@@ -2921,7 +3038,7 @@ mod tests {
     fn read_frames_returns_the_reference_frame_without_animation() {
         let d = tmpdir("noanim");
         let p = write_gltf(&d, "tri.gltf", &tri_bytes(), TRI_BODY);
-        let smd = read_frames(&p, "tri.gltf", None, 30.0, &GltfOpts::default()).unwrap();
+        let smd = read_frames(&p, "tri.gltf", None, 30.0, &z_up()).unwrap();
         assert_eq!(smd.frames.len(), 1);
         assert_eq!(smd.frames[0].poses.len(), 1);
     }
@@ -2937,12 +3054,12 @@ mod tests {
             "anim.gltf",
             Some("SkeletonAction"),
             30.0,
-            &GltfOpts::default(),
+            &z_up(),
         )
         .unwrap();
         assert_eq!(smd.frames.len(), 31);
 
-        let err = read_frames(&p, "anim.gltf", Some("nope"), 30.0, &GltfOpts::default())
+        let err = read_frames(&p, "anim.gltf", Some("nope"), 30.0, &z_up())
             .unwrap_err()
             .to_string();
         assert!(
@@ -2956,8 +3073,8 @@ mod tests {
     fn read_frames_and_read_agree_on_the_bone_table() {
         let d = tmpdir("agree");
         let p = anim_fixture(&d);
-        let geo = read(&p, "anim.gltf", &GltfOpts::default()).unwrap();
-        let smd = read_frames(&p, "anim.gltf", None, 30.0, &GltfOpts::default()).unwrap();
+        let geo = read(&p, "anim.gltf", &z_up()).unwrap();
+        let smd = read_frames(&p, "anim.gltf", None, 30.0, &z_up()).unwrap();
         let a: Vec<_> = geo.smd.nodes.iter().map(|n| n.name.clone()).collect();
         let b: Vec<_> = smd.nodes.iter().map(|n| n.name.clone()).collect();
         assert_eq!(a, b, "两条路径的骨骼表必须逐项相同");

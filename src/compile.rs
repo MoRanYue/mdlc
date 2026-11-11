@@ -12956,6 +12956,52 @@ end
     /// ⭐ **反方向**：不写 `frames` 时拿到**与「仅作动画源」完全相同的帧数**
     /// —— 不是官方的 1 帧。
     ///
+    /// `srcaxis` 的**默认值**要跟随 FBX 自己声明的上轴（`GlobalSettings.UpAxis`）。
+    ///
+    /// 夹具 = [`MIN_FBX`] 把网格节点的 `Lcl Translation` 改成 `(0, 0, 10)`：
+    /// `UpAxis = 1`（`+Y`）⟹ 默认按 Y-up → Z-up 转一次，平移落到 `(0, −10, 0)`；
+    /// 显式 `srcaxis "z"` 关掉转换，平移留在 `(0, 0, 10)`。
+    #[test]
+    fn fbx_default_axis_follows_the_file_up_axis() {
+        let d = tmpdir("fbxdefaultaxis");
+        let fbx = MIN_FBX.replace(
+            "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,0",
+            "P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,10",
+        );
+        assert_ne!(fbx, MIN_FBX, "替换必须命中夹具里的平移属性");
+        write(&d, "up.fbx", &fbx);
+        let p = d.join("up.fbx");
+
+        let mean = |opts: &crate::fbx::FbxOpts| {
+            let g = crate::fbx::read(&p, "up.fbx", opts).expect("应能读出立方体");
+            let ps: Vec<_> = g
+                .smd
+                .triangles
+                .iter()
+                .flat_map(|t| t.vertices.iter().map(|v| v.position))
+                .collect();
+            assert!(!ps.is_empty(), "夹具必须有三角形");
+            let n = ps.len() as f32;
+            let axis = |i: usize| ps.iter().map(|v| v[i]).sum::<f32>() / n;
+            (axis(0), axis(1), axis(2))
+        };
+
+        let (_, y0, z0) = mean(&crate::fbx::FbxOpts::default());
+        assert!(
+            (y0 + 10.0).abs() < 0.01 && z0.abs() < 0.01,
+            "默认要按文件里的 +Y 轴转成 Z-up：y={y0} z={z0}"
+        );
+
+        let (_, y1, z1) = mean(&crate::fbx::FbxOpts {
+            axis: Some(crate::fbx::ForcedAxis::Z),
+            ..Default::default()
+        });
+        assert!(
+            y1.abs() < 0.01 && (z1 - 10.0).abs() < 0.01,
+            "显式 srcaxis z 应保持原样：y={y1} z={z1}"
+        );
+    }
+
     /// 与上一个测试配对。⭐ 断言刻意**不写死帧数**（[`MIN_FBX`] 的 6 个关键帧
     /// 跨 5 秒，30 fps 重采样后是 151 帧 —— 写死数字会让测试与夹具的时间轴
     /// 耦合），而是**两次编译对比**：
